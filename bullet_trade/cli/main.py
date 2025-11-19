@@ -258,8 +258,8 @@ def create_parser():
         '--broker',
         type=str,
         choices=['qmt', 'qmt-remote', 'simulator'],
-        default='simulator',
-        help='券商类型'
+        default=None,
+        help='券商类型（默认读取 DEFAULT_BROKER）'
     )
     live_parser.add_argument(
         '--log-dir',

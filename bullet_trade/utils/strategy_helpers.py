@@ -195,7 +195,13 @@ def print_portfolio_info(context, top_n: Optional[int] = None, sort_by: str = "v
     cash = float(getattr(context.portfolio, "available_cash", 0.0) or 0.0)
     starting_cash = float(getattr(context.portfolio, "starting_cash", 0.0) or 0.0)
     pnl_pct = ((total_value - starting_cash) / starting_cash * 100.0) if starting_cash > 0 else 0.0
-    print(f"系统 ==>当前收益：{pnl_pct:.2f}%，当前剩余金额{_fen(cash):,.2f}, 总价值:{_fen(total_value):,.2f}")
+
+    run_params = getattr(context, "run_params", None) or {}
+    run_type = str(run_params.get("run_type") or "").upper()
+    is_live = bool(run_params.get("is_live")) or run_type == "LIVE"
+
+    if not is_live:
+        print(f"系统 ==>当前收益：{pnl_pct:.2f}%，当前剩余金额{_fen(cash):,.2f}, 总价值:{_fen(total_value):,.2f}")
     print("当前持仓:")
 
     rows = _position_rows(context, total_value, top_n)
