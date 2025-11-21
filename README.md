@@ -24,13 +24,14 @@
 ## 📖 文档
 
 - [文档首页](docs/index.md):  站点 <https://bullettrade.cn/docs/>
+- [快速上手](docs/quickstart.md)：三步跑通回测/实盘，聚宽策略无改直接复用。
+- [配置总览](docs/config.md)：回测/本地实盘/远程实盘/聚宽接入的环境变量一览。
 - [回测引擎](docs/backtest.md)：真实价格成交、分红送股处理、聚宽代码示例与 CLI 回测。
 - [实盘引擎](docs/live.md)：本地 QMT 独立实盘与远程实盘流程。
 - [交易支撑](docs/trade-support.md)：聚宽模拟盘接入、远程 QMT 服务与 helper 用法。
-- [扩展能力](docs/quickstart.md)：数据/交易提供者设计理念与扩展指引。
+- [QMT 服务配置](docs/qmt-server.md)：bullet-trade server 的完整说明。
 - [数据源指南](docs/data/DATA_PROVIDER_GUIDE.md)：聚宽、MiniQMT、Tushare 以及自定义 Provider 配置。
 - [API 文档](docs/api.md)：策略可用 API、类模型与工具函数。
-- [QMT 服务配置](docs/qmt-server.md)：bullet-trade server 的完整说明。
 - [邀请贡献](docs/contributing.md): 贡献与联系方式。 
 
 ## 🔗 链接
@@ -47,7 +48,7 @@
 
 如需交流或反馈，低佣开通QMT等，可扫码添加微信，并在 Issue/PR 中提出建议：
 
-<img src="docs/assets/wechat-contact.png" alt="微信二维码" style="max-width: 200px;">
+<img src="docs/assets/wechat-contact.png" alt="微信二维码" width="180">
 
 ---
 
