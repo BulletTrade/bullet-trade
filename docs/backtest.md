@@ -11,6 +11,7 @@ cp env.backtest.example .env
 ```
 2) 只填本页用到的变量（其余见 [配置总览](config.md)）：
 ```bash
+# 数据源类型 (jqdata, tushare, qmt)
 DEFAULT_DATA_PROVIDER=jqdata         # 必填，行情源
 JQDATA_USERNAME=your_username       # 选填，按数据源需要
 JQDATA_PASSWORD=your_password

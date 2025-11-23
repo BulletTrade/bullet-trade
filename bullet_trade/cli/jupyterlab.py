@@ -150,7 +150,19 @@ def ensure_env_file(env_path: Path) -> bool:
     env_path.parent.mkdir(parents=True, exist_ok=True)
     env_path.write_text(
         "# BulletTrade JupyterLab 默认 .env\n"
-        "# 在此配置数据源/券商等参数，如 DEFAULT_DATA_PROVIDER、DEFAULT_BROKER 等。\n",
+        "# 在此配置数据源/券商等参数，如 DEFAULT_DATA_PROVIDER、DEFAULT_BROKER 等。\n"
+        "# 数据源类型 (jqdata, tushare, qmt)\n"
+        "DEFAULT_DATA_PROVIDER=qmt\n"
+        "# 券商类型 (qmt, simulator)\n"
+        "DEFAULT_BROKER=qmt\n"
+        "# QMT 券商配置\n"
+        "QMT_ACCOUNT_ID=your_account_id\n"
+        "QMT_ACCOUNT_TYPE=stock\n"
+        "# QMT 数据目录\n"
+        "QMT_DATA_PATH=C:\\国金QMT交易端模拟\\userdata_mini\n"
+        "# QMT 会话 ID\n"
+        "QMT_SESSION_ID=0\n"
+        ,
         encoding="utf-8",
     )
     return True

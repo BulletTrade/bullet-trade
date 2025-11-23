@@ -8,9 +8,11 @@ nav:
   - 官方首页: /
   - 文档首页: index.md
   - 快速上手: quickstart.md
+  - 研究环境: research.md
   - 配置总览: config.md
   - 回测引擎: backtest.md
   - 实盘引擎: live.md
+  - Tick 行情指南: tick.md
   - 交易支撑: trade-support.md
   - QMT 服务配置: qmt-server.md
   - API 文档: api.md

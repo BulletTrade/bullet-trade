@@ -288,36 +288,63 @@ def _on_xt_tick(data: Any) -> None:
     handler = _tick_handler
     if handler is None:
         return
-    # xtdata 可能传入 dict 或对象列表
+    # xtdata 可能传入 dict（code->tick 或 code->list[tick]）或对象列表
     try:
+        items = []
         if isinstance(data, dict):
-            items = []
             for k, v in data.items():
-                items.append((k, v))
+                if isinstance(v, (list, tuple)) and v:
+                    for entry in v:
+                        items.append((k, entry))
+                else:
+                    items.append((k, v))
         elif isinstance(data, (list, tuple)):
-            items = []
             for v in data:
                 code = getattr(v, 'stock_code', None) or getattr(v, 'code', None) or getattr(v, 'InstrumentID', None)
                 items.append((code, v))
-        else:
-            items = []
     except Exception:
         items = []
 
+    def _pick(src: Any, keys) -> Any:
+        for key in keys:
+            if isinstance(src, dict) and key in src:
+                val = src.get(key)
+            else:
+                val = getattr(src, key, None) if hasattr(src, key) else None
+            if val not in (None, ""):
+                return val
+        return None
+
     for code, t in items:
         try:
-            if isinstance(t, dict):
-                last_price = t.get('lastPrice')
-                ts = t.get('time') or t.get('datetime')
-            else:
-                last_price = getattr(t, 'lastPrice', None)
-                ts = getattr(t, 'time', None)
             jq_code = _to_jq_code(str(code)) if code else None
+            last_price = _pick(t, ['lastPrice', 'last_price', 'price', 'latestPrice', 'newPrice', 'last'])
+            ts = _pick(t, ['time', 'datetime', 'data_time', 'update_time'])
             tick = {
                 'sid': jq_code,
+                'symbol': code,
                 'last_price': last_price,
                 'dt': ts,
             }
+            # 盘口/行情补充字段（尽量兼容 xtdata）
+            mappings = {
+                'bid1': ['bidPrice1', 'bidprice1', 'bid1', 'buyPrice1', 'buyprice1'],
+                'ask1': ['askPrice1', 'askprice1', 'ask1', 'sellPrice1', 'sellprice1'],
+                'bid1_volume': ['bidVolume1', 'bidvolume1', 'bid1_volume', 'buyVolume1', 'buyvolume1'],
+                'ask1_volume': ['askVolume1', 'askvolume1', 'ask1_volume', 'sellVolume1', 'sellvolume1'],
+                'last_close': ['preClose', 'lastClose', 'pre_close'],
+                'open': ['open', 'openPrice', 'open_price'],
+                'high': ['high', 'highPrice', 'high_price'],
+                'low': ['low', 'lowPrice', 'low_price'],
+                'volume': ['volume', 'vol'],
+                'amount': ['amount', 'money', 'turnover', 'value'],
+                'limit_up': ['limitUp', 'highLimit', 'limit_up'],
+                'limit_down': ['limitDown', 'lowLimit', 'limit_down'],
+            }
+            for field, keys in mappings.items():
+                val = _pick(t, keys)
+                if val is not None:
+                    tick[field] = val
             # 构造最小 context（后续接入真实 live context）
             class _Ctx:
                 live_trade = True

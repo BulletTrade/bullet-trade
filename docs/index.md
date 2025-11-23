@@ -14,6 +14,7 @@ BulletTrade 是一套兼容聚宽 API 的量化研究与交易框架，支持多
 - [实盘引擎](live.md)：本地 QMT 独立实盘与远程实盘流程。
 - [交易支撑](trade-support.md)：聚宽模拟盘接入、远程 QMT 服务与 helper 用法。
 - [QMT 服务配置](qmt-server.md)：bullet-trade server 的完整说明。
+- [Tick 订阅指南](tick.md)：本地 xtdata 与远程 qmt-remote 的订阅、字段与常见问题。
 - [数据源指南](data/DATA_PROVIDER_GUIDE.md)：聚宽、MiniQMT、Tushare 以及自定义 Provider 配置。
 - [API 文档](api.md)：策略可用 API、类模型与工具函数。
 
