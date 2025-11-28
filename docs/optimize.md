@@ -104,6 +104,43 @@ bullet-trade optimize [-h] --params PARAMS --start START --end END
 }
 ```
 
+### Python 表达式语法
+
+参数值支持 `"py:表达式"` 语法，可以使用 Python 表达式动态生成参数列表，避免手动罗列大量数值：
+
+```json
+{
+    "param_grid": {
+        "rank_days": "py:range(10, 35, 5)",
+        "threshold": "py:[x/100 for x in range(1, 10)]",
+        "ma_days": "py:list(range(5, 50, 5))"
+    }
+}
+```
+
+上述配置等价于：
+
+```json
+{
+    "param_grid": {
+        "rank_days": [10, 15, 20, 25, 30],
+        "threshold": [0.01, 0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08, 0.09],
+        "ma_days": [5, 10, 15, 20, 25, 30, 35, 40, 45]
+    }
+}
+```
+
+**支持的函数**：`range`、`list`、`int`、`float`、`round`、`abs`、`min`、`max`、`sum`、`len`、`sorted`、`reversed`
+
+**常用示例**：
+
+| 表达式 | 结果 |
+|--------|------|
+| `"py:range(1, 10)"` | [1, 2, 3, 4, 5, 6, 7, 8, 9] |
+| `"py:range(10, 30, 5)"` | [10, 15, 20, 25] |
+| `"py:[x/10 for x in range(5, 15)]"` | [0.5, 0.6, 0.7, ..., 1.4] |
+| `"py:[round(x*0.01, 2) for x in range(1, 6)]"` | [0.01, 0.02, 0.03, 0.04, 0.05] |
+
 ### 示例：动量策略优化
 
 策略中的参数：

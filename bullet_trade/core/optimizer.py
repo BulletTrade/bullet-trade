@@ -7,12 +7,44 @@
 from typing import Dict, Any, List, Optional, Iterable, Tuple
 import itertools
 import os
+import signal
+import sys
 import time
 import traceback
 import json
 import multiprocessing as mp
 import pandas as pd
 import numpy as np
+
+
+def _worker_init():
+    """
+    子进程初始化函数：
+    1. 让子进程忽略 SIGINT 信号，由主进程统一处理中断
+    2. 禁用文件日志，避免多进程同时写入同一个日志文件导致冲突
+    """
+    # Windows 上 signal.SIGINT 可能不存在或行为不同，需要容错处理
+    try:
+        signal.signal(signal.SIGINT, signal.SIG_IGN)
+    except (AttributeError, ValueError, OSError):
+        pass
+    
+    # 禁用子进程的文件日志，避免多进程同时写入/轮转同一个日志文件
+    # 这是多进程优化时的常见问题，尤其在 Windows 上会导致 PermissionError
+    try:
+        from .globals import log
+        if log._file_handler:
+            try:
+                log.logger.removeHandler(log._file_handler)
+            except Exception:
+                pass
+            try:
+                log._file_handler.close()
+            except Exception:
+                pass
+            log._file_handler = None
+    except Exception:
+        pass
 
 # 进度条（可选）
 try:
@@ -176,6 +208,15 @@ def run_param_grid(
             processes = os.cpu_count() or 1
         except Exception:
             processes = 1
+    
+    # 多进程模式下打印警告：子进程文件日志已禁用
+    if processes > 1:
+        # 使用 ANSI 颜色代码：黄色警告
+        YELLOW = "\033[33m"
+        RESET = "\033[0m"
+        print(f"{YELLOW}⚠️  多进程优化模式：子进程文件日志已禁用，避免日志文件冲突{RESET}")
+        print(f"{YELLOW}   如需调试单个参数组合，请使用单次回测命令{RESET}")
+        print()
 
     tasks = []
     for combo in combos:
@@ -195,26 +236,62 @@ def run_param_grid(
         })
 
     rows: List[Dict[str, Any]] = []
+    interrupted = False
+    
     if processes == 1:
+        # 单进程模式：直接处理中断
         iterator = map(_worker_task, tasks)
-        if show_progress and tqdm:
-            for r in tqdm(iterator, total=len(tasks), desc=progress_desc or '参数优化', unit='组'):
-                rows.append(r)
-        else:
-            for r in iterator:
-                rows.append(r)
-    else:
-        with mp.Pool(processes=processes) as pool:
-            iterator = pool.imap_unordered(_worker_task, tasks)
+        try:
             if show_progress and tqdm:
                 for r in tqdm(iterator, total=len(tasks), desc=progress_desc or '参数优化', unit='组'):
                     rows.append(r)
+            else:
+                for r in iterator:
+                    rows.append(r)
+        except KeyboardInterrupt:
+            interrupted = True
+            print("\n\n⚠️ 用户中断优化，已完成 {}/{} 组合".format(len(rows), len(tasks)))
+    else:
+        # 多进程模式：需要手动管理 Pool 以正确处理中断
+        # 注意：Windows 上 imap_unordered 迭代器阻塞时无法响应 Ctrl+C
+        # 因此使用 apply_async + 带超时的 get() 轮询，让主进程能定期检查中断信号
+        pool = None
+        try:
+            # 使用 initializer 让子进程忽略 SIGINT，由主进程统一处理
+            pool = mp.Pool(processes=processes, initializer=_worker_init)
+            
+            # 使用 apply_async 提交所有任务，返回 AsyncResult 列表
+            async_results = [pool.apply_async(_worker_task, (task,)) for task in tasks]
+            
+            # 关闭 pool，不再接受新任务（但已提交的任务继续执行）
+            pool.close()
+            
+            # 带超时轮询等待结果，这样主进程能响应 Ctrl+C
+            total = len(async_results)
+            if show_progress and tqdm:
+                pbar = tqdm(total=total, desc=progress_desc or '参数优化', unit='组')
+                for ar in async_results:
+                    # 使用带超时的 get()，每 0.5 秒检查一次，让主进程能响应中断
+                    while True:
+                        try:
+                            r = ar.get(timeout=0.5)
+                            break
+                        except mp.TimeoutError:
+                            continue  # 超时但任务未完成，继续等待
+                    rows.append(r)
+                    pbar.update(1)
+                pbar.close()
             elif show_progress and not tqdm:
                 done = 0
-                total = len(tasks)
                 last_emit = time.time()
                 emit_interval = 1.0
-                for r in iterator:
+                for ar in async_results:
+                    while True:
+                        try:
+                            r = ar.get(timeout=0.5)
+                            break
+                        except mp.TimeoutError:
+                            continue
                     rows.append(r)
                     done += 1
                     now = time.time()
@@ -223,8 +300,23 @@ def run_param_grid(
                         print(f"进度: {done}/{total} ({pct:.1f}%)")
                         last_emit = now
             else:
-                for r in iterator:
+                for ar in async_results:
+                    while True:
+                        try:
+                            r = ar.get(timeout=0.5)
+                            break
+                        except mp.TimeoutError:
+                            continue
                     rows.append(r)
+        except KeyboardInterrupt:
+            interrupted = True
+            print("\n\n⚠️ 用户中断优化，正在停止子进程...")
+            if pool:
+                pool.terminate()  # 强制终止所有子进程
+            print("已完成 {}/{} 组合".format(len(rows), len(tasks)))
+        finally:
+            if pool:
+                pool.join()  # 等待所有子进程结束
 
     df = pd.DataFrame(rows)
     # 排序（降序）
