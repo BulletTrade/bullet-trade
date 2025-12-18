@@ -18,6 +18,7 @@ class TushareProvider(DataProvider):
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         self.config = config or {}
         self._token = self.config.get("token") or os.getenv("TUSHARE_TOKEN")
+        self._tushare_custom_url = self.config.get("tushare_custom_url") or os.getenv("TUSHARE_CUSTOM_URL")
         cache_dir_set = "cache_dir" in self.config
         cache_dir = self.config.get("cache_dir")
         self._cache = CacheManager(
@@ -84,14 +85,18 @@ class TushareProvider(DataProvider):
         host: Optional[str] = None,
         port: Optional[int] = None,
     ) -> None:
-        _ = host, port, pwd  # tushare 不使用这些字段
+        _ = port, pwd  # tushare 不使用这些字段
         token = user or self._token
         if not token:
             raise RuntimeError("Tushare token 未配置，请设置 TUSHARE_TOKEN 或在 auth 中手动传入")
         ts = self._ensure_ts_module()
         self._pro = ts.pro_api(token)
         self._token = token
-
+        # 支持自定义 API URL
+        tushare_custom_url = host or self._tushare_custom_url
+        if tushare_scustom_url:
+            self._pro._DataApi__http_url = tushare_custom_url
+            print("使用自定义的URL")
     # ------------------------ K 线数据 ------------------------
     def get_price(
         self,

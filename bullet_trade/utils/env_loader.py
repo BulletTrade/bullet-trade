@@ -161,6 +161,7 @@ def get_data_provider_config() -> dict:
         'tushare': {
             'token': get_env('TUSHARE_TOKEN'),
             'cache_dir': cache_dir_for('tushare'),
+            'tushare_custom_url': get_env('TUSHARE_CUSTOM_URL'),
         },
         'qmt': {
             'host': get_env('QMT_HOST', '127.0.0.1'),
@@ -170,6 +171,7 @@ def get_data_provider_config() -> dict:
             'market': get_env('MINIQMT_MARKET'),
             'cache_dir': cache_dir_for('miniqmt'),
             'tushare_token': get_env('TUSHARE_TOKEN'),
+            'tushare_custom_url': get_env('TUSHARE_CUSTOM_URL'),
         },
         'remote_qmt': {
             'host': get_env('QMT_SERVER_HOST'),
