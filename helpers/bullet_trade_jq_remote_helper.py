@@ -212,14 +212,31 @@ class RemoteBrokerClient:
         rows = self._client.request("broker.positions", payload)
         positions = []
         for row in rows or []:
+            # 解析数量和可用数量
+            amount = int(row.get("amount") or 0)
+            # 优先读取 closeable_amount（服务端 QMT 返回的字段名）
+            available = int(
+                row.get("available")
+                or row.get("closeable_amount")
+                or row.get("can_sell_amount")
+                or row.get("sellable")
+                or row.get("can_use_amount")
+                or row.get("current_amount")
+                or row.get("qty")
+                or row.get("volume")
+                or row.get("position", 0)
+            )
+            # frozen 优先读取服务端返回值，如果没有则用 amount - available 计算
+            frozen_raw = row.get("frozen") or row.get("lock_amount")
+            frozen = int(frozen_raw) if frozen_raw is not None else (amount - available)
             positions.append(
                 RemotePosition(
                     security=row.get("security"),
-                    amount=int(row.get("amount") or 0),
+                    amount=amount,
                     avg_cost=float(row.get("avg_cost") or 0.0),
                     market_value=float(row.get("market_value") or 0.0),
-                    available=int(row.get("available") or row.get("can_sell_amount") or row.get("sellable") or row.get("can_use_amount") or row.get("current_amount") or row.get("qty") or row.get("volume") or row.get("position", 0)),
-                    frozen=int(row.get("frozen") or row.get("lock_amount") or 0),
+                    available=available,
+                    frozen=frozen,
                     market=row.get("market"),
                 )
             )
