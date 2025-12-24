@@ -331,4 +331,4 @@ def get_live_trade_config() -> dict:
 
 # 自动加载环境变量
 if __name__ != "__main__":
-    load_env()
+    load_env(os.getenv("ENV_FILE", ".env"), verbose=True)

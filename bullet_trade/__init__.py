@@ -20,7 +20,8 @@ except Exception as exc:  # pragma: no cover - 兼容运行环境缺少 GUI 依�
 
 # 加载环境变量
 from .utils.env_loader import load_env
-load_env()
+import os
+load_env(os.getenv("ENV_FILE", ".env"), verbose=True)
 
 # 配置中文字体显示
 # from .utils.font_config import setup_chinese_fonts
