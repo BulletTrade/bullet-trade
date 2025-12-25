@@ -14,6 +14,8 @@ class TushareProvider(DataProvider):
     """基于 tushare.pro 的数据提供者，字段与复权口径对齐兼容层约定。"""
 
     name: str = "tushare"
+    _TS_SUFFIX_TO_JQ = {"SH": "XSHG", "SZ": "XSHE"}
+    _JQ_SUFFIX_TO_TS = {"XSHG": "SH", "XSHE": "SZ"}
 
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         self.config = config or {}
@@ -29,6 +31,26 @@ class TushareProvider(DataProvider):
         self._pro = None
 
     # ------------------------ 公共工具 ------------------------
+    @classmethod
+    def _to_ts_code(cls, security: str) -> str:
+        if not security or not isinstance(security, str) or "." not in security:
+            return security
+        code, suffix = security.split(".", 1)
+        mapped = cls._JQ_SUFFIX_TO_TS.get(suffix.upper())
+        if mapped:
+            return f"{code}.{mapped}"
+        return security
+
+    @classmethod
+    def _to_jq_code(cls, security: str) -> str:
+        if not security or not isinstance(security, str) or "." not in security:
+            return security
+        code, suffix = security.split(".", 1)
+        mapped = cls._TS_SUFFIX_TO_JQ.get(suffix.upper())
+        if mapped:
+            return f"{code}.{mapped}"
+        return security
+
     @staticmethod
     def _ensure_ts_module():
         try:
@@ -176,9 +198,10 @@ class TushareProvider(DataProvider):
         ts = self._ensure_ts_module()
         pro = self._ensure_client()
         asset = "E"  # 默认股票
+        ts_code = self._to_ts_code(security)
 
         df = ts.pro_bar(
-            ts_code=security,
+            ts_code=ts_code,
             start_date=start_str,
             end_date=end_str,
             freq=freq,
@@ -200,6 +223,8 @@ class TushareProvider(DataProvider):
             },
             inplace=True,
         )
+        if "ts_code" in df.columns:
+            df["ts_code"] = df["ts_code"].apply(self._to_jq_code)
         df["money"] = df.get("money", 0.0)
         df["volume"] = df.get("volume", 0.0)
 
@@ -235,8 +260,7 @@ class TushareProvider(DataProvider):
 
         factor_df.index = pd.to_datetime(factor_df["trade_date"])
         merged = df.join(factor_df["adj_factor"], how="left")
-        merged["adj_factor"].fillna(method="ffill", inplace=True)
-        merged["adj_factor"].fillna(method="bfill", inplace=True)
+        merged["adj_factor"] = merged["adj_factor"].ffill().bfill()
         ref_date = pre_factor_ref_date or end_dt if fq == "pre" else pre_factor_ref_date or start_dt
         try:
             ref_date = pd.to_datetime(ref_date)
@@ -265,8 +289,9 @@ class TushareProvider(DataProvider):
 
         def _fetch(kw: Dict[str, Any]) -> pd.DataFrame:
             pro = self._ensure_client()
+            ts_code = self._to_ts_code(kw["security"])
             return pro.adj_factor(
-                ts_code=kw["security"],
+                ts_code=ts_code,
                 start_date=kw["start_date"],
                 end_date=kw["end_date"],
             )
@@ -351,6 +376,7 @@ class TushareProvider(DataProvider):
                 return {}
             merged = pd.concat(rows, ignore_index=True).drop_duplicates("ts_code")
             merged.set_index("ts_code", inplace=True)
+            merged.index = [self._to_jq_code(code) for code in merged.index]
             return merged.to_dict(orient="index")
 
         data = self._cache.cached_call("get_all_securities", kwargs, _fetch, result_type="list_dict")
@@ -366,11 +392,12 @@ class TushareProvider(DataProvider):
 
         def _fetch(kw: Dict[str, Any]) -> List[str]:
             pro = self._ensure_client()
+            index_code = self._to_ts_code(kw["index_symbol"])
             target_date = self._format_date(kw.get("date")) or datetime.today().strftime("%Y%m%d")
-            df = pro.index_weight(index_code=kw["index_symbol"], trade_date=target_date)
+            df = pro.index_weight(index_code=index_code, trade_date=target_date)
             if df is None or df.empty:
                 return []
-            return df["con_code"].dropna().tolist()
+            return [self._to_jq_code(code) for code in df["con_code"].dropna().tolist()]
 
         return self._cache.cached_call("get_index_stocks", kwargs, _fetch, result_type="list_str")
 
@@ -387,7 +414,8 @@ class TushareProvider(DataProvider):
             ts = self._ensure_ts_module()
             pro = self._ensure_client()
             # 回退策略：使用 pro.bar/ts.pro_bar 获取最近一分钟数据
-            df = ts.pro_bar(ts_code=security, freq='1min', api=pro)
+            ts_code = self._to_ts_code(security)
+            df = ts.pro_bar(ts_code=ts_code, freq='1min', api=pro)
             if df is None or df.empty:
                 return {}
             df = df.sort_values('trade_time' if 'trade_time' in df.columns else 'trade_date')
@@ -418,31 +446,70 @@ class TushareProvider(DataProvider):
         }
 
         def _fetch(kw: Dict[str, Any]) -> List[Dict[str, Any]]:
+            def _parse_date(value: Optional[str]) -> Optional[Date]:
+                if not value:
+                    return None
+                try:
+                    return pd.to_datetime(value).date()
+                except Exception:
+                    return None
+
+            def _safe_float(value: Any) -> Optional[float]:
+                try:
+                    if value is None or (isinstance(value, float) and pd.isna(value)):
+                        return None
+                    val = float(value)
+                    if pd.isna(val):
+                        return None
+                    return val
+                except (TypeError, ValueError):
+                    return None
+
             pro = self._ensure_client()
             sec = kw["security"]
-            
+            ts_code = self._to_ts_code(sec)
+            sec_jq = self._to_jq_code(sec)
+            start_dt = _parse_date(kw.get("start_date"))
+            end_dt = _parse_date(kw.get("end_date"))
+
+            def _in_range(check: Optional[Date]) -> bool:
+                if check is None:
+                    return False
+                if start_dt and check < start_dt:
+                    return False
+                if end_dt and check > end_dt:
+                    return False
+                return True
+
             # 判断证券类型：基金/ETF代码通常以5开头（如511880），股票为6位数字
-            code_only = sec.split(".")[0] if "." in sec else sec
+            code_only = sec_jq.split(".")[0] if "." in sec_jq else sec_jq
             is_fund = code_only.startswith("5") and len(code_only) == 6
-            
+
             events: List[Dict[str, Any]] = []
-            
+
             if is_fund:
                 # 基金分红：使用 fund_div 接口
                 try:
-                    df = pro.fund_div(
-                        ts_code=sec,
-                        ex_date_start=kw["start_date"],
-                        ex_date_end=kw["end_date"],
-                    )
+                    seen_dividends = set()
+                    df = pro.fund_div(ts_code=ts_code)
                     if df is not None and not df.empty:
                         for _, row in df.iterrows():
+                            div_proc = str(row.get("div_proc") or "")
+                            if div_proc and "实施" not in div_proc:
+                                continue
+                            ex_date = _parse_date(row.get("ex_date") or row.get("ann_date"))
+                            if not _in_range(ex_date):
+                                continue
                             # Tushare 基金分红字段：div_cash 为每份派息
-                            cash = float(row.get("div_cash", 0.0) or 0.0)
+                            cash = _safe_float(row.get("div_cash")) or 0.0
+                            signature = (ex_date, round(cash, 6))
+                            if signature in seen_dividends:
+                                continue
+                            seen_dividends.add(signature)
                             events.append(
                                 {
-                                    "security": sec,
-                                    "date": pd.to_datetime(row.get("ex_date") or row.get("ann_date")).date(),
+                                    "security": sec_jq,
+                                    "date": ex_date,
                                     "security_type": "fund",
                                     "scale_factor": 1.0,
                                     "bonus_pre_tax": cash,
@@ -452,36 +519,42 @@ class TushareProvider(DataProvider):
                 except Exception:
                     # 如果基金接口失败，尝试用股票接口
                     pass
-            
+
             # 股票分红：使用 dividend 接口
             if not is_fund or not events:
                 try:
-                    df = pro.dividend(
-                        ts_code=sec,
-                        start_date=kw["start_date"],
-                        end_date=kw["end_date"],
-                    )
+                    df = pro.dividend(ts_code=ts_code)
                     if df is not None and not df.empty:
                         for _, row in df.iterrows():
-                            # Tushare 股票分红字段：cash_div 为每10股派息
-                            cash = float(row.get("cash_div", 0.0) or 0.0)
-                            stock_paid = float(row.get("stock_div", 0.0) or 0.0)
-                            transfer = float(row.get("stock_transfer", 0.0) or 0.0)
+                            div_proc = str(row.get("div_proc") or "")
+                            if div_proc and "实施" not in div_proc:
+                                continue
+                            ex_date = _parse_date(row.get("ex_date"))
+                            if not _in_range(ex_date):
+                                continue
+                            # Tushare 股票分红字段为每股口径，需转换为每10股
+                            cash_pre = _safe_float(row.get("cash_div_tax"))
+                            if cash_pre is None or cash_pre == 0.0:
+                                cash_pre = _safe_float(row.get("cash_div")) or 0.0
+                            stock_paid = _safe_float(row.get("stk_bo_rate")) or 0.0
+                            transfer = _safe_float(row.get("stk_co_rate")) or 0.0
+                            if stock_paid == 0.0 and transfer == 0.0:
+                                stock_paid = _safe_float(row.get("stk_div")) or 0.0
                             per_base = 10
-                            scale = 1.0 + (stock_paid + transfer) / per_base if per_base else 1.0
+                            scale = 1.0 + stock_paid + transfer
                             events.append(
                                 {
-                                    "security": sec,
-                                    "date": pd.to_datetime(row.get("ex_date") or row.get("imp_ann_date")).date(),
+                                    "security": sec_jq,
+                                    "date": ex_date,
                                     "security_type": "stock",
                                     "scale_factor": scale,
-                                    "bonus_pre_tax": cash,
+                                    "bonus_pre_tax": cash_pre * per_base,
                                     "per_base": per_base,
                                 }
                             )
                 except Exception:
                     pass
-            
+
             return events
 
         return self._cache.cached_call("get_split_dividend", kwargs, _fetch, result_type="list_dict")
