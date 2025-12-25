@@ -128,14 +128,16 @@ class AsyncBacktestEngine(BacktestEngine):
                     task.func,
                     task.weekday,
                     task.time,
-                    overlap_strategy
+                    overlap_strategy,
+                    force=getattr(task, 'force', False),
                 )
             elif task.schedule_type.value == 'monthly':
                 self.async_scheduler.run_monthly(
                     task.func,
                     task.monthday,
                     task.time,
-                    overlap_strategy
+                    overlap_strategy,
+                    force=getattr(task, 'force', False),
                 )
             
             log.debug(
@@ -211,6 +213,7 @@ class AsyncBacktestEngine(BacktestEngine):
 
         # 设置回测频率到 settings，供调度解析使用
         set_option('backtest_frequency', self.frequency)
+        set_option('backtest_start_date', self.start_date.date())
         
         # 发布回测开始事件
         await self.event_bus.emit(BacktestStartEvent(
@@ -224,6 +227,7 @@ class AsyncBacktestEngine(BacktestEngine):
 
         # load_strategy 内部会重置设置，这里重新注入频率
         set_option('backtest_frequency', self.frequency)
+        set_option('backtest_start_date', self.start_date.date())
         
         # 初始化上下文（同步）
         self._initialize_context()
