@@ -46,6 +46,33 @@ def _coerce_time(value) -> Time:
     raise ValueError(f"无法解析时间: {value!r}")
 
 
+def _coerce_date(value) -> Optional[date]:
+    """将字符串/datetime/date 转换为 date；无法转换则返回 None。"""
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        s = value.strip()
+        if not s:
+            return None
+        for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+            try:
+                return datetime.strptime(s, fmt).date()
+            except ValueError:
+                continue
+        return None
+    return None
+
+
+def _get_backtest_start_date() -> Optional[date]:
+    """从 settings.options 读取回测 start_date（若存在）。"""
+    settings = get_settings()
+    return _coerce_date(settings.options.get("backtest_start_date"))
+
+
 def get_market_periods() -> List[Tuple[Time, Time]]:
     """获取配置的交易时段列表"""
     settings = get_settings()
@@ -317,6 +344,7 @@ class ScheduleTask:
     time: str  # 原始表达式
     weekday: Optional[int] = None
     monthday: Optional[int] = None
+    force: bool = False
     expression: Optional[TimeExpression] = None
     last_trigger_marker: Optional[Tuple[int, int]] = field(default=None, repr=False)
 
@@ -356,14 +384,15 @@ def run_daily(func: Callable, time: str = 'every_bar'):
     _tasks.append(task)
 
 
-def run_weekly(func: Callable, weekday: int, time: str = '09:30'):
+def run_weekly(func: Callable, weekday: int, time: str = '09:30', force: bool = False):
     """
     每周运行
-    
+
     Args:
         func: 要执行的函数
         weekday: 星期几（0=周一, 1=周二, ..., 6=周日）
         time: 执行时间，格式 'HH:MM'
+        force: 若回测 start_day 的 weekday 晚于指定 weekday，则在回测启动当周的首个可用交易日补跑一次。
     """
     aliases = _effective_aliases()
     expression = TimeExpression.parse(time, aliases)
@@ -372,12 +401,13 @@ def run_weekly(func: Callable, weekday: int, time: str = '09:30'):
         schedule_type=ScheduleType.WEEKLY,
         time=time,
         weekday=weekday,
+        force=bool(force),
         expression=expression,
     )
     _tasks.append(task)
 
 
-def run_monthly(func: Callable, monthday: int, time: str = '09:30'):
+def run_monthly(func: Callable, monthday: int, time: str = '09:30', force: bool = False):
     """
     每月运行
     
@@ -393,6 +423,7 @@ def run_monthly(func: Callable, monthday: int, time: str = '09:30'):
         schedule_type=ScheduleType.MONTHLY,
         time=time,
         monthday=monthday,
+        force=bool(force),
         expression=expression,
     )
     _tasks.append(task)
@@ -409,12 +440,36 @@ def get_tasks() -> List[ScheduleTask]:
     return _tasks
 
 
-def _should_trigger_monthly(task: ScheduleTask, current_date: date, previous_trade_day: Optional[date]) -> bool:
+def _should_trigger_monthly(
+    task: ScheduleTask,
+    current_date: date,
+    previous_trade_day: Optional[date],
+    backtest_start_date: Optional[date],
+) -> bool:
     if task.monthday is None:
         return False
     monthday = task.monthday
     if monthday < 1 or monthday > 31:
         return False
+
+    # force 语义：若回测 start_day 已晚于指定 monthday，默认视为本月已错过。
+    # 当 force=True 时，在回测启动当月的“最早可用交易日”补跑一次。
+    if backtest_start_date is not None:
+        if (backtest_start_date.year, backtest_start_date.month) == (current_date.year, current_date.month):
+            if backtest_start_date.day > monthday:
+                if not getattr(task, "force", False):
+                    return False
+                if current_date < backtest_start_date:
+                    return False
+                # 仅在启动当月的第一天（相对回测开始）触发一次：previous_trade_day 还未进入 start_date 之后
+                if previous_trade_day is not None and previous_trade_day >= backtest_start_date:
+                    return False
+                marker = (current_date.year, current_date.month)
+                if task.last_trigger_marker == marker:
+                    return False
+                task.last_trigger_marker = marker
+                return True
+
     if current_date.day < monthday:
         return False
     marker = (current_date.year, current_date.month)
@@ -424,6 +479,45 @@ def _should_trigger_monthly(task: ScheduleTask, current_date: date, previous_tra
         return False
     task.last_trigger_marker = marker
     return True
+
+
+def _week_marker(d: date) -> Tuple[int, int]:
+    iso = d.isocalendar()
+    return int(iso.year), int(iso.week)
+
+
+def _should_trigger_weekly(
+    task: ScheduleTask,
+    current_date: date,
+    previous_trade_day: Optional[date],
+    backtest_start_date: Optional[date],
+) -> bool:
+    if task.weekday is None:
+        return False
+    target_weekday = int(task.weekday)
+    if target_weekday < 0 or target_weekday > 6:
+        return False
+
+    # force 语义：若回测 start_day 的 weekday 晚于指定 weekday，默认视为本周已错过。
+    # 当 force=True 时，在回测启动当周的“最早可用交易日”补跑一次。
+    if backtest_start_date is not None:
+        if _week_marker(backtest_start_date) == _week_marker(current_date):
+            if backtest_start_date.weekday() > target_weekday:
+                if not getattr(task, 'force', False):
+                    return False
+                if current_date < backtest_start_date:
+                    return False
+                # 仅在回测开始当周的第一天（相对回测开始）触发一次
+                if previous_trade_day is not None and previous_trade_day >= backtest_start_date:
+                    return False
+                marker = _week_marker(current_date)
+                if task.last_trigger_marker == marker:
+                    return False
+                task.last_trigger_marker = marker
+                return True
+
+    # 默认行为：仅在指定 weekday 触发
+    return current_date.weekday() == target_weekday
 
 
 def generate_daily_schedule(
@@ -436,6 +530,7 @@ def generate_daily_schedule(
     返回 dict，键为 datetime，值为在该时间需要执行的任务列表。
     """
     schedule: Dict[datetime, List[ScheduleTask]] = defaultdict(list)
+    backtest_start_date = _get_backtest_start_date()
     for task in _tasks:
         if not task.expression:
             continue
@@ -443,11 +538,11 @@ def generate_daily_schedule(
         if task.schedule_type == ScheduleType.DAILY:
             times = task.expression.resolve(trade_day, market_periods)
         elif task.schedule_type == ScheduleType.WEEKLY:
-            if task.weekday is None or trade_day.weekday() != task.weekday:
+            if not _should_trigger_weekly(task, trade_day.date(), previous_trade_day, backtest_start_date):
                 continue
             times = task.expression.resolve(trade_day, market_periods)
         elif task.schedule_type == ScheduleType.MONTHLY:
-            if not _should_trigger_monthly(task, trade_day.date(), previous_trade_day):
+            if not _should_trigger_monthly(task, trade_day.date(), previous_trade_day, backtest_start_date):
                 continue
             times = task.expression.resolve(trade_day, market_periods)
         else:

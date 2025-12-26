@@ -16,6 +16,7 @@ import inspect
 import traceback
 
 from .scheduler import TimeExpression, get_market_periods, get_time_aliases
+from .settings import get_settings
 from .globals import log
 
 
@@ -66,6 +67,7 @@ class AsyncScheduleTask:
     expression: Optional[TimeExpression] = None
     weekday: Optional[int] = None
     monthday: Optional[int] = None
+    force: bool = False
     overlap_strategy: OverlapStrategy = OverlapStrategy.SKIP
     enabled: bool = True
     task_id: str = field(default_factory=lambda: '')
@@ -115,8 +117,8 @@ class AsyncScheduleTask:
         if expr.kind == 'every_bar':
             return is_bar
         
-        if self.schedule_type == ScheduleType.WEEKLY and self.weekday is not None:
-            if current_dt.weekday() != self.weekday:
+        if self.schedule_type == ScheduleType.WEEKLY:
+            if not self._should_trigger_weekly(current_dt.date(), previous_trade_day):
                 return False
 
         if self.schedule_type == ScheduleType.MONTHLY:
@@ -161,6 +163,44 @@ class AsyncScheduleTask:
         monthday = self.monthday
         if monthday < 1 or monthday > 31:
             return False
+
+        # force 语义（与同步 scheduler 一致）：若回测 start_day 晚于 monthday，默认认为本月已错过。
+        # force=True 时，在回测启动当月的最早可用交易日补跑一次。
+        try:
+            start_val = get_settings().options.get('backtest_start_date')
+        except Exception:
+            start_val = None
+
+        backtest_start_date: Optional[date] = None
+        if isinstance(start_val, datetime):
+            backtest_start_date = start_val.date()
+        elif isinstance(start_val, date):
+            backtest_start_date = start_val
+        elif isinstance(start_val, str):
+            s = start_val.strip()
+            if s:
+                for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+                    try:
+                        backtest_start_date = datetime.strptime(s, fmt).date()
+                        break
+                    except ValueError:
+                        continue
+
+        if backtest_start_date is not None:
+            if (backtest_start_date.year, backtest_start_date.month) == (current_date.year, current_date.month):
+                if backtest_start_date.day > monthday:
+                    if not bool(getattr(self, 'force', False)):
+                        return False
+                    if current_date < backtest_start_date:
+                        return False
+                    if previous_trade_day is not None and previous_trade_day >= backtest_start_date:
+                        return False
+                    marker = (current_date.year, current_date.month)
+                    if self.last_trigger_marker == marker:
+                        return False
+                    self.last_trigger_marker = marker
+                    return True
+
         if current_date.day < monthday:
             return False
         marker = (current_date.year, current_date.month)
@@ -170,6 +210,57 @@ class AsyncScheduleTask:
             return False
         self.last_trigger_marker = marker
         return True
+
+    @staticmethod
+    def _week_marker(d: date) -> Tuple[int, int]:
+        iso = d.isocalendar()
+        return int(iso.year), int(iso.week)
+
+    def _should_trigger_weekly(self, current_date: date, previous_trade_day: Optional[date]) -> bool:
+        if self.weekday is None:
+            return False
+        target_weekday = int(self.weekday)
+        if target_weekday < 0 or target_weekday > 6:
+            return False
+
+        # force 语义：若回测 start_day 的 weekday 晚于指定 weekday，默认视为本周已错过。
+        # force=True 时，在回测启动当周的最早可用交易日补跑一次。
+        try:
+            start_val = get_settings().options.get('backtest_start_date')
+        except Exception:
+            start_val = None
+
+        backtest_start_date: Optional[date] = None
+        if isinstance(start_val, datetime):
+            backtest_start_date = start_val.date()
+        elif isinstance(start_val, date):
+            backtest_start_date = start_val
+        elif isinstance(start_val, str):
+            s = start_val.strip()
+            if s:
+                for fmt in ("%Y-%m-%d", "%Y/%m/%d"):
+                    try:
+                        backtest_start_date = datetime.strptime(s, fmt).date()
+                        break
+                    except ValueError:
+                        continue
+
+        if backtest_start_date is not None:
+            if self._week_marker(backtest_start_date) == self._week_marker(current_date):
+                if backtest_start_date.weekday() > target_weekday:
+                    if not bool(getattr(self, 'force', False)):
+                        return False
+                    if current_date < backtest_start_date:
+                        return False
+                    if previous_trade_day is not None and previous_trade_day >= backtest_start_date:
+                        return False
+                    marker = self._week_marker(current_date)
+                    if self.last_trigger_marker == marker:
+                        return False
+                    self.last_trigger_marker = marker
+                    return True
+
+        return current_date.weekday() == target_weekday
     
     async def execute(self, *args, **kwargs) -> Any:
         """
@@ -332,7 +423,8 @@ class AsyncScheduler:
         func: Callable,
         weekday: int,
         time: str = 'open',
-        overlap_strategy: OverlapStrategy = OverlapStrategy.SKIP
+        overlap_strategy: OverlapStrategy = OverlapStrategy.SKIP,
+        force: bool = False,
     ) -> str:
         """
         每周运行任务
@@ -356,6 +448,7 @@ class AsyncScheduler:
             time=time,
             expression=expression,
             weekday=weekday,
+            force=bool(force),
             overlap_strategy=overlap_strategy
         )
         
@@ -366,7 +459,8 @@ class AsyncScheduler:
         func: Callable,
         monthday: int,
         time: str = 'open',
-        overlap_strategy: OverlapStrategy = OverlapStrategy.SKIP
+        overlap_strategy: OverlapStrategy = OverlapStrategy.SKIP,
+        force: bool = False,
     ) -> str:
         """
         每月运行任务
@@ -390,6 +484,7 @@ class AsyncScheduler:
             time=time,
             expression=expression,
             monthday=monthday,
+            force=bool(force),
             overlap_strategy=overlap_strategy
         )
         
