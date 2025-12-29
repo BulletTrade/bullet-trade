@@ -15,6 +15,9 @@ class ClientSession:
     维护单个 TCP 连接的状态：握手、请求处理、事件推送等。
     """
 
+    # 请求超时时间（秒），超过此时间未完成的请求会被取消
+    REQUEST_TIMEOUT = 60.0
+
     def __init__(self, app: "ServerApplication", reader: asyncio.StreamReader, writer: asyncio.StreamWriter, peername: str):
         self.app = app
         self.reader = reader
@@ -27,6 +30,7 @@ class ClientSession:
         self._active = False
         self._send_lock = asyncio.Lock()
         self._last_ping = time.time()
+        self._current_request: Optional[str] = None  # 当前正在处理的请求 action
 
     async def run(self) -> None:
         try:
@@ -42,6 +46,7 @@ class ClientSession:
             await self.close()
 
     async def _handshake(self) -> None:
+        log.debug(f"[SESSION] {self.session_id} 等待握手...")
         message = await read_message(self.reader)
         if message.get("type") != "handshake":
             raise ProtocolError("首包必须为 handshake")
@@ -66,6 +71,7 @@ class ClientSession:
             raise
         await write_message(self.writer, ack)
         self._active = True
+        log.info(f"[SESSION] {self.session_id} 握手成功, peer={self.peername}, account={self.account_key or '-'}")
 
     async def _loop(self) -> None:
         while self._active:
@@ -80,9 +86,20 @@ class ClientSession:
             request_id = message.get("id")
             action = message.get("action")
             payload = message.get("payload") or {}
+            self._current_request = action
             start = time.time()
             try:
-                result = await self.app.handle_request(self, action, payload)
+                # 使用 asyncio.wait_for 添加超时控制
+                result = await asyncio.wait_for(
+                    self.app.handle_request(self, action, payload),
+                    timeout=self.REQUEST_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                elapsed = time.time() - start
+                error_msg = f"请求超时（>{self.REQUEST_TIMEOUT}s）"
+                log.warning(f"[SESSION] {self.session_id} 请求 {action} 超时, 耗时={elapsed:.1f}s")
+                self.app.log_access(self, action, payload, "timeout", elapsed, error_msg, request_id=request_id)
+                await self._send_error(request_id, "REQUEST_TIMEOUT", error_msg)
             except Exception as exc:
                 elapsed = time.time() - start
                 self.app.log_access(self, action, payload, "error", elapsed, str(exc), request_id=request_id)
@@ -91,6 +108,8 @@ class ClientSession:
                 elapsed = time.time() - start
                 self.app.log_access(self, action, payload, "ok", elapsed, request_id=request_id)
                 await self._send_response(request_id, result)
+            finally:
+                self._current_request = None
 
     async def _send_response(self, request_id: Optional[str], payload: Any) -> None:
         if request_id is None:
@@ -127,6 +146,9 @@ class ClientSession:
                 except Exception:
                     pass
             return
+        current_req = self._current_request
+        if current_req:
+            log.warning(f"[SESSION] {self.session_id} 关闭时仍有请求在处理: {current_req}")
         self._active = False
         await self.app.unregister_session(self)
         try:
@@ -134,6 +156,7 @@ class ClientSession:
             await self.writer.wait_closed()
         except Exception:
             pass
+        log.debug(f"[SESSION] {self.session_id} 已关闭")
 
 
 # 避免循环导入

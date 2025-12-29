@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from functools import partial
 from typing import Any, Dict, List, Optional
 
 from bullet_trade.broker.qmt import QmtBroker
+from bullet_trade.core.globals import log
 from bullet_trade.data.providers.miniqmt import MiniQMTProvider
 from bullet_trade.utils.env_loader import get_data_provider_config
 
@@ -18,6 +22,58 @@ from .base import (
     RemoteDataAdapter,
 )
 from . import register_adapter
+
+# 专用线程池：用于执行 xtquant 的同步调用
+# max_workers 设置较大，避免长时间阻塞的调用占满线程池
+# 即使有 "僵尸" 线程，也不会影响新请求的处理
+_QMT_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_QMT_EXECUTOR_MAX_WORKERS = 32
+
+
+def _get_executor() -> ThreadPoolExecutor:
+    """
+    获取 QMT 专用线程池（惰性初始化）。
+    
+    使用专用线程池而不是默认的 asyncio 线程池，
+    避免 xtquant 的阻塞调用影响其他异步操作。
+    """
+    global _QMT_EXECUTOR
+    if _QMT_EXECUTOR is None:
+        _QMT_EXECUTOR = ThreadPoolExecutor(
+            max_workers=_QMT_EXECUTOR_MAX_WORKERS,
+            thread_name_prefix="qmt-worker-",
+        )
+        log.info(f"[QMT] 初始化专用线程池, max_workers={_QMT_EXECUTOR_MAX_WORKERS}")
+    return _QMT_EXECUTOR
+
+
+def _shutdown_executor(wait: bool = False) -> None:
+    """
+    关闭 QMT 专用线程池。
+    
+    :param wait: 是否等待所有任务完成。如果为 False，会取消等待中的任务但不会中断正在运行的任务。
+    """
+    global _QMT_EXECUTOR
+    if _QMT_EXECUTOR is not None:
+        log.info("[QMT] 关闭专用线程池...")
+        _QMT_EXECUTOR.shutdown(wait=wait, cancel_futures=True)
+        _QMT_EXECUTOR = None
+
+
+async def _run_in_qmt_executor(func, *args, **kwargs):
+    """
+    在 QMT 专用线程池中执行同步函数。
+    
+    相比 asyncio.to_thread：
+    - 使用专用线程池，不会占用默认线程池
+    - 线程池容量更大，容忍更多并发或 "僵尸" 线程
+    """
+    loop = asyncio.get_running_loop()
+    if kwargs:
+        # run_in_executor 不支持 kwargs，需要用 partial 包装
+        func = partial(func, *args, **kwargs)
+        return await loop.run_in_executor(_get_executor(), func)
+    return await loop.run_in_executor(_get_executor(), func, *args)
 
 
 def _provider_config() -> Dict[str, Any]:
@@ -68,7 +124,7 @@ class QmtDataAdapter(RemoteDataAdapter):
             )
 
         try:
-            df = await asyncio.to_thread(_call)
+            df = await _run_in_qmt_executor(_call)
             logger.debug(f"[QmtDataAdapter.get_history] 返回数据: shape={df.shape if df is not None else None}, "
                          f"columns={list(df.columns) if df is not None and hasattr(df, 'columns') else None}")
             return dataframe_to_payload(df)
@@ -101,7 +157,7 @@ class QmtDataAdapter(RemoteDataAdapter):
             return self.provider.get_current_tick(security)
 
         try:
-            tick = await asyncio.to_thread(_call)
+            tick = await _run_in_qmt_executor(_call)
             logger.debug(f"[QmtDataAdapter.get_snapshot] 返回数据: {tick}")
             return tick or {}
         except Exception as e:
@@ -116,7 +172,7 @@ class QmtDataAdapter(RemoteDataAdapter):
         def _call():
             return self.provider.get_live_current(security)
 
-        tick = await asyncio.to_thread(_call)
+        tick = await _run_in_qmt_executor(_call)
         return tick or {}
 
     async def get_trade_days(self, payload: Dict) -> Dict:
@@ -126,7 +182,7 @@ class QmtDataAdapter(RemoteDataAdapter):
         def _call():
             return self.provider.get_trade_days(start_date=start, end_date=end)
 
-        days = await asyncio.to_thread(_call)
+        days = await _run_in_qmt_executor(_call)
         return {"dtype": "list", "values": [str(day) for day in days]}
 
     async def get_security_info(self, payload: Dict) -> Dict:
@@ -135,7 +191,7 @@ class QmtDataAdapter(RemoteDataAdapter):
         def _call():
             return self.provider.get_security_info(security)
 
-        info = await asyncio.to_thread(_call)
+        info = await _run_in_qmt_executor(_call)
         return {"dtype": "dict", "value": info or {}}
 
     async def ensure_cache(self, payload: Dict) -> Dict:
@@ -144,7 +200,7 @@ class QmtDataAdapter(RemoteDataAdapter):
         start = payload.get("start")
         end = payload.get("end")
         auto = bool(payload.get("auto_download", True))
-        result = await asyncio.to_thread(
+        result = await _run_in_qmt_executor(
             self.provider.ensure_cache,
             security,
             frequency,
@@ -155,7 +211,7 @@ class QmtDataAdapter(RemoteDataAdapter):
         return {"dtype": "dict", "value": result or {}}
 
     async def get_current_tick(self, symbol: str) -> Optional[Dict]:
-        return await asyncio.to_thread(self.provider.get_current_tick, symbol)
+        return await _run_in_qmt_executor(self.provider.get_current_tick, symbol)
 
     async def get_all_securities(self, payload: Dict) -> Dict:
         types = payload.get("types") or "stock"
@@ -164,7 +220,7 @@ class QmtDataAdapter(RemoteDataAdapter):
         def _call():
             return self.provider.get_all_securities(types=types, date=date)
 
-        df = await asyncio.to_thread(_call)
+        df = await _run_in_qmt_executor(_call)
         return dataframe_to_payload(df)
 
     async def get_index_stocks(self, payload: Dict) -> Dict:
@@ -174,7 +230,7 @@ class QmtDataAdapter(RemoteDataAdapter):
         def _call():
             return self.provider.get_index_stocks(index_symbol, date=date)
 
-        stocks = await asyncio.to_thread(_call)
+        stocks = await _run_in_qmt_executor(_call)
         return {"values": stocks or []}
 
     async def get_split_dividend(self, payload: Dict) -> Dict:
@@ -185,7 +241,7 @@ class QmtDataAdapter(RemoteDataAdapter):
         def _call():
             return self.provider.get_split_dividend(security, start_date=start, end_date=end)
 
-        events = await asyncio.to_thread(_call)
+        events = await _run_in_qmt_executor(_call)
         return {"events": events or []}
 
 
@@ -220,16 +276,18 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
                 session_id=ctx.config.session_id,
                 auto_subscribe=ctx.config.auto_subscribe,
             )
-            await asyncio.to_thread(broker.connect)
+            await _run_in_qmt_executor(broker.connect)
             self._brokers[ctx.config.key] = broker
             await self.account_router.attach_handle(ctx.config.key, broker)
 
     async def stop(self) -> None:
         for broker in self._brokers.values():
             try:
-                await asyncio.to_thread(broker.disconnect)
+                await _run_in_qmt_executor(broker.disconnect)
             except Exception:
                 pass
+        # 关闭专用线程池（不等待，避免阻塞）
+        _shutdown_executor(wait=False)
 
     def _broker_for(self, ctx: AccountContext) -> QmtBroker:
         broker = self._brokers.get(ctx.config.key)
@@ -239,19 +297,19 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
 
     async def get_account_info(self, account: AccountContext, payload: Optional[Dict] = None) -> Dict:
         broker = self._broker_for(account)
-        info = await asyncio.to_thread(broker.get_account_info)
+        info = await _run_in_qmt_executor(broker.get_account_info)
         return {"dtype": "dict", "value": info}
 
     async def get_positions(self, account: AccountContext, payload: Optional[Dict] = None) -> List[Dict]:
         broker = self._broker_for(account)
-        positions = await asyncio.to_thread(broker.get_positions)
+        positions = await _run_in_qmt_executor(broker.get_positions)
         return positions or []
 
     async def list_orders(self, account: AccountContext, filters: Optional[Dict] = None) -> List[Dict]:
         broker = self._broker_for(account)
         getter = getattr(broker, "get_open_orders", None)
         if getter:
-            orders = await asyncio.to_thread(getter)
+            orders = await _run_in_qmt_executor(getter)
             return orders or []
         return []
 
@@ -387,7 +445,7 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
             return self._data_provider.get_live_current(security)
         
         try:
-            snapshot = await asyncio.to_thread(_call)
+            snapshot = await _run_in_qmt_executor(_call)
             return snapshot or {}
         except Exception as e:
             import logging

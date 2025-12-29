@@ -294,6 +294,7 @@ class ServerApplication:
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         peer = writer.get_extra_info("peername")
         address = peer[0] if isinstance(peer, (list, tuple)) else str(peer)
+        log.info(f"[CONN] 新连接: {address}, 当前活跃会话数: {len(self._sessions)}")
         if not self._is_ip_allowed(address):
             log.warning(f"拒绝未授权 IP: {address}")
             writer.close()
@@ -302,7 +303,10 @@ class ServerApplication:
         session = ClientSession(self, reader, writer, address)
         try:
             await session.run()
+        except Exception as exc:
+            log.error(f"[CONN] 会话 {session.session_id} 运行异常: {exc}")
         finally:
+            log.info(f"[CONN] 连接关闭: {address}, session={session.session_id}")
             await session.close()
 
     async def _start_components(self) -> None:
