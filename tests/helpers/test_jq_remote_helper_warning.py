@@ -22,5 +22,5 @@ def test_warning_print(monkeypatch, capsys):
     broker._data_client = None
     broker._client = fake
     broker._place_order("000001.XSHE", 100, None, "BUY", wait_timeout=0)
-    out = capsys.readouterr().out
-    assert "停牌" in out
+    captured = capsys.readouterr()
+    assert "停牌" in captured.err

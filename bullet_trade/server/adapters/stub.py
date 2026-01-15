@@ -72,7 +72,7 @@ class StubBrokerAdapter(RemoteBrokerAdapter):
             "order_id": f"stub-{len(self._orders_for(account)) + 1}",
             "security": payload.get("security"),
             "amount": payload.get("amount"),
-            "status": "submitted",
+            "status": "open",
         }
         self._orders_for(account).append(order)
         return order
