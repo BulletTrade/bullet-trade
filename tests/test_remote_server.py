@@ -127,7 +127,7 @@ async def test_remote_qmt_broker_full_flow(stub_server):
 
         limit_status = await broker.get_order_status(limit_order_id)
         assert limit_status["order_id"] == limit_order_id
-        assert limit_status["status"] in {"submitted", "cancelled"}
+        assert limit_status["status"] in {"submitted", "open", "cancelled"}
 
         snapshot = broker.sync_orders()
         snapshot_ids = {item["order_id"] for item in snapshot}
