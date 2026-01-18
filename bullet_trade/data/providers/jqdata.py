@@ -2,6 +2,7 @@ from typing import Union, List, Optional, Dict, Any, Set, Callable, Tuple
 from datetime import datetime, date as Date
 import logging
 import os
+import json
 import pandas as pd
 import jqdatasdk as jq
 from jqdatasdk import finance, query
@@ -66,6 +67,8 @@ class JQDataProvider(DataProvider):
         self._security_info_cache: Dict[str, Dict[str, Any]] = {}
         self._fund_membership_cache: Dict[str, Set[str]] = {}
         self._price_engine_supported: Optional[bool] = None
+        self._security_overrides_loaded = False
+        self._security_overrides: Dict[str, Any] = {}
 
     @staticmethod
     def _sanitize_env_value(value: str) -> str:
@@ -1148,11 +1151,113 @@ class JQDataProvider(DataProvider):
         except Exception:
             info = None
         if isinstance(info, dict):
+            override_decimals = self._resolve_override_decimals(security, info)
+            if override_decimals is not None:
+                return override_decimals
+            tick_size = info.get("tick_size")
+            tick_decimals = self._decimals_from_tick_size(tick_size)
+            if tick_decimals is not None:
+                return tick_decimals
             for key in ("price_decimals", "tick_decimals"):
                 val = info.get(key)
                 if isinstance(val, (int, float)) and val >= 0:
                     return int(val)
         return 2
+
+    @staticmethod
+    def _decimals_from_tick_size(tick_size: Any) -> Optional[int]:
+        try:
+            tick = float(tick_size)
+        except Exception:
+            return None
+        if tick <= 0:
+            return None
+        text = f"{tick:.10f}".rstrip("0").rstrip(".")
+        if "." not in text:
+            return 0
+        return len(text.split(".", 1)[1])
+
+    def _load_security_overrides(self) -> None:
+        if self._security_overrides_loaded:
+            return
+        path = os.path.join(
+            os.path.dirname(os.path.dirname(os.path.dirname(__file__))),
+            "config",
+            "security_overrides.json",
+        )
+        data: Dict[str, Any] = {}
+        try:
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    payload = json.load(f)
+                    if isinstance(payload, dict):
+                        data = payload
+        except Exception as exc:
+            logger.debug("读取security_overrides失败: %s", exc)
+        self._security_overrides = data
+        self._security_overrides_loaded = True
+
+    @staticmethod
+    def _candidate_security_keys(security: str) -> List[str]:
+        if not security or "." not in security:
+            return [security]
+        code, suffix = security.split(".", 1)
+        suffix = suffix.upper()
+        if suffix in ("XSHG", "SH"):
+            return [security, f"{code}.XSHG", f"{code}.SH"]
+        if suffix in ("XSHE", "SZ"):
+            return [security, f"{code}.XSHE", f"{code}.SZ"]
+        if suffix in ("BJ", "BSE"):
+            return [security, f"{code}.BJ", f"{code}.BSE"]
+        return [security]
+
+    def _resolve_override_decimals(self, security: str, info: Dict[str, Any]) -> Optional[int]:
+        self._load_security_overrides()
+        overrides = self._security_overrides or {}
+        by_category = overrides.get("by_category") or {}
+        by_prefix = overrides.get("by_prefix") or {}
+        by_code = overrides.get("by_code") or {}
+
+        category = None
+        tick_decimals = None
+        if isinstance(by_code, dict):
+            for key in self._candidate_security_keys(security):
+                entry = by_code.get(key)
+                if isinstance(entry, dict):
+                    if entry.get("tick_decimals") is not None:
+                        tick_decimals = entry.get("tick_decimals")
+                    if entry.get("category"):
+                        category = entry.get("category")
+                    break
+
+        if category is None and isinstance(by_prefix, dict):
+            code = security.split(".", 1)[0]
+            for prefix, cat in by_prefix.items():
+                if code.startswith(str(prefix)):
+                    category = cat
+                    break
+
+        if category is None:
+            subtype = str(info.get("subtype") or "").lower()
+            primary = str(info.get("type") or "").lower()
+            if subtype in ("mmf", "money_market_fund"):
+                category = "money_market_fund"
+            elif primary in ("fund", "etf"):
+                category = "fund"
+            else:
+                category = "stock"
+
+        if tick_decimals is None and isinstance(by_category, dict) and category:
+            entry = by_category.get(category)
+            if isinstance(entry, dict) and entry.get("tick_decimals") is not None:
+                tick_decimals = entry.get("tick_decimals")
+
+        try:
+            if tick_decimals is not None:
+                return int(tick_decimals)
+        except Exception:
+            return None
+        return None
 
     def _round_price_result(self, data: Any, security: Union[str, List[str]]) -> Any:
         if not isinstance(data, pd.DataFrame):

@@ -453,6 +453,7 @@ def _merge_overrides(security: str, base_info: Dict[str, Any]) -> Dict[str, Any]
         pass
 
     # 分类默认
+    category = out.get('category')
     cat_defaults = by_category.get(category, {}) if isinstance(by_category, dict) else {}
     if isinstance(cat_defaults, dict):
         for k, v in cat_defaults.items():
@@ -572,6 +573,30 @@ def _extract_close_series(df: Any, security: str) -> Optional[pd.Series]:
     return None
 
 
+def _resolve_fq_ref_date(current_dt: Union[datetime, Date, Any], use_real_price: bool) -> Optional[Date]:
+    """按聚宽语义返回前复权参考日期。"""
+    if use_real_price:
+        try:
+            if isinstance(current_dt, datetime):
+                return current_dt.date()
+            if isinstance(current_dt, Date):
+                return current_dt
+            return pd.to_datetime(current_dt).date()
+        except Exception:
+            return None
+    raw = _get_setting('fq_ref_date')
+    if raw is None:
+        return Date.today()
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, Date):
+        return raw
+    try:
+        return pd.to_datetime(raw).date()
+    except Exception:
+        return Date.today()
+
+
 def _fetch_pre_close(
     security: str,
     current_dt: datetime,
@@ -586,8 +611,8 @@ def _fetch_pre_close(
         "count": 2,
         "fq": "pre",
     }
-    if use_real_price:
-        pre_ref = current_dt.date() if isinstance(current_dt, datetime) else current_dt
+    pre_ref = _resolve_fq_ref_date(current_dt, use_real_price)
+    if pre_ref is not None:
         kwargs.update(
             prefer_engine=not force_no_engine,
             pre_factor_ref_date=pre_ref,
@@ -715,8 +740,8 @@ class BacktestCurrentData:
                     count=1,
                     fq='pre',
                 )
-                if use_real_price:
-                    pre_ref = current_date or current_dt
+                pre_ref = _resolve_fq_ref_date(current_date or current_dt, use_real_price)
+                if pre_ref is not None:
                     kw.update(
                         prefer_engine=not force_no_engine,
                         pre_factor_ref_date=pre_ref,
