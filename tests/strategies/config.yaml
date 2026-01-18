@@ -81,3 +81,10 @@ price_precision_compare:
   capital_base: 100000
   frequency: 'daily'
   benchmark: '000300.XSHG'
+
+current_data_limit_probe:
+  start_date: '2025-12-30'
+  end_date: '2025-12-30'
+  capital_base: 100000
+  frequency: 'daily'
+  benchmark: '000300.XSHG'
