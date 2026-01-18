@@ -1322,6 +1322,8 @@ def get_price(
                 log.warning(f"无法转换 current_dt 为 date 类型: {current_dt}, 使用今天日期")
                 pre_factor_ref_date = Date.today()
         
+        raw_df = None
+        final = None
         try:
             # 真实价格模式优先使用提供者内部引擎支持
             #log.debug(f"调用 provider.get_price(prefer_engine=True): security={security}, fields={fields}")
@@ -1345,15 +1347,22 @@ def get_price(
             # 这样可以保持与聚宽官方一致的行为，支持 df.groupby('code') 等操作
             # 注意：必须在 _coerce_price_result_to_dataframe 之前检查，否则会被转换成宽表
             if not panel and isinstance(result, pd.DataFrame) and 'time' in result.columns and 'code' in result.columns:
-                return result
-            df = _coerce_price_result_to_dataframe(result)
-            return _make_compatible_dataframe(df, fields)
-            
+                raw_df = result
+                final = result
+            else:
+                raw_df = _coerce_price_result_to_dataframe(result)
+                final = _make_compatible_dataframe(raw_df, fields)
         except Exception as e:
             _raise_if_not_implemented(e)
             log.warning(f"真实价格模式调用失败: {e}，回退到标准复权")
+            final = None
+        if final is not None:
+            _raise_if_empty_minute_data(avoid_future, freq, raw_df, security, end_date)
+            return final
     
     # 标准模式或真实价格模式失败时的回退策略
+    raw_df = None
+    final = None
     try:
         df = _provider.get_price(
             security=security,
@@ -1368,6 +1377,7 @@ def get_price(
             fill_paused=fill_paused,
             force_no_engine=force_no_engine,
         )
+        raw_df = df if isinstance(df, pd.DataFrame) else None
         
         # 调试日志：查看返回的数据格式
         log.debug(f"get_price 返回: panel={panel}, type={type(df)}, "
@@ -1377,15 +1387,17 @@ def get_price(
         # 如果 panel=False 且返回的是长表格式（包含 time 和 code 列），直接返回，不进行转换
         # 这样可以保持与聚宽官方一致的行为，支持 df.groupby('code') 等操作
         if not panel and isinstance(df, pd.DataFrame) and 'time' in df.columns and 'code' in df.columns:
-            return df
-        
-        # 兼容性处理：让多证券情况下也能通过 df['close'] 访问
-        return _make_compatible_dataframe(df, fields)
+            final = df
+        else:
+            # 兼容性处理：让多证券情况下也能通过 df['close'] 访问
+            final = _make_compatible_dataframe(df, fields)
         
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取价格数据失败: {e}")
         return pd.DataFrame()
+    _raise_if_empty_minute_data(avoid_future, freq, raw_df, security, end_date)
+    return final if final is not None else pd.DataFrame()
 
 
 
@@ -1514,6 +1526,47 @@ def _check_intraday_future_data(current_dt: datetime, fields: List[str], end_dat
     # 盘后（收盘后）- 可以获取所有数据
     else:
         pass
+
+
+def _raise_if_empty_minute_data(
+    avoid_future: bool,
+    frequency: str,
+    result: Any,
+    security: Union[str, List[str]],
+    end_date: Optional[datetime],
+) -> None:
+    if not avoid_future or not frequency or "m" not in frequency:
+        return
+    if _is_live_mode() or not _current_context:
+        return
+    if end_date is None:
+        return
+    if end_date.time() < Time(9, 30):
+        return
+    if not isinstance(result, pd.DataFrame) or not result.empty:
+        return
+    try:
+        trade_days = _provider.get_trade_days(end_date=end_date.date(), count=1)
+    except Exception:
+        trade_days = []
+    if not trade_days:
+        return
+    try:
+        last_day = pd.to_datetime(trade_days[-1]).date()
+    except Exception:
+        return
+    if last_day != end_date.date():
+        return
+    provider_name = getattr(_provider, "name", "") or "unknown"
+    provider_note = ""
+    if "qmt" in provider_name.lower():
+        provider_note = "，miniQMT 免费版可能仅有近一年数据"
+    message = (
+        "分钟数据为空，数据源未返回数据，可能未下载或超出可用范围"
+        f"{provider_note}，provider={provider_name}, security={security}, end_date={end_date}"
+    )
+    log.error(message)
+    raise UserError(message)
 
 
 def attribute_history(
