@@ -131,7 +131,7 @@ class CacheManager:
                     params[k] = str(v)
             elif k in ("security",):
                 if isinstance(v, (list, tuple)):
-                    params[k] = "|".join([str(x) for x in v])  # 保留顺序
+                    params[k] = "|" + "|".join([str(x) for x in v])  # 保留顺序并区分单字符串
                 else:
                     params[k] = str(v)
             elif isinstance(v, bool):
