@@ -50,8 +50,8 @@ class RemoteQmtProvider(DataProvider):
     def get_price(
         self,
         security: Union[str, List[str]],
-        start_date: Optional[str] = None,
-        end_date: Optional[str] = None,
+        start_date: Optional[Union[str, datetime]] = None,
+        end_date: Optional[Union[str, datetime]] = None,
         frequency: str = "daily",
         fields: Optional[List[str]] = None,
         skip_paused: bool = False,
@@ -59,19 +59,26 @@ class RemoteQmtProvider(DataProvider):
         count: Optional[int] = None,
         panel: bool = True,
         fill_paused: bool = True,
-        pre_factor_ref_date: Optional[str] = None,
+        pre_factor_ref_date: Optional[Union[str, datetime]] = None,
         prefer_engine: bool = False,
         force_no_engine: bool = False,
     ) -> pd.DataFrame:
+
+        def _str_format(date_obj):
+            if date_obj and isinstance(date_obj, datetime):
+                return date_obj.strftime('%Y-%m-%d %H:%M:%S' if 'minute' in frequency else '%Y-%m-%d')
+            return date_obj
+
         payload = {
             "security": security if isinstance(security, str) else ",".join(security),
-            "start": start_date,
-            "end": end_date,
+            "start": _str_format(start_date),
+            "end": _str_format(end_date),
             "frequency": frequency,
             "fields": fields,
             "fq": fq,
             "count": count,
         }
+
         resp = self._connection.request("data.history", payload)
         return _dataframe_from_payload(resp)
 
