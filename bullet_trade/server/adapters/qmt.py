@@ -96,7 +96,7 @@ class QmtDataAdapter(RemoteDataAdapter):
         """
         获取历史 K 线数据。
         
-        :param payload: 包含 security, count, start, end, frequency, fq 等参数
+        :param payload: 包含 security, count, start, end, frequency, fq, fields 等参数
         :return: DataFrame 转换后的 payload 字典
         """
         import traceback
@@ -109,10 +109,11 @@ class QmtDataAdapter(RemoteDataAdapter):
         end = payload.get("end")
         frequency = payload.get("frequency") or payload.get("period")
         fq = payload.get("fq")
+        fields = payload.get("fields")
         pre_factor_ref_date = payload.get("pre_factor_ref_date")
 
         logger.debug(f"[QmtDataAdapter.get_history] 请求参数: security={security}, count={count}, "
-                     f"start={start}, end={end}, frequency={frequency}, fq={fq}")
+                     f"start={start}, end={end}, frequency={frequency}, fq={fq}, fields={fields}")
 
         def _call():
             return self.provider.get_price(
@@ -122,6 +123,7 @@ class QmtDataAdapter(RemoteDataAdapter):
                 end_date=end,
                 frequency=frequency,
                 fq=fq,
+                fields=fields,
                 pre_factor_ref_date=pre_factor_ref_date,
             )
 
