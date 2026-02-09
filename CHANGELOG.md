@@ -3,6 +3,24 @@
 本文档记录所有重要的变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.6.5] - 2026-02-09
+
+### 新增
+- **券商全量委托查询**：`get_orders` 新增 `from_broker` 参数。默认行为保持不变；当 `from_broker=True` 时，可直接返回券商侧全量订单（包含人工下单或外部系统下单），方便策略对账与接管（#25）
+- **远程 helper 同步支持**：`helpers/bullet_trade_jq_remote_helper.py` 的 `get_orders` 同步支持 `from_broker` 并透传到远程服务，聚宽远程运行场景可直接查看券商全量委托（#25）
+
+### 修复
+- **远程历史数据字段过滤失效**：`QmtDataAdapter.get_history` 已透传 `fields` 到 `provider.get_price`，远程 `data.history` 现在可按需返回字段，避免字段不一致并减少无关数据返回（#24）
+- **非交易日启动稳定性**：实盘引擎新增交易日日历重试等待机制，周末/节假日/盘前启动时不再因日历尚未就绪而误判流程
+
+### 文档
+- **开发模式生效说明**：补充“为什么 Jupyter 改了源码能生效但 CLI 不生效”的排查指引，明确 `pip install -e "bullet-trade[dev]"` 与重启进程/Kernel 的必要性（#25）
+
+### 测试
+- 新增 `get_orders(from_broker=True)` 的实盘引擎覆盖用例，验证“默认行为不变 + 可选券商全量”两种路径（#25）
+- 新增远程 helper 的 `from_broker` 参数透传测试，确保请求链路完整（#25）
+- 补充 `get_history(fields=...)` 参数透传回归测试（#24）
+
 ## [0.6.4] - 2026-01-28
 
 ### 新增
