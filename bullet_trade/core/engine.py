@@ -1810,7 +1810,9 @@ class BacktestEngine:
         order_id: Optional[str] = None,
         security: Optional[str] = None,
         status: Optional[object] = None,
+        from_broker: bool = False,
     ) -> Dict[str, Order]:
+        _ = from_broker
         # 先登记队列中的订单，避免遗漏未撮合订单
         for queued in list(get_order_queue() or []):
             self._register_order(queued)

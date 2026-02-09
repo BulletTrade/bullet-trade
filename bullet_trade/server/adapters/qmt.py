@@ -314,10 +314,16 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
         order_id = filters.get("order_id") if filters else None
         security = filters.get("security") if filters else None
         status = filters.get("status") if filters else None
+        from_broker = bool(filters.get("from_broker")) if filters else False
         getter = getattr(broker, "get_orders", None)
         if getter:
             orders = await _run_in_qmt_executor(
-                lambda: getter(order_id=order_id, security=security, status=status)
+                lambda: getter(
+                    order_id=order_id,
+                    security=security,
+                    status=status,
+                    from_broker=from_broker,
+                )
             )
             return orders or []
         getter = getattr(broker, "get_open_orders", None)

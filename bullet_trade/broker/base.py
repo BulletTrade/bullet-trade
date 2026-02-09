@@ -160,6 +160,7 @@ class BrokerBase(ABC):
         order_id: Optional[str] = None,
         security: Optional[str] = None,
         status: Optional[object] = None,
+        from_broker: bool = False,
     ) -> List[Dict[str, Any]]:
         """
         获取当日订单快照（可选过滤），默认空实现。
@@ -168,6 +169,7 @@ class BrokerBase(ABC):
             order_id: 订单ID
             security: 标的代码
             status: 订单状态（可为字符串或 OrderStatus）
+            from_broker: 是否要求返回券商侧全量订单
 
         Returns:
             订单列表
@@ -315,4 +317,3 @@ class BrokerBase(ABC):
         except Exception:
 
             pass
-

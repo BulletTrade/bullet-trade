@@ -241,7 +241,9 @@ class QmtBroker(BrokerBase):
         order_id: Optional[str] = None,
         security: Optional[str] = None,
         status: Optional[object] = None,
+        from_broker: bool = False,
     ) -> List[Dict[str, Any]]:
+        _ = from_broker
         self._ensure_connected()
         orders = self.sync_orders()
         status_val: Optional[str] = None

@@ -419,6 +419,7 @@ def get_orders(
     order_id: Optional[str] = None,
     security: Optional[str] = None,
     status: Optional[object] = None,
+    from_broker: bool = False,
 ) -> Dict[str, Order]:
     """
     查询当日订单快照（聚宽风格）。
@@ -430,7 +431,7 @@ def get_orders(
     if not callable(getter):
         return {}
     try:
-        return getter(order_id=order_id, security=security, status=status) or {}
+        return getter(order_id=order_id, security=security, status=status, from_broker=from_broker) or {}
     except Exception:
         return {}
 

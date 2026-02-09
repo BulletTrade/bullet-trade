@@ -58,6 +58,7 @@ class RemoteQmtBroker(BrokerBase):
         order_id: Optional[str] = None,
         security: Optional[str] = None,
         status: Optional[object] = None,
+        from_broker: bool = False,
     ) -> List[Dict[str, Any]]:
         payload = self._base_payload()
         if order_id:
@@ -66,6 +67,8 @@ class RemoteQmtBroker(BrokerBase):
             payload["security"] = security
         if status is not None:
             payload["status"] = getattr(status, "value", status)
+        if from_broker:
+            payload["from_broker"] = True
         resp = self._connection.request("broker.orders", payload)
         return resp or []
 

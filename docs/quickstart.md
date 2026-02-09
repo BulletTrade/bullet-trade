@@ -69,6 +69,8 @@ pip install bullet-trade
 pip install -e "bullet-trade[dev]"
 ```
 
+> 提示：使用 `pip install bullet-trade` 时，实盘 CLI 读取的是已安装包；本地改源码后若想立即生效，请改用 `pip install -e "bullet-trade[dev]"` 并重启进程/Kernel。
+
 复制模板：
 ```bash
 cp env.backtest.example .env    # 回测

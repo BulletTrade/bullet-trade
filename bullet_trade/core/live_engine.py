@@ -804,14 +804,19 @@ class LiveEngine:
         except Exception:
             return str(status)
 
-    def _sync_orders_from_broker(self) -> List[Dict[str, Any]]:
+    def _sync_orders_from_broker(self, *, from_broker: bool = False) -> List[Dict[str, Any]]:
         broker = self.broker
         if not broker:
             return []
         getter = getattr(broker, "get_orders", None)
         if callable(getter):
             try:
-                return getter() or []
+                return getter(from_broker=from_broker) or []
+            except TypeError:
+                try:
+                    return getter() or []
+                except Exception:
+                    return []
             except Exception:
                 return []
         if broker.supports_orders_sync():
@@ -892,6 +897,158 @@ class LiveEngine:
                 except Exception:
                     pass
 
+    def _snapshot_is_buy(self, snapshot: Dict[str, Any]) -> Optional[bool]:
+        raw = snapshot.get("is_buy")
+        if raw is None:
+            raw = snapshot.get("isBuy")
+        if isinstance(raw, str):
+            value = raw.strip().lower()
+            if value in {"buy", "b", "true", "1", "yes", "y"}:
+                return True
+            if value in {"sell", "s", "false", "0", "no", "n"}:
+                return False
+        if raw is not None:
+            try:
+                return bool(raw)
+            except Exception:
+                return None
+        side = str(snapshot.get("order_type") or snapshot.get("side") or "").strip().lower()
+        if "buy" in side:
+            return True
+        if "sell" in side:
+            return False
+        return None
+
+    def _snapshot_order_time(self, snapshot: Dict[str, Any]) -> Optional[datetime]:
+        raw_time = snapshot.get("order_time") or snapshot.get("add_time") or snapshot.get("time")
+        if isinstance(raw_time, datetime):
+            return raw_time
+        if raw_time:
+            try:
+                return pd.to_datetime(raw_time).to_pydatetime()
+            except Exception:
+                return None
+        return None
+
+    def _build_broker_order_view(
+        self,
+        snapshot: Dict[str, Any],
+        broker_order_id: str,
+        mapped_order_id: Optional[str],
+    ) -> Optional[Order]:
+        mapped = self._orders.get(mapped_order_id) if mapped_order_id else None
+        order_remark = snapshot.get("order_remark") or snapshot.get("remark")
+        strategy_name = snapshot.get("strategy_name")
+        order_price = snapshot.get("order_price")
+        order_sysid = snapshot.get("order_sysid")
+        raw_status = snapshot.get("raw_status")
+
+        if mapped is not None:
+            extra = dict(getattr(mapped, "extra", {}) or {})
+            extra["source"] = "broker"
+            extra["is_external"] = False
+            extra["engine_order_id"] = mapped_order_id
+            if order_remark is not None:
+                extra["order_remark"] = order_remark
+            if strategy_name is not None:
+                extra["strategy_name"] = strategy_name
+            if order_price is not None:
+                extra["order_price"] = order_price
+            if order_sysid is not None:
+                extra["order_sysid"] = order_sysid
+            if raw_status is not None:
+                extra["raw_status"] = raw_status
+            return Order(
+                order_id=broker_order_id,
+                security=mapped.security,
+                amount=int(mapped.amount or 0),
+                filled=int(mapped.filled or 0),
+                price=float(mapped.price or 0.0),
+                status=self._coerce_status(mapped.status),
+                add_time=mapped.add_time,
+                is_buy=bool(mapped.is_buy),
+                action=mapped.action,
+                style=mapped.style,
+                wait_timeout=mapped.wait_timeout,
+                extra=extra,
+            )
+
+        security = snapshot.get("security") or snapshot.get("stock_code") or snapshot.get("code")
+        if not security:
+            return None
+        amount = snapshot.get("amount")
+        if amount is None:
+            amount = snapshot.get("order_volume") or snapshot.get("volume")
+        filled = snapshot.get("filled")
+        if filled is None:
+            filled = snapshot.get("traded_volume") or snapshot.get("filled_amount")
+        price = snapshot.get("price")
+        if price is None:
+            price = snapshot.get("traded_price") or snapshot.get("avg_price")
+        status = snapshot.get("status") or snapshot.get("state") or OrderStatus.open.value
+        is_buy = self._snapshot_is_buy(snapshot)
+
+        extra: Dict[str, Any] = {
+            "source": "broker",
+            "is_external": True,
+        }
+        if order_remark is not None:
+            extra["order_remark"] = order_remark
+        if strategy_name is not None:
+            extra["strategy_name"] = strategy_name
+        if order_price is not None:
+            extra["order_price"] = order_price
+        if order_sysid is not None:
+            extra["order_sysid"] = order_sysid
+        if raw_status is not None:
+            extra["raw_status"] = raw_status
+
+        return Order(
+            order_id=broker_order_id,
+            security=str(security),
+            amount=int(amount or 0),
+            filled=int(filled or 0),
+            price=float(price or 0.0),
+            status=self._coerce_status(status),
+            add_time=self._snapshot_order_time(snapshot),
+            is_buy=bool(is_buy) if is_buy is not None else True,
+            action="open" if (is_buy is None or is_buy) else "close",
+            style=OrderStyle.limit,
+            extra=extra,
+        )
+
+    def _collect_broker_orders(
+        self,
+        snapshots: List[Dict[str, Any]],
+        *,
+        order_id: Optional[str],
+        security: Optional[str],
+        status_val: Optional[str],
+    ) -> Dict[str, Order]:
+        if not snapshots:
+            return {}
+        target_id = str(order_id) if order_id is not None else None
+        result: Dict[str, Order] = {}
+        for snap in snapshots:
+            if not isinstance(snap, dict):
+                continue
+            broker_oid = snap.get("order_id") or snap.get("entrust_id")
+            if not broker_oid:
+                continue
+            broker_oid_str = str(broker_oid)
+            if target_id and broker_oid_str != target_id:
+                continue
+            mapped_oid = self._broker_order_index.get(broker_oid_str)
+            order = self._build_broker_order_view(snap, broker_oid_str, mapped_oid)
+            if not order:
+                continue
+            if security and order.security != security:
+                continue
+            if status_val is not None and self._status_value(order.status) != status_val:
+                continue
+            result[broker_oid_str] = order
+        return result
+
     def _build_trade_from_snapshot(self, snapshot: Dict[str, Any]) -> Optional[Trade]:
         if not snapshot:
             return None
@@ -958,16 +1115,24 @@ class LiveEngine:
         order_id: Optional[str] = None,
         security: Optional[str] = None,
         status: Optional[object] = None,
+        from_broker: bool = False,
     ) -> Dict[str, Order]:
         for queued in list(get_order_queue() or []):
             self._register_order(queued)
-        snapshots = self._sync_orders_from_broker()
+        snapshots = self._sync_orders_from_broker(from_broker=from_broker)
         self._apply_order_snapshots(snapshots)
 
-        if not self._orders:
-            return {}
         status_val = self._normalize_status(status)
         if status is not None and status_val is None:
+            return {}
+        if from_broker:
+            return self._collect_broker_orders(
+                snapshots,
+                order_id=order_id,
+                security=security,
+                status_val=status_val,
+            )
+        if not self._orders:
             return {}
         target_id = str(order_id) if order_id is not None else None
         result: Dict[str, Order] = {}

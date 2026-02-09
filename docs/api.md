@@ -80,7 +80,7 @@
   - `cancel_order(order_or_id)`：撤单；若订单仍在本地队列直接移除，否则尝试用券商订单号撤券商。  
   - `cancel_all_orders()`：撤销本地队列所有订单。  
   - `get_open_orders()`：返回当日未完成订单字典，`key=order_id`，`value=Order` 快照；未完成状态包含 `new/open/filling/canceling`。  
-  - `get_orders(order_id=None, security=None, status=None)`：返回当日订单字典，支持按订单号/标的/状态过滤；`status` 支持 `OrderStatus` 或字符串值；返回快照，需重新调用获取最新状态。  
+  - `get_orders(order_id=None, security=None, status=None, from_broker=False)`：返回当日订单字典，支持按订单号/标的/状态过滤；`status` 支持 `OrderStatus` 或字符串值；`from_broker=False`（默认）时返回引擎视角订单，`from_broker=True` 时返回券商侧全量订单快照（含人工/外部委托）。  
   - `get_trades(order_id=None, security=None)`：返回当日成交字典，`key=trade_id`，`value=Trade` 快照；一个订单可对应多笔成交。  
   - 默认 `set_option('order_match_mode', 'immediate')` 时创建即撮合；否则在 bar 结束批量撮合。
 - 价格样式：`MarketOrderStyle(limit_price=None, buy_price_percent=None, sell_price_percent=None)`（市价，可选保护价或价差系数，实盘会带保护价并传 `market=True`）；`LimitOrderStyle(price)`（限价）。

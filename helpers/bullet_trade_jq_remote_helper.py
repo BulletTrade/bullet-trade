@@ -405,6 +405,7 @@ class RemoteBrokerClient:
         order_id: Optional[str] = None,
         security: Optional[str] = None,
         status: Optional[object] = None,
+        from_broker: bool = False,
     ) -> Dict[str, RemoteOrder]:
         payload = self._base_payload()
         if order_id:
@@ -413,6 +414,8 @@ class RemoteBrokerClient:
             payload["security"] = security
         if status is not None:
             payload["status"] = getattr(status, "value", status)
+        if from_broker:
+            payload["from_broker"] = True
         rows = self._client.request("broker.orders", payload) or []
         result: Dict[str, RemoteOrder] = {}
         for row in rows:
@@ -953,8 +956,14 @@ def get_orders(
     order_id: Optional[str] = None,
     security: Optional[str] = None,
     status: Optional[object] = None,
+    from_broker: bool = False,
 ) -> Dict[str, RemoteOrder]:
-    return get_broker_client().get_orders(order_id=order_id, security=security, status=status)
+    return get_broker_client().get_orders(
+        order_id=order_id,
+        security=security,
+        status=status,
+        from_broker=from_broker,
+    )
 
 
 def get_trades(

@@ -280,3 +280,10 @@ runtime/
 1. 检查防火墙是否放行端口
 2. 确认 `QMT_SERVER_HOST` 和 `QMT_SERVER_PORT` 配置正确
 3. 验证 `QMT_SERVER_TOKEN` 与服务端一致
+
+### 改了源码但实盘引擎不生效
+
+1. 优先确认当前 Python 解释器加载的是哪个 `bullet_trade`：
+   `python -c "import bullet_trade,inspect;print(inspect.getfile(bullet_trade))"`
+2. 本地开发请使用可编辑安装：`pip install -e "bullet-trade[dev]"`。
+3. 修改源码后需重启运行进程（CLI）或重启 Jupyter Kernel；已启动进程不会自动热加载安装包代码。

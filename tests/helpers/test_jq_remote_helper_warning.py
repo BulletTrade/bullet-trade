@@ -26,6 +26,23 @@ def test_warning_print(monkeypatch, capsys):
     assert "停牌" in captured.err
 
 
+def test_get_orders_passes_from_broker_flag():
+    payloads = []
+
+    class _FakeClient:
+        def request(self, action, payload):
+            payloads.append((action, payload))
+            return []
+
+    broker = helper.RemoteBrokerClient(_FakeClient())
+    orders = broker.get_orders(from_broker=True)
+    assert orders == {}
+    assert payloads
+    action, payload = payloads[0]
+    assert action == "broker.orders"
+    assert payload.get("from_broker") is True
+
+
 def test_protocol_version_warning(monkeypatch, capsys):
     class _DummySocket:
         def settimeout(self, timeout):

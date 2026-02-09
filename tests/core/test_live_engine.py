@@ -24,6 +24,7 @@ from bullet_trade.core.live_runtime import (
     save_g,
 )
 from bullet_trade.core.globals import g, reset_globals
+from bullet_trade.core.models import Order, OrderStatus
 from bullet_trade.core.orders import order, clear_order_queue
 from bullet_trade.core.runtime import set_current_engine
 
@@ -807,6 +808,76 @@ async def test_market_flag_propagates_to_broker(monkeypatch, tmp_path):
     sec2, amt2, price2, side2, market2 = engine.broker.orders[1]
     assert (sec2, amt2, side2, market2) == ("000001.XSHE", 100, "buy", False)
     assert price2 == pytest.approx(10.5)
+
+
+def test_get_orders_from_broker_includes_external_snapshots(tmp_path):
+    strategy = _write_strategy(tmp_path)
+    cfg = {
+        "runtime_dir": str(tmp_path / "runtime"),
+        "g_autosave_enabled": False,
+        "account_sync_enabled": False,
+        "order_sync_enabled": False,
+        "tick_sync_enabled": False,
+        "risk_check_enabled": False,
+        "broker_heartbeat_interval": 0,
+    }
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config=cfg,
+    )
+    engine.broker = DummyBroker()
+    clear_order_queue()
+
+    local_order = Order(
+        order_id="local-1",
+        security="000001.XSHE",
+        amount=100,
+        status=OrderStatus.open,
+        is_buy=True,
+    )
+    engine._orders[local_order.order_id] = local_order
+    engine._broker_order_index["B1"] = local_order.order_id
+
+    snapshots = [
+        {
+            "order_id": "B1",
+            "security": "000001.XSHE",
+            "status": "open",
+            "amount": 100,
+            "traded_volume": 30,
+            "traded_price": 10.2,
+            "order_remark": "bt:alpha:abcd1234",
+        },
+        {
+            "order_id": "B2",
+            "security": "000002.XSHE",
+            "status": "filled",
+            "amount": 200,
+            "traded_volume": 200,
+            "traded_price": 11.8,
+            "order_type": "SELL",
+            "strategy_name": "manual",
+        },
+    ]
+    engine._sync_orders_from_broker = lambda **_: snapshots  # type: ignore[assignment]
+
+    default_orders = engine.get_orders()
+    assert set(default_orders.keys()) == {"local-1"}
+
+    broker_orders = engine.get_orders(from_broker=True)
+    assert set(broker_orders.keys()) == {"B1", "B2"}
+    assert broker_orders["B1"].extra.get("engine_order_id") == "local-1"
+    assert broker_orders["B1"].extra.get("is_external") is False
+    assert broker_orders["B2"].extra.get("is_external") is True
+    assert broker_orders["B2"].security == "000002.XSHE"
+    assert broker_orders["B2"].status == OrderStatus.filled
+
+    filled_orders = engine.get_orders(from_broker=True, status=OrderStatus.filled)
+    assert set(filled_orders.keys()) == {"B2"}
+
+    target_order = engine.get_orders(from_broker=True, order_id="B2")
+    assert set(target_order.keys()) == {"B2"}
 
 
 @pytest.mark.asyncio
