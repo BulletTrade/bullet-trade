@@ -540,6 +540,38 @@ async def test_calendar_guard_list_missing_target(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_live_engine_waits_for_calendar_retry_when_not_trade_day(tmp_path, monkeypatch):
+    strategy = _write_strategy(tmp_path)
+    now = datetime(2025, 1, 4, 7, 0, 0)
+    sleep_calls: list[float] = []
+    stop_event = asyncio.Event()
+
+    async def _fake_sleep(delay: float) -> None:
+        sleep_calls.append(delay)
+        stop_event.set()
+
+    async def _always_closed(_self, _target):
+        return False
+
+    monkeypatch.setattr(TradingCalendarGuard, "_is_trading_day", _always_closed)
+
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={"calendar_retry_minutes": 1},
+        now_provider=lambda: now,
+        sleep_provider=_fake_sleep,
+    )
+    engine._loop = asyncio.get_running_loop()
+    engine._stop_event = stop_event
+
+    await engine._run_loop()
+
+    assert len(sleep_calls) == 1
+    assert sleep_calls[0] >= 59.0
+
+
+@pytest.mark.asyncio
 async def test_live_engine_skips_processed_minute_after_restart(tmp_path):
     strategy = _write_strategy(tmp_path)
     cfg = {

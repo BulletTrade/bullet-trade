@@ -419,10 +419,19 @@ class LiveEngine:
         while not self._stop_event.is_set():
             now = self._now()
             if not await self._calendar_guard.ensure_trade_day(now):
+                await self._sleep_until_calendar_retry(now)
                 continue
             await self._ensure_trading_day(now.date())
             await self._handle_minute_tick(now)
             await self._sleep_until_next_minute(now)
+
+    async def _sleep_until_calendar_retry(self, now: datetime) -> None:
+        delay = self._calendar_guard.seconds_until_next_check(now)
+        sleeper = self._sleep or asyncio.sleep
+        try:
+            await sleeper(delay)
+        except asyncio.CancelledError:
+            raise
 
     async def _sleep_until_next_minute(self, now: datetime) -> None:
         target = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
@@ -2217,3 +2226,8 @@ class TradingCalendarGuard:
             if value is not None:
                 return value
         return default
+
+    def seconds_until_next_check(self, now: datetime) -> float:
+        if not self._next_check:
+            return 1.0
+        return max(0.1, (self._next_check - now).total_seconds())
