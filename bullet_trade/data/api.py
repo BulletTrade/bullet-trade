@@ -1631,8 +1631,12 @@ def attribute_history(
         end_date = datetime.now()
     else:
         end_date = _current_context.current_dt
-        if 'm' in unit:
-            end_date = end_date + timedelta(minutes=1)
+
+    # 对齐聚宽语义：日线不含当天，分钟线包含当前分钟
+    if 'm' in unit:
+        end_date = end_date + timedelta(minutes=1)
+    elif 'd' in unit:
+        end_date = end_date - timedelta(days=1)
 
     frequency = 'daily' if 'd' in unit else 'minute'
 

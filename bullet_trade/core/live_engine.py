@@ -2326,6 +2326,8 @@ class TradingCalendarGuard:
         self.config = config
         self._next_check: Optional[datetime] = None
         self._confirmed_date: Optional[date] = None
+        self._last_diag_log_time: Optional[datetime] = None
+        self._diag_log_interval_seconds: int = 300
 
     async def ensure_trade_day(self, now: datetime) -> bool:
         today = now.date()
@@ -2338,20 +2340,50 @@ class TradingCalendarGuard:
             return True
         wait_minutes = max(1, int(self._config_value("calendar_retry_minutes", 1)))
         self._next_check = now + timedelta(minutes=wait_minutes)
+        self._log_calendar_diag(
+            now=now,
+            target=today,
+            reason="not_trade_day",
+            extra={
+                "wait_minutes": wait_minutes,
+                "next_check": self._next_check.strftime("%Y-%m-%d %H:%M:%S"),
+            },
+        )
         log.debug("今日非交易日，下一次检查时间 %s", self._next_check.strftime("%Y-%m-%d %H:%M"))
         return False
 
     async def _is_trading_day(self, target: date) -> bool:
+        query = f"{target}~{target}"
         try:
             from bullet_trade.data.api import get_trade_days
 
             days = get_trade_days(str(target), str(target))
             if hasattr(days, "empty"):
-                return not days.empty
+                result = not days.empty
+                if not result:
+                    self._log_calendar_diag(
+                        now=datetime.now(),
+                        target=target,
+                        reason="empty_dataframe",
+                        extra={"query": query},
+                    )
+                return result
             if days is None:
+                self._log_calendar_diag(
+                    now=datetime.now(),
+                    target=target,
+                    reason="days_none",
+                    extra={"query": query},
+                )
                 return False
             if isinstance(days, (list, tuple, set)):
                 if not days:
+                    self._log_calendar_diag(
+                        now=datetime.now(),
+                        target=target,
+                        reason="days_empty",
+                        extra={"query": query},
+                    )
                     return False
                 for day in days:
                     try:
@@ -2359,27 +2391,89 @@ class TradingCalendarGuard:
                             return True
                     except Exception:
                         continue
+                self._log_calendar_diag(
+                    now=datetime.now(),
+                    target=target,
+                    reason="target_not_in_days",
+                    extra={"query": query, "sample_days": self._sample_days(days)},
+                )
                 return False
             try:
                 iterator = iter(days)
             except TypeError:
+                self._log_calendar_diag(
+                    now=datetime.now(),
+                    target=target,
+                    reason="days_not_iterable",
+                    extra={"query": query, "days_type": type(days).__name__},
+                )
                 return False
             has_value = False
+            sample_days: List[Any] = []
             for day in iterator:
                 has_value = True
+                if len(sample_days) < 5:
+                    sample_days.append(day)
                 try:
                     if pd.to_datetime(day).date() == target:
                         return True
                 except Exception:
                     continue
             if has_value:
+                self._log_calendar_diag(
+                    now=datetime.now(),
+                    target=target,
+                    reason="target_not_in_iterable",
+                    extra={"query": query, "sample_days": self._sample_days(sample_days)},
+                )
                 return False
-        except Exception:
-            pass
+        except Exception as exc:
+            self._log_calendar_diag(
+                now=datetime.now(),
+                target=target,
+                reason="get_trade_days_exception",
+                extra={"query": query, "error": repr(exc)},
+            )
         weekend_skip = bool(self._config_value("calendar_skip_weekend", True))
         if weekend_skip and target.weekday() >= 5:
+            self._log_calendar_diag(
+                now=datetime.now(),
+                target=target,
+                reason="weekend_skip",
+                extra={"weekday": target.weekday()},
+            )
             return False
         return True
+
+    @staticmethod
+    def _sample_days(days: Any, limit: int = 5) -> str:
+        values: List[str] = []
+        try:
+            for idx, day in enumerate(days):
+                if idx >= limit:
+                    break
+                values.append(str(day))
+        except Exception:
+            return "unavailable"
+        return ",".join(values) if values else "empty"
+
+    def _log_calendar_diag(
+        self,
+        *,
+        now: datetime,
+        target: date,
+        reason: str,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        if self._last_diag_log_time:
+            elapsed = (now - self._last_diag_log_time).total_seconds()
+            if elapsed < self._diag_log_interval_seconds:
+                return
+        self._last_diag_log_time = now
+        payload: Dict[str, Any] = {"target": str(target), "reason": reason}
+        if extra:
+            payload.update(extra)
+        log.debug("TradingCalendarGuard 诊断: %s", payload)
 
     def _config_value(self, name: str, default: Any) -> Any:
         if hasattr(self.config, name):
@@ -2396,3 +2490,4 @@ class TradingCalendarGuard:
         if not self._next_check:
             return 1.0
         return max(0.1, (self._next_check - now).total_seconds())
+
