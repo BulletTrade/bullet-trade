@@ -19,10 +19,16 @@ def initialize(context):
     ## 运行函数（reference_security为运行时间的参考标的；传入的标的只做种类区分，因此传入'000300.XSHG'或'510300.XSHG'是一样的）
       # 开盘前运行
       
-    run_daily(every_bar, 'every_bar')
+    #run_daily(every_bar, 'every_bar')
+    run_daily(every_bar, 'every_minute')
 
 def process_initialize(context):
   log.info('系统每次开始运行process_initialize')
+
+#def every_minute(context):
+    # 输出运行时间
+#    log.info(f'============函数运行时间(every_minute)：{context.current_dt.time()}============')
+
 
 ## 开盘前运行函数
 def every_bar(context):

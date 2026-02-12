@@ -155,7 +155,7 @@ class RemoteQmtBroker(BrokerBase):
         amount: int,
         price: Optional[float],
         wait_timeout: Optional[float],
-        remark: Optional[str],
+        remark: Optional[str] = None,
         market: bool = False,
     ) -> asyncio.Future:
         loop = asyncio.get_running_loop()
@@ -170,7 +170,7 @@ class RemoteQmtBroker(BrokerBase):
         amount: int,
         price: Optional[float],
         wait_timeout: Optional[float],
-        remark: Optional[str],
+        remark: Optional[str] = None,
         market: bool = False,
     ) -> str:
         self._last_warning = None

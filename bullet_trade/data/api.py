@@ -1283,7 +1283,7 @@ def get_price(
             force_no_engine=force_no_engine,
         )
     
-    avoid_future = _get_setting('avoid_future_data')
+    avoid_future = _should_avoid_future()
     use_real_price = _get_setting('use_real_price')
     
     current_dt = _current_context.current_dt
@@ -2331,12 +2331,11 @@ def get_trade_days(
         max_dt = _current_context.current_dt
         resolved_end = _resolve_context_dt(end_date, default_to_context=True)
         if resolved_end is not None:
-            if _should_avoid_future() and resolved_end > max_dt:
-                raise FutureDataError(
-                    f"avoid_future_data=True时，get_trade_days的end_date({resolved_end})不能大于当前时间({max_dt})"
-                )
-            if resolved_end > max_dt:
-                resolved_end = max_dt
+            if _should_avoid_future():
+                if resolved_end > max_dt:
+                    raise FutureDataError(
+                        f"avoid_future_data=True时，get_trade_days的end_date({resolved_end})不能大于当前时间({max_dt})"
+                    )
         end_date = resolved_end
     if start_date is None and count is None:
         if end_date is None:
