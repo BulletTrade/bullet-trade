@@ -3,6 +3,23 @@
 本文档记录所有重要的变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.6.6] - 2026-02-12
+
+### 新增
+- **交易日历守卫诊断日志**：`TradingCalendarGuard` 新增非交易日原因与异常诊断日志（含 `reason/query/sample_days` 等上下文），并加入 300 秒日志节流，减少重复刷屏
+
+### 修复
+- **attribute_history 时间边界对齐**：对齐聚宽语义，`1d` 日线默认排除当天，`1m` 分钟线默认包含当前分钟，避免历史窗口错位
+- **交易日判定鲁棒性**：`TradingCalendarGuard` 对 `get_trade_days` 的空 DataFrame、`None`、空列表、不可迭代与异常返回做了显式处理，交易日确认更稳定
+- **远程券商下单参数兼容**：`RemoteQmtBroker.buy/sell` 的 `remark` 参数改为可选默认 `None`，减少调用侧参数不匹配
+
+### 增强
+- **future guard 语义优化**：`get_price/get_trade_days` 统一使用 `_should_avoid_future()` 判定，仅在非 live 场景启用 `avoid_future_data`，避免实盘被回测式未来数据校验误拦截
+
+### 测试
+- 新增 `test_attribute_history_alignment.py`，覆盖日线/分钟线 `attribute_history` 结束时间对齐
+- 新增 `test_data_api_live_boundaries.py`，覆盖 live/backtest 下 `get_trade_days/get_price` 的 `avoid_future_data` 边界行为
+
 ## [0.6.5] - 2026-02-09
 
 ### 新增
