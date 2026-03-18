@@ -196,7 +196,7 @@ class QmtDataAdapter(RemoteDataAdapter):
             return self.provider.get_security_info(security)
 
         info = await _run_in_qmt_executor(_call)
-        return {"dtype": "dict", "value": info or {}}
+        return dict_payload(info or {})
 
     async def ensure_cache(self, payload: Dict) -> Dict:
         security = payload.get("security")
@@ -225,6 +225,13 @@ class QmtDataAdapter(RemoteDataAdapter):
             return self.provider.get_all_securities(types=types, date=date)
 
         df = await _run_in_qmt_executor(_call)
+        if df is not None and hasattr(df, "copy") and hasattr(df, "columns"):
+            if "code" not in getattr(df, "columns", []):
+                df = df.copy()
+                try:
+                    df.index.name = "code"
+                except Exception:
+                    pass
         return dataframe_to_payload(df)
 
     async def get_index_stocks(self, payload: Dict) -> Dict:
@@ -595,6 +602,18 @@ def dataframe_to_payload(df):
         "columns": [str(col) for col in columns],
         "records": records,
     }
+
+
+def dict_payload(value: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    payload = {
+        "dtype": "dict",
+        "value": value or {},
+    }
+    if isinstance(value, dict):
+        for key, item in value.items():
+            if key not in payload and item is not None:
+                payload[key] = item
+    return payload
 
 
 def build_qmt_bundle(config: ServerConfig, router: AccountRouter) -> AdapterBundle:

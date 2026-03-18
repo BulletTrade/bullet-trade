@@ -75,6 +75,17 @@ def test_stub_server_history(stub_server):
         conn.close()
 
 
+def test_stub_server_security_info_compat(stub_server):
+    conn = _make_connection(stub_server)
+    try:
+        resp = conn.request("data.security_info", {"security": "000001.XSHE"})
+        assert resp["value"]["display_name"] == "Stub 000001.XSHE"
+        assert resp["display_name"] == "Stub 000001.XSHE"
+        assert resp["type"] == "stock"
+    finally:
+        conn.close()
+
+
 def test_stub_server_order_flow(stub_server):
     conn = _make_connection(stub_server)
     try:
@@ -98,6 +109,26 @@ def test_remote_data_provider_dataframe_conversion():
     df = _dataframe_from_payload(payload)
     assert isinstance(df, pd.DataFrame)
     assert list(df["a"]) == [1, 2]
+
+
+def test_remote_data_provider_security_info_supports_flat_response():
+    from bullet_trade.data.providers.remote_qmt import RemoteQmtProvider
+
+    provider = object.__new__(RemoteQmtProvider)
+
+    class _FakeConnection:
+        def request(self, action, payload):
+            assert action == "data.security_info"
+            return {
+                "display_name": "黄金ETF",
+                "name": "518880",
+                "type": "etf",
+            }
+
+    provider._connection = _FakeConnection()
+    info = provider.get_security_info("518880.XSHG")
+    assert info["display_name"] == "黄金ETF"
+    assert info["type"] == "etf"
 
 
 @pytest.mark.asyncio

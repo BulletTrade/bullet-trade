@@ -23,7 +23,14 @@ class StubDataAdapter(RemoteDataAdapter):
         return {"values": ["2025-01-01"]}
 
     async def get_security_info(self, payload: Dict) -> Dict:
-        return {"value": {"symbol": payload.get("security")}}
+        security = payload.get("security")
+        info = {
+            "code": security,
+            "display_name": f"Stub {security}",
+            "name": str(security).split(".", 1)[0] if security else "",
+            "type": "stock",
+        }
+        return {"dtype": "dict", "value": info, **info}
 
     async def ensure_cache(self, payload: Dict) -> Dict:
         return {"ok": True}

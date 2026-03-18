@@ -119,6 +119,52 @@ class MiniQMTProvider(DataProvider):
         except Exception:
             return None
 
+    @staticmethod
+    def _normalize_requested_security_type(value: Any) -> str:
+        cleaned = str(value or "").strip().lower()
+        if not cleaned:
+            return "stock"
+        if cleaned == "fund":
+            return "fund"
+        if cleaned in {"stock", "etf", "index"}:
+            return cleaned
+        return cleaned
+
+    @classmethod
+    def _resolve_sector_type(cls, requested_type: str) -> Optional[tuple[str, str]]:
+        normalized = cls._normalize_requested_security_type(requested_type)
+        if normalized == "fund":
+            return "etf", "fund"
+        if normalized in {"stock", "etf", "index"}:
+            return normalized, normalized
+        return None
+
+    @staticmethod
+    def _extract_instrument_type(raw_type: Any) -> Optional[str]:
+        if isinstance(raw_type, str):
+            cleaned = raw_type.strip().lower()
+            return cleaned or None
+        if isinstance(raw_type, dict):
+            for key, enabled in raw_type.items():
+                if enabled:
+                    cleaned = str(key).strip().lower()
+                    if cleaned:
+                        return cleaned
+            if len(raw_type) == 1:
+                key = next(iter(raw_type))
+                cleaned = str(key).strip().lower()
+                return cleaned or None
+        return None
+
+    def _detect_instrument_type(self, xt: Any, security: str) -> Optional[str]:
+        detector = getattr(xt, "get_instrument_type", None)
+        if not callable(detector):
+            return None
+        try:
+            return self._extract_instrument_type(detector(security))
+        except Exception:
+            return None
+
     def _format_time(self, value: Optional[Union[str, datetime, Date]], period: str) -> str:
         if value is None:
             return ""
@@ -939,14 +985,20 @@ class MiniQMTProvider(DataProvider):
     ) -> pd.DataFrame:
         if isinstance(types, str):
             types = [types]
-        kwargs = {"types": tuple(sorted(types)), "date": date}
+        normalized_types = tuple(self._normalize_requested_security_type(item) for item in types)
+        kwargs = {"types": normalized_types, "date": date}
 
         def _fetch(kw: Dict[str, Any]) -> Dict[str, Any]:
             xt = self._ensure_xtdata()
             sectors = {"stock": "沪深A股", "etf": "沪深ETF", "index": "沪深指数"}
             rows = []
-            for t in kw["types"]:
-                sector = sectors.get(t)
+            resolved_types = []
+            for requested_type in kw["types"]:
+                resolved = self._resolve_sector_type(requested_type)
+                if resolved and resolved not in resolved_types:
+                    resolved_types.append(resolved)
+            for sector_type, result_type in resolved_types:
+                sector = sectors.get(sector_type)
                 if not sector:
                     continue
                 codes = xt.get_stock_list_in_sector(sector)
@@ -960,7 +1012,7 @@ class MiniQMTProvider(DataProvider):
                                 "name": code,
                                 "start_date": None,
                                 "end_date": None,
-                                "type": t,
+                                "type": result_type,
                             }
                         )
                         continue
@@ -971,7 +1023,7 @@ class MiniQMTProvider(DataProvider):
                             "name": info.get("InstrumentID", code),
                             "start_date": pd.to_datetime(info.get("OpenDate"), errors="coerce"),
                             "end_date": pd.to_datetime(info.get("ExpireDate"), errors="coerce"),
-                            "type": t,
+                            "type": result_type,
                         }
                     )
             if not rows:
@@ -1037,34 +1089,38 @@ class MiniQMTProvider(DataProvider):
         xt = self._ensure_xtdata()
         _ = date
         normalized = self._normalize_security_code(security)
+        detected_type = self._detect_instrument_type(xt, normalized)
         try:
             info = xt.get_instrument_detail(normalized)
         except Exception:
             info = None
+        jq_code = self._to_jq_code(normalized)
         if not info or not isinstance(info, dict):
-            jq_code = self._to_jq_code(normalized)
             return {
                 "display_name": jq_code,
                 "name": jq_code,
                 "start_date": None,
                 "end_date": None,
-                "type": "stock",
+                "type": detected_type or "stock",
                 "subtype": None,
                 "parent": None,
+                "code": jq_code,
+                "qmt_code": normalized,
             }
         start = self._to_date(info.get("OpenDate"))
         end = self._to_date(info.get("ExpireDate"))
         if end is None:
             end = Date(2200, 1, 1)
-        jq_code = self._to_jq_code(normalized)
         return {
             "display_name": info.get("InstrumentName") or jq_code,
             "name": info.get("InstrumentID") or jq_code.split(".", 1)[0],
             "start_date": start,
             "end_date": end,
-            "type": "stock",
+            "type": detected_type or "stock",
             "subtype": None,
             "parent": None,
+            "code": jq_code,
+            "qmt_code": normalized,
         }
 
     # ------------------------ Live 快照 ------------------------

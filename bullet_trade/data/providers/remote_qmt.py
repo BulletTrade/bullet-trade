@@ -146,7 +146,16 @@ class RemoteQmtProvider(DataProvider):
     ) -> Dict[str, Any]:
         payload = {"security": security, "date": date}
         resp = self._connection.request("data.security_info", payload)
-        return resp.get("value") or {}
+        if not isinstance(resp, dict):
+            return {}
+        value = resp.get("value")
+        if isinstance(value, dict) and value:
+            return value
+        return {
+            key: item
+            for key, item in resp.items()
+            if key not in {"dtype", "value"} and item is not None
+        }
 
     def set_tick_callback(self, callback: Callable[[Any, Dict[str, Any]], None], context: Any) -> None:
         self._tick_callback = callback
