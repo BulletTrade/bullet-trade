@@ -10,6 +10,7 @@ QMT 券商适配（最小实现）
 import asyncio
 import inspect
 import hashlib
+import os
 from typing import Dict, List, Optional, Any
 from datetime import datetime
 import time
@@ -17,7 +18,35 @@ import time
 from .base import BrokerBase
 from bullet_trade.core.models import OrderStatus
 from bullet_trade.core.globals import log
-from bullet_trade.utils.env_loader import get_broker_config, get_live_trade_config
+from bullet_trade.utils.env_loader import get_broker_config, get_live_trade_config, parse_bool
+
+
+def _order_debug_enabled() -> bool:
+    return parse_bool(os.getenv("BT_LIVE_ORDER_DEBUG", ""), default=False)
+
+
+def _format_order_debug_value(value: Any, *, max_length: int = 480) -> str:
+    if isinstance(value, float):
+        return f"{value:.6f}"
+    text = repr(value)
+    if len(text) > max_length:
+        return text[: max_length - 3] + "..."
+    return text
+
+
+def _emit_order_debug(stage: str, **fields: Any) -> None:
+    if not _order_debug_enabled():
+        return
+    parts = [
+        f"{key}={_format_order_debug_value(value)}"
+        for key, value in fields.items()
+        if value is not None
+    ]
+    suffix = " ".join(parts)
+    message = f"[ORDER_DEBUG] qmt.{stage}"
+    if suffix:
+        message = f"{message} {suffix}"
+    log.info(message)
 
 
 class QmtBroker(BrokerBase):
@@ -280,6 +309,17 @@ class QmtBroker(BrokerBase):
             if is_buy is not None:
                 row["is_buy"] = bool(is_buy)
             result.append(row)
+            _emit_order_debug(
+                "get_orders_row",
+                order_id=row.get("order_id"),
+                security=row.get("security"),
+                raw_status=item.get("status"),
+                mapped_status=row.get("status"),
+                order_price=item.get("order_price"),
+                price=row.get("price"),
+                filled=row.get("filled"),
+                order_type=item.get("order_type"),
+            )
         return result
 
     def get_trades(
@@ -347,6 +387,17 @@ class QmtBroker(BrokerBase):
                     "commission": float(commission or 0.0),
                     "tax": float(tax or 0.0),
                 }
+            )
+            _emit_order_debug(
+                "get_trades_row",
+                trade_id=str(trade_id),
+                order_id=str(oid) if oid is not None else "",
+                security=jq_code,
+                price=price,
+                amount=amount,
+                trade_time=trade_time,
+                commission=commission,
+                tax=tax,
             )
         return result
 
@@ -513,6 +564,20 @@ class QmtBroker(BrokerBase):
                             strategy_name = getattr(it, "strategy_name")
                     if str(oid) == str(order_id):
                         mapped_status = self._map_order_status(status)
+                        _emit_order_debug(
+                            "order_status_raw",
+                            order_id=str(oid),
+                            security=code,
+                            raw_status=status,
+                            mapped_status=mapped_status.value if isinstance(mapped_status, OrderStatus) else mapped_status,
+                            order_price=price,
+                            traded_price=traded_price,
+                            filled=filled,
+                            amount=qty,
+                            order_type=order_type,
+                            order_remark=order_remark,
+                            strategy_name=strategy_name,
+                        )
                         return {
                             "order_id": str(oid),
                             "status": mapped_status.value if isinstance(mapped_status, OrderStatus) else mapped_status,
@@ -696,6 +761,15 @@ class QmtBroker(BrokerBase):
                 status = await self.get_order_status(order_id)
                 last_snapshot = status or {}
                 st = str(last_snapshot.get("status") or "").lower()
+                _emit_order_debug(
+                    "wait_poll",
+                    order_id=order_id,
+                    elapsed=round(time.time() - start, 3),
+                    status=st,
+                    raw_status=last_snapshot.get("raw_status"),
+                    price=last_snapshot.get("price"),
+                    filled=last_snapshot.get("filled"),
+                )
                 if st in ("filled", "cancelled", "canceled", "partly_canceled", "rejected"):
                     final_status = st
                     break
@@ -984,6 +1058,19 @@ class QmtBroker(BrokerBase):
                         "order_time": order_time,
                     }
                 )
+                _emit_order_debug(
+                    "sync_orders_row",
+                    order_id=str(oid),
+                    security=self._map_to_jq_symbol(code) if code else None,
+                    raw_status=status,
+                    order_price=order_price,
+                    traded_price=traded_price,
+                    filled=filled,
+                    amount=amount,
+                    order_type=order_type,
+                    order_remark=order_remark,
+                    strategy_name=strategy_name,
+                )
             except Exception:
                 continue
         return orders
@@ -1108,6 +1195,15 @@ class QmtBroker(BrokerBase):
                             "market_value": float(market_value or 0.0),
                         }
                     )
+                    _emit_order_debug(
+                        "account_position_row",
+                        security=self._map_to_jq_symbol(code),
+                        amount=int(qty or 0),
+                        closeable_amount=int(avail or 0),
+                        avg_cost=float(avg_cost or 0.0),
+                        current_price=float(last or 0.0) if last is not None else 0.0,
+                        market_value=float(market_value or 0.0),
+                    )
                 except Exception:
                     continue
         snapshot["positions"] = positions
@@ -1124,4 +1220,10 @@ class QmtBroker(BrokerBase):
             snapshot["available_cash"] = cash_val
         if total_val is not None:
             snapshot["total_value"] = total_val
+        _emit_order_debug(
+            "account_snapshot",
+            available_cash=snapshot.get("available_cash"),
+            total_value=snapshot.get("total_value"),
+            positions_count=len(snapshot.get("positions") or []),
+        )
         return snapshot

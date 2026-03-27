@@ -714,6 +714,19 @@ class LiveEngine:
                         f"委托[{action_label}] {plan.security} 已提交，订单ID={order_id or '未知'}，"
                         f"数量={plan.amount}"
                     )
+                    self._order_debug(
+                        "submit",
+                        security=plan.security,
+                        action=action,
+                        broker_order_id=order_id,
+                        amount=plan.amount,
+                        last_price=plan.last_price,
+                        order_price=price_arg,
+                        is_market=market_flag,
+                        wait_timeout=plan.wait_timeout,
+                        style=style_name,
+                        order_remark=remark,
+                    )
                     if risk:
                         try:
                             risk.record_trade(order_value, action=action)
@@ -755,14 +768,17 @@ class LiveEngine:
                     self._apply_trade_snapshots(trade_snapshots)
             except Exception as exc:
                 log.debug(f"订单执行后同步成交快照失败: {exc}")
+            self._trace_submitted_buys("post_broker_sync", submitted_buys, order_snapshots, trade_snapshots)
             try:
                 self.refresh_account_snapshot(force=True)
             except Exception as exc:
                 log.debug(f"订单执行后刷新账户快照失败: {exc}")
+            self._trace_submitted_buys("post_account_refresh", submitted_buys, order_snapshots, trade_snapshots)
             try:
                 self._reconcile_submitted_buy_costs(submitted_buys, order_snapshots, trade_snapshots)
             except Exception as exc:
                 log.debug(f"订单执行后修正持仓成本失败: {exc}")
+            self._trace_submitted_buys("post_cost_reconcile", submitted_buys, order_snapshots, trade_snapshots)
 
     def _register_order(self, order: Order) -> None:
         if not order:
@@ -855,6 +871,108 @@ class LiveEngine:
             return OrderStatus(str(status))
         except Exception:
             return str(status)
+
+    def _order_debug_enabled(self) -> bool:
+        return parse_bool(os.getenv("BT_LIVE_ORDER_DEBUG", ""), default=False)
+
+    def _format_order_debug_value(self, value: Any, *, max_length: int = 640) -> str:
+        if isinstance(value, float):
+            return f"{value:.6f}"
+        text = repr(value)
+        if len(text) > max_length:
+            return text[: max_length - 3] + "..."
+        return text
+
+    def _order_debug(self, stage: str, **fields: Any) -> None:
+        if not self._order_debug_enabled():
+            return
+        parts = [
+            f"{key}={self._format_order_debug_value(value)}"
+            for key, value in fields.items()
+            if value is not None
+        ]
+        suffix = " ".join(parts)
+        message = f"[ORDER_DEBUG] live.{stage}"
+        if suffix:
+            message = f"{message} {suffix}"
+        log.info(message)
+
+    def _compact_order_snapshot(self, snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not isinstance(snapshot, dict):
+            return {}
+        return {
+            "order_id": snapshot.get("order_id") or snapshot.get("entrust_id"),
+            "security": snapshot.get("security"),
+            "status": snapshot.get("status") or snapshot.get("state"),
+            "raw_status": snapshot.get("raw_status"),
+            "amount": snapshot.get("amount") or snapshot.get("order_volume"),
+            "filled": snapshot.get("filled") or snapshot.get("traded_volume") or snapshot.get("filled_amount"),
+            "price": snapshot.get("price"),
+            "order_price": snapshot.get("order_price"),
+            "traded_price": snapshot.get("traded_price"),
+            "avg_price": snapshot.get("avg_price"),
+            "avg_cost": snapshot.get("avg_cost"),
+        }
+
+    def _compact_trade_snapshot(self, snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+        if not isinstance(snapshot, dict):
+            return {}
+        return {
+            "trade_id": snapshot.get("trade_id"),
+            "order_id": snapshot.get("order_id") or snapshot.get("entrust_id"),
+            "security": snapshot.get("security"),
+            "amount": snapshot.get("amount") or snapshot.get("volume") or snapshot.get("trade_volume"),
+            "price": snapshot.get("price") or snapshot.get("trade_price") or snapshot.get("traded_price"),
+            "time": snapshot.get("time") or snapshot.get("trade_time"),
+        }
+
+    def _trace_submitted_buys(
+        self,
+        stage: str,
+        submitted_buys: Dict[str, Dict[str, Any]],
+        order_snapshots: List[Dict[str, Any]],
+        trade_snapshots: List[Dict[str, Any]],
+    ) -> None:
+        if not submitted_buys or not self._order_debug_enabled():
+            return
+
+        order_by_id: Dict[str, Dict[str, Any]] = {}
+        for snap in order_snapshots:
+            broker_order_id = snap.get("order_id") or snap.get("entrust_id")
+            if broker_order_id is None:
+                continue
+            order_by_id[str(broker_order_id)] = self._compact_order_snapshot(snap)
+
+        trades_by_order_id: Dict[str, List[Dict[str, Any]]] = {}
+        for snap in trade_snapshots:
+            broker_order_id = snap.get("order_id") or snap.get("entrust_id")
+            if broker_order_id is None:
+                continue
+            trades_by_order_id.setdefault(str(broker_order_id), []).append(self._compact_trade_snapshot(snap))
+
+        target = self._portfolio_target()
+        for security, meta in submitted_buys.items():
+            broker_order_ids = [str(item) for item in meta.get("broker_order_ids") or [] if item]
+            position = target.positions.get(security)
+            order_rows = [order_by_id.get(order_id) for order_id in broker_order_ids if order_id in order_by_id]
+            trade_rows = [
+                row
+                for order_id in broker_order_ids
+                for row in trades_by_order_id.get(order_id, [])
+            ]
+            self._order_debug(
+                stage,
+                security=security,
+                broker_order_ids=broker_order_ids,
+                pre_amount=int(meta.get("pre_amount") or 0),
+                pre_avg_cost=float(meta.get("pre_avg_cost") or 0.0),
+                position_amount=int(position.total_amount or 0) if position else 0,
+                position_avg_cost=float(position.avg_cost or 0.0) if position else 0.0,
+                position_price=float(position.price or 0.0) if position else 0.0,
+                position_value=float(position.value or 0.0) if position else 0.0,
+                order_rows=order_rows,
+                trade_rows=trade_rows,
+            )
 
     def _sync_orders_from_broker(self, *, from_broker: bool = False) -> List[Dict[str, Any]]:
         broker = self.broker
@@ -998,6 +1116,16 @@ class LiveEngine:
             position.avg_cost = resolved_cost
             position.acc_avg_cost = resolved_cost
             log.debug(f"成交均价修正持仓成本: {security} avg_cost {previous_cost:.4f} -> {resolved_cost:.4f}")
+            self._order_debug(
+                "reconcile_buy_cost",
+                security=security,
+                pre_amount=pre_amount,
+                pre_avg_cost=pre_avg_cost,
+                filled_qty=filled_qty,
+                filled_value=filled_value,
+                previous_cost=previous_cost,
+                resolved_cost=resolved_cost,
+            )
 
     def _apply_order_snapshots(self, snapshots: List[Dict[str, Any]]) -> None:
         if not snapshots:
@@ -1067,6 +1195,16 @@ class LiveEngine:
                         extra["order_price"] = order_price
                 except Exception:
                     pass
+            self._order_debug(
+                "apply_order_snapshot",
+                local_order_id=mapped_oid,
+                broker_order_id=broker_oid,
+                status=self._normalize_status(getattr(order, "status", None)),
+                resolved_price=getattr(order, "price", None),
+                amount=getattr(order, "amount", None),
+                filled=getattr(order, "filled", None),
+                snapshot=self._compact_order_snapshot(snap),
+            )
 
     def _snapshot_is_buy(self, snapshot: Dict[str, Any]) -> Optional[bool]:
         raw = snapshot.get("is_buy")
