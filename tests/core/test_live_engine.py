@@ -1219,6 +1219,60 @@ def test_apply_order_snapshots_prefers_filled_price_over_order_price(tmp_path):
     assert local_order.extra["order_price"] == pytest.approx(3.247)
 
 
+def test_apply_order_snapshots_debug_logs_only_on_signature_change(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("BT_LIVE_ORDER_DEBUG", "1")
+    caplog.set_level("INFO", logger="jq_strategy")
+
+    strategy = _write_strategy(tmp_path)
+    cfg = {
+        "runtime_dir": str(tmp_path / "runtime"),
+        "g_autosave_enabled": False,
+        "account_sync_enabled": False,
+        "order_sync_enabled": False,
+        "tick_sync_enabled": False,
+        "risk_check_enabled": False,
+        "broker_heartbeat_interval": 0,
+    }
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config=cfg,
+    )
+    local_order = Order(
+        order_id="local-1",
+        security="159915.XSHE",
+        amount=100,
+        price=3.247,
+        status=OrderStatus.open,
+        is_buy=True,
+    )
+    engine._orders[local_order.order_id] = local_order
+    engine._broker_order_index["B1"] = local_order.order_id
+
+    snapshot = {
+        "order_id": "B1",
+        "security": "159915.XSHE",
+        "status": "filled",
+        "amount": 100,
+        "filled_amount": 100,
+        "price": 3.247,
+        "avg_cost": 3.231,
+        "order_price": 3.247,
+    }
+    engine._apply_order_snapshots([snapshot])
+    engine._apply_order_snapshots([dict(snapshot)])
+    engine._apply_order_snapshots([{**snapshot, "order_price": 3.248}])
+
+    lines = [
+        record.getMessage()
+        for record in caplog.records
+        if "[ORDER_DEBUG] live.apply_order_snapshot" in record.getMessage()
+    ]
+    assert len(lines) == 2
+    assert "order_price': 3.247" in lines[0]
+    assert "order_price': 3.248" in lines[1]
+
+
 @pytest.mark.asyncio
 async def test_process_orders_reconciles_limit_buy_avg_cost_from_trades(monkeypatch, tmp_path):
     strategy = _write_strategy(tmp_path)

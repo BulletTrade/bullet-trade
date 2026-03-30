@@ -234,6 +234,7 @@ class LiveEngine:
         self._orders: Dict[str, Order] = {}
         self._trades: Dict[str, Trade] = {}
         self._broker_order_index: Dict[str, str] = {}
+        self._order_snapshot_debug_signatures: Dict[str, Tuple[Any, ...]] = {}
         self._calendar_guard = TradingCalendarGuard(self.config)
         self._initial_nav_synced: bool = False
         self._provider_tick_callback_bound: bool = False
@@ -897,6 +898,37 @@ class LiveEngine:
             message = f"{message} {suffix}"
         log.info(message)
 
+    def _order_debug_signature_value(self, value: Any) -> Any:
+        if value is None:
+            return None
+        try:
+            if isinstance(value, (int, bool)):
+                return value
+            return round(float(value), 8)
+        except Exception:
+            return str(value)
+
+    def _remember_order_snapshot_debug_signature(
+        self,
+        local_order_id: str,
+        *,
+        status: Any,
+        filled: Any,
+        price: Any,
+        order_price: Any,
+    ) -> bool:
+        signature = (
+            self._order_debug_signature_value(status),
+            self._order_debug_signature_value(filled),
+            self._order_debug_signature_value(price),
+            self._order_debug_signature_value(order_price),
+        )
+        previous = self._order_snapshot_debug_signatures.get(local_order_id)
+        if previous == signature:
+            return False
+        self._order_snapshot_debug_signatures[local_order_id] = signature
+        return True
+
     def _compact_order_snapshot(self, snapshot: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if not isinstance(snapshot, dict):
             return {}
@@ -1195,16 +1227,26 @@ class LiveEngine:
                         extra["order_price"] = order_price
                 except Exception:
                     pass
-            self._order_debug(
-                "apply_order_snapshot",
-                local_order_id=mapped_oid,
-                broker_order_id=broker_oid,
-                status=self._normalize_status(getattr(order, "status", None)),
-                resolved_price=getattr(order, "price", None),
-                amount=getattr(order, "amount", None),
-                filled=getattr(order, "filled", None),
-                snapshot=self._compact_order_snapshot(snap),
-            )
+            normalized_status = self._normalize_status(getattr(order, "status", None))
+            resolved_price = getattr(order, "price", None)
+            resolved_filled = getattr(order, "filled", None)
+            if self._remember_order_snapshot_debug_signature(
+                mapped_oid,
+                status=normalized_status,
+                filled=resolved_filled,
+                price=resolved_price,
+                order_price=order_price,
+            ):
+                self._order_debug(
+                    "apply_order_snapshot",
+                    local_order_id=mapped_oid,
+                    broker_order_id=broker_oid,
+                    status=normalized_status,
+                    resolved_price=resolved_price,
+                    amount=getattr(order, "amount", None),
+                    filled=resolved_filled,
+                    snapshot=self._compact_order_snapshot(snap),
+                )
 
     def _snapshot_is_buy(self, snapshot: Dict[str, Any]) -> Optional[bool]:
         raw = snapshot.get("is_buy")
