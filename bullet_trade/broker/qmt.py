@@ -49,6 +49,14 @@ def _emit_order_debug(stage: str, **fields: Any) -> None:
     log.info(message)
 
 
+def _first_present(*values: Any) -> Any:
+    for value in values:
+        if value in (None, ""):
+            continue
+        return value
+    return None
+
+
 class QmtBroker(BrokerBase):
     """
     QMT 券商适配（基于 xtquant/xttrader）。
@@ -368,24 +376,73 @@ class QmtBroker(BrokerBase):
             if security and jq_code != security:
                 continue
             trade_id = _pick(item, "trade_id", "deal_no", "trade_no")
-            price = _pick(item, "trade_price", "price")
-            amount = _pick(item, "trade_volume", "volume", "amount")
-            trade_time = _pick(item, "trade_time", "time")
-            commission = _pick(item, "commission", "comm")
-            tax = _pick(item, "tax", "stamp_tax")
+            price = _first_present(
+                _pick(item, "traded_price"),
+                _pick(item, "trade_price"),
+                _pick(item, "avg_price", "avg_cost"),
+                _pick(item, "price"),
+            )
+            amount = _first_present(
+                _pick(item, "trade_volume"),
+                _pick(item, "traded_volume"),
+                _pick(item, "volume"),
+                _pick(item, "amount"),
+            )
+            trade_time = _first_present(
+                _pick(item, "trade_time"),
+                _pick(item, "traded_time"),
+                _pick(item, "time"),
+            )
+            commission = _first_present(
+                _pick(item, "commission_fee"),
+                _pick(item, "commission"),
+                _pick(item, "comm"),
+            )
+            tax = _first_present(_pick(item, "tax"), _pick(item, "stamp_tax"))
+            deal_balance = _first_present(
+                _pick(item, "deal_balance"),
+                _pick(item, "traded_amount"),
+                _pick(item, "trade_value"),
+                _pick(item, "amount_value"),
+            )
             if not trade_id:
                 base = f"{oid}-{trade_time}-{price}-{amount}"
                 trade_id = hashlib.md5(base.encode("utf-8")).hexdigest()[:16]
+            try:
+                normalized_amount = int(amount or 0)
+            except Exception:
+                normalized_amount = 0
+            try:
+                normalized_price = float(price or 0.0)
+            except Exception:
+                normalized_price = 0.0
+            try:
+                normalized_commission = float(commission or 0.0)
+            except Exception:
+                normalized_commission = 0.0
+            try:
+                normalized_tax = float(tax or 0.0)
+            except Exception:
+                normalized_tax = 0.0
+            if deal_balance in (None, "") and normalized_amount > 0 and normalized_price > 0:
+                deal_balance = normalized_amount * normalized_price
+            try:
+                normalized_deal_balance = float(deal_balance or 0.0)
+            except Exception:
+                normalized_deal_balance = 0.0
             result.append(
                 {
                     "trade_id": str(trade_id),
                     "order_id": str(oid) if oid is not None else "",
                     "security": jq_code,
-                    "amount": int(amount or 0),
-                    "price": float(price or 0.0),
+                    "amount": normalized_amount,
+                    "price": normalized_price,
+                    "traded_price": normalized_price,
+                    "deal_balance": normalized_deal_balance,
                     "time": trade_time,
-                    "commission": float(commission or 0.0),
-                    "tax": float(tax or 0.0),
+                    "commission": normalized_commission,
+                    "commission_fee": normalized_commission,
+                    "tax": normalized_tax,
                 }
             )
             _emit_order_debug(
@@ -398,6 +455,7 @@ class QmtBroker(BrokerBase):
                 trade_time=trade_time,
                 commission=commission,
                 tax=tax,
+                deal_balance=deal_balance,
             )
         return result
 

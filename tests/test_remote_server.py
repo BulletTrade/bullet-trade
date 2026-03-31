@@ -28,6 +28,15 @@ QMT_SERVER_TLS_CERT=/path/to/ca.pem  # 如启用了 TLS
 """
 
 
+def _ensure_current_event_loop() -> asyncio.AbstractEventLoop:
+    try:
+        return asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        return loop
+
+
 @pytest.fixture(scope="module")
 def stub_server():
     port = 59321
@@ -40,6 +49,7 @@ def stub_server():
         enable_broker=True,
         accounts=[AccountConfig(key="default", account_id="demo")],
     )
+    _ensure_current_event_loop()
     router = AccountRouter(config.accounts)
     # 注册 stub builder（import 时已经执行）
     bundle = build_stub_bundle(config, router)
@@ -102,6 +112,59 @@ def test_stub_server_order_flow(stub_server):
         conn.close()
 
 
+def test_stub_server_filled_scenario_updates_trades_positions_and_account():
+    config = ServerConfig(
+        server_type="stub",
+        listen="127.0.0.1",
+        port=59323,
+        token="stub-token",
+        enable_data=True,
+        enable_broker=True,
+        accounts=[AccountConfig(key="default", account_id="demo")],
+    )
+    _ensure_current_event_loop()
+    router = AccountRouter(config.accounts)
+    bundle = build_stub_bundle(config, router)
+    app = ServerApplication(config, router, bundle)
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=_run_loop, args=(loop, app), daemon=True)
+    thread.start()
+    asyncio.run_coroutine_threadsafe(app.wait_started(), loop).result(timeout=5)
+    conn = _make_connection(config)
+    try:
+        order = conn.request(
+            "broker.place_order",
+            {
+                "security": "510050.XSHG",
+                "side": "BUY",
+                "amount": 33800,
+                "style": {"type": "limit", "price": 2.951},
+                "stub_scenario": {
+                    "status": "filled",
+                    "filled": 33800,
+                    "traded_price": 2.906,
+                    "commission_fee": 0.0,
+                },
+            },
+        )
+        assert order["status"] == "filled"
+        assert order["traded_price"] == pytest.approx(2.906)
+        trades = conn.request("broker.trades", {"order_id": order["order_id"]})
+        assert len(trades) == 1
+        assert trades[0]["price"] == pytest.approx(2.906)
+        positions = conn.request("broker.positions", {})
+        assert positions[0]["security"] == "510050.XSHG"
+        assert positions[0]["amount"] == 33800
+        assert positions[0]["available_amount"] == 0
+        account = conn.request("broker.account", {})
+        assert account["value"]["available_cash"] == pytest.approx(1000000 - (33800 * 2.906))
+    finally:
+        conn.close()
+        asyncio.run_coroutine_threadsafe(app.shutdown(), loop).result(timeout=5)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+
+
 def test_stub_server_cancel_risk_controls(monkeypatch):
     monkeypatch.setenv("MAX_DAILY_CANCELS", "1")
     monkeypatch.setenv("MIN_CANCEL_INTERVAL_SECONDS", "0")
@@ -117,6 +180,7 @@ def test_stub_server_cancel_risk_controls(monkeypatch):
         accounts=[AccountConfig(key="default", account_id="demo")],
         order_risk_enabled=True,
     )
+    _ensure_current_event_loop()
     router = AccountRouter(config.accounts)
     bundle = build_stub_bundle(config, router)
     app = ServerApplication(config, router, bundle)
@@ -139,6 +203,118 @@ def test_stub_server_cancel_risk_controls(monkeypatch):
         asyncio.run_coroutine_threadsafe(app.shutdown(), loop).result(timeout=5)
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=5)
+
+
+def test_stub_adapter_open_buy_terminal_execution_releases_reserved_cash_exactly():
+    _ensure_current_event_loop()
+    config = ServerConfig(
+        server_type="stub",
+        listen="127.0.0.1",
+        port=59331,
+        token="stub-token",
+        enable_data=True,
+        enable_broker=True,
+        accounts=[AccountConfig(key="default", account_id="demo")],
+    )
+    router = AccountRouter(config.accounts)
+    bundle = build_stub_bundle(config, router)
+    adapter = bundle.broker_adapter
+    account = router.get("default")
+    state = adapter._account_state_for(account)
+    state["available_cash"] = 50000.0
+    state["transferable_cash"] = 50000.0
+    state["frozen_cash"] = 0.0
+    order = asyncio.get_event_loop().run_until_complete(
+        adapter.place_order(
+            account,
+            {
+                "security": "511880.XSHG",
+                "side": "BUY",
+                "amount": 100,
+                "style": {"type": "limit", "price": 10.5},
+                "stub_scenario": {"status": "open", "reserve_on_open": True},
+            },
+        )
+    )
+    assert state["available_cash"] == pytest.approx(48950.0)
+    assert state["frozen_cash"] == pytest.approx(1050.0)
+
+    adapter._apply_terminal_execution(
+        account=account,
+        order=order,
+        status="filled",
+        filled=100,
+        traded_price=10.1,
+        commission=0.05,
+        tax=0.0,
+    )
+
+    assert state["available_cash"] == pytest.approx(48989.95)
+    assert state["frozen_cash"] == pytest.approx(0.0)
+    positions = adapter._positions_for(account)
+    assert positions["511880.XSHG"]["amount"] == 100
+    assert positions["511880.XSHG"]["available_amount"] == 0
+
+
+def test_stub_adapter_open_sell_terminal_execution_releases_remaining_volume_exactly():
+    _ensure_current_event_loop()
+    config = ServerConfig(
+        server_type="stub",
+        listen="127.0.0.1",
+        port=59332,
+        token="stub-token",
+        enable_data=True,
+        enable_broker=True,
+        accounts=[AccountConfig(key="default", account_id="demo")],
+    )
+    router = AccountRouter(config.accounts)
+    bundle = build_stub_bundle(config, router)
+    adapter = bundle.broker_adapter
+    account = router.get("default")
+    state = adapter._account_state_for(account)
+    state["available_cash"] = 50000.0
+    state["transferable_cash"] = 50000.0
+    positions = adapter._positions_for(account)
+    positions["159915.XSHE"] = {
+        "security": "159915.XSHE",
+        "amount": 100,
+        "available_amount": 100,
+        "closeable_amount": 100,
+        "can_use_volume": 100,
+        "frozen_volume": 0,
+        "avg_cost": 10.1,
+        "last_price": 10.1,
+        "current_price": 10.1,
+    }
+    order = asyncio.get_event_loop().run_until_complete(
+        adapter.place_order(
+            account,
+            {
+                "security": "159915.XSHE",
+                "side": "SELL",
+                "amount": 100,
+                "style": {"type": "limit", "price": 10.9},
+                "stub_scenario": {"status": "open", "reserve_on_open": True},
+            },
+        )
+    )
+    assert positions["159915.XSHE"]["available_amount"] == 0
+    assert positions["159915.XSHE"]["frozen_volume"] == 100
+
+    adapter._apply_terminal_execution(
+        account=account,
+        order=order,
+        status="partly_canceled",
+        filled=40,
+        traded_price=10.8,
+        commission=0.03,
+        tax=0.0,
+    )
+
+    assert state["available_cash"] == pytest.approx(50431.97)
+    assert positions["159915.XSHE"]["amount"] == 60
+    assert positions["159915.XSHE"]["available_amount"] == 60
+    assert positions["159915.XSHE"]["frozen_volume"] == 0
 
 
 def test_stub_server_place_order_idempotency(stub_server):

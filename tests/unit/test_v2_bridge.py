@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import importlib.util
 import sys
 from pathlib import Path
@@ -72,6 +73,36 @@ def test_v2_sync_account_prefers_position_avg_cost_fields():
     assert snapshot["available_cash"] == pytest.approx(317.10)
     assert snapshot["locked_cash"] == pytest.approx(491.20)
     assert snapshot["positions"][0]["avg_cost"] == pytest.approx(3.231)
+
+
+@pytest.mark.unit
+def test_v2_sync_account_preserves_zero_closeable_amount():
+    broker = _build_broker()
+    broker.client = DummyClient(
+        {
+            "broker.account": {
+                "available_cash": 100000.0,
+                "frozen_cash": 0.0,
+                "total_asset": 100000.0,
+            },
+            "broker.positions": [
+                {
+                    "security": "510050.SH",
+                    "amount": 33800,
+                    "available_amount": 0,
+                    "can_use_volume": 0,
+                    "open_price": 2.906,
+                    "last_price": 2.902,
+                    "position_value": 98087.6,
+                }
+            ],
+        }
+    )
+
+    snapshot = broker.sync_account()
+
+    assert snapshot["positions"][0]["amount"] == 33800
+    assert snapshot["positions"][0]["closeable_amount"] == 0
 
 
 @pytest.mark.unit
@@ -196,3 +227,33 @@ def test_v2_normalize_order_row_does_not_use_order_price_as_fill_price_when_fill
     assert row["price"] == pytest.approx(0.0)
     assert row["avg_cost"] == pytest.approx(0.0)
     assert row["order_price"] == pytest.approx(3.247)
+
+
+@pytest.mark.unit
+def test_v2_normalize_trade_row_preserves_zero_commission_fee():
+    broker = _build_broker()
+
+    row = broker._normalize_trade_row(
+        {
+            "trade_id": "t-1",
+            "order_id": "o-1",
+            "security": "510050.SH",
+            "amount": 33800,
+            "traded_price": 2.906,
+            "commission_fee": 0,
+            "commission": 1.23,
+            "tax": 0,
+        }
+    )
+
+    assert row["price"] == pytest.approx(2.906)
+    assert row["commission"] == pytest.approx(0.0)
+    assert row["tax"] == pytest.approx(0.0)
+
+
+@pytest.mark.unit
+def test_v2_market_order_requires_protect_price():
+    broker = _build_broker()
+
+    with pytest.raises(v2_bridge.V2BridgeError, match="保护价"):
+        asyncio.run(broker.buy("159915.SZ", 100, market=True))
