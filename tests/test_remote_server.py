@@ -81,6 +81,8 @@ def test_stub_server_history(stub_server):
     try:
         resp = conn.request("data.history", {"security": "000001.XSHE"})
         assert resp["dtype"] == "dataframe"
+        assert resp["columns"] == ["open", "close", "high", "low", "volume", "money"]
+        assert len(resp["records"]) == 5
     finally:
         conn.close()
 
@@ -89,9 +91,22 @@ def test_stub_server_security_info_compat(stub_server):
     conn = _make_connection(stub_server)
     try:
         resp = conn.request("data.security_info", {"security": "000001.XSHE"})
-        assert resp["value"]["display_name"] == "Stub 000001.XSHE"
-        assert resp["display_name"] == "Stub 000001.XSHE"
+        assert resp["value"]["display_name"] == "平安银行"
+        assert resp["display_name"] == "平安银行"
         assert resp["type"] == "stock"
+        assert resp["qmt_code"] == "000001.SZ"
+    finally:
+        conn.close()
+
+
+def test_stub_server_live_current_contract(stub_server):
+    conn = _make_connection(stub_server)
+    try:
+        resp = conn.request("data.live_current", {"security": "159915.XSHE"})
+        assert resp["last_price"] > 0
+        assert resp["high_limit"] > resp["last_price"]
+        assert resp["low_limit"] < resp["last_price"]
+        assert resp["paused"] is False
     finally:
         conn.close()
 
@@ -104,10 +119,42 @@ def test_stub_server_order_flow(stub_server):
             {"security": "000001.XSHE", "side": "BUY", "amount": 100, "style": {"type": "limit", "price": 10.0}},
         )
         assert order["order_id"].startswith("stub-")
+        assert order["status"] == "open"
+        assert order["raw_status"] == 50
+        assert order["price_type"] == 50
+        assert order["order_type"] == 23
+        assert order["is_buy"] is True
+        assert order["order_remark"] == "bullet-trade"
+        assert order["strategy_name"] == "bullet-trade"
         orders = conn.request("broker.orders", {})
         assert len(orders) == 1
+        assert orders[0]["raw_status"] == 50
         cancel = conn.request("broker.cancel_order", {"order_id": order["order_id"]})
         assert cancel.get("value") is True
+        assert cancel["status"] == "canceled"
+        assert cancel["raw_status"] == 54
+        assert cancel["last_snapshot"]["status"] == "canceled"
+        assert cancel["timed_out"] is False
+    finally:
+        conn.close()
+
+
+def test_stub_server_market_order_uses_market_price_type(stub_server):
+    conn = _make_connection(stub_server)
+    try:
+        order = conn.request(
+            "broker.place_order",
+            {
+                "security": "518880.XSHG",
+                "side": "BUY",
+                "amount": 100,
+                "market": True,
+                "style": {"type": "market", "protect_price": 10.073},
+            },
+        )
+        assert order["price_type"] == 88
+        assert order["order_price"] == pytest.approx(10.073)
+        assert order["raw_status"] == 50
     finally:
         conn.close()
 
@@ -393,7 +440,8 @@ async def test_remote_qmt_broker_full_flow(stub_server):
 
         limit_status = await broker.get_order_status(limit_order_id)
         assert limit_status["order_id"] == limit_order_id
-        assert limit_status["status"] in {"submitted", "open", "cancelled"}
+        assert limit_status["status"] in {"submitted", "open", "canceled"}
+        assert "raw_status" in limit_status
 
         snapshot = broker.sync_orders()
         snapshot_ids = {item["order_id"] for item in snapshot}
@@ -401,7 +449,7 @@ async def test_remote_qmt_broker_full_flow(stub_server):
 
         assert await broker.cancel_order(limit_order_id) is True
         updated_status = await broker.get_order_status(limit_order_id)
-        assert updated_status["status"] == "cancelled"
+        assert updated_status["status"] == "canceled"
     finally:
         broker.disconnect()
 

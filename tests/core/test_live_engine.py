@@ -5,7 +5,10 @@ LiveEngine 核心行为测试。
 from __future__ import annotations
 
 import asyncio
+import copy
+import importlib.util
 import shutil
+import sys
 from datetime import date, datetime, timedelta, time as Time
 from pathlib import Path
 
@@ -28,6 +31,17 @@ from bullet_trade.core.globals import g, reset_globals
 from bullet_trade.core.models import Order, OrderStatus
 from bullet_trade.core.orders import LimitOrderStyle, MarketOrderStyle, order, clear_order_queue
 from bullet_trade.core.runtime import set_current_engine
+
+
+WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+V2_BRIDGE_PATH = WORKSPACE_ROOT / "strategies" / "bt_strategies" / "sim" / "common" / "v2_bridge.py"
+_V2_SPEC = importlib.util.spec_from_file_location("bt_v2_bridge_live_engine_test", V2_BRIDGE_PATH)
+assert _V2_SPEC is not None and _V2_SPEC.loader is not None
+_V2_MODULE = importlib.util.module_from_spec(_V2_SPEC)
+sys.modules[_V2_SPEC.name] = _V2_MODULE
+_V2_SPEC.loader.exec_module(_V2_MODULE)
+AiStocksV2Broker = _V2_MODULE.AiStocksV2Broker
+V2ClientConfig = _V2_MODULE.V2ClientConfig
 
 
 class DummyBroker(BrokerBase):
@@ -239,6 +253,81 @@ class FillAwareBroker(DummyBroker):
                 "time": datetime.now().isoformat(),
             }
         ]
+
+
+class SequencedV2Client:
+    def __init__(self, responses: dict[str, list[object]]):
+        self.responses = {
+            action: [copy.deepcopy(item) for item in items]
+            for action, items in responses.items()
+        }
+        self.calls: list[tuple[str, object, object]] = []
+
+    def connect(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+    def health(self):
+        return {"ok": True}
+
+    def request(self, action, payload=None, timeout=None):
+        self.calls.append((action, copy.deepcopy(payload), timeout))
+        queue = self.responses.get(action)
+        if not queue:
+            raise AssertionError(f"未预置或已耗尽 V2 响应: {action}")
+        return copy.deepcopy(queue.pop(0))
+
+
+def _build_v2_broker(client: SequencedV2Client) -> AiStocksV2Broker:
+    broker = AiStocksV2Broker(
+        V2ClientConfig(
+            host="127.0.0.1",
+            port=59620,
+            token="token",
+            account_key="lxm_main",
+            sub_account_id="btsim_core_etf",
+            strategy_name="test-v2",
+        )
+    )
+    broker.client = client
+    return broker
+
+
+def _build_v2_live_engine(tmp_path: Path, broker: BrokerBase) -> LiveEngine:
+    strategy = _write_strategy(tmp_path)
+    cfg = {
+        "runtime_dir": str(tmp_path / "runtime-v2"),
+        "g_autosave_enabled": False,
+        "account_sync_enabled": False,
+        "order_sync_enabled": False,
+        "tick_sync_enabled": False,
+        "risk_check_enabled": False,
+        "broker_heartbeat_interval": 0,
+    }
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=lambda: broker,
+        live_config=cfg,
+    )
+    return engine
+
+
+def _prime_live_engine(engine: LiveEngine, broker: BrokerBase) -> None:
+    loop = asyncio.get_running_loop()
+    engine._loop = loop
+    engine._order_lock = asyncio.Lock()
+    engine._stop_event = asyncio.Event()
+    engine.event_bus = EventBus(loop)
+    engine.async_scheduler = AsyncScheduler()
+    engine.broker = broker
+    engine._risk = None
+    engine.context.current_dt = datetime(2026, 4, 1, 10, 0, 0)
+    engine.context.portfolio.available_cash = 100000.0
+    engine.context.portfolio.transferable_cash = 100000.0
+    engine.context.portfolio.locked_cash = 0.0
+    engine.context.portfolio.total_value = 100000.0
 
 
 def _write_strategy(tmp_path: Path) -> Path:
@@ -1368,6 +1457,265 @@ async def test_process_orders_reconciles_market_buy_avg_cost_from_trades(monkeyp
     assert engine.broker.submitted_market is True
     assert engine.broker.submitted_price == pytest.approx(3.279)
     set_current_engine(None)
+
+
+def test_apply_account_snapshot_preserves_v2_locked_cash_and_stock_subportfolio(tmp_path):
+    strategy = _write_strategy(tmp_path)
+    cfg = {
+        "runtime_dir": str(tmp_path / "runtime"),
+        "g_autosave_enabled": False,
+        "account_sync_enabled": False,
+        "order_sync_enabled": False,
+        "tick_sync_enabled": False,
+        "risk_check_enabled": False,
+        "broker_heartbeat_interval": 0,
+    }
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config=cfg,
+    )
+
+    engine._apply_account_snapshot(
+        {
+            "available_cash": 317.10,
+            "transferable_cash": 317.10,
+            "locked_cash": 491.20,
+            "total_value": 100000.0,
+            "positions": [
+                {
+                    "security": "159915.XSHE",
+                    "amount": 30700,
+                    "closeable_amount": 0,
+                    "avg_cost": 3.231,
+                    "current_price": 3.231,
+                    "market_value": 99191.7,
+                }
+            ],
+        }
+    )
+
+    portfolio = engine.context.portfolio
+    assert portfolio.available_cash == pytest.approx(317.10)
+    assert portfolio.transferable_cash == pytest.approx(317.10)
+    assert portfolio.locked_cash == pytest.approx(491.20)
+    assert portfolio.total_value == pytest.approx(100000.0)
+    assert portfolio.positions["159915.XSHE"].closeable_amount == 0
+    stock_sub = portfolio.subportfolios["stock"]
+    assert stock_sub.available_cash == pytest.approx(317.10)
+    assert stock_sub.transferable_cash == pytest.approx(317.10)
+    assert stock_sub.positions["159915.XSHE"].total_amount == 30700
+
+
+@pytest.mark.asyncio
+async def test_live_engine_v2_rejected_order_releases_locked_cash(monkeypatch, tmp_path):
+    client = SequencedV2Client(
+        {
+            "broker.place_order": [
+                {"order_id": "v2-B1"},
+            ],
+            "broker.orders": [
+                [
+                    {
+                        "order_id": "v2-B1",
+                        "security": "159915.SZ",
+                        "side": "BUY",
+                        "amount": 100,
+                        "filled": 0,
+                        "status": "open",
+                        "style": {"type": "limit", "price": 3.247},
+                    }
+                ],
+                [
+                    {
+                        "order_id": "v2-B1",
+                        "security": "159915.SZ",
+                        "side": "BUY",
+                        "amount": 100,
+                        "filled": 0,
+                        "status": "rejected",
+                        "raw_status": 57,
+                        "style": {"type": "limit", "price": 3.247},
+                    }
+                ],
+            ],
+            "broker.trades": [
+                [],
+            ],
+            "broker.account": [
+                {
+                    "available_cash": 100000.0,
+                    "transferable_cash": 100000.0,
+                    "frozen_cash": 0.0,
+                    "total_asset": 100000.0,
+                },
+                {
+                    "available_cash": 99675.3,
+                    "transferable_cash": 99675.3,
+                    "frozen_cash": 324.7,
+                    "total_asset": 100000.0,
+                },
+                {
+                    "available_cash": 100000.0,
+                    "transferable_cash": 100000.0,
+                    "frozen_cash": 0.0,
+                    "total_asset": 100000.0,
+                },
+            ],
+            "broker.positions": [
+                [],
+                [],
+                [],
+            ],
+        }
+    )
+    broker = _build_v2_broker(client)
+    engine = _build_v2_live_engine(tmp_path, broker)
+    _prime_live_engine(engine, broker)
+    set_current_engine(engine)
+
+    class Snap:
+        paused = False
+        last_price = 3.231
+        high_limit = 3.500
+        low_limit = 3.000
+
+    monkeypatch.setattr("bullet_trade.core.live_engine.get_current_data", lambda: {"159915.SZ": Snap()})
+    clear_order_queue()
+    try:
+        order_obj = await asyncio.to_thread(order, "159915.SZ", 100, LimitOrderStyle(3.247))
+        assert order_obj is not None
+        backing = engine.portfolio_proxy.backing
+        assert backing.available_cash == pytest.approx(99675.3)
+        assert backing.locked_cash == pytest.approx(324.7)
+        assert backing.total_value == pytest.approx(100000.0)
+
+        await engine._order_sync_step()
+        await engine._account_sync_step()
+
+        assert order_obj.status == OrderStatus.rejected
+        assert backing.available_cash == pytest.approx(100000.0)
+        assert backing.locked_cash == pytest.approx(0.0)
+        assert backing.total_value == pytest.approx(100000.0)
+        assert backing.positions == {}
+    finally:
+        clear_order_queue()
+        set_current_engine(None)
+
+
+@pytest.mark.asyncio
+async def test_live_engine_v2_partial_fill_updates_cash_locked_and_positions(monkeypatch, tmp_path):
+    client = SequencedV2Client(
+        {
+            "broker.place_order": [
+                {"order_id": "v2-B2"},
+            ],
+            "broker.orders": [
+                [
+                    {
+                        "order_id": "v2-B2",
+                        "security": "159915.SZ",
+                        "side": "BUY",
+                        "amount": 30700,
+                        "filled": 0,
+                        "status": "open",
+                        "style": {"type": "limit", "price": 3.247},
+                    }
+                ],
+                [
+                    {
+                        "order_id": "v2-B2",
+                        "security": "159915.SZ",
+                        "side": "BUY",
+                        "amount": 30700,
+                        "filled": 15100,
+                        "status": "partial_filled",
+                        "avg_cost": 3.231,
+                        "deal_balance": 48788.1,
+                        "style": {"type": "limit", "price": 3.247},
+                    }
+                ],
+            ],
+            "broker.trades": [
+                [],
+            ],
+            "broker.account": [
+                {
+                    "available_cash": 100000.0,
+                    "transferable_cash": 100000.0,
+                    "frozen_cash": 0.0,
+                    "total_asset": 100000.0,
+                },
+                {
+                    "available_cash": 317.1,
+                    "transferable_cash": 317.1,
+                    "frozen_cash": 99682.9,
+                    "total_asset": 100000.0,
+                },
+                {
+                    "available_cash": 558.7,
+                    "transferable_cash": 558.7,
+                    "frozen_cash": 50653.2,
+                    "total_asset": 100000.0,
+                },
+            ],
+            "broker.positions": [
+                [],
+                [],
+                [
+                    {
+                        "security": "159915.SZ",
+                        "amount": 15100,
+                        "available_amount": 0,
+                        "closeable_amount": 0,
+                        "avg_cost": 3.231,
+                        "last_price": 3.231,
+                        "position_value": 48788.1,
+                    }
+                ],
+            ],
+        }
+    )
+    broker = _build_v2_broker(client)
+    engine = _build_v2_live_engine(tmp_path, broker)
+    _prime_live_engine(engine, broker)
+    set_current_engine(engine)
+
+    class Snap:
+        paused = False
+        last_price = 3.231
+        high_limit = 3.500
+        low_limit = 3.000
+
+    monkeypatch.setattr("bullet_trade.core.live_engine.get_current_data", lambda: {"159915.SZ": Snap()})
+    clear_order_queue()
+    try:
+        order_obj = await asyncio.to_thread(order, "159915.SZ", 30700, LimitOrderStyle(3.247))
+        assert order_obj is not None
+        backing = engine.portfolio_proxy.backing
+        assert backing.available_cash == pytest.approx(317.1)
+        assert backing.locked_cash == pytest.approx(99682.9)
+        assert backing.total_value == pytest.approx(100000.0)
+
+        await engine._order_sync_step()
+        await engine._account_sync_step()
+
+        assert order_obj.status == OrderStatus.filling
+        assert order_obj.filled == 15100
+        assert order_obj.price == pytest.approx(3.231)
+        assert backing.available_cash == pytest.approx(558.7)
+        assert backing.locked_cash == pytest.approx(50653.2)
+        assert backing.total_value == pytest.approx(100000.0)
+        position = backing.positions["159915.SZ"]
+        assert position.total_amount == 15100
+        assert position.closeable_amount == 0
+        assert position.avg_cost == pytest.approx(3.231)
+        stock_sub = backing.subportfolios["stock"]
+        assert stock_sub.available_cash == pytest.approx(558.7)
+        assert stock_sub.positions["159915.SZ"].total_amount == 15100
+    finally:
+        clear_order_queue()
+        set_current_engine(None)
 
 
 @pytest.mark.asyncio

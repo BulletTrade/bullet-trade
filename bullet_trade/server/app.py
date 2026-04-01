@@ -402,7 +402,7 @@ class ServerApplication:
             style = payload.get("style") or {}
             price = style.get("price")
             protect_price = style.get("protect_price")
-            if price is not None:
+            if price is not None or protect_price is not None:
                 return
             security = payload.get("security")
             if not security or not self.adapters.data_adapter:

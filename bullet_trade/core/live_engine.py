@@ -2528,20 +2528,37 @@ class LiveEngine:
         try:
             target = self.portfolio_proxy.backing if isinstance(self.context.portfolio, LivePortfolioProxy) else self.context.portfolio
             cash = snapshot.get('available_cash')
+            transferable = snapshot.get('transferable_cash')
+            locked = snapshot.get('locked_cash')
+            if locked is None:
+                locked = snapshot.get('frozen_cash')
             total = snapshot.get('total_value')
             if cash is not None:
                 target.available_cash = float(cash)
+            if transferable is not None:
+                target.transferable_cash = float(transferable)
+            if locked is not None:
+                target.locked_cash = float(locked)
             if total is not None:
                 target.total_value = float(total)
             positions = snapshot.get('positions') or []
             target.positions.clear()
+            stock_subportfolio = None
+            try:
+                stock_subportfolio = target.subportfolios.get('stock')
+            except Exception:
+                stock_subportfolio = None
+            if stock_subportfolio is not None:
+                stock_subportfolio.available_cash = float(getattr(target, 'available_cash', 0.0) or 0.0)
+                stock_subportfolio.transferable_cash = float(getattr(target, 'transferable_cash', 0.0) or 0.0)
+                stock_subportfolio.positions.clear()
             for item in positions:
                 security = item.get('security')
                 if not security:
                     continue
                 amount = int(item.get('amount', item.get('total_amount', 0)) or 0)
                 price = float(item.get('current_price', item.get('price', 0.0)) or 0.0)
-                target.positions[security] = Position(
+                position = Position(
                     security=security,
                     total_amount=amount,
                     closeable_amount=int(item.get('closeable_amount', amount)),
@@ -2549,6 +2566,9 @@ class LiveEngine:
                     price=price,
                     value=float(item.get('market_value', amount * price)),
                 )
+                target.positions[security] = position
+                if stock_subportfolio is not None:
+                    stock_subportfolio.positions[security] = position
             target.update_value()
         except Exception as exc:
             log.debug(f"应用账户快照失败: {exc}")
