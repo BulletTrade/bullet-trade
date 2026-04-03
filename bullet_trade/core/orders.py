@@ -117,6 +117,22 @@ def _resolve_log_price(
     return float(price) if price is not None else None
 
 
+def _record_requested_order_price(
+    order_obj: Order,
+    price: Optional[float],
+    style: Optional[Union[OrderStyle, MarketOrderStyle, LimitOrderStyle]],
+) -> None:
+    requested_price = _resolve_log_price(price, style)
+    if requested_price is None:
+        return
+    extra = getattr(order_obj, "extra", None)
+    if extra is None:
+        order_obj.extra = {}
+        extra = order_obj.extra
+    extra["order_price"] = float(requested_price)
+    extra.setdefault("requested_order_price", float(requested_price))
+
+
 def order(
     security: str,
     amount: int,
@@ -163,6 +179,7 @@ def order(
         style=resolved_style,
         wait_timeout=wait_timeout,
     )
+    _record_requested_order_price(order_obj, price, resolved_style)
     
     _order_queue.append(order_obj)
     _register_order_snapshot(order_obj)
@@ -286,6 +303,7 @@ def order_value(
         style=resolved_style,
         wait_timeout=wait_timeout,
     )
+    _record_requested_order_price(order_obj, price, resolved_style)
     
     # 存储目标价值，用于撮合时计算
     order_obj._target_value = abs(value)  # type: ignore
@@ -333,6 +351,7 @@ def order_target(
         style=resolved_style,
         wait_timeout=wait_timeout,
     )
+    _record_requested_order_price(order_obj, price, resolved_style)
 
     order_obj._is_target_amount = True  # type: ignore
     order_obj._target_amount = amount  # type: ignore
@@ -380,6 +399,7 @@ def order_target_value(
         style=resolved_style,
         wait_timeout=wait_timeout,
     )
+    _record_requested_order_price(order_obj, price, resolved_style)
 
     order_obj._is_target_value = True  # type: ignore
     order_obj._target_value = value  # type: ignore

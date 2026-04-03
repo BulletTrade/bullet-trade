@@ -63,6 +63,27 @@ _DEFAULT_MARKET_SELL_PERCENT = -_BASE_MARKET_SLIPPAGE / 2
 PRE_MARKET_OFFSET = timedelta(minutes=30)
 
 
+def _iter_security_code_candidates(security: Optional[str]) -> List[str]:
+    """生成证券代码兼容候选，优先保留原始输入。"""
+    if not security:
+        return []
+    if "." not in security:
+        return [security]
+
+    code, suffix = security.split(".", 1)
+    suffix = suffix.upper()
+    candidates = [security]
+    if suffix == "SH":
+        candidates.append(f"{code}.XSHG")
+    elif suffix == "XSHG":
+        candidates.append(f"{code}.SH")
+    elif suffix == "SZ":
+        candidates.append(f"{code}.XSHE")
+    elif suffix == "XSHE":
+        candidates.append(f"{code}.SZ")
+    return list(dict.fromkeys(candidates))
+
+
 class BacktestEngine:
     """回测引擎"""
     
@@ -138,6 +159,9 @@ class BacktestEngine:
         self.start_total_value: Optional[float] = None
         # 新增：回测运行耗时（秒）
         self.runtime_seconds: Optional[float] = None
+        self.run_started_at: Optional[str] = None
+        self.run_finished_at: Optional[str] = None
+        self._benchmark_base_price: Optional[float] = None
         self._trade_calendar: Dict[date, Dict[str, Any]] = {}
         self._trade_seq = 0
         market_cfg = get_live_trade_config()
@@ -192,6 +216,7 @@ class BacktestEngine:
                 self.handle_data_func = getattr(strategy_module, 'handle_data', None)
                 self.before_trading_start_func = getattr(strategy_module, 'before_trading_start', None)
                 self.after_trading_end_func = getattr(strategy_module, 'after_trading_end', None)
+                self.process_initialize_func = getattr(strategy_module, 'process_initialize', None)
                 
                 log.info("策略文件加载成功")
             else:
@@ -481,6 +506,10 @@ class BacktestEngine:
             self._setup_log_file()
         
         t0_run = time.time()
+        self.run_started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        self.run_finished_at = None
+        self.runtime_seconds = None
+        self._benchmark_base_price = None
         
         log.info("=" * 60)
         log.info(f"开始回测: {self.start_date.strftime('%Y-%m-%d')} 至 {self.end_date.strftime('%Y-%m-%d')}")
@@ -540,41 +569,55 @@ class BacktestEngine:
         except Exception as e:
             log.warning(f"初始化参数/持仓注入失败: {e}")
         
-        # 调用initialize
+        # 调用 initialize
         if self.initialize_func:
             log.info("调用策略初始化函数...")
             try:
                 self.initialize_func(self.context)
                 log.info("策略初始化完成")
-                # 根据 extras 覆盖 g.xxx（在策略初始化后执行）
-                try:
-                    if self.extras:
-                        applied = 0
-                        for k, v in self.extras.items():
-                            try:
-                                setattr(g, k, v)
-                                applied += 1
-                            except Exception:
-                                pass
-                        log.info(f"已根据 extras 覆盖 g 参数: {applied} 项")
-                except Exception as ex:
-                    log.warning(f"extras 覆盖 g 参数失败: {ex}")
-                # 避免重复：若 before_market_open/market_open 已通过调度注册，则取消直接调用
-                try:
-                    tasks = get_tasks()
-                    if self.before_trading_start_func and any(t.func is self.before_trading_start_func for t in tasks):
-                        log.debug("检测到 before_market_open 已由调度注册，取消重复直接调用")
-                        self.before_trading_start_func = None
-                    if self.handle_data_func and any(t.func is self.handle_data_func for t in tasks):
-                        log.debug("检测到 market_open 已由调度注册，取消重复直接调用")
-                        self.handle_data_func = None
-                except Exception as ex:
-                    log.warning(f"调度重复检查失败: {ex}")
             except Exception as e:
                 log.error(f"策略初始化失败: {e}")
                 import traceback
                 log.error(traceback.format_exc())
                 raise
+
+        # 根据 extras 覆盖 g.xxx（在策略初始化后、process_initialize 前执行）
+        try:
+            if self.extras:
+                applied = 0
+                for k, v in self.extras.items():
+                    try:
+                        setattr(g, k, v)
+                        applied += 1
+                    except Exception:
+                        pass
+                log.info(f"已根据 extras 覆盖 g 参数: {applied} 项")
+        except Exception as ex:
+            log.warning(f"extras 覆盖 g 参数失败: {ex}")
+
+        # 调用 process_initialize，使回测与 live 保持一致
+        if self.process_initialize_func:
+            log.info("调用策略进程初始化函数...")
+            try:
+                self.process_initialize_func(self.context)
+                log.info("策略进程初始化完成")
+            except Exception as e:
+                log.error(f"策略进程初始化失败: {e}")
+                import traceback
+                log.error(traceback.format_exc())
+                raise
+
+        # 避免重复：若 before_market_open/market_open 已通过调度注册，则取消直接调用
+        try:
+            tasks = get_tasks()
+            if self.before_trading_start_func and any(t.func is self.before_trading_start_func for t in tasks):
+                log.debug("检测到 before_market_open 已由调度注册，取消重复直接调用")
+                self.before_trading_start_func = None
+            if self.handle_data_func and any(t.func is self.handle_data_func for t in tasks):
+                log.debug("检测到 market_open 已由调度注册，取消重复直接调用")
+                self.handle_data_func = None
+        except Exception as ex:
+            log.warning(f"调度重复检查失败: {ex}")
         
         # 获取交易日列表（直接使用Provider，避免上下文限制导致只取到起始日）
         provider = get_data_provider()
@@ -588,7 +631,13 @@ class BacktestEngine:
             extra_days = provider.get_trade_days(
                 end_date=trade_days[0] if trade_days else None,
                 count=60
-            ) or []
+            )
+            if extra_days is None:
+                extra_days = []
+            elif isinstance(extra_days, np.ndarray):
+                extra_days = extra_days.tolist()
+            else:
+                extra_days = list(extra_days)
             calendar_days.extend(pd.to_datetime(d).date() for d in extra_days)
         except Exception as exc:
             log.debug(f"扩展交易日序列失败: {exc}")
@@ -682,6 +731,7 @@ class BacktestEngine:
         
         # 记录运行耗时
         try:
+            self.run_finished_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             self.runtime_seconds = float(time.time() - t0_run)
             log.info(f"本次回测耗时: {self.runtime_seconds:.3f} 秒")
         except Exception:
@@ -1640,6 +1690,16 @@ class BacktestEngine:
                 
                 # 资金检查价格：若存在限价/保护价则按限价锁资，否则按撮合价
                 fund_check_price = limit_price if limit_price is not None else trade_price
+                try:
+                    extra = getattr(order, "extra", None)
+                    if extra is None:
+                        order.extra = {}
+                        extra = order.extra
+                    if fund_check_price is not None:
+                        extra["order_price"] = float(fund_check_price)
+                        extra.setdefault("requested_order_price", float(fund_check_price))
+                except Exception:
+                    pass
                 
                 # 费用参数
                 order_cost_config = self._get_order_cost_config(order.security)
@@ -1731,7 +1791,11 @@ class BacktestEngine:
                     if order.security not in self.context.portfolio.positions:
                         self.context.portfolio.positions[order.security] = Position(security=order.security)
                     position = self.context.portfolio.positions[order.security]
+                    prev_amount = int(getattr(position, 'total_amount', 0) or 0)
                     position.update_position(trade_amount, trade_price)
+                    if prev_amount <= 0:
+                        position.buy_time = current_dt
+                    position.last_buy_time = current_dt
                     # T+ 规则：若 tplus=1，将当日买入计入锁定，并从可卖数量中抵消同额增量
                     tplus = self._infer_tplus_from_info(info)
                     if tplus == 1:
@@ -1774,6 +1838,14 @@ class BacktestEngine:
                 order.amount = trade_amount if is_buy else -trade_amount
                 order.status = OrderStatus.filled
                 order.filled = trade_amount
+                try:
+                    extra = getattr(order, "extra", None)
+                    if extra is None:
+                        order.extra = {}
+                        extra = order.extra
+                    extra["fill_price"] = float(trade_price)
+                except Exception:
+                    pass
                 
             except Exception as e:
                 log.error(f"处理订单失败: {order.security}, 错误: {e}")
@@ -1907,93 +1979,74 @@ class BacktestEngine:
         """更新持仓价格（使用收盘价）"""
         if not self.context.portfolio.positions:
             return
-        
-        securities = list(self.context.portfolio.positions.keys())
-        try:
-            # 获取多个标的的收盘价
-            # 返回的DataFrame: index=时间, columns=标的代码（如果只有一个字段）
-            df = api_get_price(
-                security=securities,
-                end_date=self.context.current_dt,
-                frequency='daily',
-                fields=['close'],
-                count=1,
-                fq='none'
-            )
-            
-            if not df.empty:
-                long_df = None
-                if ('code' in df.columns) and ('close' in df.columns):
-                    long_df = df
-                elif isinstance(df.columns, pd.MultiIndex):
-                    try:
-                        level1 = list(df.columns.get_level_values(1))
-                        if ('code' in level1) and ('close' in level1):
-                            long_df = df.copy()
-                            long_df.columns = long_df.columns.get_level_values(1)
-                    except Exception:
-                        long_df = None
-                # 取最后一行（最新数据）
+
+        for security in list(self.context.portfolio.positions.keys()):
+            try:
+                df = api_get_price(
+                    security=security,
+                    end_date=self.context.current_dt,
+                    frequency='daily',
+                    fields=['close'],
+                    count=1,
+                    fq='none'
+                )
+                if df.empty:
+                    continue
+
                 last_row = df.iloc[-1]
-                
-                # 更新每个标的的价格
-                for security in securities:
-                    try:
-                        close_price = None
-                        if long_df is not None:
-                            # 长表：列包含 time/code/close
-                            if 'code' not in long_df.columns or 'close' not in long_df.columns:
-                                log.error(f"{security} 长表行情列缺失，列={list(long_df.columns)}")
-                                continue
-                            sub = long_df[long_df['code'] == security]
-                            if sub.empty:
-                                log.error(f"{security} 无法在长表行情中找到 close 价格，列={list(long_df.columns)}")
-                                continue
-                            if 'time' in sub.columns:
-                                sub = sub.sort_values('time')
-                            close_price = sub.iloc[-1].get('close')
-                        else:
-                            # 对于单个字段，列名就是标的代码
-                            # 对于多个字段，列名是MultiIndex
-                            # 对于单证券多字段，列名是字段名（如 ['open', 'close']）
-                            if security in df.columns:
-                                close_price = last_row[security]
-                            elif ('close', security) in df.columns:
-                                # MultiIndex格式
-                                close_price = last_row[('close', security)]
-                            elif 'close' in df.columns:
-                                # 单证券多字段格式：列名是字段名
-                                close_price = last_row['close']
-                            else:
-                                log.error(f"{security} 无法匹配收盘价列，列={list(df.columns)}")
-                                continue
-                        
-                        if pd.notna(close_price) and close_price > 0:
-                            self.context.portfolio.positions[security].update_price(float(close_price))
-                    except Exception as e:
-                        log.debug(f"更新{security}价格失败: {e}")
-        except Exception as e:
-            log.debug(f"更新持仓价格失败: {e}")
-        
+                close_price = None
+                if 'close' in df.columns:
+                    close_price = last_row['close']
+                elif security in df.columns:
+                    close_price = last_row[security]
+                elif ('close', security) in df.columns:
+                    close_price = last_row[('close', security)]
+                else:
+                    log.error(f"{security} 无法匹配收盘价列，列={list(df.columns)}")
+                    continue
+
+                if pd.notna(close_price) and close_price > 0:
+                    self.context.portfolio.positions[security].update_price(float(close_price))
+            except Exception as e:
+                log.debug(f"更新{security}价格失败: {e}")
+
         self.context.portfolio.update_value()
     
     def _record_daily(self):
         """记录每日数据"""
         portfolio = self.context.portfolio
-        
+        base_total_value = self.start_total_value if self.start_total_value is not None else self.initial_cash
+
         record = {
             'date': self.context.current_dt,
             'total_value': portfolio.total_value,
             'cash': portfolio.available_cash,
             'positions_value': portfolio.positions_value,
-            'returns': portfolio.total_value - (self.start_total_value if self.start_total_value is not None else self.initial_cash),
-            'returns_pct': (portfolio.total_value / (self.start_total_value if self.start_total_value is not None else self.initial_cash) - 1) * 100,
+            'returns': portfolio.total_value - base_total_value,
+            'returns_pct': (portfolio.total_value / base_total_value - 1) * 100,
         }
+
+        benchmark_price = self._resolve_benchmark_close(self.context.current_dt)
+        if benchmark_price is not None and benchmark_price > 0:
+            if self._benchmark_base_price is None:
+                self._benchmark_base_price = benchmark_price
+            if self._benchmark_base_price and self._benchmark_base_price > 0:
+                benchmark_value = base_total_value * benchmark_price / self._benchmark_base_price
+                benchmark_returns_pct = (benchmark_value / base_total_value - 1) * 100
+                record['benchmark_price'] = benchmark_price
+                record['benchmark_value'] = benchmark_value
+                record['benchmark_returns_pct'] = benchmark_returns_pct
+                record['excess_returns_pct'] = record['returns_pct'] - benchmark_returns_pct
         
         self.daily_records.append(record)
         
         log.info(f"账户总值: {portfolio.total_value:,.2f}, 现金: {portfolio.available_cash:,.2f}, 持仓市值: {portfolio.positions_value:,.2f}")
         log.info(f"累计收益率: {record['returns_pct']:.2f}%")
+        if 'benchmark_returns_pct' in record:
+            log.info(
+                f"基准收益率: {record['benchmark_returns_pct']:.2f}%, "
+                f"累计超额收益: {record['excess_returns_pct']:.2f}%"
+            )
 
     # 新增：记录每日持仓快照（在更新收盘价后调用）
     def _record_daily_positions(self):
@@ -2019,20 +2072,77 @@ class BacktestEngine:
         注意：直接使用原始 jq.get_price，不经过包装函数，
         因为基准数据是预加载整个回测期间的数据，不需要未来数据检测
         """
+        provider = get_data_provider()
+        last_error: Optional[Exception] = None
+        for candidate in _iter_security_code_candidates(benchmark):
+            try:
+                if candidate == benchmark:
+                    log.info(f"加载基准数据: {candidate}")
+                else:
+                    log.info(f"加载基准数据兼容尝试: {benchmark} -> {candidate}")
+
+                # 通过当前数据提供者直接获取（不经过包装，避免未来数据检测），一次性加载全区间收盘价
+                data = provider.get_price(
+                    security=candidate,
+                    start_date=self.start_date,
+                    end_date=self.end_date,
+                    frequency='daily',
+                    fields=['close']
+                )
+                if data is None or len(data) == 0:
+                    last_error = ValueError(f"标的{candidate}返回空数据")
+                    continue
+                self.benchmark_data = data
+                if candidate != benchmark:
+                    log.info(f"基准代码兼容成功: {benchmark} -> {candidate}")
+                return
+            except Exception as e:
+                last_error = e
+
+        if last_error is not None:
+            log.warning(f"加载基准数据失败: {last_error}")
+
+    def _resolve_benchmark_close(self, current_dt: datetime) -> Optional[float]:
+        if self.benchmark_data is None:
+            return None
         try:
-            log.info(f"加载基准数据: {benchmark}")
-            
-            # 通过当前数据提供者直接获取（不经过包装，避免未来数据检测），一次性加载全区间收盘价
-            provider = get_data_provider()
-            self.benchmark_data = provider.get_price(
-                security=benchmark,
-                start_date=self.start_date,
-                end_date=self.end_date,
-                frequency='daily',
-                fields=['close']
-            )
-        except Exception as e:
-            log.warning(f"加载基准数据失败: {e}")
+            df = self.benchmark_data
+            if df is None or len(df) == 0:
+                return None
+            work_df = df.copy()
+            if not isinstance(work_df.index, pd.DatetimeIndex):
+                work_df.index = pd.to_datetime(work_df.index)
+            target_dt = pd.Timestamp(current_dt).normalize()
+            eligible = work_df.loc[work_df.index <= target_dt]
+            if eligible.empty:
+                return None
+            row = eligible.iloc[-1]
+            if isinstance(row, pd.Series):
+                if "close" in row.index:
+                    price = row["close"]
+                elif len(row) == 1:
+                    price = row.iloc[0]
+                else:
+                    price = None
+                    for key, value in row.items():
+                        if isinstance(key, tuple) and key and str(key[0]).lower() == "close":
+                            price = value
+                            break
+                    if price is None:
+                        for key, value in row.items():
+                            if str(key).lower() == "close":
+                                price = value
+                                break
+                    if price is None:
+                        price = row.iloc[-1]
+            else:
+                price = row
+            if price is None or pd.isna(price):
+                return None
+            return float(price)
+        except Exception as exc:
+            log.debug(f"解析 benchmark 收盘价失败: {exc}")
+            return None
     
     def _generate_empty_results(self) -> Dict[str, Any]:
         """生成空回测结果（没有交易日的情况）"""
@@ -2060,6 +2170,9 @@ class BacktestEngine:
                 'algorithm_id': self.algorithm_id,
                 'extras': self.extras,
                 'runtime_seconds': getattr(self, 'runtime_seconds', 0.0),
+                'run_started_at': self.run_started_at,
+                'run_finished_at': self.run_finished_at,
+                'benchmark': get_settings().benchmark,
                 'initial_total_value': float(self.initial_cash),
                 'final_total_value': float(self.initial_cash),
             }
@@ -2158,6 +2271,9 @@ class BacktestEngine:
                 'algorithm_id': self.algorithm_id,
                 'extras': self.extras,
                 'runtime_seconds': self.runtime_seconds,
+                'run_started_at': self.run_started_at,
+                'run_finished_at': self.run_finished_at,
+                'benchmark': get_settings().benchmark,
                 'initial_total_value': float(self.start_total_value if self.start_total_value is not None else self.initial_cash),
                 'final_total_value': float(df['total_value'].iloc[-1] if len(df) > 0 else 0.0),
             }

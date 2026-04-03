@@ -31,6 +31,8 @@ DEFAULT_TEMPLATE_NAME = "default.html"
 DEFAULT_METRICS_ORDER: Sequence[str] = (
     "策略收益",
     "策略年化收益",
+    "基准收益",
+    "累计超额收益",
     "最大回撤",
     "最大回撤区间",
     "最大回撤持续天数",
@@ -54,6 +56,7 @@ class ReportContext:
     summary_rows: List[Dict[str, str]]
     metric_rows: List[Dict[str, str]]
     equity_image: Optional[str]
+    excess_image: Optional[str]
     drawdown_image: Optional[str]
     monthly_heatmap_image: Optional[str]
 
@@ -162,11 +165,12 @@ def _build_context(
     if df.empty:
         raise ReportGenerationError("daily_records.csv 为空，无法生成报告。")
 
-    summary_rows = _build_summary_rows(df, results.get("meta") or meta or {})
+    merged_meta = _merge_meta(results.get("meta") or {}, meta or {})
+    summary_rows = _build_summary_rows(df, merged_meta, metrics)
     metric_rows = _build_metric_rows(metrics, metrics_keys)
-    charts = _build_chart_images(df)
+    charts = _build_chart_images(df, merged_meta)
 
-    context_title = title or meta.get("title") if meta else None
+    context_title = title or merged_meta.get("title")
     if not context_title:
         context_title = results_dir.name
 
@@ -178,12 +182,25 @@ def _build_context(
         summary_rows=summary_rows,
         metric_rows=metric_rows,
         equity_image=charts.get("equity"),
+        excess_image=charts.get("excess"),
         drawdown_image=charts.get("drawdown"),
         monthly_heatmap_image=charts.get("monthly_heatmap"),
     )
 
 
-def _build_summary_rows(df: pd.DataFrame, meta: Dict[str, Any]) -> List[Dict[str, str]]:
+def _merge_meta(base: Dict[str, Any], overlay: Dict[str, Any]) -> Dict[str, Any]:
+    merged = dict(base or {})
+    for key, value in (overlay or {}).items():
+        if key not in merged or merged.get(key) in (None, "", {}, []):
+            merged[key] = value
+    return merged
+
+
+def _build_summary_rows(
+    df: pd.DataFrame,
+    meta: Dict[str, Any],
+    metrics: Dict[str, Any],
+) -> List[Dict[str, str]]:
     rows: List[Dict[str, str]] = []
 
     start_date = meta.get("start_date")
@@ -196,12 +213,33 @@ def _build_summary_rows(df: pd.DataFrame, meta: Dict[str, Any]) -> List[Dict[str
     initial_value = float(df["total_value"].iloc[0]) if not df.empty else None
     final_value = float(df["total_value"].iloc[-1]) if not df.empty else None
     trading_days = len(df)
+    runtime_seconds = meta.get("runtime_seconds")
 
     rows.append({"label": "回测开始日期", "value": start_date or "-"})
     rows.append({"label": "回测结束日期", "value": end_date or "-"})
+    rows.append({"label": "回测启动时间", "value": str(meta.get("run_started_at") or "-")})
+    rows.append({"label": "回测结束时间", "value": str(meta.get("run_finished_at") or "-")})
+    rows.append(
+        {
+            "label": "总耗时",
+            "value": f"{float(runtime_seconds):.2f}s"
+            if isinstance(runtime_seconds, (int, float))
+            else "-",
+        }
+    )
+    rows.append({"label": "Benchmark", "value": str(meta.get("benchmark") or "-")})
     rows.append({"label": "交易天数", "value": str(trading_days)})
     rows.append({"label": "初始资金", "value": _format_currency(initial_value)})
     rows.append({"label": "期末资产", "value": _format_currency(final_value)})
+    if "基准收益" in metrics:
+        rows.append({"label": "基准收益", "value": _format_metric_value("基准收益", metrics.get("基准收益"))})
+    if "累计超额收益" in metrics:
+        rows.append(
+            {
+                "label": "累计超额收益",
+                "value": _format_metric_value("累计超额收益", metrics.get("累计超额收益")),
+            }
+        )
 
     return rows
 
@@ -225,27 +263,70 @@ def _build_metric_rows(
     return rows
 
 
-def _build_chart_images(df: pd.DataFrame) -> Dict[str, Optional[str]]:
-    charts: Dict[str, Optional[str]] = {"equity": None, "drawdown": None, "monthly_heatmap": None}
+def _build_chart_images(df: pd.DataFrame, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Optional[str]]:
+    charts: Dict[str, Optional[str]] = {
+        "equity": None,
+        "excess": None,
+        "drawdown": None,
+        "monthly_heatmap": None,
+    }
     if df.empty:
         return charts
 
-    charts["equity"] = _figure_to_data_url(_build_equity_figure(df))
+    charts["equity"] = _figure_to_data_url(_build_equity_figure(df, meta or {}))
+    charts["excess"] = _figure_to_data_url(_build_excess_figure(df, meta or {}))
     charts["drawdown"] = _figure_to_data_url(_build_drawdown_figure(df))
     charts["monthly_heatmap"] = _figure_to_data_url(_build_monthly_heatmap_figure(df))
     return charts
 
 
-def _build_equity_figure(df: pd.DataFrame):
+def _build_equity_figure(df: pd.DataFrame, meta: Dict[str, Any]):
     fig, ax = plt.subplots(figsize=(10, 4))
     base = float(df["total_value"].iloc[0])
     ax.plot(df.index, df["total_value"], color="#1f77b4", linewidth=2)
+    benchmark_ctx = core_analysis._compute_benchmark_context(
+        df,
+        base_value=meta.get("initial_total_value"),
+    )
+    benchmark_value = benchmark_ctx.get("benchmark_value")
+    benchmark_code = meta.get("benchmark") or "benchmark"
+    if benchmark_value is not None:
+        ax.plot(
+            df.index,
+            benchmark_value,
+            color="#ff7f0e",
+            linewidth=2,
+            linestyle=":",
+            label=f"Benchmark({benchmark_code})",
+        )
     ax.set_title("账户净值曲线", fontsize=12)
     ax.set_ylabel("总资产 (元)")
     ax.grid(True, alpha=0.3)
     ax.tick_params(axis="x", rotation=30)
     ax.axhline(y=base, linestyle="--", color="#ff7f0e", alpha=0.5, label="初始资金")
     ax.legend(loc="best")
+    fig.tight_layout()
+    return fig
+
+
+def _build_excess_figure(df: pd.DataFrame, meta: Dict[str, Any]):
+    fig, ax = plt.subplots(figsize=(10, 4))
+    benchmark_ctx = core_analysis._compute_benchmark_context(
+        df,
+        base_value=meta.get("initial_total_value"),
+    )
+    excess_returns = benchmark_ctx.get("excess_returns_pct")
+    if excess_returns is None:
+        ax.text(0.5, 0.5, "无 benchmark 数据", ha="center", va="center")
+        ax.axis("off")
+        fig.tight_layout()
+        return fig
+    ax.plot(df.index, excess_returns, color="#9467bd", linewidth=2)
+    ax.axhline(y=0.0, linestyle="--", color="#666", alpha=0.6)
+    ax.set_title("累计超额收益曲线", fontsize=12)
+    ax.set_ylabel("超额收益 (%)")
+    ax.grid(True, alpha=0.3)
+    ax.tick_params(axis="x", rotation=30)
     fig.tight_layout()
     return fig
 
@@ -326,6 +407,7 @@ def _render_html_report(context: ReportContext, template_text: str) -> str:
         summary_table=summary_html,
         metrics_table=metrics_html,
         equity_image=_image_html(context.equity_image, "收益曲线"),
+        excess_image=_image_html(context.excess_image, "累计超额收益曲线"),
         drawdown_image=_image_html(context.drawdown_image, "回撤曲线"),
         heatmap_image=_image_html(context.monthly_heatmap_image, "月度收益热力图"),
     )
@@ -355,6 +437,7 @@ def _render_pdf_report(context: ReportContext, output_path: Path) -> None:
 
         for image_data, title in [
             (context.equity_image, "账户净值曲线"),
+            (context.excess_image, "累计超额收益曲线"),
             (context.drawdown_image, "最大回撤曲线"),
             (context.monthly_heatmap_image, "月度收益热力图"),
         ]:

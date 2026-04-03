@@ -56,6 +56,8 @@ class Position:
         acc_avg_cost: 累计平均成本
         value: 市值
         side: 多空方向 ('long' or 'short')
+        buy_time: 当前这轮持仓首次建仓时间
+        last_buy_time: 最近一次买入/加仓时间
     """
     security: str
     total_amount: int = 0
@@ -65,6 +67,8 @@ class Position:
     acc_avg_cost: float = 0.0
     value: float = 0.0
     side: str = 'long'
+    buy_time: Optional[datetime] = None
+    last_buy_time: Optional[datetime] = None
     # 当日买入但受 T+1 限制的数量（次日释放为可卖）
     today_buy_t1: int = 0
     

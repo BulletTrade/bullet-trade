@@ -1,17 +1,20 @@
 import datetime as dt
+import logging
 from typing import Iterable, Optional, Sequence
 
+import numpy as np
 import pandas as pd
 import pytest
 
 from bullet_trade.core.engine import BacktestEngine
+from bullet_trade.core.globals import g, reset_globals
 from bullet_trade.core.scheduler import (
     run_daily,
     run_monthly,
     run_weekly,
     unschedule_all,
 )
-from bullet_trade.core.settings import reset_settings, set_option
+from bullet_trade.core.settings import reset_settings, set_benchmark, set_option
 
 
 class StubProvider:
@@ -89,9 +92,11 @@ class StubProvider:
 def reset_state():
     unschedule_all()
     reset_settings()
+    reset_globals()
     yield
     unschedule_all()
     reset_settings()
+    reset_globals()
 
 
 def _patch_provider(monkeypatch, trade_days: Sequence[str]):
@@ -188,3 +193,106 @@ def test_backtest_engine_weekly_and_monthly(monkeypatch):
 
     assert [hit.date() for hit in weekly_hits] == [dt.date(2024, 6, 13), dt.date(2024, 6, 17)]
     assert monthly_hits == [dt.datetime(2024, 6, 17, 16, 0)]
+
+
+def test_backtest_engine_calls_process_initialize_from_strategy_file(monkeypatch, tmp_path):
+    trade_day = "2024-06-17"
+    _patch_provider(monkeypatch, [trade_day])
+
+    strategy_file = tmp_path / "scheduled_strategy.py"
+    strategy_file.write_text(
+        """
+def initialize(context):
+    set_option('use_real_price', False)
+
+def process_initialize(context):
+    g.process_initialize_called = int(getattr(g, 'process_initialize_called', 0) or 0) + 1
+    run_daily(trade, '09:40')
+
+def trade(context):
+    g.trade_hits = int(getattr(g, 'trade_hits', 0) or 0) + 1
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    engine = BacktestEngine(strategy_file=str(strategy_file))
+    engine.run(
+        start_date=trade_day,
+        end_date=trade_day,
+        capital_base=100000,
+        frequency="daily",
+    )
+
+    assert getattr(g, "process_initialize_called", 0) == 1
+    assert getattr(g, "trade_hits", 0) == 1
+
+
+def test_backtest_engine_loads_benchmark_with_suffix_fallback(monkeypatch):
+    trade_day = "2024-06-17"
+
+    class BenchmarkProvider(StubProvider):
+        def __init__(self, trade_days):
+            super().__init__(trade_days)
+            self.price_calls = []
+
+        def get_price(self, security, *args, **kwargs):
+            self.price_calls.append(security)
+            if security == "000300.SH":
+                raise ValueError("找不到标的000300.SH")
+            if security == "000300.XSHG":
+                return pd.DataFrame({"close": [4000.0]}, index=[pd.Timestamp(trade_day)])
+            return super().get_price(security, *args, **kwargs)
+
+    provider = BenchmarkProvider([trade_day])
+    import bullet_trade.data.api as api_module
+
+    monkeypatch.setattr(api_module, "_provider", provider, raising=False)
+    monkeypatch.setattr(api_module, "_auth_attempted", True, raising=False)
+
+    def initialize(context):
+        set_option("use_real_price", False)
+        set_benchmark("000300.SH")
+
+    engine = BacktestEngine(initialize=initialize)
+    engine.run(
+        start_date=trade_day,
+        end_date=trade_day,
+        capital_base=100000,
+        frequency="daily",
+    )
+
+    assert provider.price_calls[:2] == ["000300.SH", "000300.XSHG"]
+    assert engine.benchmark_data is not None
+    assert engine.daily_records[0]["benchmark_price"] == 4000.0
+
+
+def test_backtest_engine_accepts_ndarray_trade_days_extension(monkeypatch, caplog):
+    trade_day = "2024-06-17"
+
+    class ArrayTradeDaysProvider(StubProvider):
+        def get_trade_days(self, start_date=None, end_date=None, count=None):
+            days = super().get_trade_days(start_date=start_date, end_date=end_date, count=count)
+            if count is not None:
+                return np.array(days, dtype="datetime64[ns]")
+            return days
+
+    provider = ArrayTradeDaysProvider(["2024-06-13", "2024-06-14", trade_day])
+    import bullet_trade.data.api as api_module
+
+    monkeypatch.setattr(api_module, "_provider", provider, raising=False)
+    monkeypatch.setattr(api_module, "_auth_attempted", True, raising=False)
+
+    def initialize(context):
+        set_option("use_real_price", False)
+
+    caplog.set_level(logging.DEBUG)
+    engine = BacktestEngine(initialize=initialize)
+    engine.run(
+        start_date=trade_day,
+        end_date=trade_day,
+        capital_base=100000,
+        frequency="daily",
+    )
+
+    assert "扩展交易日序列失败" not in caplog.text

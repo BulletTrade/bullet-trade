@@ -631,6 +631,60 @@ def _call_provider_get_price(**kwargs) -> pd.DataFrame:
     return get_price(**filtered)
 
 
+def _is_security_lookup_error(exc: Exception) -> bool:
+    text = str(exc or "").strip().lower()
+    if not text:
+        return False
+    zh_markers = ("找不到标的", "标的不存在", "证券不存在", "代码不存在")
+    if any(marker in str(exc) for marker in zh_markers):
+        return True
+    en_markers = ("security", "symbol", "ticker", "code")
+    not_found_markers = ("not found", "unknown", "invalid", "does not exist")
+    return any(marker in text for marker in en_markers) and any(
+        marker in text for marker in not_found_markers
+    )
+
+
+def _call_provider_get_price_with_security_fallback(**kwargs) -> pd.DataFrame:
+    """对单证券价格查询做代码后缀兼容重试。"""
+    security = kwargs.get("security")
+    if not isinstance(security, str):
+        return _call_provider_get_price(**kwargs)
+
+    last_exc: Optional[Exception] = None
+    candidates = _candidate_security_keys(security)
+    for idx, candidate in enumerate(candidates):
+        try:
+            result = _call_provider_get_price(**{**kwargs, "security": candidate})
+            if idx > 0:
+                log.debug(f"行情代码兼容成功: {security} -> {candidate}")
+            return result
+        except Exception as exc:
+            last_exc = exc
+            if idx >= len(candidates) - 1 or not _is_security_lookup_error(exc):
+                raise
+    if last_exc is not None:
+        raise last_exc
+    return _call_provider_get_price(**kwargs)
+
+
+def _build_empty_price_frame(security: Any, fields: Optional[List[str]]) -> pd.DataFrame:
+    """构造带字段列的空价格表，避免策略因属性访问出现二次误导错误。"""
+    normalized_fields = list(fields or [])
+    if not normalized_fields:
+        return pd.DataFrame()
+
+    if isinstance(security, (list, tuple, set)):
+        securities = [str(item) for item in security]
+        if len(securities) > 1:
+            columns = pd.MultiIndex.from_product(
+                [normalized_fields, securities], names=["field", "code"]
+            )
+            return pd.DataFrame(columns=columns)
+
+    return pd.DataFrame(columns=normalized_fields)
+
+
 def _fetch_pre_close(
     security: str,
     current_dt: datetime,
@@ -654,7 +708,7 @@ def _fetch_pre_close(
         )
 
     try:
-        df = _call_provider_get_price(**kwargs)
+        df = _call_provider_get_price_with_security_fallback(**kwargs)
     except Exception:
         return None
 
@@ -784,9 +838,9 @@ class BacktestCurrentData:
                 return kw
 
             if use_minute:
-                df = _call_provider_get_price(**_build_fetch_kwargs('minute'))
+                df = _call_provider_get_price_with_security_fallback(**_build_fetch_kwargs('minute'))
             else:
-                df = _call_provider_get_price(**_build_fetch_kwargs('daily'))
+                df = _call_provider_get_price_with_security_fallback(**_build_fetch_kwargs('daily'))
 
             if not df.empty:
                 if 'time' in df.columns and 'code' in df.columns:
@@ -1148,10 +1202,20 @@ def get_security_info(security: str, date: Optional[Union[str, datetime]] = None
         return empty
 
     try:
-        try:
-            raw_info = info_fn(security, date=resolved_date)
-        except TypeError:
-            raw_info = info_fn(security)
+        raw_info = None
+        candidates = _candidate_security_keys(security)
+        for idx, candidate in enumerate(candidates):
+            try:
+                try:
+                    raw_info = info_fn(candidate, date=resolved_date)
+                except TypeError:
+                    raw_info = info_fn(candidate)
+                if idx > 0:
+                    log.debug(f"证券信息代码兼容成功: {security} -> {candidate}")
+                break
+            except Exception as inner_exc:
+                if idx >= len(candidates) - 1 or not _is_security_lookup_error(inner_exc):
+                    raise
     except Exception as exc:
         log.debug(f"获取{security}基本信息失败: {exc}")
         raw_info = {}
@@ -1269,19 +1333,24 @@ def get_price(
 
     if not _current_context:
         # 没有回测上下文，直接调用原始API
-        return _call_provider_get_price(
-            security=security,
-            start_date=start_date,
-            end_date=end_date,
-            frequency=frequency,
-            fields=fields,
-            skip_paused=skip_paused,
-            fq=fq,
-            count=count,
-            panel=panel,
-            fill_paused=fill_paused,
-            force_no_engine=force_no_engine,
-        )
+        try:
+            return _call_provider_get_price_with_security_fallback(
+                security=security,
+                start_date=start_date,
+                end_date=end_date,
+                frequency=frequency,
+                fields=fields,
+                skip_paused=skip_paused,
+                fq=fq,
+                count=count,
+                panel=panel,
+                fill_paused=fill_paused,
+                force_no_engine=force_no_engine,
+            )
+        except Exception as e:
+            _raise_if_not_implemented(e)
+            log.error(f"获取价格数据失败: {e}")
+            return _build_empty_price_frame(security, fields)
     
     avoid_future = _should_avoid_future()
     use_real_price = _get_setting('use_real_price')
@@ -1361,7 +1430,7 @@ def get_price(
         try:
             # 真实价格模式优先使用提供者内部引擎支持
             #log.debug(f"调用 provider.get_price(prefer_engine=True): security={security}, fields={fields}")
-            result = _call_provider_get_price(
+            result = _call_provider_get_price_with_security_fallback(
                 security=security,
                 start_date=start_date,
                 end_date=end_date,
@@ -1398,7 +1467,7 @@ def get_price(
     raw_df = None
     final = None
     try:
-        df = _call_provider_get_price(
+        df = _call_provider_get_price_with_security_fallback(
             security=security,
             start_date=start_date,
             end_date=end_date,
@@ -1429,7 +1498,7 @@ def get_price(
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取价格数据失败: {e}")
-        return pd.DataFrame()
+        return _build_empty_price_frame(security, fields)
     _raise_if_empty_minute_data(avoid_future, freq, raw_df, security, end_date)
     return final if final is not None else pd.DataFrame()
 
@@ -2399,8 +2468,17 @@ def get_index_stocks(
     resolved_date = _ensure_not_future_date(resolved_date, "get_index_stocks.date")
     _ensure_history_view("get_index_stocks", resolved_date)
     
+    candidates = _candidate_security_keys(index_symbol)
     try:
-        return _provider.get_index_stocks(index_symbol, date=resolved_date)
+        for idx, candidate in enumerate(candidates):
+            try:
+                result = _provider.get_index_stocks(candidate, date=resolved_date)
+                if idx > 0:
+                    log.debug(f"指数代码兼容成功: {index_symbol} -> {candidate}")
+                return result
+            except Exception as inner_exc:
+                if idx >= len(candidates) - 1 or not _is_security_lookup_error(inner_exc):
+                    raise
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取指数成分股失败: {e}")

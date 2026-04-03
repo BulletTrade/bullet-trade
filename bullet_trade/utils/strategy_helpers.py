@@ -133,7 +133,7 @@ def _position_rows(context, total_value: float, top_n: Optional[int]) -> List[Li
         display_name = info.get("display_name") or info.get("name") or ""
         buy_time = getattr(pos, "buy_time", None) or getattr(pos, "last_buy_time", None)
         if isinstance(buy_time, datetime):
-            buy_str = buy_time.strftime("%Y-%m-%d")
+            buy_str = buy_time.strftime("%Y-%m-%d %H:%M")
         else:
             buy_str = "--"
         entries.append(

@@ -9,39 +9,53 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-from bullet_trade.core.analysis import generate_report, load_results_from_directory
+from bullet_trade.core.analysis import generate_html_report, generate_report, load_results_from_directory
 from bullet_trade.reporting import ReportGenerationError, generate_cli_report
 
 pytestmark = pytest.mark.unit
 
 
 def _prepare_results_dir(tmp_path: Path) -> Path:
-    project_root = Path(__file__).resolve().parents[3]
-    sample_dir = project_root / "backtest_results"
     target_dir = tmp_path / "results"
-    target_dir.mkdir()
-    # 查找子目录中的 daily_records.csv 文件
-    sample_file = None
-    for subdir in sample_dir.iterdir():
-        if subdir.is_dir():
-            candidate = subdir / "daily_records.csv"
-            if candidate.exists():
-                sample_file = candidate
-                break
-    if sample_file is None:
-        raise FileNotFoundError(f"未找到测试数据文件: {sample_dir}/*/daily_records.csv")
-    shutil.copy(sample_file, target_dir / "daily_records.csv")
-    # metrics.json 提供最小指标集
+    target_dir.mkdir(parents=True)
+
+    df = pd.DataFrame(
+        {
+            "date": pd.to_datetime(["2024-01-02", "2024-01-03", "2024-01-04"]),
+            "total_value": [100000.0, 101000.0, 102500.0],
+            "cash": [100000.0, 50000.0, 40000.0],
+            "positions_value": [0.0, 51000.0, 62500.0],
+            "returns": [0.0, 1000.0, 2500.0],
+            "returns_pct": [0.0, 1.0, 2.5],
+            "daily_returns": [0.0, 0.01, 0.0148514851],
+            "benchmark_price": [4000.0, 4040.0, 4080.0],
+            "benchmark_value": [100000.0, 101000.0, 102000.0],
+            "benchmark_returns_pct": [0.0, 1.0, 2.0],
+            "excess_returns_pct": [0.0, 0.0, 0.5],
+        }
+    ).set_index("date")
+    df.to_csv(target_dir / "daily_records.csv", encoding="utf-8-sig")
+
     metrics_payload = {
         "generated_at": "2024-01-01T00:00:00Z",
-        "meta": {"start_date": "2023-01-01", "end_date": "2023-12-31"},
+        "meta": {
+            "start_date": "2024-01-02",
+            "end_date": "2024-01-04",
+            "run_started_at": "2024-01-05 09:30:00",
+            "run_finished_at": "2024-01-05 09:30:03",
+            "runtime_seconds": 3.21,
+            "benchmark": "000300.XSHG",
+            "initial_total_value": 100000.0,
+        },
         "metrics": {
-            "策略收益": 12.34,
+            "策略收益": 2.50,
             "策略年化收益": 10.11,
-            "最大回撤": -5.67,
+            "基准收益": 2.00,
+            "累计超额收益": 0.50,
+            "最大回撤": -0.80,
             "胜率": 55.0,
             "盈亏比": 1.23,
-            "交易天数": 250,
+            "交易天数": 3,
         },
     }
     (target_dir / "metrics.json").write_text(
@@ -55,8 +69,12 @@ def test_generate_cli_report_html(tmp_path):
     report_path = generate_cli_report(input_dir=str(results_dir), fmt="html")
     assert report_path.exists()
     content = report_path.read_text(encoding="utf-8")
-    assert "data:image/png;base64" in content
+    assert content.count("data:image/png;base64") >= 4
     assert "<table" in content
+    assert "Benchmark" in content
+    assert "000300.XSHG" in content
+    assert "累计超额收益" in content
+    assert "回测启动时间" in content
 
 
 def test_generate_cli_report_pdf(tmp_path):
@@ -80,36 +98,16 @@ def test_generate_cli_report_with_metric_filter(tmp_path):
 
 
 def test_generate_cli_report_missing_metrics(tmp_path):
-    project_root = Path(__file__).resolve().parents[3]
-    sample_dir = project_root / "backtest_results"
+    source_dir = _prepare_results_dir(tmp_path / "source")
     target_dir = tmp_path / "results"
     target_dir.mkdir()
-    # 查找子目录中的 daily_records.csv 文件
-    sample_file = None
-    for subdir in sample_dir.iterdir():
-        if subdir.is_dir():
-            candidate = subdir / "daily_records.csv"
-            if candidate.exists():
-                sample_file = candidate
-                break
-    if sample_file is None:
-        raise FileNotFoundError(f"未找到测试数据文件: {sample_dir}/*/daily_records.csv")
-    shutil.copy(sample_file, target_dir / "daily_records.csv")
+    shutil.copy(source_dir / "daily_records.csv", target_dir / "daily_records.csv")
     with pytest.raises(ReportGenerationError):
         generate_cli_report(input_dir=str(target_dir), fmt="html")
 
 
 def test_generate_report_exports_metrics_json(tmp_path, monkeypatch):
-    project_root = Path(__file__).resolve().parents[3]
-    sample_dir = project_root / "backtest_results"
-    # 查找子目录中的测试数据
-    actual_sample_dir = None
-    for subdir in sample_dir.iterdir():
-        if subdir.is_dir() and (subdir / "daily_records.csv").exists():
-            actual_sample_dir = subdir
-            break
-    if actual_sample_dir is None:
-        raise FileNotFoundError(f"未找到测试数据目录: {sample_dir}/*/daily_records.csv")
+    actual_sample_dir = _prepare_results_dir(tmp_path)
     monkeypatch.setattr(
         "bullet_trade.data.api.get_all_securities",
         lambda types=None: pd.DataFrame(),
@@ -128,3 +126,20 @@ def test_generate_report_exports_metrics_json(tmp_path, monkeypatch):
     assert metrics_path.exists()
     payload = json.loads(metrics_path.read_text(encoding="utf-8"))
     assert "metrics" in payload
+    assert payload["meta"]["benchmark"] == "000300.XSHG"
+    assert payload["meta"]["run_started_at"] == "2024-01-05 09:30:00"
+
+
+def test_load_results_from_directory_merges_metrics_meta(tmp_path):
+    results_dir = _prepare_results_dir(tmp_path)
+    results = load_results_from_directory(str(results_dir))
+    assert results["meta"]["benchmark"] == "000300.XSHG"
+    assert results["meta"]["run_started_at"] == "2024-01-05 09:30:00"
+
+
+def test_generate_html_report_includes_benchmark_and_run_context(tmp_path):
+    results_dir = _prepare_results_dir(tmp_path)
+    html = generate_html_report(results_dir=str(results_dir))
+    assert "Benchmark: 000300.XSHG" in html
+    assert "回测启动: 2024-01-05 09:30:00" in html
+    assert "累计超额收益" in html

@@ -44,6 +44,96 @@ _TRADE_KEY_ALIASES: Dict[str, Sequence[str]] = {
 }
 
 
+def _merge_meta_dict(base: Optional[Dict[str, Any]], overlay: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    merged: Dict[str, Any] = dict(base or {})
+    for key, value in (overlay or {}).items():
+        if key not in merged or merged.get(key) in (None, "", {}, []):
+            merged[key] = value
+    return merged
+
+
+def _last_valid_number(series: Optional[pd.Series]) -> Optional[float]:
+    if series is None:
+        return None
+    try:
+        clean = pd.to_numeric(series, errors="coerce").dropna()
+    except Exception:
+        return None
+    if clean.empty:
+        return None
+    return float(clean.iloc[-1])
+
+
+def _compute_benchmark_context(
+    df: pd.DataFrame,
+    *,
+    base_value: Optional[float] = None,
+) -> Dict[str, Any]:
+    empty = {
+        "benchmark_value": None,
+        "benchmark_returns_pct": None,
+        "excess_returns_pct": None,
+        "benchmark_total_returns_pct": None,
+        "benchmark_annual_returns_pct": None,
+        "excess_total_returns_pct": None,
+    }
+    if df is None or df.empty:
+        return empty
+
+    def _numeric_series(column: str) -> Optional[pd.Series]:
+        if column not in df.columns:
+            return None
+        series = pd.to_numeric(df[column], errors="coerce")
+        if series.dropna().empty:
+            return None
+        return series
+
+    base = base_value
+    if base is None or base <= 0:
+        try:
+            base = float(pd.to_numeric(df["total_value"], errors="coerce").dropna().iloc[0])
+        except Exception:
+            base = None
+
+    strategy_returns_pct = _numeric_series("returns_pct")
+    if strategy_returns_pct is None and base and base > 0 and "total_value" in df.columns:
+        strategy_total_value = pd.to_numeric(df["total_value"], errors="coerce")
+        strategy_returns_pct = (strategy_total_value / float(base) - 1.0) * 100.0
+
+    benchmark_returns_pct = _numeric_series("benchmark_returns_pct")
+    benchmark_value = _numeric_series("benchmark_value")
+    if benchmark_returns_pct is None and benchmark_value is not None and base and base > 0:
+        benchmark_returns_pct = (benchmark_value / float(base) - 1.0) * 100.0
+    elif benchmark_value is None and benchmark_returns_pct is not None and base and base > 0:
+        benchmark_value = float(base) * (1.0 + benchmark_returns_pct / 100.0)
+
+    excess_returns_pct = _numeric_series("excess_returns_pct")
+    if excess_returns_pct is None and strategy_returns_pct is not None and benchmark_returns_pct is not None:
+        excess_returns_pct = strategy_returns_pct - benchmark_returns_pct
+
+    benchmark_total_returns_pct = _last_valid_number(benchmark_returns_pct)
+    excess_total_returns_pct = _last_valid_number(excess_returns_pct)
+
+    benchmark_annual_returns_pct: Optional[float] = None
+    if benchmark_value is not None:
+        clean = pd.to_numeric(benchmark_value, errors="coerce").dropna()
+        trading_days = len(clean)
+        years = trading_days / 250.0
+        if trading_days > 0 and years > 0 and clean.iloc[0] > 0:
+            benchmark_annual_returns_pct = (
+                pow(float(clean.iloc[-1]) / float(clean.iloc[0]), 1 / years) - 1
+            ) * 100.0
+
+    return {
+        "benchmark_value": benchmark_value,
+        "benchmark_returns_pct": benchmark_returns_pct,
+        "excess_returns_pct": excess_returns_pct,
+        "benchmark_total_returns_pct": benchmark_total_returns_pct,
+        "benchmark_annual_returns_pct": benchmark_annual_returns_pct,
+        "excess_total_returns_pct": excess_total_returns_pct,
+    }
+
+
 def _get_trade_attr(trade: Any, key: str, default: Any = None) -> Any:
     """兼容对象与字典格式的交易记录字段获取。"""
     if isinstance(trade, dict):
@@ -417,6 +507,7 @@ def calculate_metrics(results: Dict[str, Any]) -> Dict[str, float]:
             '策略年化收益': 0.0,
             '基准收益': 0.0,
             '基准年化收益': 0.0,
+            '累计超额收益': 0.0,
             'Alpha': 0.0,
             'Beta': 0.0,
             '夏普比率': 0.0,
@@ -440,6 +531,8 @@ def calculate_metrics(results: Dict[str, Any]) -> Dict[str, float]:
         base = None
     if not base or base <= 0:
         base = float(df['total_value'].iloc[0])
+
+    benchmark_ctx = _compute_benchmark_context(df, base_value=base)
     
     # 策略收益（百分比）
     total_returns = (df['total_value'].iloc[-1] / base - 1) * 100
@@ -568,6 +661,9 @@ def calculate_metrics(results: Dict[str, Any]) -> Dict[str, float]:
     metrics = {
         '策略收益': round(total_returns, 2),
         '策略年化收益': round(annual_returns, 2),
+        '基准收益': round(float(benchmark_ctx.get('benchmark_total_returns_pct') or 0.0), 2),
+        '基准年化收益': round(float(benchmark_ctx.get('benchmark_annual_returns_pct') or 0.0), 2),
+        '累计超额收益': round(float(benchmark_ctx.get('excess_total_returns_pct') or 0.0), 2),
         '策略波动率': round(volatility, 2),
         '最大回撤': round(max_drawdown, 2),
         '最大回撤区间': max_dd_interval,
@@ -828,6 +924,16 @@ def load_results_from_directory(results_dir: str) -> Dict[str, Any]:
         'runtime_seconds': None,
     }
 
+    metrics_path = os.path.join(results_dir, 'metrics.json')
+    if os.path.exists(metrics_path):
+        try:
+            with open(metrics_path, 'r', encoding='utf-8') as fp:
+                payload = json.load(fp)
+            if isinstance(payload, dict):
+                results['meta'] = _merge_meta_dict(results['meta'], payload.get('meta', {}))
+        except Exception:
+            pass
+
     return results
 
 def generate_report(
@@ -877,8 +983,7 @@ def generate_report(
                     results['events'] = loaded.get('events', [])
                 if results.get('daily_positions') is None:
                     results['daily_positions'] = loaded.get('daily_positions', None)
-                if not results.get('meta'):
-                    results['meta'] = loaded.get('meta', {})
+                results['meta'] = _merge_meta_dict(results.get('meta', {}), loaded.get('meta', {}))
             except Exception:
                 pass
             output_dir = output_dir or results_dir
@@ -1437,8 +1542,7 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
                     results['events'] = loaded.get('events', [])
                 if results.get('daily_positions') is None:
                     results['daily_positions'] = loaded.get('daily_positions', None)
-                if not results.get('meta'):
-                    results['meta'] = loaded.get('meta', {})
+                results['meta'] = _merge_meta_dict(results.get('meta', {}), loaded.get('meta', {}))
             except Exception:
                 pass
         if output_file is None and results_dir is not None:
@@ -1452,12 +1556,21 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
     events = results.get('events', [])
     metrics = calculate_metrics(results)
     meta = results.get('meta', {})
+    base_total_value = None
+    try:
+        base_total_value = float(meta.get('initial_total_value'))
+    except Exception:
+        base_total_value = None
+    benchmark_ctx = _compute_benchmark_context(df, base_value=base_total_value)
 
     # 页面标题与运行耗时
     title = meta.get('strategy_file', '策略回测报告')
     date_range = f"{meta.get('start_date', '')} 至 {meta.get('end_date', '')}"
     runtime_seconds = meta.get('runtime_seconds', None)
     runtime_text = f"总用时: {runtime_seconds:.2f}s" if isinstance(runtime_seconds, (int, float)) else "总用时: 未记录"
+    run_started_at = meta.get('run_started_at') or '未记录'
+    run_finished_at = meta.get('run_finished_at') or '未记录'
+    benchmark_code = meta.get('benchmark') or '-'
     
     # 样式（增加网格化风险指标布局与头部元信息 & 表格美化）
     style = """
@@ -1499,13 +1612,14 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
     """
     
     # 顶部头部
+    meta_lines = [f"Benchmark: {benchmark_code}", f"回测启动: {run_started_at}", f"回测结束: {run_finished_at}", runtime_text]
     header_html = f"""
     <div class=\"header\">
       <div>
         <div class=\"title\">{title}</div>
         <div class=\"subtitle\">{date_range}</div>
       </div>
-      <div class=\"meta\">{runtime_text}</div>
+      <div class=\"meta\">{'<br>'.join(meta_lines)}</div>
     </div>
     """
     
@@ -1521,6 +1635,18 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
         ),
         secondary_y=False
     )
+    benchmark_value = benchmark_ctx.get('benchmark_value')
+    if benchmark_value is not None:
+        fig_total.add_trace(
+            go.Scatter(
+                x=df.index,
+                y=benchmark_value,
+                mode='lines',
+                name=f"Benchmark({benchmark_code})",
+                line=dict(color='#ff7f0e', width=2, dash='dot')
+            ),
+            secondary_y=False
+        )
     # 初始资金（用首日总资产作为近似）
     if len(df) > 0:
         init_cash = float(df['total_value'].iloc[0])
@@ -1553,6 +1679,23 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
     fig_total.update_layout(title='总资产与回撤', xaxis_title='日期')
     fig_total.update_yaxes(title_text='资产', secondary_y=False)
     fig_total.update_yaxes(title_text='回撤 (%)', secondary_y=True, range=[min(dd_min * 1.05, -1.0), 0])
+
+    fig_excess = go.Figure()
+    excess_returns_pct = benchmark_ctx.get('excess_returns_pct')
+    if excess_returns_pct is not None:
+        fig_excess.add_trace(
+            go.Scatter(
+                x=df.index,
+                y=excess_returns_pct,
+                mode='lines',
+                name='累计超额收益',
+                line=dict(color='#9467bd', width=2)
+            )
+        )
+        fig_excess.add_hline(y=0, line_dash='dash', line_color='gray')
+        fig_excess.update_layout(title='累计超额收益', xaxis_title='日期', yaxis_title='超额收益(%)')
+    else:
+        fig_excess.update_layout(title='累计超额收益 (无 benchmark 数据)')
     
     # 标注Top5最大回撤区间（峰到谷）
     intervals = []
@@ -1778,7 +1921,7 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
     # 风险指标网格（紧凑布局）
     metrics_items = list(metrics.items())
     # 格式化部分指标（带百分号）
-    percent_keys = {'策略收益','策略年化收益','最大回撤','日胜率','交易胜率','胜率'}
+    percent_keys = {'策略收益','策略年化收益','基准收益','基准年化收益','累计超额收益','最大回撤','日胜率','交易胜率','胜率'}
     metrics_html_items = []
     for k, v in metrics_items:
         val = v
@@ -1791,6 +1934,7 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
     
     # 导出各图为HTML片段
     total_html = pio.to_html(fig_total, include_plotlyjs='cdn', full_html=False)
+    excess_html = pio.to_html(fig_excess, include_plotlyjs=False, full_html=False)
     annual_html = pio.to_html(fig_annual, include_plotlyjs=False, full_html=False)
     monthly_html = pio.to_html(fig_monthly, include_plotlyjs=False, full_html=False)
     open_html = pio.to_html(fig_open, include_plotlyjs=False, full_html=False)
@@ -2047,7 +2191,7 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
 </head>
 <body>
 """
-    body_html_parts = [header_html, metrics_grid_html, total_html, annual_html, monthly_html, calendar_section_html, open_html, pnl_html, daily_group_html, trade_group_html, csv_tables_html, "</body></html>"]
+    body_html_parts = [header_html, metrics_grid_html, total_html, excess_html, annual_html, monthly_html, calendar_section_html, open_html, pnl_html, daily_group_html, trade_group_html, csv_tables_html, "</body></html>"]
     html = "\n".join([head_html] + body_html_parts)
 
     if output_file:
