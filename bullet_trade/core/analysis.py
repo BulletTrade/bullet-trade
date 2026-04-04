@@ -1575,8 +1575,11 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
     # 样式（增加网格化风险指标布局与头部元信息 & 表格美化）
     style = """
     <style>
-    body { font-family: Arial, sans-serif; margin: 20px; }
-    .header { display: flex; justify-content: space-between; align-items: baseline; }
+    body { font-family: "PingFang SC", "Noto Sans SC", "Microsoft YaHei", sans-serif; margin: 20px; color: #111827; }
+    .header { display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; }
+    .brand { display: flex; align-items: center; gap: 14px; }
+    .brand-logo { width: 40px; height: 40px; flex: 0 0 40px; }
+    .eyebrow { font-size: 13px; font-weight: 700; color: #2563eb; letter-spacing: 0.08em; text-transform: uppercase; }
     .title { font-size: 24px; font-weight: bold; }
     .subtitle { color: #555; margin-top: 4px; }
     .meta { color: #333; font-size: 13px; }
@@ -1615,9 +1618,13 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
     meta_lines = [f"Benchmark: {benchmark_code}", f"回测启动: {run_started_at}", f"回测结束: {run_finished_at}", runtime_text]
     header_html = f"""
     <div class=\"header\">
-      <div>
+      <div class=\"brand\">
+        <img class=\"brand-logo\" src=\"https://bullettrade.cn/favicon.svg\" alt=\"BulletTrade\" />
+        <div>
+        <div class=\"eyebrow\">BulletTrade 回测</div>
         <div class=\"title\">{title}</div>
         <div class=\"subtitle\">{date_range}</div>
+        </div>
       </div>
       <div class=\"meta\">{'<br>'.join(meta_lines)}</div>
     </div>
@@ -1644,6 +1651,20 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
                 mode='lines',
                 name=f"Benchmark({benchmark_code})",
                 line=dict(color='#ff7f0e', width=2, dash='dot')
+            ),
+            secondary_y=False
+        )
+        excess_asset_value = pd.to_numeric(df['total_value'], errors='coerce') - pd.to_numeric(
+            benchmark_value,
+            errors='coerce',
+        )
+        fig_total.add_trace(
+            go.Scatter(
+                x=df.index,
+                y=excess_asset_value,
+                mode='lines',
+                name='超额资产 (元)',
+                line=dict(color='#9467bd', width=2, dash='dot')
             ),
             secondary_y=False
         )
@@ -1677,25 +1698,14 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
         secondary_y=True
     )
     fig_total.update_layout(title='总资产与回撤', xaxis_title='日期')
-    fig_total.update_yaxes(title_text='资产', secondary_y=False)
-    fig_total.update_yaxes(title_text='回撤 (%)', secondary_y=True, range=[min(dd_min * 1.05, -1.0), 0])
-
-    fig_excess = go.Figure()
-    excess_returns_pct = benchmark_ctx.get('excess_returns_pct')
-    if excess_returns_pct is not None:
-        fig_excess.add_trace(
-            go.Scatter(
-                x=df.index,
-                y=excess_returns_pct,
-                mode='lines',
-                name='累计超额收益',
-                line=dict(color='#9467bd', width=2)
-            )
-        )
-        fig_excess.add_hline(y=0, line_dash='dash', line_color='gray')
-        fig_excess.update_layout(title='累计超额收益', xaxis_title='日期', yaxis_title='超额收益(%)')
-    else:
-        fig_excess.update_layout(title='累计超额收益 (无 benchmark 数据)')
+    fig_total.update_yaxes(title_text='资产 / 超额资产 (元)', secondary_y=False)
+    fig_total.update_yaxes(
+        title_text='回撤 (%)',
+        secondary_y=True,
+        range=[min(dd_min * 1.05, -1.0), 0],
+        tickfont=dict(color='darkred'),
+        title_font=dict(color='darkred'),
+    )
     
     # 标注Top5最大回撤区间（峰到谷）
     intervals = []
@@ -1771,6 +1781,7 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
         colorbar=dict(title='收益(%)')
     ))
     fig_monthly.update_layout(title='月度收益热力图', xaxis_title='月份', yaxis_title='年份')
+    fig_monthly.update_yaxes(autorange='reversed')
     # 添加每格文字标注
     for yi, yv in enumerate(pivot.index):
         for xi, xv in enumerate(pivot.columns):
@@ -1934,7 +1945,6 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
     
     # 导出各图为HTML片段
     total_html = pio.to_html(fig_total, include_plotlyjs='cdn', full_html=False)
-    excess_html = pio.to_html(fig_excess, include_plotlyjs=False, full_html=False)
     annual_html = pio.to_html(fig_annual, include_plotlyjs=False, full_html=False)
     monthly_html = pio.to_html(fig_monthly, include_plotlyjs=False, full_html=False)
     open_html = pio.to_html(fig_open, include_plotlyjs=False, full_html=False)
@@ -2186,12 +2196,12 @@ def generate_html_report(results: Dict[str, Any] = None, output_file: Optional[s
 <meta charset=\"utf-8\">
 <meta http-equiv=\"X-UA-Compatible\" content=\"IE=edge\">
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-<title>{title}</title>
+<title>BulletTrade 回测 - {title}</title>
 {style}
 </head>
 <body>
 """
-    body_html_parts = [header_html, metrics_grid_html, total_html, excess_html, annual_html, monthly_html, calendar_section_html, open_html, pnl_html, daily_group_html, trade_group_html, csv_tables_html, "</body></html>"]
+    body_html_parts = [header_html, metrics_grid_html, total_html, annual_html, monthly_html, calendar_section_html, open_html, pnl_html, daily_group_html, trade_group_html, csv_tables_html, "</body></html>"]
     html = "\n".join([head_html] + body_html_parts)
 
     if output_file:
@@ -2542,6 +2552,7 @@ def build_daily_return_calendar_page_from_df(
     try:
         from pyecharts.charts import Calendar, Page
         from pyecharts import options as opts
+        from pyecharts.commons.utils import JsCode
     except Exception as e:
         raise RuntimeError(f"pyecharts 未安装或导入失败：{e}")
 
@@ -2561,7 +2572,7 @@ def build_daily_return_calendar_page_from_df(
     for y in years:
         data_year = [{
             "name": f"{d.strftime('%Y-%m-%d')}：{float(r_pct.loc[d]):.2f}%",
-            "value": [d.strftime("%Y-%m-%d"), float(c_val.loc[d])]
+            "value": [d.strftime("%Y-%m-%d"), float(c_val.loc[d]), float(r_pct.loc[d])]
         } for d in r_pct.index if d.year == y]
 
         if hatch_holiday:
@@ -2581,7 +2592,7 @@ def build_daily_return_calendar_page_from_df(
                 ds = d.strftime("%Y-%m-%d")
                 data_year.append({
                     "name": f"{ds}：{holiday_label}",
-                    "value": [ds, 0.0],
+                    "value": [ds, 0.0, None],
                     "itemStyle": {
                         "color": holiday_color,
                         "decal": decal_obj
@@ -2593,6 +2604,24 @@ def build_daily_return_calendar_page_from_df(
             .add(
                 series_name=str(y),
                 yaxis_data=data_year,
+                label_opts=opts.LabelOpts(
+                    is_show=True,
+                    position="inside",
+                    font_size=7,
+                    color="#333333",
+                    margin=0,
+                    formatter=JsCode(
+                        """
+                        function(params) {
+                          var raw = params.value && params.value.length > 2 ? params.value[2] : null;
+                          if (raw === null || raw === undefined || isNaN(raw)) {
+                            return '';
+                          }
+                          return raw.toFixed(1) + '%';
+                        }
+                        """
+                    ),
+                ),
                 calendar_opts=opts.CalendarOpts(
                     range_=str(y),
                     pos_top=inner_top_px,
@@ -2613,7 +2642,19 @@ def build_daily_return_calendar_page_from_df(
                     pos_left="center",
                     pos_top="2%"
                 ),
-                tooltip_opts=opts.TooltipOpts(formatter="{b}"),
+                tooltip_opts=opts.TooltipOpts(
+                    formatter=JsCode(
+                        """
+                        function(params) {
+                          var raw = params.value && params.value.length > 2 ? params.value[2] : null;
+                          if (raw === null || raw === undefined || isNaN(raw)) {
+                            return params.name;
+                          }
+                          return params.value[0] + '：' + raw.toFixed(2) + '%';
+                        }
+                        """
+                    )
+                ),
             )
         )
         page.add(cal)

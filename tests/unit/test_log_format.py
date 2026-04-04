@@ -19,7 +19,10 @@ def test_log_format_backtest(caplog):
     caplog.set_level("INFO", logger="jq_strategy")
     log.info("测试消息")
     record = caplog.records[-1]
-    assert "[策略时间:2025-01-02 09:00:00]" in record.message
+    assert "[2025-01-02 09:00:00]" in record.message
+    assert "策略时间:" not in record.message
+    formatted = log._formatter.format(record)
+    assert formatted.startswith("[INFO] [2025-01-02 09:00:00]")
 
 
 def test_log_format_live_delay(caplog):

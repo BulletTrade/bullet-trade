@@ -10,7 +10,8 @@ def test_log_format_backtest(caplog):
     log.set_strategy_time(datetime(2025, 1, 1, 9, 40, 0))
     log.info("hello")
     text = "\n".join(r.getMessage() for r in caplog.records)
-    assert "策略时间:2025-01-01 09:40:00" in text
+    assert "[2025-01-01 09:40:00]" in text
+    assert "策略时间:" not in text
     assert "delay=" not in text
 
 
@@ -22,4 +23,3 @@ def test_log_format_live(caplog):
     log.info("hello")
     text = "\n".join(r.getMessage() for r in caplog.records)
     assert "策略:" in text and "当前:" in text and "delay=" in text
-

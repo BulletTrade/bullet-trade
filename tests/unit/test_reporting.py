@@ -142,4 +142,12 @@ def test_generate_html_report_includes_benchmark_and_run_context(tmp_path):
     html = generate_html_report(results_dir=str(results_dir))
     assert "Benchmark: 000300.XSHG" in html
     assert "回测启动: 2024-01-05 09:30:00" in html
-    assert "累计超额收益" in html
+    assert "BulletTrade 回测" in html
+    assert "https://bullettrade.cn/favicon.svg" in html
+    assert '"autorange":"reversed"' in html
+    assert "return raw.toFixed(1) + '%'" in html
+    assert "回撤 / 超额收益 (%)" not in html
+    assert '"yaxis3"' not in html
+    assert '"text":"回撤 (%)"' in html
+    assert '"text":"资产 / 超额资产 (元)"' in html
+    assert '超额资产 (元)' in html
