@@ -7,6 +7,11 @@ use_directory_urls: false
 nav:
   - 官方首页: /
   - 文档首页: index.md
+  - 新手入门:
+      - 环境准备：安装 Python: python-setup.md
+      - 总览与选型: beginner-guide.md
+      - 方案 A：独立运行: beginner-route-a.md
+      - 方案 B：聚宽侧模拟盘运行: beginner-route-b.md
   - 快速上手: quickstart.md
   - 研究环境: research.md
   - 配置总览: config.md
@@ -40,7 +45,11 @@ markdown_extensions:
   - toc:
       permalink: true
   - pymdownx.highlight
-  - pymdownx.superfences
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
 plugins:
   - search
   - mike:
@@ -55,3 +64,6 @@ extra:
       link: https://github.com/BulletTrade/bullet-trade
 extra_css:
   - css/custom.css
+extra_javascript:
+  - https://cdn.jsdelivr.net/npm/mermaid@10.9.1/dist/mermaid.min.js
+  - js/mermaid-init.js

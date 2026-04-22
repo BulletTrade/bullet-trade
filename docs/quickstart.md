@@ -1,7 +1,25 @@
 # 快速上手
 
-这页只给最短路径。  
-先跑通，再看高级参数。
+这页保留作为旧入口。  
+如果你是第一次使用 BulletTrade，推荐先看：
+
+- [新手入门总览：先选方案，再看对应文档](beginner-guide.md)
+- [环境准备：先安装 Python，再创建虚拟环境](python-setup.md)
+
+那一页已经把下面这些问题合并讲清楚了：
+
+- 我们支持哪两种方案
+- 两种方案的结构分别是什么
+- 怎么决策选 A 或 B
+- 进入 A 方案或 B 方案的详细文档
+
+## 如果你只想看最短路径
+
+最短顺序仍然是：
+
+1. 先安装
+2. 先跑一个最小回测
+3. 再打通本地 QMT 或远程 `qmt-remote`
 
 ## 1. 安装
 
@@ -28,6 +46,12 @@ bullet-trade backtest strategies/demo_strategy.py --start 2024-01-01 --end 2024-
 ```
 
 ## 3. 本地 QMT
+
+如果你还不知道 `.env` 是什么，先看：
+
+- [什么是 `.env` 文件，怎么创建](python-setup.md#env-file)
+
+下面这些代码块不是命令，而是要写进 `.env` 文件里的内容。
 
 `.env` 最少：
 
@@ -85,7 +109,6 @@ bullet-trade live strategies/demo_strategy.py --broker qmt-remote
 - `LOG_DIR`
 - `RUNTIME_DIR`
 - `QMT_ACCOUNT_TYPE`
-- `QMT_SERVER_ACCOUNT_KEY`
 - `QMT_SESSION_ID`
 - 风控相关参数
 
@@ -96,11 +119,6 @@ bullet-trade live strategies/demo_strategy.py --broker qmt-remote
 不用。  
 默认就是 `stock`。  
 只有期货账户才需要写 `QMT_ACCOUNT_TYPE=future`。
-
-### `--accounts default=123456:stock` 要不要写
-
-单账户场景也不用。  
-如果 `.env` 里已经有 `QMT_ACCOUNT_ID=123456`，server 直接就能启动。
 
 ### `--data-path` 为什么报错
 
@@ -113,6 +131,10 @@ QMT_DATA_PATH=C:\国金QMT交易端\userdata_mini
 
 更多说明：
 
+- [环境准备：先安装 Python，再创建虚拟环境](python-setup.md)
+- [新手入门总览：先选方案，再看对应文档](beginner-guide.md)
+- [方案 A：策略在 BulletTrade 本地直接运行](beginner-route-a.md)
+- [方案 B：策略继续在聚宽侧运行，BulletTrade 负责接收信号并在本地 QMT 执行](beginner-route-b.md)
 - [配置总览](config.md)
 - [实盘引擎](live.md)
 - [QMT server](qmt-server.md)

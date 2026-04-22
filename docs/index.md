@@ -7,6 +7,10 @@ BulletTrade 是一套兼容聚宽 API 的量化研究与交易框架，支持多
 </p>
 
 ## index
+- [环境准备：安装 Python](python-setup.md)：两个方案共用的前置步骤，先装 Python，再创建虚拟环境。
+- [新手入门总览](beginner-guide.md)：先看 BulletTrade 目前支持的两种方案、结构图和选型方法，再进入对应文档。
+- [方案 A：独立运行](beginner-route-a.md)：策略在 BulletTrade 独立运行，连接本地 QMT。
+- [方案 B：聚宽侧模拟盘运行](beginner-route-b.md)：策略在聚宽侧模拟盘运行，BulletTrade 负责接收信号并在本地 QMT 执行。
 - [快速上手](quickstart.md)：三步跑通回测/实盘，聚宽策略无改直接复用。
 - [研究环境（JupyterLab）](research.md)：`bullet-trade lab` 一键启动 Notebook，默认根目录、设置文件与示例说明。
 - [配置总览](config.md)：回测/本地实盘/远程实盘/聚宽接入的环境变量一览。
@@ -51,6 +55,7 @@ BulletTrade 是一套兼容聚宽 API 的量化研究与交易框架，支持多
   # windows (cmd)
   copy env.example .env
   ```
+- 如果你还不知道 `.env` 是什么，先看 [什么是 `.env` 文件，怎么创建](python-setup.md#env-file)。
 - 安装全部可选依赖：
   ```bash
   pip install -e ".[all]"
