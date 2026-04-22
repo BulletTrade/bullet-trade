@@ -9,6 +9,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
+from bullet_trade.core import analysis as analysis_module
 from bullet_trade.core.analysis import generate_html_report, generate_report, load_results_from_directory
 from bullet_trade.reporting import ReportGenerationError, generate_cli_report
 
@@ -151,3 +152,19 @@ def test_generate_html_report_includes_benchmark_and_run_context(tmp_path):
     assert '"text":"回撤 (%)"' in html
     assert '"text":"资产 / 超额资产 (元)"' in html
     assert '超额资产 (元)' in html
+
+
+def test_analysis_resample_aliases_work_across_supported_pandas_versions():
+    series = pd.Series(
+        [0.01, 0.02, -0.01],
+        index=pd.to_datetime(["2023-12-29", "2024-01-03", "2024-02-01"]),
+    )
+
+    annual = series.resample(analysis_module._YEAR_END_FREQ).sum()
+    monthly = series.resample(analysis_module._MONTH_END_FREQ).sum()
+
+    assert annual.index.year.tolist() == [2023, 2024]
+    assert annual.round(4).tolist() == [0.01, 0.01]
+    assert monthly.index.year.tolist() == [2023, 2024, 2024]
+    assert monthly.index.month.tolist() == [12, 1, 2]
+    assert monthly.round(4).tolist() == [0.01, 0.02, -0.01]
