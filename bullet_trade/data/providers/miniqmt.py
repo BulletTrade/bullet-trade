@@ -550,7 +550,7 @@ class MiniQMTProvider(DataProvider):
             if not missing_dates:
                 return df
             
-            logger.debug(f"QMT _fill_paused_days: 发现 {len(missing_dates)} 个停牌日需要填充: {sorted(missing_dates)}")
+            #logger.debug(f"QMT _fill_paused_days: 发现 {len(missing_dates)} 个停牌日需要填充: {sorted(missing_dates)}")
             
             # 为缺失的日期创建填充行
             fill_rows = []
@@ -595,7 +595,7 @@ class MiniQMTProvider(DataProvider):
                     index=[row[0] for row in fill_rows]
                 )
                 df = pd.concat([df, fill_df]).sort_index()
-                logger.debug(f"QMT _fill_paused_days: 填充后 df.index={df.index.tolist()[-5:] if len(df) > 5 else df.index.tolist()}")
+                #logger.debug(f"QMT _fill_paused_days: 填充后 df.index={df.index.tolist()[-5:] if len(df) > 5 else df.index.tolist()}")
             
             return df
             
@@ -714,7 +714,7 @@ class MiniQMTProvider(DataProvider):
             )
             raise
         
-        logger.debug(f"QMT _fetch_local_data: xt.get_local_data 返回 data.keys()={list(data.keys()) if data else None}")
+        #logger.debug(f"QMT _fetch_local_data: xt.get_local_data 返回 data.keys()={list(data.keys()) if data else None}")
         
         df = data.get(security)
         if df is None or df.empty:
@@ -722,7 +722,7 @@ class MiniQMTProvider(DataProvider):
             return pd.DataFrame()
         
         df = df.copy()
-        logger.debug(f"QMT _fetch_local_data: df.columns={list(df.columns)}, df.shape={df.shape}")
+        #logger.debug(f"QMT _fetch_local_data: df.columns={list(df.columns)}, df.shape={df.shape}")
         
         # xtquant 时间戳为毫秒级 UTC，需要转换到沪深时区（Asia/Shanghai）再处理
         if "time" not in df.columns:
@@ -744,7 +744,7 @@ class MiniQMTProvider(DataProvider):
         
         # 在这里处理 count，确保停牌日数据也被包含
         if end_time and count and not df.empty:
-            logger.debug(f"QMT _fetch_local_data: 截取前 df.index={df.index.tolist()[-5:] if len(df) > 5 else df.index.tolist()}")
+            #logger.debug(f"QMT _fetch_local_data: 截取前 df.index={df.index.tolist()[-5:] if len(df) > 5 else df.index.tolist()}")
             # 先过滤掉超过原始 end_time 的数据（因为我们把 end_time 往后推了）
             try:
                 end_dt = pd.to_datetime(end_time)
@@ -755,12 +755,12 @@ class MiniQMTProvider(DataProvider):
                     df = df[df.index <= end_dt_normalized]
                 else:
                     df = df[df.index <= end_dt]
-                logger.debug(f"QMT _fetch_local_data: 过滤后 df.index={df.index.tolist()[-5:] if len(df) > 5 else df.index.tolist()}")
+                #logger.debug(f"QMT _fetch_local_data: 过滤后 df.index={df.index.tolist()[-5:] if len(df) > 5 else df.index.tolist()}")
             except Exception as e:
                 logger.debug(f"QMT _fetch_local_data: 过滤失败 {e}")
             # 然后再 tail(count)
             df = df.tail(count)
-            logger.debug(f"QMT _fetch_local_data: 截取后 df.index={df.index.tolist()}")
+            #logger.debug(f"QMT _fetch_local_data: 截取后 df.index={df.index.tolist()}")
         
         return df
 
