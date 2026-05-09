@@ -33,7 +33,7 @@ classifiers = [
 ]
 
 dependencies = [
-    "pandas>=1.3.0",
+    "pandas>=1.3.0,<3.0",
     "numpy>=1.21.0",
     "matplotlib>=3.4.0",
     "jqdatasdk>=1.8.0",

@@ -100,9 +100,12 @@ QMT_SERVER_ACCOUNT_KEY=main
 - `QMT_SESSION_ID`
 - `QMT_AUTO_SUBSCRIBE`
 - `MAX_ORDER_VALUE`
+- `MIN_BUY_ORDER_VALUE`
 - `MAX_DAILY_TRADES`
 - `RISK_CHECK_ENABLED`
 - `QMT_SERVER_TLS_CERT`
+
+`MIN_BUY_ORDER_VALUE` 用于过滤实盘买入小单，默认 `0` 表示不限制。它只在风控开启后生效：本地 LiveEngine 需 `RISK_CHECK_ENABLED=true`，远程 QMT server 需 `QMT_SERVER_ORDER_RISK_ENABLED=true`。该参数只拦截买入订单，卖出、清仓和降仓不受影响。
 
 ## 6. 一个判断原则
 

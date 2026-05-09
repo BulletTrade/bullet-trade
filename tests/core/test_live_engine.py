@@ -19,7 +19,12 @@ from bullet_trade.broker.base import BrokerBase
 from bullet_trade.core import pricing
 from bullet_trade.core.async_scheduler import AsyncScheduler
 from bullet_trade.core.event_bus import EventBus
-from bullet_trade.core.live_engine import LiveConfig, LiveEngine, LivePortfolioProxy, TradingCalendarGuard
+from bullet_trade.core.live_engine import (
+    LiveConfig,
+    LiveEngine,
+    LivePortfolioProxy,
+    TradingCalendarGuard,
+)
 from bullet_trade.core.live_lock import LiveLockBusyError
 from bullet_trade.core.live_runtime import (
     load_strategy_metadata,
@@ -30,6 +35,7 @@ from bullet_trade.core.live_runtime import (
 from bullet_trade.core.globals import g, reset_globals
 from bullet_trade.core.models import Order, OrderStatus
 from bullet_trade.core.orders import LimitOrderStyle, MarketOrderStyle, order, clear_order_queue
+from bullet_trade.core.risk_control import RiskController
 from bullet_trade.core.runtime import set_current_engine
 
 
@@ -62,7 +68,13 @@ class DummyBroker(BrokerBase):
         return True
 
     def get_account_info(self):
-        return {"account_id": "dummy", "account_type": "stock", "positions": [], "available_cash": 1000.0, "total_value": 1000.0}
+        return {
+            "account_id": "dummy",
+            "account_type": "stock",
+            "positions": [],
+            "available_cash": 1000.0,
+            "total_value": 1000.0,
+        }
 
     def get_positions(self):
         return []
@@ -114,7 +126,13 @@ class DummyBroker(BrokerBase):
             "available_cash": 888.0,
             "total_value": 999.0,
             "positions": [
-                {"security": "000001.XSHE", "amount": 100, "avg_cost": 10.0, "current_price": 11.0, "market_value": 1100.0}
+                {
+                    "security": "000001.XSHE",
+                    "amount": 100,
+                    "avg_cost": 10.0,
+                    "current_price": 11.0,
+                    "market_value": 1100.0,
+                }
             ],
         }
 
@@ -127,7 +145,11 @@ class DummyBroker(BrokerBase):
 
     def subscribe_ticks(self, symbols):
         for sym in symbols:
-            self._tick_snapshots[sym] = {"sid": sym, "last_price": 1.23, "dt": datetime.now().isoformat()}
+            self._tick_snapshots[sym] = {
+                "sid": sym,
+                "last_price": 1.23,
+                "dt": datetime.now().isoformat(),
+            }
 
     def unsubscribe_ticks(self, symbols=None):
         if not symbols:
@@ -258,8 +280,7 @@ class FillAwareBroker(DummyBroker):
 class SequencedV2Client:
     def __init__(self, responses: dict[str, list[object]]):
         self.responses = {
-            action: [copy.deepcopy(item) for item in items]
-            for action, items in responses.items()
+            action: [copy.deepcopy(item) for item in items] for action, items in responses.items()
         }
         self.calls: list[tuple[str, object, object]] = []
 
@@ -401,10 +422,12 @@ def test_live_config_parses_string_bool_overrides(monkeypatch):
     monkeypatch.delenv("RISK_CHECK_ENABLED", raising=False)
     monkeypatch.delenv("ACCOUNT_SYNC_ENABLED", raising=False)
 
-    cfg = LiveConfig.load({
-        "risk_check_enabled": "false",
-        "account_sync_enabled": "false",
-    })
+    cfg = LiveConfig.load(
+        {
+            "risk_check_enabled": "false",
+            "account_sync_enabled": "false",
+        }
+    )
 
     assert cfg.risk_check_enabled is False
     assert cfg.account_sync_enabled is False
@@ -442,8 +465,12 @@ def _build_lock_test_engine(
 def test_live_engine_rejects_duplicate_instance_same_account(monkeypatch, tmp_path):
     monkeypatch.setenv("BULLET_TRADE_HOME", str(tmp_path))
     strategy = _write_strategy(tmp_path)
-    engine1 = _build_lock_test_engine(tmp_path, strategy, runtime_name="runtime-a", account_id="acct-main")
-    engine2 = _build_lock_test_engine(tmp_path, strategy, runtime_name="runtime-b", account_id="acct-main")
+    engine1 = _build_lock_test_engine(
+        tmp_path, strategy, runtime_name="runtime-a", account_id="acct-main"
+    )
+    engine2 = _build_lock_test_engine(
+        tmp_path, strategy, runtime_name="runtime-b", account_id="acct-main"
+    )
 
     engine1._acquire_live_locks()
     try:
@@ -1141,7 +1168,9 @@ async def test_process_orders_skips_risk_checks_when_disabled(monkeypatch, tmp_p
         high_limit = 10.5
         low_limit = 9.5
 
-    monkeypatch.setattr("bullet_trade.core.live_engine.get_current_data", lambda: {"159915.XSHE": Snap()})
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.get_current_data", lambda: {"159915.XSHE": Snap()}
+    )
 
     clear_order_queue()
     set_current_engine(engine)
@@ -1154,6 +1183,61 @@ async def test_process_orders_skips_risk_checks_when_disabled(monkeypatch, tmp_p
     assert len(engine.broker.orders) == 1
     security, amount, _, side, market = engine.broker.orders[0]
     assert (security, amount, side, market) == ("159915.XSHE", 100, "buy", True)
+
+
+@pytest.mark.asyncio
+async def test_process_orders_rejects_buy_below_min_value_when_risk_enabled(monkeypatch, tmp_path):
+    """测试实盘风控开启后会拒绝低于最小金额的买入委托。"""
+    strategy = _write_strategy(tmp_path)
+    cfg = {
+        "runtime_dir": str(tmp_path / "runtime"),
+        "g_autosave_enabled": False,
+        "account_sync_enabled": False,
+        "order_sync_enabled": False,
+        "tick_sync_enabled": False,
+        "risk_check_enabled": False,
+        "broker_heartbeat_interval": 0,
+    }
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config=cfg,
+    )
+    engine.broker = DummyBroker()
+    engine.context.portfolio.available_cash = 10_000
+    engine.context.portfolio.total_value = 10_000
+    engine._risk = RiskController(
+        config={
+            "max_order_value": 100_000,
+            "max_daily_trade_value": 500_000,
+            "max_daily_trades": 100,
+            "max_daily_cancels": 100,
+            "min_cancel_interval_seconds": 0.0,
+            "max_cancel_per_order": 3,
+            "min_buy_order_value": 2_000.0,
+            "max_stock_count": 20,
+            "max_position_ratio": 100.0,
+            "stop_loss_ratio": 5.0,
+        }
+    )
+
+    class Snap:
+        paused = False
+        last_price = 10.0
+        high_limit = 10.5
+        low_limit = 9.5
+
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.get_current_data", lambda: {"159915.XSHE": Snap()}
+    )
+
+    clear_order_queue()
+    order_obj = order("159915.XSHE", 100)
+
+    await engine._process_orders(engine.context.current_dt)
+
+    assert len(engine.broker.orders) == 0
+    assert order_obj.status == OrderStatus.rejected
 
 
 @pytest.mark.asyncio
@@ -1184,7 +1268,9 @@ async def test_market_flag_propagates_to_broker(monkeypatch, tmp_path):
         high_limit = 10.5
         low_limit = 9.5
 
-    monkeypatch.setattr("bullet_trade.core.live_engine.get_current_data", lambda: {"000001.XSHE": Snap()})
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.get_current_data", lambda: {"000001.XSHE": Snap()}
+    )
 
     clear_order_queue()
     order("000001.XSHE", 100)
@@ -1196,7 +1282,9 @@ async def test_market_flag_propagates_to_broker(monkeypatch, tmp_path):
 
     sec1, amt1, price1, side1, market1 = engine.broker.orders[0]
     assert (sec1, amt1, side1, market1) == ("000001.XSHE", 100, "buy", True)
-    expected_price = pricing.compute_market_protect_price("000001.XSHE", 10.0, 10.5, 9.5, 0.015, True)
+    expected_price = pricing.compute_market_protect_price(
+        "000001.XSHE", 10.0, 10.5, 9.5, 0.015, True
+    )
     assert price1 == pytest.approx(expected_price)
 
     sec2, amt2, price2, side2, market2 = engine.broker.orders[1]
@@ -1321,7 +1409,9 @@ def test_apply_order_snapshots_prefers_filled_price_over_order_price(tmp_path):
     assert local_order.extra["order_price"] == pytest.approx(3.247)
 
 
-def test_apply_order_snapshots_preserves_requested_market_price_when_broker_reports_different_order_price(tmp_path):
+def test_apply_order_snapshots_preserves_requested_market_price_when_broker_reports_different_order_price(
+    tmp_path,
+):
     strategy = _write_strategy(tmp_path)
     cfg = {
         "runtime_dir": str(tmp_path / "runtime"),
@@ -1507,7 +1597,9 @@ async def test_process_orders_reconciles_limit_buy_avg_cost_from_trades(monkeypa
         high_limit = 3.500
         low_limit = 3.000
 
-    monkeypatch.setattr("bullet_trade.core.live_engine.get_current_data", lambda: {"159915.XSHE": Snap()})
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.get_current_data", lambda: {"159915.XSHE": Snap()}
+    )
 
     clear_order_queue()
     await asyncio.to_thread(order, "159915.XSHE", 30700, LimitOrderStyle(3.247))
@@ -1555,7 +1647,9 @@ async def test_process_orders_reconciles_market_buy_avg_cost_from_trades(monkeyp
         high_limit = 3.500
         low_limit = 3.000
 
-    monkeypatch.setattr("bullet_trade.core.live_engine.get_current_data", lambda: {"159915.XSHE": Snap()})
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.get_current_data", lambda: {"159915.XSHE": Snap()}
+    )
     monkeypatch.setattr(pricing, "compute_market_protect_price", lambda *args, **kwargs: 3.279)
 
     clear_order_queue()
@@ -1690,7 +1784,9 @@ async def test_live_engine_v2_rejected_order_releases_locked_cash(monkeypatch, t
         high_limit = 3.500
         low_limit = 3.000
 
-    monkeypatch.setattr("bullet_trade.core.live_engine.get_current_data", lambda: {"159915.SZ": Snap()})
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.get_current_data", lambda: {"159915.SZ": Snap()}
+    )
     clear_order_queue()
     try:
         order_obj = await asyncio.to_thread(order, "159915.SZ", 100, LimitOrderStyle(3.247))
@@ -1797,7 +1893,9 @@ async def test_live_engine_v2_partial_fill_updates_cash_locked_and_positions(mon
         high_limit = 3.500
         low_limit = 3.000
 
-    monkeypatch.setattr("bullet_trade.core.live_engine.get_current_data", lambda: {"159915.SZ": Snap()})
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.get_current_data", lambda: {"159915.SZ": Snap()}
+    )
     clear_order_queue()
     try:
         order_obj = await asyncio.to_thread(order, "159915.SZ", 30700, LimitOrderStyle(3.247))
@@ -1863,7 +1961,9 @@ async def test_process_orders_runs_once_with_lock(monkeypatch, tmp_path):
         high_limit = 10.5
         low_limit = 9.5
 
-    monkeypatch.setattr("bullet_trade.core.live_engine.get_current_data", lambda: {"000001.XSHE": Snap()})
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.get_current_data", lambda: {"000001.XSHE": Snap()}
+    )
 
     clear_order_queue()
     order("000001.XSHE", 100, wait_timeout=0)
@@ -1939,7 +2039,9 @@ async def test_order_waits_until_processed(monkeypatch, tmp_path):
         high_limit = 10.5
         low_limit = 9.5
 
-    monkeypatch.setattr("bullet_trade.core.live_engine.get_current_data", lambda: {"000001.XSHE": Snap()})
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.get_current_data", lambda: {"000001.XSHE": Snap()}
+    )
 
     clear_order_queue()
 
@@ -2011,7 +2113,11 @@ async def test_live_engine_triggers_broker_lifecycle_hooks_at_safe_markers(tmp_p
 
 def test_live_engine_apply_account_snapshot_sets_position_buy_times(tmp_path):
     engine = _build_v2_live_engine(tmp_path, DummyBroker())
-    target = engine.portfolio_proxy.backing if isinstance(engine.context.portfolio, LivePortfolioProxy) else engine.context.portfolio
+    target = (
+        engine.portfolio_proxy.backing
+        if isinstance(engine.context.portfolio, LivePortfolioProxy)
+        else engine.context.portfolio
+    )
 
     engine._apply_account_snapshot(
         {

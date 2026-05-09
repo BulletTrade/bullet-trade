@@ -2802,10 +2802,10 @@ class LiveEngine:
             ]
             return "|" + "|".join(segments) + "|"
 
-        lines = [_border("-"), _format_row(headers), _border("=")]
+        lines = [_border("-"), _format_row(headers), _border("-")]
         for row in normalized_rows:
             lines.append(_format_row(row))
-            lines.append(_border("-"))
+        lines.append(_border("-"))
         return "\n".join(lines)
 
     @staticmethod

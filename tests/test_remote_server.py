@@ -116,7 +116,12 @@ def test_stub_server_order_flow(stub_server):
     try:
         order = conn.request(
             "broker.place_order",
-            {"security": "000001.XSHE", "side": "BUY", "amount": 100, "style": {"type": "limit", "price": 10.0}},
+            {
+                "security": "000001.XSHE",
+                "side": "BUY",
+                "amount": 100,
+                "style": {"type": "limit", "price": 10.0},
+            },
         )
         assert order["order_id"].startswith("stub-")
         assert order["status"] == "open"
@@ -239,12 +244,58 @@ def test_stub_server_cancel_risk_controls(monkeypatch):
     try:
         order = conn.request(
             "broker.place_order",
-            {"security": "000001.XSHE", "side": "BUY", "amount": 100, "style": {"type": "limit", "price": 10.0}},
+            {
+                "security": "000001.XSHE",
+                "side": "BUY",
+                "amount": 100,
+                "style": {"type": "limit", "price": 10.0},
+            },
         )
         first = conn.request("broker.cancel_order", {"order_id": order["order_id"]})
         assert first.get("value") is True
         with pytest.raises(RuntimeError, match="当日撤单次数超限"):
             conn.request("broker.cancel_order", {"order_id": order["order_id"]})
+    finally:
+        conn.close()
+        asyncio.run_coroutine_threadsafe(app.shutdown(), loop).result(timeout=5)
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=5)
+
+
+def test_stub_server_rejects_buy_below_min_order_value(monkeypatch):
+    """测试服务端下单风控会拒绝低于最小金额的买入委托。"""
+    monkeypatch.setenv("MIN_BUY_ORDER_VALUE", "2000")
+
+    config = ServerConfig(
+        server_type="stub",
+        listen="127.0.0.1",
+        port=59323,
+        token="stub-token",
+        enable_data=True,
+        enable_broker=True,
+        accounts=[AccountConfig(key="default", account_id="demo")],
+        order_risk_enabled=True,
+    )
+    _ensure_current_event_loop()
+    router = AccountRouter(config.accounts)
+    bundle = build_stub_bundle(config, router)
+    app = ServerApplication(config, router, bundle)
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=_run_loop, args=(loop, app), daemon=True)
+    thread.start()
+    asyncio.run_coroutine_threadsafe(app.wait_started(), loop).result(timeout=5)
+    conn = _make_connection(config)
+    try:
+        with pytest.raises(RuntimeError, match="买入订单金额低于最小值"):
+            conn.request(
+                "broker.place_order",
+                {
+                    "security": "000001.XSHE",
+                    "side": "BUY",
+                    "amount": 100,
+                    "style": {"type": "limit", "price": 10.0},
+                },
+            )
     finally:
         conn.close()
         asyncio.run_coroutine_threadsafe(app.shutdown(), loop).result(timeout=5)

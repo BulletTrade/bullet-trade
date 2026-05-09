@@ -20,10 +20,24 @@
 - **💼 实盘接入**：本地 QMT、远程 QMT server、模拟券商按需选择。
 - **🧩 可扩展**：数据/券商接口基于抽象基类，便于自定义实现。
 
+## 🚀 新手应该先看什么
+
+如果只是运行量价策略，例如 ETF 策略，通常不需要额外购买数据，也可以在本地完成回测和运行。涉及财务数据、小市值等策略时，可以按自己的数据条件选择聚宽、TuShare 或自定义数据源，社区里也有不少用户改成 TuShare 等数据源后正常使用。
+
+建议按下面顺序阅读：
+
+1. [安装 Python 和运行环境](docs/python-setup.md)：先把本地 Python、虚拟环境和依赖准备好。
+2. [新手入门总览](docs/beginner-guide.md)：如果需要实盘，先看这里判断应该选择方案 A 还是方案 B。
+3. [方案 A：BulletTrade 本地独立运行](docs/beginner-route-a.md)：策略直接在本地 BulletTrade 里运行，并连接本地 QMT 执行交易。
+4. [方案 B：聚宽模拟盘运行策略](docs/beginner-route-b.md)：策略在聚宽模拟盘运行，BulletTrade 负责接收信号并在本地 QMT 执行交易。
 
 ## 📖 文档
 
 - [文档首页](docs/index.md):  站点 <https://bullettrade.cn/docs/>
+- [环境准备：安装 Python](docs/python-setup.md)：两个方案共用的前置步骤，先装 Python，再创建虚拟环境。
+- [新手入门总览](docs/beginner-guide.md)：先看 BulletTrade 目前支持的两种方案、结构图和选型方法，再进入对应文档。
+- [方案 A：独立运行](docs/beginner-route-a.md)：策略在 BulletTrade 独立运行，连接本地 QMT。
+- [方案 B：聚宽侧模拟盘运行](docs/beginner-route-b.md)：策略在聚宽侧模拟盘运行，BulletTrade 负责接收信号并在本地 QMT 执行。
 - [快速上手](docs/quickstart.md)：三步跑通回测/实盘，聚宽策略无改直接复用。
 - [配置总览](docs/config.md)：回测/本地实盘/远程实盘/聚宽接入的环境变量一览。
 - [回测引擎](docs/backtest.md)：真实价格成交、分红送股处理、聚宽代码示例与 CLI 回测。

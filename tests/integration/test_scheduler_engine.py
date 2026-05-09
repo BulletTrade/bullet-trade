@@ -36,7 +36,7 @@ class StubProvider:
         **kwargs,
     ) -> pd.DataFrame:
         fields = list(fields) if fields else ["close"]
-        freq = "T" if frequency == "minute" else "D"
+        freq = "min" if frequency == "minute" else "D"
         if count:
             end = pd.to_datetime(end_date)
             dates = pd.date_range(end=end, periods=count, freq=freq)

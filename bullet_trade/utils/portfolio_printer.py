@@ -133,12 +133,11 @@ def _render_table(headers: Sequence[str], rows: Sequence[Sequence[str]]) -> str:
         segs = [f" {_pad_cell(str(v), widths[i])} " for i, v in enumerate(values)]
         return "|" + "|".join(segs) + "|"
 
-    lines = [border("-"), fmt_row(headers), border("=")]
+    lines = [border("-"), fmt_row(headers), border("-")]
     for row in norm_rows:
         lines.append(fmt_row(row))
-        lines.append(border("-"))
+    lines.append(border("-"))
     return "\n".join(lines)
 
 
 __all__ = ["render_account_overview"]
-

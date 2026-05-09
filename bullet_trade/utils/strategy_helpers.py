@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import datetime
 from decimal import Decimal, ROUND_HALF_UP
+import unicodedata
 from typing import Any, List, Optional
 
 try:
@@ -86,29 +87,46 @@ def _format_percent(value: float) -> str:
     return f"{value * 100:.2f}%"
 
 
+def _display_width(text: str) -> int:
+    """计算终端显示宽度，中文全角字符按两个半角宽度处理。"""
+    width = 0
+    for ch in str(text):
+        if unicodedata.combining(ch):
+            continue
+        width += 2 if unicodedata.east_asian_width(ch) in ("F", "W") else 1
+    return width
+
+
+def _pad_cell(text: str, target_width: int) -> str:
+    """按终端显示宽度在单元格右侧补空格。"""
+    current = _display_width(text)
+    padding = max(target_width - current, 0)
+    return text + (" " * padding)
+
+
 def _format_table(headers: List[str], rows: List[List[Any]]) -> str:
     if tabulate is not None:
-        return tabulate(rows, headers=headers, tablefmt="psql")
+        return tabulate(rows, headers=headers, tablefmt="pretty")
 
-    widths = [len(h) for h in headers]
+    widths = [_display_width(h) for h in headers]
     str_rows: List[List[str]] = []
     for row in rows:
         str_row = [str(cell) for cell in row]
         str_rows.append(str_row)
         for idx, cell in enumerate(str_row):
-            widths[idx] = max(widths[idx], len(cell))
+            widths[idx] = max(widths[idx], _display_width(cell))
 
     def _border(char: str = "-") -> str:
         return "+" + "+".join(char * (w + 2) for w in widths) + "+"
 
     def _format_row(row_vals: List[str]) -> str:
-        cells = [f" {val:<{widths[i]}} " for i, val in enumerate(row_vals)]
+        cells = [f" {_pad_cell(str(val), widths[i])} " for i, val in enumerate(row_vals)]
         return "|" + "|".join(cells) + "|"
 
-    lines = [_border("-"), _format_row(headers), _border("=")]
+    lines = [_border("-"), _format_row(headers), _border("-")]
     for row in str_rows:
         lines.append(_format_row(row))
-        lines.append(_border("-"))
+    lines.append(_border("-"))
     return "\n".join(lines)
 
 

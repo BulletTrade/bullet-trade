@@ -49,7 +49,7 @@ class MiniQMTProvider(DataProvider):
             if env_auto_str is not None:
                 auto_download = env_auto_str.lower() in ("1", "true", "yes", "on")
         if auto_download is None:
-            auto_download = self.mode != "live"
+            auto_download = True
         self.auto_download = bool(auto_download)
         self.config["auto_download"] = self.auto_download
         self._cache = CacheManager(

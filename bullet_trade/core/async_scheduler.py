@@ -443,10 +443,16 @@ class AsyncScheduler:
         self._tasks.append(task)
         self._task_map[task.task_id] = task
         
+        overlap_labels = {
+            OverlapStrategy.SKIP: "跳过",
+            OverlapStrategy.WAIT: "等待",
+            OverlapStrategy.CONCURRENT: "并发",
+        }
+        overlap_label = overlap_labels.get(task.overlap_strategy, task.overlap_strategy.value)
         logger.info(
             f"✅ 注册任务: {task.task_id} "
             f"({task.schedule_type.value}, {task.time}, "
-            f"策略: {task.overlap_strategy.value})"
+            f"重叠处理: {overlap_label})"
         )
         
         return task.task_id

@@ -176,8 +176,25 @@ def test_ping_an_bank_dividend_alignment(monkeypatch):
 
 
 @pytest.mark.unit
-def test_live_mode_disables_auto_download(monkeypatch):
-    frames, dividends, dates, raw_df = _build_sample_frames()
+def test_live_mode_enables_auto_download_by_default(monkeypatch):
+    frames, dividends, dates, _ = _build_sample_frames()
+    fake_xt = FakeXtData(frames, dividends)
+    provider = _make_provider(monkeypatch, fake_xt, cache_dir=None, mode="live")
+
+    assert provider.auto_download is True
+    provider.get_price(
+        SECURITY_JQ,
+        start_date=dates[0],
+        end_date=dates[-1],
+        fq="none",
+    )
+
+    assert fake_xt.download_calls == [(SECURITY_QMT, "1d")]
+
+
+@pytest.mark.unit
+def test_live_mode_respects_explicit_auto_download_false(monkeypatch):
+    frames, dividends, dates, _ = _build_sample_frames()
     fake_xt = FakeXtData(frames, dividends)
     provider = _make_provider(monkeypatch, fake_xt, cache_dir=None, mode="live", auto_download=False)
 
