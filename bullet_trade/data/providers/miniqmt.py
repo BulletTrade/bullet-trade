@@ -179,6 +179,21 @@ class MiniQMTProvider(DataProvider):
         fmt = "%Y%m%d" if normalized == "1d" else "%Y%m%d%H%M%S"
         return dt.strftime(fmt)
 
+    def _expand_1m_start_for_open_auction(
+        self,
+        start_date: Optional[Union[str, datetime]],
+        start_str: str,
+    ) -> str:
+        if not start_date or not start_str:
+            return start_str
+        try:
+            start_dt = pd.to_datetime(start_date)
+        except Exception:
+            return start_str
+        if start_dt.hour == 9 and start_dt.minute == 31 and start_dt.second == 0:
+            return start_dt.replace(hour=9, minute=30, second=0, microsecond=0).strftime("%Y%m%d%H%M%S")
+        return start_str
+
     def _download_history_data(
         self,
         xt: Any,
@@ -661,6 +676,11 @@ class MiniQMTProvider(DataProvider):
     ) -> pd.DataFrame:
         start_str = self._format_time(start_date, period)
         end_str = self._format_time(end_date, period)
+        fetch_start_str = (
+            self._expand_1m_start_for_open_auction(start_date, start_str)
+            if period == "1m"
+            else start_str
+        )
         if self.auto_download:
             handled = self._prepare_backtest_history_data(
                 xt,
@@ -677,13 +697,15 @@ class MiniQMTProvider(DataProvider):
             xt,
             security=security,
             period=period,
-            start_time=start_str,
+            start_time=fetch_start_str,
             end_time=end_str,
             count=count,
             dividend_type="none",
         )
         if raw_df.empty:
             return raw_df
+        if period == "1m":
+            raw_df = self._merge_open_auction_minute_for_resample(raw_df)
 
         if fq == "pre":
             # Prefer xtquant built-in front-ratio (前复权) first, then anchor to ref date
@@ -692,11 +714,13 @@ class MiniQMTProvider(DataProvider):
                 xt,
                 security=security,
                 period=period,
-                start_time=start_str,
+                start_time=fetch_start_str,
                 end_time=end_str,
                 count=count,
                 dividend_type="front_ratio",
             )
+            if period == "1m":
+                adj_df = self._merge_open_auction_minute_for_resample(adj_df)
             if adj_df.empty:
                 # Fallback: event-based forward-adjust when local ratio data is unavailable
                 adj_df = self._build_adjusted_from_events(security, raw_df, direction="pre")
@@ -709,11 +733,13 @@ class MiniQMTProvider(DataProvider):
                 xt,
                 security=security,
                 period=period,
-                start_time=start_str,
+                start_time=fetch_start_str,
                 end_time=end_str,
                 count=count,
                 dividend_type="back_ratio",
             )
+            if period == "1m":
+                adj_df = self._merge_open_auction_minute_for_resample(adj_df)
             if adj_df.empty:
                 adj_df = self._build_adjusted_from_events(security, raw_df, direction="post")
             df = self._align_reference(raw_df, adj_df, pre_factor_ref_date, default_to_start=True)

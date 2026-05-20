@@ -139,6 +139,37 @@ def test_miniqmt_parses_compact_numeric_time_index():
 
 
 @pytest.mark.unit
+def test_miniqmt_native_1m_merges_open_auction_like_jqdata(monkeypatch):
+    times = ["2026-05-14 09:30:00", "2026-05-14 09:31:00", "2026-05-14 09:32:00"]
+    raw_1m = _build_minute_frame(times)
+    fake_xt = FakeXtData({(SECURITY_QMT, "1m", "none"): raw_1m})
+    provider = _make_provider(monkeypatch, fake_xt)
+
+    result = provider.get_price(
+        SECURITY_JQ,
+        start_date="2026-05-14 09:31:00",
+        end_date="2026-05-14 09:32:00",
+        frequency="1m",
+        fq="none",
+        fields=PRICE_FIELDS,
+    )
+
+    expected = pd.DataFrame(
+        {
+            "open": [11.0, 12.0],
+            "high": [11.5, 12.5],
+            "low": [9.5, 11.5],
+            "close": [11.0, 12.0],
+            "volume": [20100.0, 10200.0],
+            "money": [10.0 * 100.0 + 11.0 * 101.0, 12.0 * 102.0],
+        },
+        index=pd.to_datetime(["2026-05-14 09:31:00", "2026-05-14 09:32:00"]),
+    )
+    pd.testing.assert_frame_equal(result, expected)
+    assert fake_xt.local_calls[0]["start_time"] == "20260514093000"
+
+
+@pytest.mark.unit
 def test_miniqmt_resamples_5m_with_partial_current_bar(monkeypatch):
     times = [f"2026-05-14 09:{minute:02d}:00" for minute in range(30, 38)]
     raw_1m = _build_minute_frame(times)
