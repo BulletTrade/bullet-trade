@@ -397,6 +397,8 @@ class ServerApplication:
     async def _maybe_fill_price(self, payload: Dict) -> None:
         """
         若下单缺少 price，尝试用数据服务补充最新成交价。
+
+        市价单不能把该价格写回 protect_price；保护价应由 broker adapter 按买卖方向和默认偏移计算。
         """
         try:
             style = payload.get("style") or {}
@@ -430,11 +432,11 @@ class ServerApplication:
                         price = last[-1] if isinstance(last[-1], (int, float)) else None
             if price is not None:
                 if style.get("type", "").lower() == "market":
-                    style["protect_price"] = float(price)
+                    payload["_estimated_price"] = float(price)
                 else:
                     style["price"] = float(price)
-                payload["style"] = style
-                payload.setdefault("price", float(price))
+                    payload["style"] = style
+                    payload.setdefault("price", float(price))
         except Exception:
             # 补价失败不终止下单，交由后续逻辑处理
             pass
@@ -596,7 +598,12 @@ def _estimate_order_value(payload: Dict) -> Optional[float]:
     except (TypeError, ValueError):
         amount = 0.0
     style = payload.get("style") or {}
-    price = style.get("price") or style.get("protect_price") or payload.get("price")
+    price = (
+        style.get("price")
+        or style.get("protect_price")
+        or payload.get("price")
+        or payload.get("_estimated_price")
+    )
     try:
         price = float(price) if price is not None else None
     except (TypeError, ValueError):

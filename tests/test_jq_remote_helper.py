@@ -7,9 +7,14 @@ from tests.test_remote_server import stub_server  # 复用 stub server fixture
 class _RecordingClient:
     def __init__(self):
         self.requests = []
+        self.positions = [{"security": "000001.XSHE", "amount": 300, "closeable_amount": 300}]
 
     def request(self, action, payload):
         self.requests.append((action, dict(payload)))
+        if action == "broker.positions":
+            return self.positions
+        if action == "broker.order_status":
+            return {"order_id": payload.get("order_id"), "status": "filled"}
         return {"order_id": "oid-1", "status": "open", "amount": payload.get("amount"), "price": 10.0}
 
 
@@ -54,6 +59,82 @@ def test_helper_order_sends_zero_wait_timeout():
     assert payload["wait_timeout"] == 0
     assert payload["style"] == {"type": "limit", "price": 10.0}
     assert payload["idempotency_key"].startswith("bt-helper-")
+
+
+def test_helper_order_without_price_sends_market_sell_payload():
+    client = _RecordingClient()
+    broker = helper.RemoteBrokerClient(client, account_key="default")
+
+    broker.order("000001.XSHE", -100, price=None, wait_timeout=0)
+
+    action, payload = client.requests[0]
+    assert action == "broker.place_order"
+    assert payload["side"] == "SELL"
+    assert payload["amount"] == 100
+    assert payload["market"] is True
+    assert payload["style"] == {"type": "market"}
+
+
+def test_helper_order_target_value_accepts_value_alias_for_market_sell():
+    client = _RecordingClient()
+    broker = helper.RemoteBrokerClient(client, account_key="default")
+    broker.bind_data_client(_FakeDataClient())
+
+    broker.order_target_value("000001.XSHE", value=0, wait_timeout=5)
+
+    action, payload = next(item for item in client.requests if item[0] == "broker.place_order")
+    assert action == "broker.place_order"
+    assert payload["side"] == "SELL"
+    assert payload["amount"] == 300
+    assert payload["wait_timeout"] == 5
+    assert payload["market"] is True
+    assert payload["style"] == {"type": "market"}
+
+
+def test_helper_order_value_without_price_sends_market_sell_payload():
+    client = _RecordingClient()
+    broker = helper.RemoteBrokerClient(client, account_key="default")
+    broker.bind_data_client(_FakeDataClient())
+
+    broker.order_value("000001.XSHE", -1000, wait_timeout=0)
+
+    action, payload = client.requests[-1]
+    assert action == "broker.place_order"
+    assert payload["side"] == "SELL"
+    assert payload["amount"] == 100
+    assert payload["market"] is True
+    assert payload["style"] == {"type": "market"}
+
+
+def test_helper_order_target_without_price_sends_market_delta_payloads():
+    client = _RecordingClient()
+    broker = helper.RemoteBrokerClient(client, account_key="default")
+
+    broker.order_target("000001.XSHE", 500, wait_timeout=0)
+    broker.order_target("000001.XSHE", 100, wait_timeout=0)
+
+    place_orders = [payload for action, payload in client.requests if action == "broker.place_order"]
+    assert place_orders[0]["side"] == "BUY"
+    assert place_orders[0]["amount"] == 200
+    assert place_orders[0]["style"] == {"type": "market"}
+    assert place_orders[1]["side"] == "SELL"
+    assert place_orders[1]["amount"] == 200
+    assert place_orders[1]["style"] == {"type": "market"}
+
+
+def test_helper_order_target_value_without_price_sends_market_buy_payload():
+    client = _RecordingClient()
+    broker = helper.RemoteBrokerClient(client, account_key="default")
+    broker.bind_data_client(_FakeDataClient())
+
+    broker.order_target_value("000001.XSHE", target_value=5000, wait_timeout=0)
+
+    action, payload = client.requests[-1]
+    assert action == "broker.place_order"
+    assert payload["side"] == "BUY"
+    assert payload["amount"] == 200
+    assert payload["market"] is True
+    assert payload["style"] == {"type": "market"}
 
 
 def test_helper_order_sends_optional_order_payload_fields():

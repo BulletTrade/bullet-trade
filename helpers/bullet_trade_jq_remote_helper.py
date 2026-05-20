@@ -414,10 +414,11 @@ class RemoteBrokerClient:
     def order_target_value(
         self,
         security: str,
-        target_value: float,
+        target_value: Optional[float] = None,
         price: Optional[float] = None,
         wait_timeout: float = 0,
         *,
+        value: Optional[float] = None,
         market: Optional[bool] = None,
         remark: Optional[str] = None,
         order_remark: Optional[str] = None,
@@ -437,6 +438,12 @@ class RemoteBrokerClient:
         
         注意：服务端会自动处理最小手数/步进取整，实际市值可能与目标略有偏差。
         """
+        if target_value is None:
+            if value is None:
+                raise TypeError("order_target_value() missing required argument: 'target_value' or 'value'")
+            target_value = value
+        elif value is not None:
+            raise TypeError("order_target_value() got both 'target_value' and 'value'")
         p = price or self._infer_price(security)
         if not p:
             raise RuntimeError("无法获取价格，无法按目标市值下单")
@@ -1196,10 +1203,11 @@ def order_target(
 
 def order_target_value(
     security: str,
-    target_value: float,
+    target_value: Optional[float] = None,
     price: Optional[float] = None,
     wait_timeout: float = 0,
     *,
+    value: Optional[float] = None,
     market: Optional[bool] = None,
     remark: Optional[str] = None,
     order_remark: Optional[str] = None,
@@ -1210,6 +1218,7 @@ def order_target_value(
         target_value,
         price=price,
         wait_timeout=wait_timeout,
+        value=value,
         market=market,
         remark=remark,
         order_remark=order_remark,

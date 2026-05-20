@@ -183,10 +183,6 @@ class RemoteQmtBroker(BrokerBase):
         payload = self._base_payload()
         effective_market = bool(market or price is None)
         style = {"type": "market" if effective_market else "limit"}
-        if price is None and effective_market:
-            price = self._infer_price(security)
-            if price is not None:
-                style["protect_price"] = price
         if price is not None:
             if effective_market:
                 style["protect_price"] = price

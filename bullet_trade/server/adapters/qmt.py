@@ -32,6 +32,68 @@ _QMT_EXECUTOR: Optional[ThreadPoolExecutor] = None
 _QMT_EXECUTOR_MAX_WORKERS = 32
 
 
+def _to_positive_float(value: Any) -> Optional[float]:
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None
+
+
+def _merge_lower(*values: Optional[float]) -> Optional[float]:
+    present = [value for value in values if value is not None]
+    return max(present) if present else None
+
+
+def _merge_upper(*values: Optional[float]) -> Optional[float]:
+    present = [value for value in values if value is not None]
+    return min(present) if present else None
+
+
+def _round_price_to_tick(price: float, tick: float) -> float:
+    if tick <= 0:
+        return price
+    return float(f"{round(price / tick) * tick:.6f}")
+
+
+def _clamp_market_protect_price(
+    security: str,
+    price: float,
+    last_price: float,
+    high_limit: Any,
+    low_limit: Any,
+    is_buy: bool,
+) -> float:
+    """Clamp an explicit market protect price with the same cage rules as computed defaults."""
+    base_price = float(last_price or 0.0)
+    if base_price <= 0:
+        return price
+    from bullet_trade.core import pricing
+
+    tick = pricing.get_min_price_step(security, base_price)
+    cage_buy, cage_sell = pricing.compute_price_bounds(security, base_price, tick)
+    current_high = _to_positive_float(high_limit)
+    current_low = _to_positive_float(low_limit)
+    if is_buy:
+        lower = current_low
+        upper = _merge_upper(current_high, cage_buy)
+    else:
+        lower = _merge_lower(current_low, cage_sell)
+        upper = current_high
+
+    clamped = float(price)
+    if lower is not None:
+        clamped = max(clamped, lower)
+    if upper is not None:
+        clamped = min(clamped, upper)
+    clamped = _round_price_to_tick(clamped, tick)
+    if lower is not None:
+        clamped = max(clamped, lower)
+    if upper is not None:
+        clamped = min(clamped, upper)
+    return clamped
+
+
 def _get_executor() -> ThreadPoolExecutor:
     """
     获取 QMT 专用线程池（惰性初始化）。
@@ -463,7 +525,20 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
         
         if is_market:
             if price not in (None, ""):
-                price = float(price)
+                requested_market_price = float(price)
+                price = _clamp_market_protect_price(
+                    security,
+                    requested_market_price,
+                    last_price,
+                    high_limit,
+                    low_limit,
+                    is_buy,
+                )
+                if abs(price - requested_market_price) > 1e-9:
+                    logger.warning(
+                        f"{security} 客户端保护价 {requested_market_price:.4f} "
+                        f"超出当前价格笼子/涨跌停，调整为 {price:.4f}"
+                    )
                 logger.info(
                     f"{security} 市价单沿用客户端保护价: {price:.4f} "
                     f"（基准价={last_price:.4f}）"
