@@ -427,6 +427,18 @@ class MiniQMTProvider(DataProvider):
         result.index.name = ordered.index.name
         return result[ordered.columns]
 
+    @staticmethod
+    def _drop_open_auction_minute_for_resample(df: pd.DataFrame) -> pd.DataFrame:
+        """
+        QMT 股票 1m 本地数据可能包含 09:30 集合竞价行；聚宽分钟 K 从 09:31 开始。
+        """
+        if df.empty or not isinstance(df.index, pd.DatetimeIndex):
+            return df
+        mask = (df.index.hour == 9) & (df.index.minute == 30) & (df.index.second == 0)
+        if not mask.any():
+            return df
+        return df.loc[~mask].copy()
+
     # ------------------------ 认证 ------------------------
     def auth(
         self,
@@ -755,6 +767,10 @@ class MiniQMTProvider(DataProvider):
                 pre_factor_ref_date=pre_factor_ref_date,
             )
 
+        raw_1m = self._drop_open_auction_minute_for_resample(raw_1m)
+        if raw_1m.empty:
+            return raw_1m
+
         raw_df = self._resample_minute_frame(raw_1m, minute_group)
         if fq == "pre":
             adj_1m = self._fetch_local_data(
@@ -769,6 +785,7 @@ class MiniQMTProvider(DataProvider):
             if adj_1m.empty:
                 adj_df = self._build_adjusted_from_events(security, raw_df, direction="pre")
             else:
+                adj_1m = self._drop_open_auction_minute_for_resample(adj_1m)
                 adj_df = self._resample_minute_frame(adj_1m, minute_group)
             df = self._align_reference(raw_df, adj_df, pre_factor_ref_date)
             decimals = self._infer_price_decimals_from_raw(raw_1m)
@@ -786,6 +803,7 @@ class MiniQMTProvider(DataProvider):
             if adj_1m.empty:
                 adj_df = self._build_adjusted_from_events(security, raw_df, direction="post")
             else:
+                adj_1m = self._drop_open_auction_minute_for_resample(adj_1m)
                 adj_df = self._resample_minute_frame(adj_1m, minute_group)
             df = self._align_reference(raw_df, adj_df, pre_factor_ref_date, default_to_start=True)
             decimals = self._infer_price_decimals_from_raw(raw_1m)

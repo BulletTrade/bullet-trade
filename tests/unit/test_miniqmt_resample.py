@@ -84,7 +84,7 @@ def _make_provider(monkeypatch, fake_xt: FakeXtData, **config) -> MiniQMTProvide
 
 @pytest.mark.unit
 def test_miniqmt_resamples_5m_with_partial_current_bar(monkeypatch):
-    times = [f"2026-05-14 09:{minute:02d}:00" for minute in range(31, 38)]
+    times = [f"2026-05-14 09:{minute:02d}:00" for minute in range(30, 38)]
     raw_1m = _build_minute_frame(times)
     fake_xt = FakeXtData({(SECURITY_QMT, "1m", "none"): raw_1m})
     provider = _make_provider(monkeypatch, fake_xt)
@@ -100,14 +100,14 @@ def test_miniqmt_resamples_5m_with_partial_current_bar(monkeypatch):
 
     expected = pd.DataFrame(
         {
-            "open": [10.0, 15.0],
-            "high": [14.5, 16.5],
-            "low": [9.5, 14.5],
-            "close": [14.0, 16.0],
-            "volume": [510.0, 211.0],
+            "open": [11.0, 16.0],
+            "high": [15.5, 17.5],
+            "low": [10.5, 15.5],
+            "close": [15.0, 17.0],
+            "volume": [515.0, 213.0],
             "money": [
-                sum((10.0 + idx) * (100.0 + idx) for idx in range(5)),
-                sum((10.0 + idx) * (100.0 + idx) for idx in range(5, 7)),
+                sum((10.0 + idx) * (100.0 + idx) for idx in range(1, 6)),
+                sum((10.0 + idx) * (100.0 + idx) for idx in range(6, 8)),
             ],
         },
         index=pd.to_datetime(["2026-05-14 09:35:00", "2026-05-14 09:37:00"]),
