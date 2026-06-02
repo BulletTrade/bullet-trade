@@ -88,6 +88,12 @@ def _create_provider(
         provider_cfg = dict(config.get("remote_qmt", {}) or {})
         provider_cfg.update(overrides)
         return RemoteQmtProvider(provider_cfg)
+    if target == "rqdata":
+        from .providers.rqdata import RQDataProvider
+
+        provider_cfg = dict(config.get("rqdata", {}) or {})
+        provider_cfg.update(overrides)
+        return RQDataProvider(provider_cfg)
 
     raise ValueError(f"未知的数据提供者: {provider_name}")
 

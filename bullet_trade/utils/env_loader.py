@@ -188,6 +188,12 @@ def get_data_provider_config() -> dict:
             "token": get_env("QMT_SERVER_TOKEN"),
             "tls_cert": get_env("QMT_SERVER_TLS_CERT"),
         },
+        "rqdata": {
+            "username": get_env("RQDATA_USERNAME") or get_env("RQDATA_USER"),
+            "password": get_env("RQDATA_PASSWORD") or get_env("RQDATA_PWD"),
+            "license": get_env("RQDATA_LICENSE"),
+            "cache_dir": cache_dir_for("rqdata"),
+        },
     }
 
 
