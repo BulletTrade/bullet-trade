@@ -447,3 +447,228 @@ class TestRQDataProviderPostprocessExtraFields:
 
         assert result is not df  # 应该返回新 df
         assert "factor" in result.columns
+
+
+@pytest.mark.unit
+class TestRQDataProviderGetPriceStringDate:
+    """测试 get_price 接受字符串日期。"""
+
+    def test_string_date_iso_format(self, monkeypatch):
+        provider, dummy_rq = _provider_with_dummy_rq(monkeypatch)
+
+        df = provider.get_price(
+            "000001.XSHE",
+            start_date="2024-01-01",
+            end_date="2024-01-02",
+            fields=["close"],
+        )
+
+        assert not df.empty
+        # 验证传给 rqdatac 的是 Timestamp
+        call = dummy_rq.get_price_calls[-1]
+        assert isinstance(call["start_date"], pd.Timestamp)
+        assert isinstance(call["end_date"], pd.Timestamp)
+
+    def test_string_date_compact_format(self, monkeypatch):
+        provider, dummy_rq = _provider_with_dummy_rq(monkeypatch)
+
+        df = provider.get_price(
+            "000001.XSHE",
+            start_date="20240101",
+            end_date="20240102",
+            fields=["close"],
+        )
+
+        assert not df.empty
+
+    def test_date_object(self, monkeypatch):
+        provider, dummy_rq = _provider_with_dummy_rq(monkeypatch)
+
+        df = provider.get_price(
+            "000001.XSHE",
+            start_date=dt.date(2024, 1, 1),
+            end_date=dt.date(2024, 1, 2),
+            fields=["close"],
+        )
+
+        assert not df.empty
+
+    def test_datetime_object(self, monkeypatch):
+        provider, dummy_rq = _provider_with_dummy_rq(monkeypatch)
+
+        df = provider.get_price(
+            "000001.XSHE",
+            start_date=dt.datetime(2024, 1, 1),
+            end_date=dt.datetime(2024, 1, 2),
+            fields=["close"],
+        )
+
+        assert not df.empty
+
+
+@pytest.mark.unit
+class TestRQDataProviderMultiSecurityShape:
+    """测试多证券返回格式。"""
+
+    def test_multi_security_returns_flat_format(self, monkeypatch):
+        provider, dummy_rq = _provider_with_dummy_rq(monkeypatch)
+
+        df = provider.get_price(
+            ["000001.XSHE", "600000.XSHG"],
+            start_date="2024-01-01",
+            end_date="2024-01-02",
+            fields=["close"],
+        )
+
+        # 多证券默认返回平铺格式，含 code 和 time 列
+        assert not df.empty
+        assert "code" in df.columns or "order_book_id" in df.columns
+
+    def test_multi_security_contains_all_securities(self, monkeypatch):
+        provider, dummy_rq = _provider_with_dummy_rq(monkeypatch)
+
+        securities = ["000001.XSHE", "600000.XSHG", "000002.XSHE"]
+        df = provider.get_price(
+            securities,
+            start_date="2024-01-01",
+            end_date="2024-01-02",
+            fields=["close"],
+        )
+
+        # 验证返回的数据包含所有请求的证券
+        if "code" in df.columns:
+            assert set(df["code"].unique()) == set(securities)
+
+
+@pytest.mark.unit
+class TestRQDataProviderHighLowLimit:
+    """测试分钟线涨跌停价合并。"""
+
+    def test_minute_strips_limit_fields(self, monkeypatch):
+        provider, dummy_rq = _provider_with_dummy_rq(monkeypatch)
+
+        df = provider.get_price(
+            "000001.XSHE",
+            start_date="2024-01-01",
+            end_date="2024-01-02",
+            frequency="1m",
+            fields=["close", "high_limit", "low_limit"],
+        )
+
+        # 验证分钟线不传 limit_up/limit_down 给 rqdatac
+        call = dummy_rq.get_price_calls[0]  # 第一次调用是分钟数据
+        fields = call.get("fields", [])
+        assert "limit_up" not in fields
+        assert "limit_down" not in fields
+
+    def test_daily_keeps_limit_fields(self, monkeypatch):
+        provider, dummy_rq = _provider_with_dummy_rq(monkeypatch)
+
+        df = provider.get_price(
+            "000001.XSHE",
+            start_date="2024-01-01",
+            end_date="2024-01-02",
+            frequency="1d",
+            fields=["close", "high_limit", "low_limit"],
+        )
+
+        # 日线应该传 limit_up/limit_down 给 rqdatac
+        call = dummy_rq.get_price_calls[-1]
+        fields = call.get("fields", [])
+        assert "limit_up" in fields
+        assert "limit_down" in fields
+
+
+@pytest.mark.unit
+class TestRQDataProviderPostprocessExtraFieldsPaused:
+    """测试 _postprocess_extra_fields 的 paused 字段。"""
+
+    def test_paused_field_for_stock(self, monkeypatch):
+        provider, dummy_rq = _provider_with_dummy_rq(monkeypatch)
+
+        df = pd.DataFrame(
+            {"close": [10.0]},
+            index=pd.MultiIndex.from_tuples(
+                [("000001.XSHE", pd.Timestamp("2024-01-02"))],
+                names=["order_book_id", "date"],
+            ),
+        )
+
+        result = provider._postprocess_extra_fields(
+            df, ["paused"], ["000001.XSHE"], "2024-01-01", "2024-01-02", "daily", False, "pre"
+        )
+
+        assert result is not df
+        assert "paused" in result.columns
+
+    def test_paused_field_for_etf_defaults_false(self, monkeypatch):
+        provider, dummy_rq = _provider_with_dummy_rq(monkeypatch)
+
+        df = pd.DataFrame(
+            {"close": [10.0]},
+            index=pd.MultiIndex.from_tuples(
+                [("159001.XSHE", pd.Timestamp("2024-01-02"))],
+                names=["order_book_id", "date"],
+            ),
+        )
+
+        result = provider._postprocess_extra_fields(
+            df, ["paused"], ["159001.XSHE"], "2024-01-01", "2024-01-02", "daily", False, "pre"
+        )
+
+        # ETF 不是股票，paused 应该默认为 False
+        assert result["paused"].iloc[0] is False or result["paused"].iloc[0] == False
+
+
+@pytest.mark.unit
+class TestRQDataProviderGetLiveCurrent:
+    """测试 get_live_current 方法。"""
+
+    def test_get_live_current_returns_dict(self, monkeypatch):
+        provider, dummy_rq = _provider_with_dummy_rq(monkeypatch)
+
+        # 模拟 get_price 返回 1m 数据
+        def fake_get_price(**kwargs):
+            return pd.DataFrame(
+                {
+                    "close": [10.5],
+                    "limit_up": [11.55],
+                    "limit_down": [9.45],
+                },
+                index=pd.MultiIndex.from_tuples(
+                    [("000001.XSHE", pd.Timestamp("2024-01-02 14:59:00"))],
+                    names=["order_book_id", "date"],
+                ),
+            )
+
+        dummy_rq.get_price = fake_get_price
+
+        result = provider.get_live_current("000001.XSHE")
+
+        assert isinstance(result, dict)
+        assert "last_price" in result
+        assert "high_limit" in result
+        assert "low_limit" in result
+        assert "paused" in result
+
+    def test_get_live_current_returns_empty_on_error(self, monkeypatch):
+        provider, dummy_rq = _provider_with_dummy_rq(monkeypatch)
+
+        def fake_get_price(**kwargs):
+            raise Exception("connection error")
+
+        dummy_rq.get_price = fake_get_price
+
+        result = provider.get_live_current("000001.XSHE")
+        assert result == {}
+
+    def test_get_live_current_returns_empty_on_no_data(self, monkeypatch):
+        provider, dummy_rq = _provider_with_dummy_rq(monkeypatch)
+
+        def fake_get_price(**kwargs):
+            return pd.DataFrame()
+
+        dummy_rq.get_price = fake_get_price
+
+        result = provider.get_live_current("000001.XSHE")
+        assert result == {}
