@@ -1692,15 +1692,11 @@ class RQDataProvider(DataProvider):
             self.auth()
         return self._rq
 
-    def _format_date(self, value: Optional[Union[str, datetime, Date]]) -> Optional[str]:
-        """将日期统一转为 YYYYMMDD 字符串，None 透传。"""
+    def _format_date(self, value):
+        """将 str/date/datetime 统一转为 pd.Timestamp，None 透传。"""
         if value is None:
             return None
-        if isinstance(value, str):
-            return value if len(value) == 8 and value.isdigit() else pd.to_datetime(value).strftime("%Y%m%d")
-        if isinstance(value, (datetime, Date)):
-            return value.strftime("%Y%m%d")
-        return None
+        return pd.Timestamp(value)
 
     def _normalize_frequency(self, frequency: str) -> str:
         """聚宽频率 → RQData 频率（daily→1d, minute→1m 等）。"""
@@ -1761,8 +1757,8 @@ class RQDataProvider(DataProvider):
             is_single = isinstance(security, str)
             securities = [security] if is_single else list(security)
             jq_fields = list(kw["fields"]) if kw["fields"] else list(self._JQ_DEFAULT_FIELDS)
-            start_date = kw.get("start_date")
-            end_date = kw.get("end_date")
+            start_date = self._format_date(kw.get("start_date"))
+            end_date = self._format_date(kw.get("end_date"))
             count = kw.get("count")
             freq = kw["frequency"]
             fq_val = kw.get("fq", "pre")
@@ -1776,11 +1772,17 @@ class RQDataProvider(DataProvider):
             # count + end_date 反推 start_date
             if end_date is not None and start_date is None and count is not None:
                 if "m" in rq_freq:
-                    trade_days_needed = count // (240/rq_freq[0])
+                    # 分钟线：根据 count 和频率计算需要多少分钟，往前推算 start_date
+                    _minutes = int(re.match(r"(\d+)", rq_freq).group(1))
+                    total_minutes = count * _minutes
+                    # 每天 240 分钟交易时间，向上取整得到需要的交易日数
+                    trade_days_needed = -(-total_minutes // 240)
+                    days_list = self.get_trade_days(end_date=end_date, count=trade_days_needed)
+                    start_date = days_list[0] if days_list else end_date
                 else:
-                    trade_days_needed = count
-                days_list = self.get_trade_days(end_date=end_date, count=trade_days_needed)
-                start_date = days_list[0] if days_list else end_date
+                    # 日线：直接用 count 作为交易日数
+                    days_list = self.get_trade_days(end_date=end_date, count=count)
+                    start_date = days_list[0] if days_list else end_date
 
             rq_api_fields = self._translate_fields_to_rq(jq_fields)
 
@@ -1793,24 +1795,11 @@ class RQDataProvider(DataProvider):
                     if _f in _rq_fields:
                         _rq_fields.remove(_f)
                         _stripped_limit.append(_f)
-            df = None
-            if _is_minute:
-                # 获取start_date和end_date的时分转字符串后拼接成HHMM:HHMM
-                start_time = start_date.strftime("%H:%M")
-                end_time = end_date.strftime("%H:%M")
-                time_str = (start_time,end_time)
-                df = self._ensure_client().get_price(
-                    order_book_ids=securities, start_date=start_date, end_date=end_date,
-                    frequency=rq_freq, fields=_rq_fields or None, adjust_type=adjust,
-                    skip_suspended=kw.get("skip_paused", False), expect_df=True, market="cn",
-                    time_slice=time_str
-                )
-            else:
-                df = self._ensure_client().get_price(
-                    order_book_ids=securities, start_date=start_date, end_date=end_date,
-                    frequency=rq_freq, fields=_rq_fields or None, adjust_type=adjust,
-                    skip_suspended=kw.get("skip_paused", False), expect_df=True, market="cn"
-                )
+            df = self._ensure_client().get_price(
+                order_book_ids=securities, start_date=start_date, end_date=end_date,
+                frequency=rq_freq, fields=_rq_fields or None, adjust_type=adjust,
+                skip_suspended=kw.get("skip_paused", False), expect_df=True, market="cn",
+            )
 
             if df is None or df.empty:
                 return self._empty_price_frame(is_single, kw.get("panel", True), jq_fields)
@@ -1825,6 +1814,16 @@ class RQDataProvider(DataProvider):
             self._postprocess_fill_paused(df, kw.get("fill_paused", True), kw.get("skip_paused", False))
 
             if count:
+                # 先按 start_date/end_date 过滤，再截取 count 条
+                if start_date is not None or end_date is not None:
+                    if isinstance(df.index, pd.MultiIndex):
+                        time_level = df.index.get_level_values("time")
+                    else:
+                        time_level = df.index
+                    if start_date is not None:
+                        df = df[time_level >= start_date]
+                    if end_date is not None:
+                        df = df[time_level <= end_date]
                 df = df.groupby(level="order_book_id", sort=False).tail(count) if not is_single else df.tail(count)
 
             if not is_single:
@@ -1855,8 +1854,8 @@ class RQDataProvider(DataProvider):
         try:
             daily_df = self._ensure_client().get_price(
                 order_book_ids=securities,
-                start_date=dates[0].strftime("%Y-%m-%d"),
-                end_date=dates[-1].strftime("%Y-%m-%d"),
+                start_date=dates[0],
+                end_date=dates[-1],
                 frequency="1d", fields=limit_fields, adjust_type="none",
                 skip_suspended=skip_paused, expect_df=True, market="cn",
             )
@@ -1895,6 +1894,8 @@ class RQDataProvider(DataProvider):
             return df
 
         df = df.copy()
+        start_date = self._format_date(start_date)
+        end_date = self._format_date(end_date)
         for f in extra_fields:
             if f == "factor":
                 raw = self._ensure_client().get_ex_factor(
@@ -1982,7 +1983,9 @@ class RQDataProvider(DataProvider):
 
         def _fetch(kw: Dict[str, Any]) -> List[str]:
             rq = self._ensure_client()
-            s_date, e_date, cnt = kw.get("start_date"), kw.get("end_date"), kw.get("count")
+            s_date = self._format_date(kw.get("start_date"))
+            e_date = self._format_date(kw.get("end_date"))
+            cnt = kw.get("count")
             if s_date is None and e_date is None:
                 return []
             if s_date is None:
