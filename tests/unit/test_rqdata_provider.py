@@ -621,6 +621,29 @@ class TestRQDataProviderPostprocessExtraFieldsPaused:
 
 
 @pytest.mark.unit
+class TestRQDataProviderPostprocessExtraFieldsAvg:
+    """测试 _postprocess_extra_fields 的 avg 字段。"""
+
+    def test_avg_field_calculated(self, monkeypatch):
+        provider, dummy_rq = _provider_with_dummy_rq(monkeypatch)
+
+        df = pd.DataFrame(
+            {"close": [10.0], "volume": [1000.0], "money": [10500.0]},
+            index=pd.MultiIndex.from_tuples(
+                [("000001.XSHE", pd.Timestamp("2024-01-02"))],
+                names=["order_book_id", "date"],
+            ),
+        )
+
+        result = provider._postprocess_extra_fields(
+            df, ["avg"], ["000001.XSHE"], "2024-01-01", "2024-01-02", "daily", False, "pre"
+        )
+
+        assert result is not df
+        assert "avg" in result.columns
+
+
+@pytest.mark.unit
 class TestRQDataProviderGetLiveCurrent:
     """测试 get_live_current 方法。"""
 
