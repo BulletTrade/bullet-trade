@@ -3,6 +3,14 @@
 本文档记录所有重要的变更。格式基于 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.0.0/)，
 版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [0.7.4] - 2026-06-08
+
+### 修复
+- **聚宽远程 helper 下单兼容性**：修复 `bullet_trade_jq_remote_helper.py` 在 Python 3.7 以下环境调用 `time.time_ns()` 生成下单幂等键时抛出异常的问题，避免聚宽旧版运行环境在下单请求发出前中断。
+
+### 测试
+- **旧版 Python 时间 API 回归覆盖**：新增模拟缺少 `time.time_ns` 的 helper 幂等键生成测试，覆盖聚宽旧环境兼容路径。
+
 ## [0.7.3] - 2026-06-03
 
 ### 概览
