@@ -56,6 +56,7 @@ class ServerApplication:
             )
         self._server: Optional[asyncio.AbstractServer] = None
         self._sessions: Set[ClientSession] = set()
+        self._created_at = time.time()
         self._ip_allowlist = self._prepare_allowlist(config.allowlist)
         self._shutdown: Optional[asyncio.Event] = None
         self._started: Optional[asyncio.Event] = None
@@ -104,12 +105,37 @@ class ServerApplication:
                 pass
 
     def active_features(self) -> List[str]:
+        """返回当前配置启用的功能列表。
+
+        Args:
+            None。
+
+        Returns:
+            List[str]: 配置启用的功能名称。
+        """
+
         features = []
         if self.adapters.data_adapter:
             features.append("data")
         if self.adapters.broker_adapter:
             features.append("broker")
         return features
+
+    def _qmt_status_snapshot(self) -> Optional[Dict[str, Any]]:
+        """读取 QMT adapter 暴露的 readiness 快照。
+
+        Args:
+            None。
+
+        Returns:
+            Optional[Dict[str, Any]]: QMT guard 快照；非 QMT server 返回 None。
+        """
+
+        for adapter in (self.adapters.broker_adapter, self.adapters.data_adapter):
+            status_fn = getattr(adapter, "qmt_status", None)
+            if callable(status_fn):
+                return status_fn()
+        return None
 
     async def wait_started(self) -> None:
         self._ensure_runtime_events()
@@ -528,13 +554,19 @@ class ServerApplication:
             await self.tick_manager.start()
 
     def _health_snapshot(self) -> Dict:
+        value = {
+            "process_alive": True,
+            "uptime_seconds": max(0.0, time.time() - self._created_at),
+            "sessions": len(self._sessions),
+            "accounts": [ctx.config.key for ctx in self.router.list_accounts()],
+            "features": self.active_features(),
+        }
+        qmt_status = self._qmt_status_snapshot()
+        if qmt_status is not None:
+            value["qmt"] = qmt_status
         return {
             "dtype": "dict",
-            "value": {
-                "sessions": len(self._sessions),
-                "accounts": [ctx.config.key for ctx in self.router.list_accounts()],
-                "features": self.active_features(),
-            },
+            "value": value,
         }
 
     def _prepare_allowlist(self, allowlist: List[str]):

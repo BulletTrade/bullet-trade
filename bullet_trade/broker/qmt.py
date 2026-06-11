@@ -60,7 +60,7 @@ def _first_present(*values: Any) -> Any:
 class QmtBroker(BrokerBase):
     """
     QMT 券商适配（基于 xtquant/xttrader）。
-    
+
     当前实现重点：
     - connect: 读取 QMT_DATA_PATH 等配置，启动 XtQuantTrader 并完成连接/订阅；
     - buy/sell/cancel/order_status：保留最小骨架，等待后续补齐真实交易调用；
@@ -111,115 +111,203 @@ class QmtBroker(BrokerBase):
         if not self._connected:
             raise RuntimeError(f"QMT 未连接，请先调用 connect() 并确保 xtquant 环境可用, account_id: {self.account_id}, account_type: {self.account_type}")
 
+    @property
+    def is_connected(self) -> bool:
+        """返回 QMT broker 当前是否已连接。
+
+        Args:
+            None。
+
+        Returns:
+            bool: True 表示已连接，False 表示未连接或已断开。
+        """
+
+        return bool(self._connected)
+
     def connect(self) -> bool:
+        """执行一次有边界的 QMT 连接尝试。
+
+        Args:
+            None。
+
+        Returns:
+            bool: 连接和订阅成功时返回 True。
+
+        Raises:
+            RuntimeError: 缺少数据目录、xtquant 环境不可用、start/connect/subscribe 返回失败。
+
+        Side Effects:
+            成功时保存 xtquant trader/account/callback；失败时尽力清理本次创建的 trader。
+        """
+
         data_path = self._data_path
         if not data_path:
             raise RuntimeError("缺少 QMT 数据目录，请在 .env 中设置 QMT_DATA_PATH，或在实例化 QmtBroker 时传入 data_path。")
 
-        attempt = 0
-        while True:
-            attempt += 1
+        try:
+            from xtquant.xttrader import XtQuantTrader, XtQuantTraderCallback  # type: ignore
+            from xtquant.xttype import StockAccount  # type: ignore
+        except Exception as e:
+            raise RuntimeError(
+                f"未检测到 xtquant 环境或导入失败，请在 Windows 安装 QMT/xtquant 并配置 Python 依赖, account_id: {self.account_id}, account_type: {self.account_type}, data_path: {data_path}"
+            ) from e
+
+        self._xt_imported = True
+        session_id = self._session_id or int(time.time() * 1000)
+        self._session_id = session_id
+        trader = None
+        callback = None
+        account = None
+
+        try:
+
+            class _Callback(XtQuantTraderCallback):  # type: ignore
+                """QMT trader 回调桥。
+
+                职责:
+                    将 xtquant 断连事件同步到外层 QmtBroker。
+                核心协作对象:
+                    XtQuantTrader、QmtBroker。
+                关键状态:
+                    outer 指向外层 broker。
+                """
+
+                def __init__(self, outer: "QmtBroker"):
+                    """初始化回调桥。
+
+                    Args:
+                        outer: 外层 QMT broker。
+
+                    Returns:
+                        None。
+                    """
+
+                    self.outer = outer
+
+                def on_disconnected(self):  # noqa: N802
+                    """处理 xtquant 断连回调。
+
+                    Args:
+                        None。
+
+                    Returns:
+                        None。
+
+                    Side Effects:
+                        将外层 broker 标记为未连接。
+                    """
+
+                    self.outer._connected = False
+
+                # 其余回调后续接入（订单、成交、持仓变更）
+
+            trader = XtQuantTrader(data_path, session_id)  # type: ignore
+            callback = _Callback(self)
+            trader.register_callback(callback)  # type: ignore
+
             try:
-                from xtquant.xttrader import XtQuantTrader, XtQuantTraderCallback  # type: ignore
-                from xtquant.xttype import StockAccount  # type: ignore
-            except Exception as e:
-                raise RuntimeError(
-                    f"未检测到 xtquant 环境或导入失败，请在 Windows 安装 QMT/xtquant 并配置 Python 依赖, account_id: {self.account_id}, account_type: {self.account_type}, data_path: {data_path}"
-                ) from e
+                account = StockAccount(self.account_id, self.account_type.upper())  # type: ignore[arg-type]
+            except TypeError:
+                account = StockAccount(self.account_id)  # type: ignore[arg-type,call-arg]
 
-            self._xt_imported = True
-            session_id = self._session_id or int(time.time() * 1000)
-            self._session_id = session_id
+            start_ret = trader.start()  # type: ignore
+            if start_ret not in (0, None):
+                raise RuntimeError(f"xtquant start() 返回异常状态: {start_ret}")
 
+            connect_ret = trader.connect()  # type: ignore
+            if connect_ret not in (0, None):
+                raise RuntimeError(f"xtquant connect() 失败，返回码: {connect_ret}")
+
+            if self._auto_subscribe:
+                subscribe_ret = trader.subscribe(account)  # type: ignore
+                if subscribe_ret not in (0, None):
+                    raise RuntimeError(f"xtquant subscribe() 失败，返回码: {subscribe_ret}")
+
+        except Exception:
+            self._connected = False
+            self._cleanup_trader_attempt(trader, callback)
+            self._xt_trader = None
+            self._xt_account = None
+            self._xt_callback = None
+            raise
+
+        self._xt_trader = trader  # type: ignore[assignment]
+        self._xt_account = account
+        self._xt_callback = callback
+        self._connected = True
+
+        # 尝试读取账户与持仓快照并按 print_portfolio_info 风格打印
+        try:
+            # QMT 在刚连接后资产/持仓可能需要短暂刷新，这里稍等以提高命中率
+            time.sleep(0.2)
+            snap = self._build_account_snapshot()
             try:
-                class _Callback(XtQuantTraderCallback):  # type: ignore
-                    def __init__(self, outer: "QmtBroker"):
-                        self.outer = outer
-                    def on_disconnected(self):  # noqa: N802
-                        self.outer._connected = False
-                    # 其余回调后续接入（订单、成交、持仓变更）
+                from bullet_trade.utils.portfolio_printer import render_account_overview
 
-                trader = XtQuantTrader(data_path, session_id)  # type: ignore
-                callback = _Callback(self)
-                trader.register_callback(callback)  # type: ignore
-
-                try:
-                    account = StockAccount(self.account_id, self.account_type.upper())  # type: ignore[arg-type]
-                except TypeError:
-                    account = StockAccount(self.account_id)  # type: ignore[arg-type,call-arg]
-
-                start_ret = trader.start()  # type: ignore
-                if start_ret not in (0, None):
-                    raise RuntimeError(f"xtquant start() 返回异常状态: {start_ret}")
-
-                connect_ret = trader.connect()  # type: ignore
-                if connect_ret not in (0, None):
-                    raise RuntimeError(f"xtquant connect() 失败，返回码: {connect_ret}")
-
-                if self._auto_subscribe:
-                    subscribe_ret = trader.subscribe(account)  # type: ignore
-                    if subscribe_ret not in (0, None):
-                        raise RuntimeError(f"xtquant subscribe() 失败，返回码: {subscribe_ret}")
-
-            except Exception as exc:
-                try:
-                    if "trader" in locals():
-                        stop_fn = getattr(locals()["trader"], "stop", None)
-                        if callable(stop_fn):
-                            stop_fn()
-                except Exception:
-                    pass
-                if not self._retry_on_failure:
-                    raise
-                wait_s = self._retry_interval or 60
-                log.error(f"QMT 连接失败（第 {attempt} 次）: {exc}，{wait_s}s 后重试 account_id: {self.account_id}, account_type: {self.account_type}, data_path: {data_path}")
-                time.sleep(wait_s)
-                continue
-
-            self._xt_trader = trader  # type: ignore[name-defined]
-            self._xt_account = account
-            self._xt_callback = callback
-            self._connected = True
-
-            # 尝试读取账户与持仓快照并按 print_portfolio_info 风格打印
-            try:
-                # QMT 在刚连接后资产/持仓可能需要短暂刷新，这里稍等以提高命中率
-                time.sleep(0.2)
-                snap = self._build_account_snapshot()
-                try:
-                    from bullet_trade.utils.portfolio_printer import render_account_overview
-
-                    overview = render_account_overview(snap, limit=20)
-                    log.info("QMT 连接建立: account_id=%s, type=%s\n%s", self.account_id, self.account_type, overview)
-                except Exception:
-                    # 回退到简易行
-                    cash = snap.get("available_cash")
-                    total = snap.get("total_value")
-                    poss = snap.get("positions") or []
-                    log.info(
-                        f"QMT 连接建立: account_id={self.account_id}, type={self.account_type}, 现金={cash}, 总资产={total}, 持仓{len(poss)}"
-                    )
+                overview = render_account_overview(snap, limit=20)
+                log.info("QMT 连接建立: account_id=%s, type=%s\n%s", self.account_id, self.account_type, overview)
             except Exception:
+                # 回退到简易行
+                cash = snap.get("available_cash")
+                total = snap.get("total_value")
+                poss = snap.get("positions") or []
                 log.info(
-                    f"QMT 连接建立: account_id={self.account_id}, type={self.account_type}"
+                    f"QMT 连接建立: account_id={self.account_id}, type={self.account_type}, 现金={cash}, 总资产={total}, 持仓{len(poss)}"
                 )
+        except Exception:
+            log.info(
+                f"QMT 连接建立: account_id={self.account_id}, type={self.account_type}"
+            )
 
-            return True
+        return True
+
+    def _cleanup_trader_attempt(
+        self, trader: Optional[object], callback: Optional[object] = None
+    ) -> None:
+        """清理一次失败连接尝试中创建的 xtquant trader。
+
+        Args:
+            trader: 本次连接尝试创建的 trader，可能为 None。
+            callback: 本次注册的 callback，可能为 None。
+
+        Returns:
+            None。
+
+        Side Effects:
+            尽力调用 unregister/disconnect/stop，并清空当前连接状态。
+        """
+
+        if trader is None:
+            return
+        cleanup_errors: List[str] = []
+        if callback is not None:
+            for name in ("unregister_callback", "remove_callback"):
+                fn = getattr(trader, name, None)
+                if not callable(fn):
+                    continue
+                try:
+                    fn(callback)
+                    break
+                except Exception as exc:
+                    cleanup_errors.append(f"{name}: {exc}")
+        for name in ("disconnect", "stop"):
+            fn = getattr(trader, name, None)
+            if not callable(fn):
+                continue
+            try:
+                fn()
+            except Exception as exc:
+                cleanup_errors.append(f"{name}: {exc}")
+        if cleanup_errors:
+            log.warning(
+                "QMT 失败连接清理出现异常: account_id=%s errors=%s",
+                self.account_id,
+                "; ".join(cleanup_errors),
+            )
 
     def disconnect(self) -> bool:
         if self._xt_trader:
-            try:
-                disconnect_fn = getattr(self._xt_trader, "disconnect", None)
-                if callable(disconnect_fn):
-                    disconnect_fn()
-            except Exception:
-                pass
-            try:
-                stop_fn = getattr(self._xt_trader, "stop", None)
-                if callable(stop_fn):
-                    stop_fn()
-            except Exception:
-                pass
+            self._cleanup_trader_attempt(self._xt_trader, self._xt_callback)
 
         self._connected = False
         self._xt_trader = None

@@ -106,7 +106,7 @@ class ClientSession:
             except Exception as exc:
                 elapsed = time.time() - start
                 self.app.log_access(self, action, payload, "error", elapsed, str(exc), request_id=request_id)
-                await self._send_error(request_id, "REQUEST_FAILED", str(exc))
+                await self._send_error(request_id, getattr(exc, "code", "REQUEST_FAILED"), str(exc))
             else:
                 elapsed = time.time() - start
                 self.app.log_access(self, action, payload, "ok", elapsed, request_id=request_id)
