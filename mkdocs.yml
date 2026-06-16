@@ -25,9 +25,13 @@ nav:
   - API 文档: api.md
   - 数据源:
       - 数据源指南: data/DATA_PROVIDER_GUIDE.md
+      - 数据源能力矩阵: data/DATA_PROVIDER_MATRIX.md
+      - 数据源接入验收框架: data/DATA_PROVIDER_ACCEPTANCE.md
       - 聚宽数据: data/DATA_PROVIDER_JQDATA.md
       - MiniQMT 数据: data/DATA_PROVIDER_MINIQMT.md
       - Tushare 数据: data/DATA_PROVIDER_TUSHARE.md
+      - RQData 数据 Beta: data/DATA_PROVIDER_RQDATA.md
+      - easy_tdx 通达信数据 Beta: data/DATA_PROVIDER_EASY_TDX.md
   - 邀请贡献: contributing.md
 theme:
   name: material

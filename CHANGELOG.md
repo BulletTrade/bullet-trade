@@ -5,7 +5,15 @@
 
 ## [未发布]
 
+## [0.8.0] - 2026-06-16
+
+### 新增
+- **RQData 数据源 Beta**：新增 `RQDataProvider`，通过 `rqdatac` 提供聚宽兼容 `get_price/get_trade_days/get_all_securities/get_index_stocks/get_split_dividend` 等接口，支持 `factor`、`paused`、分钟线涨跌停补齐和 `pre_factor_ref_date` 动态前复权锚定路径；缺依赖或缺账号只影响显式启用的 `rqdata` provider。
+- **easy_tdx 通达信数据源 Beta**：新增 `EasyTdxProvider`，通过 `easy-tdx` online 行情服务器提供免费日线、分钟线、实时 quote 和基础证券列表能力；前复权优先用 TDX 除权除息事件构造 `factor` 并支持日线 `pre_factor_ref_date` 动态锚定；真实模式连接失败显式报错，`use_stub=True` 仅用于测试/demo，不会静默返回假行情。
+- **数据源可用性探测脚本**：新增 `scripts/probe_easy_tdx_capabilities.py`，用于在本机探测通达信免费行情的日线、分钟线、quote 和证券列表返回范围，便于补充发布前数据使用约束。
+
 ### 修复
+- **easy_tdx 长区间历史行情截断**：`EasyTdxProvider` 的日期区间请求不再被 8000 条窗口低估，旧日期短窗口也会按距今跨度估算请求条数，允许按更大 `count` 拉取通达信 online 可返回的完整历史窗口；同时在连接前创建 `~/.easy_tdx`，避免上游自动保存 best host 时因目录不存在而偶发失败。
 - **远程 QMT 下单等待超时语义**：`broker.place_order` 在已拿到券商委托号但等待终态超时时返回 `open/submitted + timed_out=true` 的可追踪订单信息，避免客户端 RPC 超时掩盖真实委托号。
 - **远程请求超时预算**：`qmt-remote` 默认 RPC timeout 调整为 60 秒，并在下单时自动保证请求超时大于 `wait_timeout + QMT_PLACE_ORDER_TIMEOUT_MARGIN`，降低服务端刚返回 open/timed_out 前客户端先断开的概率。
 - **服务端请求窗口同步扩展**：server session 默认请求超时保持 60 秒；当 `broker.place_order` 显式传入更长 `wait_timeout` 时，外层请求窗口同步扩展到 `wait_timeout + 30s`，避免 server 先于下单等待窗口超时。
@@ -18,7 +26,12 @@
 - **聚宽 helper 超时余量可配置**：`bullet_trade_jq_remote_helper.configure()` 新增可选 `place_order_timeout_margin` 参数，默认 30 秒，旧调用方不需要调整；显式配置为 0 秒时不会被默认值覆盖。
 
 ### 测试
+- 补充 RQData/easy_tdx provider 离线单元测试，覆盖字段映射、panel 形状、`panel=False` 长表、动态复权锚定、显式 stub 边界、连接失败不返回假行情、实时 quote 和证券类型兜底判断。
+- 补充 easy_tdx 与 JQData 的真实 e2e 对账测试，覆盖日线未复权、1m 未复权、日线前复权价格和 `pre_factor_ref_date` 动态前复权；对账窗口固定在 JQData 当前可见日期内。
 - 补充远程 QMT 下单等待超时、长连接请求超时清理、订单/成交追踪字段、helper 忽略未知新增字段、RPC timeout 安全余量和 `sub_account_id` list 返回兼容测试。
+
+### 文档
+- 新增 RQData/easy_tdx Beta 数据源文档、数据源能力矩阵和 OpenSpec 接入说明，明确安装方式、配置项、复权限制、真实账号/online smoke 验收状态，以及通达信免费数据需要通过探测脚本确认历史深度。
 
 ## [0.7.4] - 2026-06-08
 

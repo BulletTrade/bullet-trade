@@ -51,6 +51,10 @@ def _normalize_provider_name(name: Optional[str]) -> str:
         return "miniqmt"
     if lowered in ("qmt-remote", "remote-qmt", "remote_qmt"):
         return "remote_qmt"
+    if lowered in ("rqdata", "rqdatac", "ricequant"):
+        return "rqdata"
+    if lowered in ("tdx", "easytdx", "easy_tdx", "easy-tdx"):
+        return "easy_tdx"
     return lowered
 
 
@@ -88,6 +92,18 @@ def _create_provider(
         provider_cfg = dict(config.get("remote_qmt", {}) or {})
         provider_cfg.update(overrides)
         return RemoteQmtProvider(provider_cfg)
+    if target == "rqdata":
+        from .providers.rqdata import RQDataProvider
+
+        provider_cfg = dict(config.get("rqdata", {}) or {})
+        provider_cfg.update(overrides)
+        return RQDataProvider(provider_cfg)
+    if target == "easy_tdx":
+        from .providers.easy_tdx import EasyTdxProvider
+
+        provider_cfg = dict(config.get("easy_tdx", {}) or {})
+        provider_cfg.update(overrides)
+        return EasyTdxProvider(provider_cfg)
 
     raise ValueError(f"未知的数据提供者: {provider_name}")
 
@@ -188,6 +204,23 @@ def _sdk_fallback_targets(
                 return target
     elif normalized == "remote_qmt":
         raise AttributeError(f"{normalized} 未实现 {method_name}，且无可用的 SDK 回退路径")
+    elif normalized == "rqdata":
+        mod = _lazy_import("rqdatac")
+        if mod:
+            target = getattr(mod, method_name, None)
+            if target:
+                return target
+    elif normalized == "easy_tdx":
+        client = None
+        ensure_client = getattr(provider, "_ensure_client", None)
+        if callable(ensure_client):
+            try:
+                client = ensure_client()
+            except Exception as exc:
+                errors.append(f"easy_tdx MacClient 初始化失败: {exc}")
+        candidate = _get_from(client, "easy_tdx.MacClient")
+        if candidate:
+            return candidate
 
     detail = "; ".join(attempts + errors) if (attempts or errors) else "无可用回退"
     raise AttributeError(f"{normalized} 未实现 {method_name}，已尝试回退到同名 provider 的 SDK/客户端: {detail}")

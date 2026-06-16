@@ -56,12 +56,18 @@ class TestEnvLoader:
         monkeypatch.setenv("DEFAULT_DATA_PROVIDER", "jqdata")
         monkeypatch.setenv("JQDATA_USERNAME", "test_user")
         monkeypatch.setenv("JQDATA_PASSWORD", "test_pwd")
+        monkeypatch.setenv("RQDATA_LICENSE", "test_license")
+        monkeypatch.setenv("EASY_TDX_PORT", "7710")
+        monkeypatch.setenv("EASY_TDX_USE_STUB", "true")
 
         config = get_data_provider_config()
 
         assert config["default"] == "jqdata"
         assert config["jqdata"]["username"] == "test_user"
         assert config["jqdata"]["password"] == "test_pwd"
+        assert config["rqdata"]["license"] == "test_license"
+        assert config["easy_tdx"]["port"] == 7710
+        assert config["easy_tdx"]["use_stub"] is True
 
     def test_get_broker_config(self, monkeypatch):
         """测试获取券商配置"""

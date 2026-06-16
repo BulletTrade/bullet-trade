@@ -67,6 +67,12 @@ qmt = [
 qmtserver = [
     "pywin32>=305; platform_system == 'Windows'",
 ]
+rqdata = [
+    "rqdatac",
+]
+tdx = [
+    "easy-tdx>=0.1.0; python_version >= '3.10'",
+]
 report = [
     "snapshot-selenium>=0.0.3",
     "selenium>=4.10.0",
@@ -74,7 +80,7 @@ report = [
     "snapshot-phantomjs>=0.0.3",
 ]
 all = [
-    "bullet-trade[dev,tushare,qmt,qmtserver,report]",
+    "bullet-trade[dev,tushare,qmt,qmtserver,rqdata,tdx,report]",
 ]
 
 [project.urls]
@@ -122,6 +128,8 @@ markers = [
     "requires_jqdata: 需要聚宽数据源的测试",
     "requires_network: 需要网络连接的测试",
     "requires_qmt: 需要QMT数据源的测试",
+    "requires_rqdata: 需要RQData账号或SDK的测试",
+    "requires_tdx: 需要easy_tdx在线行情的测试",
     "asyncio: 异步测试标记",
 ]
 

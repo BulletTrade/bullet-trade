@@ -42,49 +42,78 @@
 - 🔒 对数据安全有要求
 - 💻 已有 QMT 环境
 
+### RQData Provider Beta
+
+**优点：**
+- 支持通过 `rqdatac` 接入米筐数据，接口按聚宽风格封装。
+- provider 支持未复权价格、factor 和 `pre_factor_ref_date` 手工锚定路径。
+
+**当前限制：**
+- 目前仅完成 mock 单测，真实 RQData 账号和派息窗口对账待补。
+- 需要显式安装 `bullet-trade[rqdata]` 并配置 license 或账号。
+
+### easy_tdx Provider Beta
+
+**优点：**
+- 使用免费通达信 online 行情服务器，本机 macOS/Linux 也能测试，不需要 Windows 客户端。
+- 适合轻量行情 smoke、免费数据探索和实时 quote 验证。
+
+**当前限制：**
+- `easy-tdx` 需要 Python 3.10+。
+- 免费分钟线历史深度有限，必须用探测脚本确认。
+- 通过通达信除权除息事件构造 `factor`，支持日线 `pre_factor_ref_date` 动态前复权；分钟线仍受免费 online 分钟历史深度限制。
+- 真实模式连接失败不会自动返回 stub 假行情；`use_stub=True` 仅用于测试/demo。
+
 ## 📋 数据 API 支持矩阵
 
 标记说明：
 - ✅H：已实现，支持历史视角（可在回测按日期/时间查询）
 - ✅：已实现，但仅返回最新或不保证历史视角
+- PASS：已完成当前验收框架下的真实 smoke/e2e 或闭环验证
+- PARTIAL：只完成部分场景、schema、样例或 wrapper 验证，边界见验收报告
+- LIMIT：接口受数据源天然限制，不能按完整基准能力使用
+- MOCK：仅完成 mock/offline 合同测试，真实账号或真实数据尚未验收
+- BLOCKED：缺账号、权限或环境，真实验收阻塞
 - —：未实现（会抛 `NotImplementedError`）
 
 回测说明：
 - 若数据源不支持历史视角，回测中会抛 `UserError`，避免误用“最新数据”参与回测。
 
-| API | JQData | MiniQMT | RemoteQMT | Tushare |
-| --- | --- | --- | --- | --- |
-| get_price | ✅H | ✅H | ✅H | ✅H |
-| history | ✅H | ✅H | ✅H | ✅H |
-| attribute_history | ✅H | ✅H | ✅H | ✅H |
-| get_bars | ✅H | — | — | — |
-| get_ticks | ✅H | — | — | — |
-| get_current_tick | ✅ | ✅ | ✅ | — |
-| get_current_data | ✅ | ✅ | ✅ | ✅ |
-| get_extras | ✅H | — | — | — |
-| get_fundamentals | ✅H | — | — | — |
-| get_fundamentals_continuously | ✅H | — | — | — |
-| get_all_securities | ✅H | ✅ | ✅ | ✅H |
-| get_security_info | ✅H | ✅ | ✅ | ✅H |
-| get_fund_info | ✅H | — | — | — |
-| get_trade_days | ✅H | ✅H | ✅H | ✅H |
-| get_trade_day | ✅H | ✅H | ✅H | ✅H |
-| get_index_stocks | ✅H | ✅H | ✅H | ✅H |
-| get_index_weights | ✅H | — | — | ✅H |
-| get_industry_stocks | ✅H | — | — | — |
-| get_industry | ✅H | — | — | — |
-| get_concept_stocks | ✅H | — | — | — |
-| get_concept | ✅H | — | — | — |
-| get_margincash_stocks | ✅H | — | — | — |
-| get_marginsec_stocks | ✅H | — | — | — |
-| get_dominant_future | ✅H | — | — | — |
-| get_future_contracts | ✅H | — | — | — |
-| get_billboard_list | ✅H | — | — | — |
-| get_locked_shares | ✅H | — | — | — |
-| get_split_dividend | ✅H | ✅H | ✅H | ✅H |
+| API | JQData | MiniQMT | RemoteQMT | Tushare | RQData Beta | easy_tdx Beta |
+| --- | --- | --- | --- | --- | --- | --- |
+| get_price | ✅H | ✅H | ✅H | ✅H | MOCK | ✅H* |
+| history | ✅H | ✅H | ✅H | ✅H | MOCK | ✅H* |
+| attribute_history | ✅H | ✅H | ✅H | ✅H | MOCK | ✅H* |
+| get_bars | ✅H | — | — | — | — | ✅H* |
+| get_ticks | ✅H | — | — | — | — | — |
+| get_current_tick | ✅ | ✅ | ✅ | — | — | PASS |
+| get_current_data | ✅ | ✅ | ✅ | ✅ | MOCK | ✅* |
+| get_extras | ✅H | — | — | — | — | — |
+| get_fundamentals | ✅H | — | — | — | — | — |
+| get_fundamentals_continuously | ✅H | — | — | — | — | — |
+| get_all_securities | ✅H | ✅ | ✅ | ✅H | MOCK | ✅* |
+| get_security_info | ✅H | ✅ | ✅ | ✅H | MOCK | ✅* |
+| get_fund_info | ✅H | — | — | — | — | — |
+| get_trade_days | ✅H | ✅H | ✅H | ✅H | MOCK | ✅H* |
+| get_trade_day | ✅H | ✅H | ✅H | ✅H | MOCK | ✅H* |
+| get_index_stocks | ✅H | ✅H | ✅H | ✅H | MOCK | LIMIT |
+| get_index_weights | ✅H | — | — | ✅H | MOCK | — |
+| get_industry_stocks | ✅H | — | — | — | — | — |
+| get_industry | ✅H | — | — | — | — | — |
+| get_concept_stocks | ✅H | — | — | — | — | — |
+| get_concept | ✅H | — | — | — | — | — |
+| get_margincash_stocks | ✅H | — | — | — | — | — |
+| get_marginsec_stocks | ✅H | — | — | — | — | — |
+| get_dominant_future | ✅H | — | — | — | — | — |
+| get_future_contracts | ✅H | — | — | — | — | — |
+| get_billboard_list | ✅H | — | — | — | — | — |
+| get_locked_shares | ✅H | — | — | — | — | — |
+| get_split_dividend | ✅H | ✅H | ✅H | ✅H | MOCK | ✅* |
 
 补充说明：
 - MiniQMT/RemoteQMT 的指数成分历史视角依赖 xtquant/远端服务端实现，若接口返回为空或报错请以实际能力为准。
+- RQData Beta 当前统一标为 `MOCK`：代码路径和离线合同测试已覆盖，但没有真实账号/API key，不能视为真实数据验收通过。
+- easy_tdx Beta 的 `*` 表示已按当前验收定义通过或可用，但存在明确边界：免费分钟线旧历史深度有限，证券列表不保证与 JQData 全量一致，交易日由上证指数日线推导，指数成分接口仍标为 `LIMIT`。
 
 ## 🔧 配置说明
 
@@ -116,6 +145,25 @@ MINIQMT_AUTO_DOWNLOAD=true
 
 # 交易日市场代码
 MINIQMT_MARKET=SH
+```
+
+### 3. RQData 配置（Beta）
+
+```env
+DEFAULT_DATA_PROVIDER=rqdata
+RQDATA_LICENSE=your_license
+# 或
+RQDATA_USERNAME=your_username
+RQDATA_PASSWORD=your_password
+```
+
+### 4. easy_tdx 配置（Beta）
+
+```env
+DEFAULT_DATA_PROVIDER=easy_tdx
+EASY_TDX_PORT=7709
+EASY_TDX_TIMEOUT=10
+EASY_TDX_USE_STUB=false
 ```
 
 ## 📝 代码示例
@@ -169,6 +217,12 @@ set_data_provider('qmt')
 
 # 切换到 Tushare（如果配置了）
 set_data_provider('tushare')
+
+# 切换到 RQData Beta
+set_data_provider('rqdata')
+
+# 切换到 easy_tdx Beta
+set_data_provider('easy_tdx')
 ```
 
 ## 🎯 直接访问特有接口
@@ -180,6 +234,8 @@ set_data_provider('tushare')
 ## ✅ 数据源对比测试
 
 用于验证不同 provider 的复权口径与数据一致性，建议在准备好账号与本地数据后执行：
+
+新增数据源必须先按《[数据源接入验收框架](DATA_PROVIDER_ACCEPTANCE.md)》逐项输出验收表。不能完全一致的函数，例如证券列表、实时 quote、指数成分，应标明对比方式、兼容尝试和残余风险，而不是简单写“支持”。
 
 - `tests/e2e/data/test_provider_parity.py::test_ping_an_bank_real_parity`  
   对比 JQData 与 MiniQMT 在分红窗口内的未复权/前复权价格。
@@ -258,4 +314,8 @@ QMT_DATA_PATH=C:\国金QMT交易端模拟\userdata_mini
 - [聚宽数据](DATA_PROVIDER_JQDATA.md)
 - [MiniQMT 数据](DATA_PROVIDER_MINIQMT.md)
 - [Tushare 数据](DATA_PROVIDER_TUSHARE.md)
+- [RQData 数据 Beta](DATA_PROVIDER_RQDATA.md)
+- [easy_tdx 通达信数据 Beta](DATA_PROVIDER_EASY_TDX.md)
+- [数据源能力矩阵](DATA_PROVIDER_MATRIX.md)
+- [数据源接入验收框架](DATA_PROVIDER_ACCEPTANCE.md)
 - [按名称直接访问数据提供者](DATA_PROVIDER_DIRECT_ACCESS.md)

@@ -188,6 +188,19 @@ def get_data_provider_config() -> dict:
             "token": get_env("QMT_SERVER_TOKEN"),
             "tls_cert": get_env("QMT_SERVER_TLS_CERT"),
         },
+        "rqdata": {
+            "username": get_env("RQDATA_USERNAME") or get_env("RQDATA_USER"),
+            "password": get_env("RQDATA_PASSWORD") or get_env("RQDATA_PWD"),
+            "license": get_env("RQDATA_LICENSE"),
+            "cache_dir": cache_dir_for("rqdata"),
+        },
+        "easy_tdx": {
+            "host": get_env("EASY_TDX_HOST"),
+            "port": get_env_int("EASY_TDX_PORT", 7709),
+            "timeout": get_env_float("EASY_TDX_TIMEOUT", 10.0),
+            "use_stub": get_env_bool("EASY_TDX_USE_STUB", False),
+            "cache_dir": cache_dir_for("easy_tdx"),
+        },
     }
 
 

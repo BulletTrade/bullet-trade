@@ -15,7 +15,7 @@
 ## ✨ 核心特性
 
 - **🔄 聚宽兼容**：`from jqdata import *`
-- **📊 多数据源**：JQData、MiniQMT、TuShare、本地缓存与远程 QMT server 均可切换。
+- **📊 多数据源**：JQData、MiniQMT、TuShare、本地缓存、远程 QMT server，以及 Beta 版 RQData/easy_tdx 均可切换。
 - **⚡ 回测 & 报告**：分钟/日线回测、真实价格撮合、HTML/PDF 报告一键生成。
 - **💼 实盘接入**：本地 QMT、远程 QMT server、模拟券商按需选择。
 - **🧩 可扩展**：数据/券商接口基于抽象基类，便于自定义实现。
@@ -44,7 +44,7 @@
 - [实盘引擎](docs/live.md)：本地 QMT 独立实盘与远程实盘流程。
 - [交易支撑](docs/trade-support.md)：聚宽模拟盘接入、远程 QMT 服务与 helper 用法。
 - [QMT 服务配置](docs/qmt-server.md)：bullet-trade server 的完整说明。
-- [数据源指南](docs/data/DATA_PROVIDER_GUIDE.md)：聚宽、MiniQMT、Tushare 以及自定义 Provider 配置。
+- [数据源指南](docs/data/DATA_PROVIDER_GUIDE.md)：聚宽、MiniQMT、Tushare、RQData/easy_tdx Beta 以及自定义 Provider 配置。
 - [API 文档](docs/api.md)：策略可用 API、类模型与工具函数。
 - [邀请贡献](docs/contributing.md): 贡献与联系方式。 
 

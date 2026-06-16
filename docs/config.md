@@ -128,7 +128,7 @@ QMT_SERVER_SUB_ACCOUNT=demo@main
 | 变量 | 默认/示例 | 作用 |
 | --- | --- | --- |
 | `BT_ENV_FILE` / `BULLET_TRADE_ENV_FILE` / `ENV_FILE` | `./.env.live` | 显式指定要加载的 `.env` 文件；优先于自动向上查找 `.env`。 |
-| `DEFAULT_DATA_PROVIDER` | `jqdata` | 默认行情源：`jqdata`、`tushare`、`qmt`、`qmt-remote`。 |
+| `DEFAULT_DATA_PROVIDER` | `jqdata` | 默认行情源：`jqdata`、`tushare`、`qmt`、`qmt-remote`、`rqdata`、`easy_tdx`。RQData/easy_tdx 仍为 Beta，需要显式启用。 |
 | `DEFAULT_BROKER` | `simulator` | 默认券商/交易通道：`simulator`、`qmt`、`qmt-remote`。 |
 | `LOG_DIR` | `./logs` | 日志目录。 |
 | `LOG_LEVEL` | `INFO` | 控制台日志级别。 |
@@ -153,6 +153,12 @@ QMT_SERVER_SUB_ACCOUNT=demo@main
 | `JQDATA_CACHE_VERSION` | `2` | 缓存 schema 版本；改值可强制旧缓存失效。 |
 | `TUSHARE_TOKEN` | 空 | Tushare token。 |
 | `TUSHARE_CUSTOM_URL` | 空 | Tushare 自定义接入地址。 |
+| `RQDATA_LICENSE` | 空 | RQData license；配置后优先使用 license 初始化 `rqdatac`。 |
+| `RQDATA_USERNAME` / `RQDATA_PASSWORD` | 空 | RQData 用户名和密码；未配置 license 时使用。 |
+| `RQDATA_USER` / `RQDATA_PWD` | 空 | RQData 账号密码旧别名，仍兼容。 |
+| `EASY_TDX_HOST` / `EASY_TDX_PORT` | 自动选主机 / `7709` | easy_tdx 通达信 online 行情服务器地址和端口；留空 host 时使用 SDK 自动选主机。 |
+| `EASY_TDX_TIMEOUT` | `10` | easy_tdx 连接超时秒数。 |
+| `EASY_TDX_USE_STUB` | `false` | 仅用于测试/demo 的显式 stub 开关；真实模式连接失败不会返回假行情。 |
 | `QMT_DATA_PATH` | 空 | MiniQMT/xtquant 数据目录；本地 QMT 行情和本地 QMT 交易都依赖它。 |
 | `MINIQMT_AUTO_DOWNLOAD` | `true` | MiniQMT 行情是否自动下载；设为 `false` 时只读本地缓存。 |
 | `MINIQMT_MARKET` | `SH` | MiniQMT 行情市场代码。 |
