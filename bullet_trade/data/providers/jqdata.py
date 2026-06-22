@@ -733,15 +733,43 @@ class JQDataProvider(DataProvider):
         except Exception:
             return None
 
-    def _infer_security_type(self, security: str, ref_date: Optional[Date]) -> str:
+    def _resolve_security_identity(
+        self, security: str, ref_date: Optional[Date]
+    ) -> Tuple[str, str]:
+        """
+        解析证券在聚宽中的真实代码和证券类型。
+
+        Args:
+            security: 调用方传入的证券代码，可能使用 .SH/.SZ 后缀。
+            ref_date: 查询参考日期。
+
+        Returns:
+            Tuple[str, str]: 聚宽可识别代码与证券类型；无法识别时按股票返回原代码。
+        """
         try:
-            for t in ['stock', 'etf', 'lof', 'fund', 'fja', 'fjb']:
-                df = self.get_all_securities(types=t, date=ref_date)
-                if not df.empty and security in df.index:
-                    return t
+            candidates = list(dict.fromkeys(self._candidate_security_keys(security)))
+            for candidate in candidates:
+                for t in ['stock', 'etf', 'lof', 'fund', 'fja', 'fjb']:
+                    df = self.get_all_securities(types=t, date=ref_date)
+                    if isinstance(df, pd.DataFrame) and candidate in df.index:
+                        return candidate, t
         except Exception:
             pass
-        return 'stock'
+        return security, 'stock'
+
+    def _infer_security_type(self, security: str, ref_date: Optional[Date]) -> str:
+        """
+        推断证券类型，兼容聚宽后缀和交易所后缀。
+
+        Args:
+            security: 调用方传入的证券代码。
+            ref_date: 查询参考日期。
+
+        Returns:
+            str: 聚宽证券类型；无法识别时返回 stock。
+        """
+        _, sec_type = self._resolve_security_identity(security, ref_date)
+        return sec_type
 
     def get_split_dividend(self, security: str,
                            start_date: Optional[Union[str, datetime, Date]] = None,
@@ -759,8 +787,8 @@ class JQDataProvider(DataProvider):
             if sd is None or ed is None:
                 # Provider层要求明确日期
                 return []
-            sec_type = self._infer_security_type(security_i, ed)
-            code_num = security_i.split('.')[0]
+            resolved_security, sec_type = self._resolve_security_identity(security_i, ed)
+            code_num = resolved_security.split('.')[0]
             events: List[Dict[str, Any]] = []
             try:
                 if sec_type in ('fja', 'fjb'):
@@ -817,7 +845,7 @@ class JQDataProvider(DataProvider):
                     except Exception:
                         table = _FINANCE_TABLE_STUB
                     q = query(table).filter(
-                        table.code == security_i,
+                        table.code == resolved_security,
                         table.a_xr_date >= sd,
                         table.a_xr_date <= ed
                     )

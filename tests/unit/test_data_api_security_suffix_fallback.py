@@ -14,6 +14,7 @@ class SuffixFallbackProvider(DataProvider):
         self.price_calls = []
         self.info_calls = []
         self.index_calls = []
+        self.split_calls = []
 
     def auth(self, *args, **kwargs):
         return True
@@ -45,7 +46,20 @@ class SuffixFallbackProvider(DataProvider):
             return ["000001.XSHE"]
         raise ValueError(f"找不到标的{index_symbol}")
 
-    def get_split_dividend(self, *args, **kwargs):
+    def get_split_dividend(self, security, start_date=None, end_date=None):
+        """返回测试用拆分事件，并记录实际查询代码。"""
+        self.split_calls.append(security)
+        if security == "159967.XSHE":
+            return [
+                {
+                    "security": security,
+                    "date": pd.Timestamp("2020-11-06").date(),
+                    "security_type": "etf",
+                    "scale_factor": 3.63839094,
+                    "bonus_pre_tax": 0.0,
+                    "per_base": 1,
+                }
+            ]
         return []
 
 
@@ -53,6 +67,17 @@ class MissingSecurityProvider(SuffixFallbackProvider):
     def get_price(self, security, *args, **kwargs):
         self.price_calls.append(security)
         raise ValueError(f"找不到标的{security}")
+
+
+class EmptyThenUnsupportedSplitProvider(SuffixFallbackProvider):
+    """模拟原始代码无事件、兼容后缀不支持分红接口的 provider。"""
+
+    def get_split_dividend(self, security, start_date=None, end_date=None):
+        """返回空事件后，在兼容候选代码上抛出不支持异常。"""
+        self.split_calls.append(security)
+        if security == "159967.SZ":
+            return []
+        raise NotImplementedError("get_split_dividend unsupported")
 
 
 @pytest.fixture(autouse=True)
@@ -107,6 +132,41 @@ def test_get_index_stocks_supports_sh_suffix_fallback(monkeypatch):
 
     assert stocks == ["000001.XSHE"]
     assert provider.index_calls == ["000300.SH", "000300.XSHG"]
+
+
+@pytest.mark.unit
+def test_get_split_dividend_supports_sz_suffix_fallback(monkeypatch):
+    """验证拆分事件查询可从 .SZ fallback 到 .XSHE。"""
+    provider = SuffixFallbackProvider()
+    monkeypatch.setattr(data_api, "_provider", provider, raising=False)
+
+    events = data_api.get_split_dividend(
+        "159967.SZ",
+        start_date="2020-11-06",
+        end_date="2020-11-06",
+    )
+
+    assert len(events) == 1
+    assert events[0]["security"] == "159967.SZ"
+    assert events[0]["security_type"] == "etf"
+    assert events[0]["scale_factor"] == pytest.approx(3.63839094)
+    assert provider.split_calls == ["159967.SZ", "159967.XSHE"]
+
+
+@pytest.mark.unit
+def test_get_split_dividend_keeps_empty_result_when_fallback_unsupported(monkeypatch):
+    """验证原始代码正常返回空事件时，后续兼容候选异常不会升级为失败。"""
+    provider = EmptyThenUnsupportedSplitProvider()
+    monkeypatch.setattr(data_api, "_provider", provider, raising=False)
+
+    events = data_api.get_split_dividend(
+        "159967.SZ",
+        start_date="2020-11-06",
+        end_date="2020-11-06",
+    )
+
+    assert events == []
+    assert provider.split_calls == ["159967.SZ", "159967.XSHE"]
 
 
 @pytest.mark.unit

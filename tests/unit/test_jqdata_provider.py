@@ -133,6 +133,8 @@ class _DummyFinance:
     """JQData 分红单测专用 finance 假对象，避免访问真实 jqdatasdk finance 模块。"""
 
     STK_XR_XD = jqdata._FINANCE_TABLE_STUB
+    FUND_DIVIDEND = jqdata._FINANCE_TABLE_STUB
+    FUND_MF_DAILY_PROFIT = jqdata._FINANCE_TABLE_STUB
 
     def __init__(self, df):
         """
@@ -164,7 +166,9 @@ class _DummyFinance:
 def test_get_split_dividend_prefers_ratio_fields(monkeypatch):
     provider = JQDataProvider({"cache_dir": None})
     monkeypatch.setattr(
-        JQDataProvider, "_infer_security_type", lambda self, *args, **kwargs: "stock"
+        JQDataProvider,
+        "_resolve_security_identity",
+        lambda self, security, ref_date: (security, "stock"),
     )
     monkeypatch.setattr(jqdata, "query", lambda *args, **kwargs: _DummyQuery())
 
@@ -195,7 +199,9 @@ def test_get_split_dividend_prefers_ratio_fields(monkeypatch):
 def test_get_split_dividend_falls_back_to_share_base(monkeypatch):
     provider = JQDataProvider({"cache_dir": None})
     monkeypatch.setattr(
-        JQDataProvider, "_infer_security_type", lambda self, *args, **kwargs: "stock"
+        JQDataProvider,
+        "_resolve_security_identity",
+        lambda self, security, ref_date: (security, "stock"),
     )
     monkeypatch.setattr(jqdata, "query", lambda *args, **kwargs: _DummyQuery())
 
@@ -220,3 +226,53 @@ def test_get_split_dividend_falls_back_to_share_base(monkeypatch):
     event = events[0]
     assert event["bonus_pre_tax"] == pytest.approx(4.0)
     assert event["scale_factor"] == pytest.approx(1.4)
+
+
+@pytest.mark.unit
+def test_get_split_dividend_resolves_sz_etf_suffix(monkeypatch):
+    """验证 JQData provider 用 .SZ 查询 ETF 时仍能读取基金拆分事件。"""
+    provider = JQDataProvider({"cache_dir": None})
+
+    def fake_get_all_securities(types="stock", date=None):
+        """
+        返回测试用证券清单，只在 etf 类型下暴露聚宽后缀代码。
+
+        Args:
+            types: 查询的证券类型。
+            date: 查询参考日期，测试中不使用。
+
+        Returns:
+            pd.DataFrame: 指定类型的证券索引。
+        """
+        _ = date
+        if types == "etf":
+            return pd.DataFrame(index=["159967.XSHE"])
+        return pd.DataFrame()
+
+    monkeypatch.setattr(provider, "get_all_securities", fake_get_all_securities)
+    monkeypatch.setattr(jqdata, "query", lambda *args, **kwargs: _DummyQuery())
+
+    df = pd.DataFrame(
+        [
+            {
+                "ex_date": dt.date(2020, 11, 6),
+                "record_date": dt.date(2020, 11, 5),
+                "proportion": 0.0,
+                "split_ratio": 3.63839094,
+            }
+        ]
+    )
+    monkeypatch.setattr(jqdata, "finance", _DummyFinance(df))
+
+    events = provider.get_split_dividend(
+        "159967.SZ",
+        start_date="2020-11-06",
+        end_date="2020-11-06",
+    )
+
+    assert len(events) == 1
+    event = events[0]
+    assert event["security"] == "159967.SZ"
+    assert event["security_type"] == "etf"
+    assert event["scale_factor"] == pytest.approx(3.63839094)
+    assert event["per_base"] == 1

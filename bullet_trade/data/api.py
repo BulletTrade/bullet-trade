@@ -683,6 +683,80 @@ def _call_provider_get_price_with_security_fallback(**kwargs) -> pd.DataFrame:
     return _call_provider_get_price(**kwargs)
 
 
+def _normalize_split_dividend_events(
+    events: List[Dict[str, Any]], requested_security: str
+) -> List[Dict[str, Any]]:
+    """
+    将 provider 返回的分红/拆分事件代码规范为调用方请求代码。
+
+    Args:
+        events: provider 返回的事件列表。
+        requested_security: 调用方原始请求的证券代码。
+
+    Returns:
+        List[Dict[str, Any]]: 事件副本列表，security 字段与请求代码保持一致。
+    """
+    normalized: List[Dict[str, Any]] = []
+    for event in events or []:
+        if not isinstance(event, dict):
+            continue
+        item = dict(event)
+        item["security"] = requested_security
+        normalized.append(item)
+    return normalized
+
+
+def _call_provider_get_split_dividend_with_security_fallback(
+    security: str,
+    *,
+    start_date: Optional[Date],
+    end_date: Optional[Date],
+) -> List[Dict[str, Any]]:
+    """
+    对分红/拆分查询做代码后缀兼容重试。
+
+    Args:
+        security: 调用方请求的证券代码。
+        start_date: 查询起始日期。
+        end_date: 查询结束日期。
+
+    Returns:
+        List[Dict[str, Any]]: 标准化后的分红/拆分事件列表。
+    """
+    if not isinstance(security, str):
+        return _provider.get_split_dividend(security, start_date=start_date, end_date=end_date)
+
+    last_exc: Optional[Exception] = None
+    had_successful_call = False
+    candidates = list(dict.fromkeys(_candidate_security_keys(security)))
+    for idx, candidate in enumerate(candidates):
+        try:
+            result = _provider.get_split_dividend(
+                candidate,
+                start_date=start_date,
+                end_date=end_date,
+            )
+            had_successful_call = True
+        except Exception as exc:
+            last_exc = exc
+            if had_successful_call:
+                log.debug(f"分红拆分代码兼容候选失败[{candidate}]: {exc}")
+                continue
+            if idx >= len(candidates) - 1 or not _is_security_lookup_error(exc):
+                raise
+            continue
+
+        events = _normalize_split_dividend_events(result or [], security)
+        if events:
+            if idx > 0:
+                log.debug(f"分红拆分代码兼容成功: {security} -> {candidate}")
+            return events
+
+    if last_exc is not None and not had_successful_call:
+        raise last_exc
+    return []
+
+
 def _price_block_frequency_key(frequency: str) -> str:
     """
     归一化行情块缓存使用的频率键。
@@ -3486,7 +3560,11 @@ def get_split_dividend(
 
     # 直接通过当前数据提供者获取标准化事件
     try:
-        return _provider.get_split_dividend(security, start_date=sd, end_date=ed)
+        return _call_provider_get_split_dividend_with_security_fallback(
+            security,
+            start_date=sd,
+            end_date=ed,
+        )
     except Exception as e:
         _raise_if_not_implemented(e)
         log.debug(f"获取分红数据失败[{security}]: {e}")
