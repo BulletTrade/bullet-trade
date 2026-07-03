@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import secrets
 import time
 from typing import Any, Dict, Optional
@@ -20,6 +21,11 @@ class ClientSession:
     # 请求超时时间（秒），超过此时间未完成的请求会被取消
     REQUEST_TIMEOUT = 60.0
     PLACE_ORDER_TIMEOUT_MARGIN = 30.0
+    REQUEST_TIMEOUT_ENV = ("QMT_SERVER_REQUEST_TIMEOUT_SECONDS", "QMT_SERVER_REQUEST_TIMEOUT")
+    PLACE_ORDER_TIMEOUT_MARGIN_ENV = (
+        "QMT_SERVER_PLACE_ORDER_TIMEOUT_MARGIN_SECONDS",
+        "QMT_SERVER_PLACE_ORDER_TIMEOUT_MARGIN",
+    )
 
     def __init__(self, app: "ServerApplication", reader: asyncio.StreamReader, writer: asyncio.StreamWriter, peername: str):
         self.app = app
@@ -147,7 +153,7 @@ class ClientSession:
             broker adapter 返回 `open/timed_out` 之前先返回 REQUEST_TIMEOUT。
         """
 
-        timeout = float(self.REQUEST_TIMEOUT)
+        timeout = self._positive_env_float(self.REQUEST_TIMEOUT_ENV, self.REQUEST_TIMEOUT)
         if str(action or "") != "broker.place_order":
             return timeout
         try:
@@ -156,7 +162,25 @@ class ClientSession:
             wait_timeout = 0.0
         if wait_timeout <= 0:
             return timeout
-        return max(timeout, wait_timeout + float(self.PLACE_ORDER_TIMEOUT_MARGIN))
+        margin = self._positive_env_float(
+            self.PLACE_ORDER_TIMEOUT_MARGIN_ENV,
+            self.PLACE_ORDER_TIMEOUT_MARGIN,
+        )
+        return max(timeout, wait_timeout + margin)
+
+    @staticmethod
+    def _positive_env_float(names: tuple[str, ...], default: float) -> float:
+        for name in names:
+            raw = os.getenv(name)
+            if raw in (None, ""):
+                continue
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if value > 0:
+                return value
+        return float(default)
 
     async def send_event(self, event: str, payload: Dict[str, Any]) -> None:
         if not self._active:

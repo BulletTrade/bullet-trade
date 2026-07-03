@@ -166,6 +166,27 @@ def test_server_session_extends_place_order_timeout_for_long_wait():
     assert session._request_timeout_for("broker.place_order", {"wait_timeout": "bad"}) == 60.0
 
 
+def test_server_session_request_timeout_can_be_configured(monkeypatch):
+    """慢数据节点可调大 session 外层超时，默认行为不变。"""
+
+    session = ClientSession.__new__(ClientSession)
+    monkeypatch.setenv("QMT_SERVER_REQUEST_TIMEOUT_SECONDS", "130")
+
+    assert session._request_timeout_for("broker.account", {}) == 130.0
+    assert session._request_timeout_for("data.get_index_stocks", {}) == 130.0
+    assert session._request_timeout_for("broker.place_order", {"wait_timeout": 90}) == 130.0
+
+
+def test_server_session_request_timeout_ignores_invalid_env(monkeypatch):
+    """非法超时配置不应覆盖原来的 60 秒默认值。"""
+
+    session = ClientSession.__new__(ClientSession)
+    monkeypatch.setenv("QMT_SERVER_REQUEST_TIMEOUT_SECONDS", "bad")
+    monkeypatch.setenv("QMT_SERVER_REQUEST_TIMEOUT", "-1")
+
+    assert session._request_timeout_for("broker.account", {}) == 60.0
+
+
 def test_stub_server_history(stub_server):
     conn = _make_connection(stub_server)
     try:

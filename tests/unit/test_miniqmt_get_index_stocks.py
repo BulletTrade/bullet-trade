@@ -38,3 +38,17 @@ def test_miniqmt_get_index_stocks_uses_index_weight(monkeypatch) -> None:
     assert dummy.last_symbol == "399101.SZ"
     assert result == ["000001.XSHE", "600000.XSHG"]
     assert any("get_index_stocks 不支持历史日期" in message for message in warnings)
+
+
+def test_miniqmt_get_index_stocks_can_opt_out_index_weight_download(monkeypatch) -> None:
+    dummy = DummyXt()
+    provider = MiniQMTProvider(
+        {"cache_dir": None, "auto_download": True, "index_weight_auto_download": False}
+    )
+    monkeypatch.setattr(provider, "_ensure_xtdata", lambda: dummy)
+
+    result = provider.get_index_stocks("399101.XSHE")
+
+    assert dummy.download_calls == 0
+    assert dummy.last_symbol == "399101.SZ"
+    assert result == ["000001.XSHE", "600000.XSHG"]

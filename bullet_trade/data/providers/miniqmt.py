@@ -54,6 +54,23 @@ class MiniQMTProvider(DataProvider):
             auto_download = True
         self.auto_download = bool(auto_download)
         self.config["auto_download"] = self.auto_download
+        index_weight_auto_download = self.config.get("index_weight_auto_download")
+        if index_weight_auto_download is None:
+            env_index_weight_auto_download = os.getenv("MINIQMT_INDEX_WEIGHT_AUTO_DOWNLOAD")
+            if env_index_weight_auto_download is not None:
+                index_weight_auto_download = env_index_weight_auto_download.lower() in (
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                )
+        if index_weight_auto_download is None:
+            index_weight_auto_download = self.auto_download
+        # Keep the historical default: auto_download=True also refreshes index
+        # weights. Slow MiniQMT nodes can opt out with
+        # MINIQMT_INDEX_WEIGHT_AUTO_DOWNLOAD=0 after a separate prewarm.
+        self.index_weight_auto_download = bool(index_weight_auto_download)
+        self.config["index_weight_auto_download"] = self.index_weight_auto_download
         self._cache = CacheManager(
             provider_name=self.name,
             cache_dir=cache_dir,
@@ -1895,7 +1912,7 @@ class MiniQMTProvider(DataProvider):
         def _fetch(kw: Dict[str, Any]) -> List[str]:
             xt = self._ensure_xtdata()
             normalized_symbol = self._normalize_security_code(kw["index_symbol"])
-            if self.auto_download and hasattr(xt, "download_index_weight"):
+            if self.index_weight_auto_download and hasattr(xt, "download_index_weight"):
                 try:
                     xt.download_index_weight()
                 except Exception:
