@@ -50,6 +50,8 @@ flowchart TD
 - BulletTrade 自己负责调度、取数、计算信号和下单
 - QMT / MiniQMT 和策略放在同一台 Windows 机器上运行
 
+如果券商不再提供 MiniQMT，方案 A 也可以改成“大 QMT helper + `qmt-remote`”的方式运行：先按 [大 QMT 服务向导](big-qmt-server.md) 启动 `58620` qmt server，再让本地策略连接 `qmt-remote`。
+
 ### 方案 B：策略在聚宽侧模拟盘运行
 
 适合：
@@ -73,6 +75,8 @@ flowchart TD
 - 策略逻辑继续在聚宽侧跑
 - 聚宽负责产生交易动作
 - BulletTrade 只负责接收信号，并通过本地 QMT 下单
+
+方案 B 同样支持大 QMT。区别只在 Windows 侧的 server 后端：MiniQMT 用 `QMT_DATA_PATH`，大 QMT 用 [大 QMT 服务向导](big-qmt-server.md) 里的 helper 和 `--server-type big_qmt`；聚宽侧仍然连接同一个 `58620` qmt server。
 
 > 聚宽侧改策略有两种方式：显式调用 helper，或接管聚宽函数。先看 [聚宽策略接入方案对比](joinquant-integration-options.md)，再选择 [方案 A：显式调用 helper](joinquant-helper-explicit.md) 或 [方案 B：接管聚宽函数](joinquant-live-takeover-usage.md)。
 

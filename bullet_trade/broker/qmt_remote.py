@@ -325,12 +325,12 @@ class RemoteQmtBroker(BrokerBase):
             except Exception:
                 pass
             self._last_warning = str(warning)
+        status = str(resp.get("status") or resp.get("order_status") or "").strip().lower()
+        if status == "submit_unknown":
+            raise RuntimeError(f"远程券商下单提交状态未知: order_id={resp.get('order_id') or ''} response={resp}")
         order_id = resp.get("order_id")
         if not order_id:
             raise RuntimeError(f"远程券商未返回 order_id: {resp}")
-        status = str(resp.get("status") or resp.get("order_status") or "").strip().lower()
-        if status == "submit_unknown":
-            raise RuntimeError(f"远程券商下单提交状态未知: order_id={order_id} response={resp}")
         if status in {"rejected", "canceled", "cancelled", "failed", "error"}:
             raise RuntimeError(f"远程券商下单失败: order_id={order_id} status={status} response={resp}")
         self._last_order_responses[str(order_id)] = dict(resp)

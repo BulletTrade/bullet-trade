@@ -11,6 +11,8 @@
 
 ## 1. 先启动远程 server
 
+下面是 MiniQMT 后端的启动方式。若 Windows 侧使用大 QMT，请先按 [大 QMT 服务向导](big-qmt-server.md) 在大 QMT 里运行 helper，再启动 `bullet-trade server --server-type big_qmt`；聚宽侧 helper 仍然连接 `58620`。
+
 Windows 机器上的 `.env` 最少只要：
 
 ```env
@@ -74,7 +76,7 @@ bt.configure(
 ### server 端为什么不能写 `--data-path`
 
 因为当前版本没有这个参数。  
-数据目录要放到 `.env` 里的 `QMT_DATA_PATH`。
+MiniQMT 数据目录要放到 `.env` 里的 `QMT_DATA_PATH`。大 QMT 不使用这个配置入口。
 
 ### `:stock` 必须写吗
 
@@ -92,4 +94,4 @@ bt.configure(
 --accounts hedge=654321:future
 ```
 
-更多说明见 [QMT server](qmt-server.md)。
+更多 MiniQMT server 说明见 [QMT server](qmt-server.md)。大 QMT 后端见 [大 QMT 服务向导](big-qmt-server.md)。

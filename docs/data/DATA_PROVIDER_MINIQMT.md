@@ -2,6 +2,8 @@
 
 `MiniQMTProvider` 位于 `bullet_trade/data/providers/miniqmt.py`，用于在本地安装了 mini QMT/xtquant 环境的场景下直接复用行情数据。
 
+本页只说明 MiniQMT/xtquant 直连模式。大 QMT 不是这个 provider 的替代配置，不能只通过 `QMT_DATA_PATH` 接入；大 QMT 需要在大 QMT 策略里运行 helper，再由 `bullet-trade server --server-type big_qmt` 对外提供 `qmt-remote`。完整步骤见 [大 QMT 服务向导](../big-qmt-server.md)。
+
 ## 依赖与配置
 - 依赖官方 `xtquant` 包（通常随 miniQMT 安装提供），未安装时会抛出明确的 ImportError。  
 - 支持的配置/环境变量：

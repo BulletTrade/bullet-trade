@@ -30,6 +30,8 @@
 
 - **QMT / MiniQMT 和 BulletTrade 应该放在同一台 Windows 机器上**
 
+本页默认讲 MiniQMT/xtquant 直连模式，也就是 `.env` 里配置 `DEFAULT_DATA_PROVIDER=qmt`、`DEFAULT_BROKER=qmt` 和 `QMT_DATA_PATH`。如果券商不再提供 MiniQMT，需要使用大 QMT 承接网关能力，不要套用本页的 `QMT_DATA_PATH` 配置，请改看 [大 QMT 服务向导](big-qmt-server.md)。大 QMT 启动后，上层策略仍可按方案 A 用 `qmt-remote` 运行。
+
 ### 2. 建议的基础准备
 
 - 已按 [环境准备：先安装 Python，再创建虚拟环境](python-setup.md) 完成 Python 安装
@@ -46,6 +48,8 @@
 ![登录时选择独立交易](assets/miniqmt_login.png)
 
 ![MiniQMT 启动入口](assets/mini_qmt.png)
+
+大 QMT 的登录和 helper 启动流程不同，见 [大 QMT 服务向导](big-qmt-server.md)。
 
 ### 3. 先完成共享环境准备文档
 
@@ -188,4 +192,3 @@ QMT 数据目录要写到 `.env` 的 `QMT_DATA_PATH`。
 - 你已经确认 `QMT_DATA_PATH` 正确
 - 你已经先用最小资金或模拟环境验证
 - 你已经能在日志里区分“没有信号”和“有信号但下单失败”
-

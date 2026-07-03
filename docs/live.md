@@ -7,6 +7,8 @@
 
 ## 1. 本地 QMT 最小配置
 
+这是 MiniQMT/xtquant 直连模式，要求本机能访问 `userdata_mini`。大 QMT 不支持直接套用这组 `QMT_DATA_PATH` 配置；大 QMT 需要先启动 helper，再通过远程 `qmt-remote` 使用，见 [大 QMT 服务向导](big-qmt-server.md)。
+
 `.env` 最少只写这几个：
 
 ```env
@@ -49,6 +51,8 @@ bullet-trade live strategies/demo_strategy.py --broker qmt-remote
 
 ## 3. 远程 server 怎么启动
 
+下面是 MiniQMT 后端的 server 启动方式。大 QMT 后端请使用 [大 QMT 服务向导](big-qmt-server.md) 里的 `--server-type big_qmt` 和 `BIG_QMT_GATEWAY_*` 配置。
+
 Windows 服务端 `.env`：
 
 ```env
@@ -63,7 +67,7 @@ QMT_SERVER_TOKEN=secret
 bullet-trade --env-file .env server --listen 0.0.0.0 --port 58620 --enable-data --enable-broker
 ```
 
-更完整的说明看 [QMT server](qmt-server.md)。
+更完整的 MiniQMT server 说明看 [QMT server](qmt-server.md)。大 QMT 后端看 [大 QMT 服务向导](big-qmt-server.md)。
 
 ## 4. 多账户时再看这两个参数
 
@@ -174,7 +178,7 @@ bt.configure(
 ### `--data-path` 为什么不能写
 
 因为当前版本没有这个 CLI 参数。  
-数据目录要写在 `.env` 的 `QMT_DATA_PATH`。
+MiniQMT 数据目录要写在 `.env` 的 `QMT_DATA_PATH`。大 QMT 不使用这个配置入口，见 [大 QMT 服务向导](big-qmt-server.md)。
 
 ### 运行态目录和日志目录要不要先配
 

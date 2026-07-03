@@ -8,6 +8,7 @@ from bullet_trade.core.globals import log
 from bullet_trade.utils.env_loader import load_env
 
 from .adapters import get_adapter  # type: ignore
+from .adapters import big_qmt  # noqa: F401
 from .adapters import qmt  # noqa: F401
 from .adapters.base import AccountRouter
 from .app import ServerApplication

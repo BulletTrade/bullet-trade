@@ -8,6 +8,8 @@
 - 聚宽负责选股、择时和生成买卖动作
 - BulletTrade 负责把这些动作转发到本地或云端 Windows QMT / MiniQMT 机器执行
 
+本页默认用 MiniQMT/xtquant 启动远程 `bullet-trade server`。如果券商不再提供 MiniQMT，也可以先按 [大 QMT 服务向导](big-qmt-server.md) 在大 QMT 里启动 helper，再启动 `bullet-trade server --server-type big_qmt`；聚宽侧 helper 仍然连接同一个 `58620` qmt server。
+
 这条路线适合：
 
 - 复杂策略现在就在聚宽侧跑
@@ -54,6 +56,8 @@ flowchart TD
 2. 启动支持 MiniQMT 的 QMT 环境
 3. 登录 QMT 账号
 
+如果使用大 QMT，不需要 `userdata_mini` 和 xtquant 本地数据目录这条配置链路；需要在大 QMT 里新建并运行 helper 策略，具体见 [大 QMT 服务向导](big-qmt-server.md)。
+
 ### 建议的基础准备
 
 - 已按 [环境准备：先安装 Python，再创建虚拟环境](python-setup.md) 完成 Python 安装
@@ -92,6 +96,8 @@ pip install "bullet-trade[qmt]"
 - [什么是 `.env` 文件，怎么创建](python-setup.md#env-file)
 
 ## 第三章：配置并启动远程 `bullet-trade server`
+
+下面是 MiniQMT/xtquant 后端的配置。大 QMT 后端不要写 `QMT_DATA_PATH`，请按 [大 QMT 服务向导](big-qmt-server.md) 使用 `BIG_QMT_GATEWAY_URL` 和 `--server-type big_qmt`。
 
 先准备 `.env` 文件。  
 下面这个代码块不是命令，而是要写进 `.env` 文件里的内容：

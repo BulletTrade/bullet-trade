@@ -5,6 +5,12 @@
 
 ## 🆚 数据提供者对比
 
+先区分几个名字：
+
+- `qmt` / MiniQMT Provider：本地 `xtquant` / `userdata_mini` 直连数据源。
+- 大 QMT：另一种 QMT 数据和交易后端，通过大 QMT 策略 helper 提供能力，不直接写成 `DEFAULT_DATA_PROVIDER=big_qmt`。
+- `qmt-remote` / RemoteQMT：远程客户端数据源。它是一层协议包装，底层 server 可以接 MiniQMT，也可以接大 QMT。
+
 ### JQData Provider 
 
 **优点：**
@@ -41,6 +47,8 @@
 - ⚡ 需要极速数据访问
 - 🔒 对数据安全有要求
 - 💻 已有 QMT 环境
+
+说明：MiniQMT Provider 是本地 `xtquant` / `userdata_mini` 直连模式。大 QMT 不使用这个 provider 直接配置；大 QMT 应先启动 helper 和 `bullet-trade server --server-type big_qmt`，再由策略使用 `qmt-remote` 访问。详见 [大 QMT 服务向导](../big-qmt-server.md)。
 
 ### RQData Provider Beta
 
@@ -132,6 +140,8 @@ JQDATA_PASSWORD=your_password
 ```
 
 ### 2. MiniQMT 配置（.env 示例）
+
+这组配置只适用于 MiniQMT/xtquant。大 QMT 不需要 `QMT_DATA_PATH`，也不能只靠设置 `DEFAULT_DATA_PROVIDER=qmt` 启动；大 QMT 配置见 [大 QMT 服务向导](../big-qmt-server.md)。
 
 ```env
 # 默认数据源设置为 qmt
@@ -247,7 +257,7 @@ set_data_provider('easy_tdx')
 执行前确保：
 - `JQDATA_USERNAME/JQDATA_PASSWORD` 已配置
 - `TUSHARE_TOKEN` 已配置（如使用 Tushare）
-- `QMT_DATA_PATH` 已配置（如使用 QMT）
+- `QMT_DATA_PATH` 已配置（如使用 MiniQMT/xtquant）
 
 ## 🎯 代码格式对照表
 
@@ -302,6 +312,7 @@ QMT_DATA_PATH=C:\国金QMT交易端模拟\userdata_mini
 - 路径是否存在
 - 路径是否正确（根据实际安装目录调整）
 - QMT 是否已经下载了相应的数据
+- 如果你使用的是大 QMT，不走这个数据目录配置，请看 [大 QMT 服务向导](../big-qmt-server.md)。
 
 ### Q4: 数据格式不一致怎么办？
 
@@ -313,6 +324,7 @@ QMT_DATA_PATH=C:\国金QMT交易端模拟\userdata_mini
 
 - [聚宽数据](DATA_PROVIDER_JQDATA.md)
 - [MiniQMT 数据](DATA_PROVIDER_MINIQMT.md)
+- [大 QMT 服务向导](../big-qmt-server.md)
 - [Tushare 数据](DATA_PROVIDER_TUSHARE.md)
 - [RQData 数据 Beta](DATA_PROVIDER_RQDATA.md)
 - [easy_tdx 通达信数据 Beta](DATA_PROVIDER_EASY_TDX.md)

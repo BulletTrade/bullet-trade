@@ -2,9 +2,19 @@
 
 这页只讲一件事：在 Windows 上把 `bullet-trade server` 启起来，给远程策略提供行情和下单。
 
+本页默认讲 MiniQMT/xtquant 后端，也就是通过 `QMT_DATA_PATH` 访问 `userdata_mini`。这套配置不能直接套到大 QMT。
+
+如果券商不再提供 MiniQMT，需要用大 QMT 策略环境提供数据和交易网关，请先看 [大 QMT 服务向导](big-qmt-server.md)。那种模式下，大 QMT helper 监听 `127.0.0.1:9000`，`bullet-trade server --server-type big_qmt` 再对外提供 `qmt-remote` 服务。
+
+概念上要分清三层：
+
+- `qmt`：MiniQMT/xtquant 本地直连数据源和交易通道。
+- `big_qmt`：大 QMT helper server 后端，不是本地直连 provider。
+- `qmt-remote`：客户端远程协议，底层可以接 MiniQMT server，也可以接大 QMT server。
+
 ## 先记住两点
 
-- `bullet-trade server` **不支持** `--data-path`，QMT 数据目录要写到 `.env` 的 `QMT_DATA_PATH`。
+- `bullet-trade server` **不支持** `--data-path`，MiniQMT 数据目录要写到 `.env` 的 `QMT_DATA_PATH`。
 - 单账户时，`--accounts` 不是必填；如果已经在 `.env` 里写了 `QMT_ACCOUNT_ID`，可以直接启动。
 
 ## 最小 `.env`
@@ -19,7 +29,7 @@ QMT_SERVER_TOKEN=secret
 
 说明：
 
-- `QMT_DATA_PATH`：QMT 的 `userdata_mini` 目录
+- `QMT_DATA_PATH`：MiniQMT 的 `userdata_mini` 目录
 - `QMT_ACCOUNT_ID`：QMT 账号
 - `QMT_SERVER_TOKEN`：远程访问 token
 
@@ -114,6 +124,6 @@ QMT_SERVER_ACCOUNT_KEY=main
 先检查这几项：
 
 - QMT 客户端是否已登录
-- `QMT_DATA_PATH` 是否指向正确的 `userdata_mini`
+- `QMT_DATA_PATH` 是否指向正确的 MiniQMT `userdata_mini`
 - Windows 防火墙是否放行了监听端口
 - `QMT_SERVER_TOKEN` 是否和客户端一致

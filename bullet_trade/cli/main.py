@@ -238,7 +238,7 @@ def create_parser():
     # server 命令
     server_parser = subparsers.add_parser("server", help="启动远程数据/券商服务")
     server_parser.add_argument(
-        "--server-type", dest="server_type", default="qmt", help="服务类型（默认 qmt，可扩展）"
+        "--server-type", dest="server_type", default="qmt", help="服务类型（默认 qmt；大 QMT 用 big_qmt 或 big-qmt）"
     )
     server_parser.add_argument(
         "--listen", dest="listen", default=None, help="监听地址（覆盖 QMT_SERVER_LISTEN）"

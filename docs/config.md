@@ -11,6 +11,16 @@
 
 适用场景：策略和 QMT 在同一台 Windows 机器上运行。
 
+这是 MiniQMT/xtquant 直连模式，依赖 `QMT_DATA_PATH` 指向 `userdata_mini`。大 QMT 不能直接使用这组配置；大 QMT 先按 [大 QMT 服务向导](big-qmt-server.md) 启动 helper 和 `--server-type big_qmt`，策略侧再使用第 3 节的 `qmt-remote`。
+
+命名关系：
+
+| 名称 | 含义 |
+|------|------|
+| `qmt` | MiniQMT/xtquant 本地直连 provider/broker |
+| `big_qmt` | 大 QMT server 后端 |
+| `qmt-remote` | 客户端远程 provider/broker，实际后端可能是 MiniQMT 或大 QMT |
+
 ```env
 DEFAULT_DATA_PROVIDER=qmt
 DEFAULT_BROKER=qmt
@@ -32,6 +42,8 @@ bullet-trade live strategies/demo_strategy.py --broker qmt
 ## 2. 远程 server 最小配置
 
 适用场景：Windows 机器只负责连 QMT，对外提供远程行情和交易服务。
+
+下面是 MiniQMT 后端的远程 server 配置。大 QMT 后端使用 `BIG_QMT_GATEWAY_URL`、`BIG_QMT_GATEWAY_PASSWORD` 和 `--server-type big_qmt`，见 [大 QMT 服务向导](big-qmt-server.md)。
 
 ```env
 QMT_DATA_PATH=C:\国金QMT交易端\userdata_mini
@@ -224,6 +236,8 @@ QMT_SERVER_SUB_ACCOUNT=demo@main
 
 这些配置作用在 `bullet-trade server` 进程。
 
+`QMT_SERVER_TYPE=qmt` 是 MiniQMT/xtquant 后端；`QMT_SERVER_TYPE=big_qmt` 或 CLI `--server-type big_qmt` 是大 QMT helper 后端。大 QMT 还需要配置 `BIG_QMT_GATEWAY_*`，完整步骤见 [大 QMT 服务向导](big-qmt-server.md)。
+
 | 变量 | 默认 | 作用 |
 | --- | --- | --- |
 | `QMT_SERVER_TYPE` | `qmt` | server adapter 类型。 |
@@ -277,8 +291,9 @@ bullet_trade/config/security_overrides.json
 
 如果只是先跑通：
 
-- 本地 QMT：只配 `DEFAULT_DATA_PROVIDER`、`DEFAULT_BROKER`、`QMT_DATA_PATH`、`QMT_ACCOUNT_ID`。
-- 远程 server：只配 `QMT_DATA_PATH`、`QMT_ACCOUNT_ID`、`QMT_SERVER_TOKEN`。
+- 本地 MiniQMT：只配 `DEFAULT_DATA_PROVIDER`、`DEFAULT_BROKER`、`QMT_DATA_PATH`、`QMT_ACCOUNT_ID`。
+- MiniQMT 远程 server：只配 `QMT_DATA_PATH`、`QMT_ACCOUNT_ID`、`QMT_SERVER_TOKEN`。
+- 大 QMT 远程 server：先按 [大 QMT 服务向导](big-qmt-server.md) 配 helper，再配 `BIG_QMT_GATEWAY_URL`、`BIG_QMT_GATEWAY_PASSWORD`、`QMT_SERVER_TOKEN`。
 - 远程客户端：只配 `DEFAULT_DATA_PROVIDER`、`DEFAULT_BROKER`、`QMT_SERVER_HOST`、`QMT_SERVER_PORT`、`QMT_SERVER_TOKEN`。
 
 其他配置先不写进 `.env` 也可以，但需要查的时候，上面的索引应该都能找到。

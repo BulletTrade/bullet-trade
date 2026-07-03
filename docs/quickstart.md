@@ -47,6 +47,8 @@ bullet-trade backtest strategies/demo_strategy.py --start 2024-01-01 --end 2024-
 
 ## 3. 本地 QMT
 
+本节是 MiniQMT/xtquant 直连配置。它要求本机有 `userdata_mini` 数据目录，并且能加载 MiniQMT/xtquant。大 QMT 不使用 `QMT_DATA_PATH` 直连；如果要用大 QMT，请看 [大 QMT 服务向导](big-qmt-server.md)，启动后客户端仍走第 5 节的 `qmt-remote`。
+
 如果你还不知道 `.env` 是什么，先看：
 
 - [什么是 `.env` 文件，怎么创建](python-setup.md#env-file)
@@ -69,6 +71,8 @@ bullet-trade live strategies/demo_strategy.py --broker qmt
 ```
 
 ## 4. 远程 server
+
+下面是 MiniQMT 后端的远程 server 配置。如果 Windows 侧使用大 QMT，请改用 [大 QMT 服务向导](big-qmt-server.md) 里的 `bullet-trade server --server-type big_qmt`。
 
 Windows 上的 `.env` 最少：
 
@@ -123,11 +127,13 @@ bullet-trade live strategies/demo_strategy.py --broker qmt-remote
 ### `--data-path` 为什么报错
 
 因为当前版本没有这个参数。  
-请把数据目录写到 `.env`：
+MiniQMT 后端请把数据目录写到 `.env`：
 
 ```env
 QMT_DATA_PATH=C:\国金QMT交易端\userdata_mini
 ```
+
+大 QMT 后端不使用 `QMT_DATA_PATH`，见 [大 QMT 服务向导](big-qmt-server.md)。
 
 更多说明：
 
@@ -135,6 +141,7 @@ QMT_DATA_PATH=C:\国金QMT交易端\userdata_mini
 - [新手入门总览：先选方案，再看对应文档](beginner-guide.md)
 - [方案 A：策略在 BulletTrade 本地直接运行](beginner-route-a.md)
 - [方案 B：策略继续在聚宽侧运行，BulletTrade 负责接收信号并在本地 QMT 执行](beginner-route-b.md)
+- [大 QMT 服务向导](big-qmt-server.md)
 - [配置总览](config.md)
 - [实盘引擎](live.md)
 - [QMT server](qmt-server.md)

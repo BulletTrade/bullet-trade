@@ -283,6 +283,22 @@ def test_remote_qmt_broker_rejects_submit_unknown_response(monkeypatch):
         raise AssertionError("submit_unknown response should raise")
 
 
+def test_remote_qmt_broker_rejects_submit_unknown_without_order_id(monkeypatch):
+    """服务端返回 submit_unknown 时即使没有订单号也要按提交未知处理。"""
+
+    monkeypatch.setenv("QMT_SERVER_TOKEN", "dummy-token")
+    broker = RemoteQmtBroker(account_id="acc")
+    broker._connection = _FakeConn(response={"order_id": "", "status": "submit_unknown"})  # type: ignore
+    broker.connect()
+
+    try:
+        broker._place_order_sync("BUY", "000001.XSHE", 100, 10.5, 16)
+    except RuntimeError as exc:
+        assert "submit_unknown" in str(exc)
+    else:
+        raise AssertionError("submit_unknown response should raise")
+
+
 @pytest.mark.parametrize("status", ["rejected", "canceled", "cancelled", "failed", "error"])
 def test_remote_qmt_broker_rejects_terminal_failure_status(monkeypatch, status):
     """服务端明确返回终态失败时客户端不应当成成功订单。"""

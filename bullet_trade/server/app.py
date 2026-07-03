@@ -226,6 +226,12 @@ class ServerApplication:
         account_key = payload.get("account_key") or session.account_key
         sub_account_id = payload.get("sub_account_id") or session.sub_account_id
         resolved_key, sub_cfg = self.virtual_accounts.resolve(account_key, sub_account_id)
+        if sub_account_id and "sub_account_id" not in payload:
+            payload["sub_account_id"] = (
+                sub_cfg.sub_account_id
+                if sub_cfg
+                else str(sub_account_id).split("@", 1)[0]
+            )
         ctx = self.router.get(resolved_key)
         if method == "place_order":
             cached_result = await self._lookup_idempotent_place_result(resolved_key, sub_cfg, payload)
@@ -564,6 +570,12 @@ class ServerApplication:
         qmt_status = self._qmt_status_snapshot()
         if qmt_status is not None:
             value["qmt"] = qmt_status
+            backend_type = qmt_status.get("backend_type") if isinstance(qmt_status, dict) else None
+            if backend_type:
+                value["backend_type"] = backend_type
+            big_qmt_gateway = qmt_status.get("big_qmt_gateway") if isinstance(qmt_status, dict) else None
+            if big_qmt_gateway is not None:
+                value["big_qmt_gateway"] = big_qmt_gateway
         return {
             "dtype": "dict",
             "value": value,
