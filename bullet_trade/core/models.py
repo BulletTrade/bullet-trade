@@ -6,7 +6,7 @@
 
 from enum import Enum
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Any
+from typing import Dict, Optional, Any, List
 from datetime import datetime, date
 import pandas as pd
 
@@ -40,6 +40,137 @@ class OrderStyle(Enum):
     """下单方式枚举"""
     market = 'market'  # 市价单
     limit = 'limit'  # 限价单
+
+
+def security_code_aliases(security: Optional[str]) -> List[str]:
+    """
+    Return compatible security-code aliases for position lookups.
+
+    BulletTrade strategy code commonly uses JoinQuant suffixes (XSHG/XSHE),
+    while broker/V2/QMT snapshots may use exchange suffixes (SH/SZ). Position
+    containers must allow either spelling to find the same position without
+    storing duplicate rows.
+    """
+
+    if security is None:
+        return []
+    text = str(security).strip()
+    if not text:
+        return []
+    if "." not in text:
+        return [text]
+
+    code, suffix = text.rsplit(".", 1)
+    suffix_upper = suffix.upper()
+    candidates = [text, f"{code}.{suffix_upper}"]
+    if suffix_upper == "SH":
+        candidates.append(f"{code}.XSHG")
+    elif suffix_upper == "XSHG":
+        candidates.append(f"{code}.SH")
+    elif suffix_upper == "SZ":
+        candidates.append(f"{code}.XSHE")
+    elif suffix_upper == "XSHE":
+        candidates.append(f"{code}.SZ")
+
+    result: List[str] = []
+    seen = set()
+    for item in candidates:
+        if item and item not in seen:
+            result.append(item)
+            seen.add(item)
+    return result
+
+
+_MISSING = object()
+
+
+class SecurityPositionMap(dict):
+    """
+    Dict-like position map with SH/SZ and XSHG/XSHE alias lookup.
+
+    The map stores only one key per actual position. Alias support applies to
+    lookup, membership, deletion, pop and setdefault, so backtest and live code
+    can safely use either QMT-style or JoinQuant-style suffixes.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__()
+        if args or kwargs:
+            self.update(*args, **kwargs)
+
+    def _resolve_existing_key(self, key: Any) -> Any:
+        if dict.__contains__(self, key):
+            return key
+        if isinstance(key, str):
+            for alias in security_code_aliases(key):
+                if dict.__contains__(self, alias):
+                    return alias
+        return key
+
+    def __contains__(self, key: object) -> bool:
+        if dict.__contains__(self, key):
+            return True
+        if isinstance(key, str):
+            return any(dict.__contains__(self, alias) for alias in security_code_aliases(key))
+        return False
+
+    def __getitem__(self, key: Any) -> Any:
+        resolved = self._resolve_existing_key(key)
+        if not dict.__contains__(self, resolved):
+            raise KeyError(key)
+        return dict.__getitem__(self, resolved)
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        resolved = self._resolve_existing_key(key)
+        dict.__setitem__(self, resolved, value)
+
+    def __delitem__(self, key: Any) -> None:
+        resolved = self._resolve_existing_key(key)
+        if not dict.__contains__(self, resolved):
+            raise KeyError(key)
+        dict.__delitem__(self, resolved)
+
+    def get(self, key: Any, default: Any = None) -> Any:
+        resolved = self._resolve_existing_key(key)
+        if dict.__contains__(self, resolved):
+            return dict.__getitem__(self, resolved)
+        return default
+
+    def pop(self, key: Any, default: Any = _MISSING) -> Any:
+        resolved = self._resolve_existing_key(key)
+        if dict.__contains__(self, resolved):
+            return dict.pop(self, resolved)
+        if default is _MISSING:
+            raise KeyError(key)
+        return default
+
+    def setdefault(self, key: Any, default: Any = None) -> Any:
+        resolved = self._resolve_existing_key(key)
+        if dict.__contains__(self, resolved):
+            return dict.__getitem__(self, resolved)
+        dict.__setitem__(self, key, default)
+        return default
+
+    def update(self, *args: Any, **kwargs: Any) -> None:
+        items: Dict[Any, Any] = {}
+        if args:
+            if len(args) > 1:
+                raise TypeError("update expected at most 1 positional argument")
+            other = args[0]
+            if hasattr(other, "keys"):
+                items.update({key: other[key] for key in other.keys()})
+            else:
+                for key, value in other:
+                    items[key] = value
+        items.update(kwargs)
+        for key, value in items.items():
+            self[key] = value
+
+
+def ensure_security_position_map(value: Any) -> SecurityPositionMap:
+    if isinstance(value, SecurityPositionMap):
+        return value
+    return SecurityPositionMap(value or {})
 
 
 @dataclass
@@ -121,8 +252,11 @@ class SubPortfolio:
     available_cash: float = 0.0
     transferable_cash: float = 0.0
     total_value: float = 0.0
-    positions: Dict[str, Position] = field(default_factory=dict)
+    positions: Dict[str, Position] = field(default_factory=SecurityPositionMap)
     positions_value: float = 0.0
+
+    def __post_init__(self):
+        self.positions = ensure_security_position_map(self.positions)
     
     def update_value(self):
         """更新账户总价值"""
@@ -150,7 +284,7 @@ class Portfolio:
     transferable_cash: float = 100000.0
     locked_cash: float = 0.0
     starting_cash: float = 100000.0
-    positions: Dict[str, Position] = field(default_factory=dict)
+    positions: Dict[str, Position] = field(default_factory=SecurityPositionMap)
     positions_value: float = 0.0
     subportfolios: Dict[str, SubPortfolio] = field(default_factory=dict)
     
@@ -160,6 +294,7 @@ class Portfolio:
     
     def __post_init__(self):
         """初始化子账户"""
+        self.positions = ensure_security_position_map(self.positions)
         if not self.subportfolios:
             self.subportfolios['stock'] = SubPortfolio(
                 type='stock',
@@ -167,6 +302,12 @@ class Portfolio:
                 transferable_cash=self.transferable_cash,
                 total_value=self.total_value
             )
+        else:
+            for subportfolio in self.subportfolios.values():
+                try:
+                    subportfolio.positions = ensure_security_position_map(subportfolio.positions)
+                except Exception:
+                    pass
     
     def update_value(self):
         """更新账户总价值"""

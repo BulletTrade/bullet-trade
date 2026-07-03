@@ -967,6 +967,78 @@ async def test_tick_subscription_and_account_sync(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_live_account_sync_positions_support_broker_suffix_aliases(tmp_path):
+    class BrokerSuffixDummy(DummyBroker):
+        def sync_account(self):
+            self.account_sync_calls += 1
+            return {
+                "available_cash": 350608.27,
+                "total_value": 499979.27,
+                "positions": [
+                    {
+                        "security": "511880.SH",
+                        "amount": 500,
+                        "closeable_amount": 500,
+                        "avg_cost": 100.601,
+                        "current_price": 100.598,
+                        "market_value": 50299.0,
+                    },
+                    {
+                        "security": "000001.SZ",
+                        "amount": 9600,
+                        "closeable_amount": 0,
+                        "avg_cost": 10.32,
+                        "current_price": 10.32,
+                        "market_value": 99072.0,
+                    },
+                ],
+            }
+
+    strategy = _write_strategy(tmp_path)
+    cfg = {
+        "runtime_dir": str(tmp_path / "runtime"),
+        "g_autosave_enabled": False,
+        "account_sync_interval": 1,
+        "account_sync_enabled": True,
+        "order_sync_enabled": False,
+        "tick_subscription_limit": 2,
+        "tick_sync_enabled": False,
+        "risk_check_enabled": False,
+        "broker_heartbeat_interval": 0,
+        "scheduler_market_periods": "09:30-11:30,13:00-15:00",
+    }
+    broker = BrokerSuffixDummy()
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=lambda: broker,
+        live_config=cfg,
+        now_provider=lambda: datetime(2025, 1, 1, 9, 0, 0),
+    )
+    loop = asyncio.get_running_loop()
+    engine._loop = loop
+    engine._stop_event = asyncio.Event()
+    engine.event_bus = EventBus(loop)
+    engine.async_scheduler = AsyncScheduler()
+
+    await engine._bootstrap()
+    await engine._account_sync_step()
+
+    positions = engine.context.portfolio.positions
+    assert positions["511880.XSHG"].total_amount == 500
+    assert positions.get("511880.XSHG").closeable_amount == 500
+    assert positions["000001.XSHE"].total_amount == 9600
+    assert list(positions.keys()) == ["511880.SH", "000001.SZ"]
+    assert len(list(positions.values())) == 2
+    assert engine.context.portfolio.positions_value == pytest.approx(149371.0)
+
+    stock_sub = engine.context.portfolio.subportfolios["stock"]
+    assert stock_sub.positions["511880.XSHG"].total_amount == 500
+    assert stock_sub.positions["000001.XSHE"].closeable_amount == 0
+
+    await engine._shutdown()
+
+
+@pytest.mark.asyncio
 async def test_scheduler_resets_future_cursor(tmp_path):
     strategy = _write_strategy(tmp_path)
     cfg = {
