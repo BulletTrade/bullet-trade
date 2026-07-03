@@ -5,6 +5,28 @@
 
 ## [未发布]
 
+## [0.9.0] - 2026-07-03
+
+### 新增
+- **大 QMT 网关后端 Beta**：新增 `big_qmt` / `big-qmt` server adapter，通过大 QMT 策略 helper 承接行情、账户、持仓、委托、成交、下单和撤单能力，并继续向上层暴露兼容 `qmt-remote` 的协议。
+- **大 QMT helper 策略**：新增 `helpers/big_qmt_gateway_strategy_sample.py`，可复制到大 QMT Python 策略中运行，提供本机 HTTP/JSON gateway、启动日志、健康检查、交易开关、撤单开关和虚拟子账户订单备注映射。
+
+### 增强
+- **MiniQMT 缓存预下载接口**：补齐 MiniQMT provider 和 QMT server adapter 的 `ensure_cache` 能力，统一“先下载/确保缓存，再读取历史行情”的数据准备流程。
+- **远程 server 状态透出**：`admin.health` 会透出后端类型和大 QMT helper 健康状态，方便部署后确认当前服务实际连接的是 MiniQMT 还是大 QMT。
+
+### 兼容性
+- **持仓代码后缀别名**：实盘账户同步后的持仓支持 `.SH/.SZ` 与 `.XSHG/.XSHE` 互相命中，避免大 QMT 返回 QMT 后缀时策略按聚宽后缀读取不到持仓。
+- **远程下单未知状态处理**：`qmt-remote` 对 `submit_unknown` 响应优先按提交状态未知处理，即使远端尚未返回订单号，也不会误报成普通“未返回 order_id”。
+
+### 文档
+- **大 QMT 图文向导**：新增大 QMT 服务向导和 6 张操作截图，说明大 QMT helper 启动、`--server-type big_qmt`、`BIG_QMT_GATEWAY_*` 配置、方案 A/方案 B 兼容关系，以及 MiniQMT 与大 QMT 两种后端的边界。
+- **MiniQMT / 大 QMT 边界说明**：更新新手路线、配置总览、实盘、QMT server 和数据源文档，明确 `qmt` 是 MiniQMT/xtquant 本地直连，`big_qmt` 是大 QMT server 后端，`qmt-remote` 是上层远程协议。
+
+### 测试
+- **大 QMT 后端合同测试**：新增 Big QMT adapter 和 helper 单元测试，覆盖数据格式归一化、交易日日期兼容、账户/持仓/订单/成交结构、下单确认、submit_unknown、撤单开关、虚拟子账户备注过滤和 QMT userOrderId 兼容。
+- **MiniQMT 与持仓兼容回归**：新增 MiniQMT `ensure_cache`、QMT history adapter、持仓后缀别名和 live 账户同步回归测试。
+
 ## [0.8.2] - 2026-06-25
 
 ### 修复
