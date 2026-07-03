@@ -10,6 +10,17 @@
 
 本页默认用 MiniQMT/xtquant 启动远程 `bullet-trade server`。如果券商不再提供 MiniQMT，也可以先按 [大 QMT 服务向导](big-qmt-server.md) 在大 QMT 里启动 helper，再启动 `bullet-trade server --server-type big_qmt`；聚宽侧 helper 仍然连接同一个 `58620` qmt server。
 
+新手先按这条链路理解：
+
+```text
+聚宽模拟盘策略 -> bullet_trade_jq_remote_helper.py -> bullet-trade server -> QMT / MiniQMT / 大 QMT -> 券商
+```
+
+这里最容易弄错的是网络方向：  
+**不是 QMT 主动连聚宽，而是聚宽侧 helper 主动访问你的 `bullet-trade server`。**
+
+所以只要策略继续在聚宽侧运行，不管后面选择哪种策略修改方案，聚宽都必须能访问 `bullet-trade server` 的地址和端口。
+
 这条路线适合：
 
 - 复杂策略现在就在聚宽侧跑
@@ -30,7 +41,7 @@ flowchart TD
     G --> H["研究里上传 helper 和测试 notebook"]
     H --> I["在聚宽研究里做远程调试"]
     I --> J["修改聚宽模拟策略"]
-    J --> K["在策略里接入 bt.configure 和 bt.order 系列函数"]
+    J --> K["选择策略修改方案 1 或 2"]
     K --> L["在聚宽模拟环境运行策略"]
 ```
 
@@ -57,6 +68,15 @@ flowchart TD
 3. 登录 QMT 账号
 
 如果使用大 QMT，不需要 `userdata_mini` 和 xtquant 本地数据目录这条配置链路；需要在大 QMT 里新建并运行 helper 策略，具体见 [大 QMT 服务向导](big-qmt-server.md)。
+
+MiniQMT 和大 QMT 的 Windows 侧启动方式不同，但聚宽侧看到的入口应保持一致：
+
+| Windows 侧后端 | Windows 侧做什么 | 聚宽侧连接什么 |
+| --- | --- | --- |
+| MiniQMT / xtquant | 配 `QMT_DATA_PATH`，启动 `bullet-trade server` | `bullet-trade server` 的 `58620` |
+| 大 QMT helper | 先在大 QMT 里运行 helper，再启动 `bullet-trade server --server-type big_qmt` | 仍然是 `bullet-trade server` 的 `58620` |
+
+大 QMT helper 的内部端口，例如 `9000`，不要给聚宽直接连。
 
 ### 建议的基础准备
 
@@ -179,6 +199,9 @@ nc -vz your.server.ip 58620
 - `TcpTestSucceeded : True`
 - 或者 `succeeded`
 
+如果本机测试通、外网测试不通，优先看安全组、防火墙、端口映射。  
+如果外网端口通，但聚宽 helper 仍连不上，优先检查 `host`、`port`、`token` 是否和服务端一致。
+
 ## 第五章：把 helper 和测试 notebook 上传到聚宽研究根目录
 
 如果你前面是在 Windows 云服务器上启动了 QMT 和 `bullet-trade server`，到这里就先不要动云服务器那边了。  
@@ -266,26 +289,26 @@ print("持仓数量:", len(positions))
 
 ![聚宽研究 / Jupyter 中成功打印账户和持仓](assets/joinquant-jupyter-test.png)
 
-## 第七章：选择聚宽策略改法
+## 第七章：选择聚宽侧策略修改方案
 
-把聚宽策略接到 BulletTrade，有两种改法：
+把聚宽策略接到 BulletTrade，有两种策略修改方案。这里说的是“策略代码怎么改”，不是网络怎么接入；不管选哪种，聚宽侧都要能访问同一个 `bullet-trade server`。
 
-| 方案 | 文档 | 特点 |
+| 策略修改方案 | 文档 | 特点 |
 | --- | --- | --- |
-| 聚宽接入方案 A：显式调用 helper | [方案 A：显式调用 helper](joinquant-helper-explicit.md) | 下单处改成 `bt.order(...)`、`bt.order_target_value(...)`，行为清楚，改动较多 |
-| 聚宽接入方案 B：接管聚宽函数 | [方案 B：接管聚宽函数](joinquant-live-takeover-usage.md) | 在 `process_initialize` 安装兼容层，原策略的 `order(...)`、`context.portfolio` 尽量不改 |
+| 策略修改方案 1：显式调用 helper | [策略修改方案 1：显式调用 helper](joinquant-helper-explicit.md) | 下单处改成 `bt.order(...)`、`bt.order_target_value(...)`，行为清楚，改动较多 |
+| 策略修改方案 2：接管聚宽函数 | [策略修改方案 2：接管聚宽函数](joinquant-live-takeover-usage.md) | 在 `process_initialize` 安装兼容层，原策略的 `order(...)`、`context.portfolio` 尽量不改 |
 
 建议：
 
-- 第一次联调先用方案 A 在聚宽研究里查通账户和持仓。
-- 正式迁移存量聚宽模拟盘策略，优先看方案 B。
-- 如果策略只有一两个下单点，并且不依赖聚宽虚拟盘的现金和持仓判断，方案 A 也可以长期使用。
+- 第一次联调先用策略修改方案 1 在聚宽研究里查通账户和持仓。
+- 正式迁移存量聚宽模拟盘策略，优先看策略修改方案 2。
+- 如果策略只有一两个下单点，并且不依赖聚宽虚拟盘的现金和持仓判断，策略修改方案 1 也可以长期使用。
 
-更完整的优缺点对比见 [聚宽策略接入方案对比](joinquant-integration-options.md)。
+更完整的优缺点对比见 [聚宽策略修改方案对比](joinquant-integration-options.md)。
 
-下面保留的是方案 A 的手动替换说明；如果你采用方案 B，直接看 [方案 B：接管聚宽函数](joinquant-live-takeover-usage.md)。
+下面保留的是策略修改方案 1 的手动替换说明；如果你采用策略修改方案 2，直接看 [策略修改方案 2：接管聚宽函数](joinquant-live-takeover-usage.md)。
 
-### 方案 A：显式调用 helper 的改法
+### 策略修改方案 1：显式调用 helper 的改法
 
 很多用户卡在这里。  
 核心原则其实很简单：
@@ -445,6 +468,19 @@ def test_remote_trade(context):
 
 ![聚宽测试日志示意](assets/joinquant_test.png)
 
+## 最小验收标准
+
+建议按下面顺序验收，不要跳步：
+
+| 阶段 | 通过标准 |
+| --- | --- |
+| Windows/QMT | QMT 已登录，`bullet-trade server` 正在监听 `58620` |
+| 网络 | 聚宽研究环境能访问 server，服务端日志能看到请求 |
+| 认证 | token 正确，不返回鉴权错误 |
+| 账户 | `bt.get_account()` 能返回真实账户资金 |
+| 持仓 | `bt.get_positions()` 能返回真实持仓 |
+| 策略修改 | 已选择策略修改方案 1 或 2，并只改必要下单/账户入口 |
+| 测试单 | 小金额或仿真测试单能在 QMT 侧看到委托 |
 
 ## 常见报错与排查
 

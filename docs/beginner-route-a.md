@@ -8,6 +8,15 @@
 - BulletTrade 负责调度、取数、计算信号和下单
 - QMT / MiniQMT 与策略放在同一台 Windows 机器上运行
 
+新手先按这条最小链路理解：
+
+```text
+策略文件 -> bullet-trade live -> QMT / MiniQMT -> 券商
+```
+
+也就是说，你先不要同时引入太多组件。  
+先在一台 Windows 机器上把“最小策略能启动、能取数、能看到账户、能发测试单”跑通，再考虑远程、复杂策略或多账户。
+
 ## 适合谁
 
 优先考虑下面这些：
@@ -31,6 +40,13 @@
 - **QMT / MiniQMT 和 BulletTrade 应该放在同一台 Windows 机器上**
 
 本页默认讲 MiniQMT/xtquant 直连模式，也就是 `.env` 里配置 `DEFAULT_DATA_PROVIDER=qmt`、`DEFAULT_BROKER=qmt` 和 `QMT_DATA_PATH`。如果券商不再提供 MiniQMT，需要使用大 QMT 承接网关能力，不要套用本页的 `QMT_DATA_PATH` 配置，请改看 [大 QMT 服务向导](big-qmt-server.md)。大 QMT 启动后，上层策略仍可按方案 A 用 `qmt-remote` 运行。
+
+两种 QMT 后端不要混着配：
+
+| 后端 | 适合场景 | 关键配置 |
+| --- | --- | --- |
+| MiniQMT / xtquant 直连 | 券商仍提供 MiniQMT，能访问 `userdata_mini` | `DEFAULT_DATA_PROVIDER=qmt`、`DEFAULT_BROKER=qmt`、`QMT_DATA_PATH=...` |
+| 大 QMT helper + qmt-remote | 券商关闭 MiniQMT，只能用大 QMT 策略环境 | 先启动大 QMT helper，再让策略连接 `qmt-remote` |
 
 ### 2. 建议的基础准备
 
@@ -86,7 +102,7 @@ QMT_ACCOUNT_ID=123456
 再新建一个最简单的策略文件，例如 `my_first_strategy.py`：
 
 ```python
-from bullet_trade.core.api import *
+from jqdata import *
 
 
 def initialize(context):
@@ -148,6 +164,19 @@ bullet-trade live my_first_strategy.py --broker qmt
 下面这种日志，才说明本地直跑链路基本正常：
 
 ![本地实盘日志示意](assets/qmt-trade-live.png)
+
+## 最小验收标准
+
+在替换成正式策略前，建议至少满足这些条件：
+
+| 检查项 | 通过标准 |
+| --- | --- |
+| Python 环境 | `bullet-trade --version` 能正常输出 |
+| 数据路径 | `QMT_DATA_PATH` 指向正确的 `userdata_mini` |
+| 回测 | 最小策略能生成结果 |
+| live 启动 | 日志能看到策略启动和调度 |
+| 账户 | 能读取到账户资金和持仓 |
+| 下单 | 小金额或仿真测试单能在 QMT 侧看到委托结果 |
 
 ## 常见坑
 

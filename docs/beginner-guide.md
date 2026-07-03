@@ -25,6 +25,22 @@
 
 ## 我们现在支持两种方案
 
+先看一张总表：
+
+| 问题 | 方案 A：独立运行 | 方案 B：聚宽侧模拟盘运行 |
+| --- | --- | --- |
+| 策略在哪里跑 | 你的电脑或服务器上的 BulletTrade | 聚宽模拟盘 |
+| 谁负责算信号 | BulletTrade 本地策略 | 聚宽策略 |
+| 谁负责真实下单 | BulletTrade 连接 QMT | BulletTrade server 连接 QMT |
+| 适合的策略 | 量价、ETF 轮动、择时、普通调仓 | 财务、小市值、平台因子、复杂选股 |
+| 网络要求 | 本机直连 QMT 时不需要公网；远程 `qmt-remote` 才需要网络可达 | 聚宽必须能访问 `bullet-trade server` |
+| 策略改动 | 尽量迁移到 BulletTrade 本地运行 | 保留聚宽侧运行，只改下单/账户接入 |
+
+这里有两个概念不要混在一起：
+
+- **方案 A / 方案 B**：表示策略运行在哪里。
+- **策略修改方案 1 / 2**：只在方案 B 里使用，表示聚宽策略代码怎么改。
+
 ### 方案 A：独立运行
 
 适合：
@@ -78,7 +94,7 @@ flowchart TD
 
 方案 B 同样支持大 QMT。区别只在 Windows 侧的 server 后端：MiniQMT 用 `QMT_DATA_PATH`，大 QMT 用 [大 QMT 服务向导](big-qmt-server.md) 里的 helper 和 `--server-type big_qmt`；聚宽侧仍然连接同一个 `58620` qmt server。
 
-> 聚宽侧改策略有两种方式：显式调用 helper，或接管聚宽函数。先看 [聚宽策略接入方案对比](joinquant-integration-options.md)，再选择 [方案 A：显式调用 helper](joinquant-helper-explicit.md) 或 [方案 B：接管聚宽函数](joinquant-live-takeover-usage.md)。
+> 聚宽侧改策略有两种策略修改方案：显式调用 helper，或接管聚宽函数。先看 [聚宽策略修改方案对比](joinquant-integration-options.md)，再选择 [策略修改方案 1：显式调用 helper](joinquant-helper-explicit.md) 或 [策略修改方案 2：接管聚宽函数](joinquant-live-takeover-usage.md)。
 
 ## 怎么决策选哪种方案
 
@@ -105,7 +121,7 @@ flowchart TD
 这类代码通常可以先按“独立运行”思路理解：
 
 ```python
-from bullet_trade.core.api import *
+from jqdata import *
 
 
 def initialize(context):

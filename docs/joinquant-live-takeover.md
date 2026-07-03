@@ -1,6 +1,6 @@
 # 聚宽模拟盘完全接管设计说明
 
-> 用户接入流程见 [聚宽接入方案 B：接管聚宽函数](joinquant-live-takeover-usage.md)。当前文档用于说明兼容层实现边界、账户代理、下单映射和验收清单。
+> 用户接入流程见 [聚宽策略修改方案 2：接管聚宽函数](joinquant-live-takeover-usage.md)。当前文档用于说明兼容层实现边界、账户代理、下单映射和验收清单。
 
 ## 目标
 
@@ -390,10 +390,10 @@ def order_target_percent(security, percent):
 
 当前文档描述的是下一代推荐接入方式。
 
-两种用户接入方式都保留：
+两种聚宽侧策略修改方案都保留：
 
-- [方案 A：显式调用 helper](joinquant-helper-explicit.md)
-- [方案 B：接管聚宽函数](joinquant-live-takeover-usage.md)
+- [策略修改方案 1：显式调用 helper](joinquant-helper-explicit.md)
+- [策略修改方案 2：接管聚宽函数](joinquant-live-takeover-usage.md)
 
 现有显式 helper 方式仍可使用：
 

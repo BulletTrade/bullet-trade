@@ -11,6 +11,25 @@
 > 先记住一句话：  
 > **只有当 `python --version` 和 `pip --version` 都能正常输出时，才开始执行 `python -m venv .venv`。**
 
+## 做完这一页你应该得到什么
+
+做完后，你至少应该确认 4 件事：
+
+| 检查项 | 期望结果 |
+| --- | --- |
+| `python --version` | 能看到 Python 版本，例如 `Python 3.11.9` |
+| `pip --version` | 能看到 pip 版本，并且不报错 |
+| 虚拟环境 | 命令行前面出现 `(.venv)` |
+| `bullet-trade --version` | 能正常输出 BulletTrade 版本 |
+
+如果你现在只是想先知道完整顺序，可以先记住这条最短路线：
+
+```text
+安装 Python -> 验证 python/pip -> 创建 .venv -> 激活 .venv -> 安装 bullet-trade -> 验证 bullet-trade
+```
+
+本页后面会把每一步拆开讲。
+
 ## 1. 先确认你要在哪台机器上装 Python
 
 ### 方案 A
@@ -178,6 +197,15 @@ python -m pip install --upgrade pip
 
 然后按你的场景安装。
 
+### 先看你属于哪种安装
+
+| 场景 | 安装命令 |
+| --- | --- |
+| 只做回测、研究、普通客户端调用 | `pip install bullet-trade` |
+| 这台机器直接连接 QMT / MiniQMT | `pip install "bullet-trade[qmt]"` |
+| 这台机器要启动 `bullet-trade server` 并连接 QMT | `pip install "bullet-trade[qmt]"` |
+| 策略在聚宽侧跑，本机只是远程 server 客户端 | 通常不需要在聚宽侧安装包，只上传 helper 文件 |
+
 ### 情况 1：只是先做回测、JQData 联调，或者只是作为 `qmt-remote` 客户端
 
 这种情况先装基础版就够了：
@@ -295,3 +323,20 @@ copy env.example .env
 
 - 如果你要本地直跑策略，看 [方案 A：策略在 BulletTrade 本地直接运行](beginner-route-a.md)
 - 如果你要让策略继续在聚宽侧运行，看 [方案 B：策略继续在聚宽侧运行，BulletTrade 负责接收信号并在本地 QMT 执行](beginner-route-b.md)
+
+## 常见误区
+
+### 1. 在系统 Python 里直接装一堆依赖
+
+不建议新手这么做。  
+优先使用 `.venv`，这样后面升级、重装、排查依赖都简单。
+
+### 2. 以为 `.env` 是命令
+
+`.env` 是配置文件，不是命令。  
+文档里的 `QMT_ACCOUNT_ID=...`、`QMT_DATA_PATH=...` 这类内容要写进 `.env` 文件，不是直接粘到命令行执行。
+
+### 3. 聚宽侧也要 `pip install bullet-trade`
+
+方案 B 通常不需要在聚宽侧安装 BulletTrade 包。  
+聚宽侧主要上传 `bullet_trade_jq_remote_helper.py`，真正连接 QMT 的 `bullet-trade server` 运行在 Windows/QMT 那台机器上。

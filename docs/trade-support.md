@@ -2,12 +2,12 @@
 
 这页只保留最小流程：聚宽策略如何连到远程 `bullet-trade server` 做真实下单。
 
-聚宽侧改策略有两种方式：
+聚宽侧改策略有两种策略修改方案：
 
-- [聚宽接入方案 A：显式调用 helper](joinquant-helper-explicit.md)：下单处写 `bt.order(...)`、`bt.order_target_value(...)`。
-- [聚宽接入方案 B：接管聚宽函数](joinquant-live-takeover-usage.md)：在 `process_initialize` 安装兼容层，原来的 `order(...)`、`context.portfolio` 尽量不改。
+- [策略修改方案 1：显式调用 helper](joinquant-helper-explicit.md)：下单处写 `bt.order(...)`、`bt.order_target_value(...)`。
+- [策略修改方案 2：接管聚宽函数](joinquant-live-takeover-usage.md)：在 `process_initialize` 安装兼容层，原来的 `order(...)`、`context.portfolio` 尽量不改。
 
-两种方式的优缺点见 [聚宽策略接入方案对比](joinquant-integration-options.md)。
+两种方案的优缺点见 [聚宽策略修改方案对比](joinquant-integration-options.md)。
 
 ## 1. 先启动远程 server
 

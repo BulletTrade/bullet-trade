@@ -38,6 +38,10 @@
 - [新手入门总览](docs/beginner-guide.md)：先看 BulletTrade 目前支持的两种方案、结构图和选型方法，再进入对应文档。
 - [方案 A：独立运行](docs/beginner-route-a.md)：策略在 BulletTrade 独立运行，连接本地 QMT。
 - [方案 B：聚宽侧模拟盘运行](docs/beginner-route-b.md)：策略在聚宽侧模拟盘运行，BulletTrade 负责接收信号并在本地 QMT 执行。
+- 方案 B 子文档：
+  - [聚宽策略修改方案对比](docs/joinquant-integration-options.md)：比较显式调用 helper 和接管聚宽函数两种改法。
+  - [策略修改方案 1：显式调用 helper](docs/joinquant-helper-explicit.md)：下单处显式改成 `bt.order_target_value(...)` 等函数。
+  - [策略修改方案 2：接管聚宽函数](docs/joinquant-live-takeover-usage.md)：模拟盘接管账户状态和下单函数，尽量减少策略代码改动。
 - [快速上手](docs/quickstart.md)：三步跑通回测/实盘，聚宽策略无改直接复用。
 - [配置总览](docs/config.md)：回测/本地实盘/远程实盘/聚宽接入的环境变量一览。
 - [回测引擎](docs/backtest.md)：真实价格成交、分红送股处理、聚宽代码示例与 CLI 回测。

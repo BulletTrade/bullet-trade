@@ -1,8 +1,10 @@
-# 聚宽接入方案 A：显式调用 helper
+# 聚宽策略修改方案 1：显式调用 helper
 
 这份文档适合需要在聚宽策略或聚宽研究里直接调用 `bt.xxx` 的用户。
 
-方案 A 的核心是：聚宽继续运行策略，真实下单点显式改成 `bullet_trade_jq_remote_helper` 的函数。
+策略修改方案 1 的核心是：聚宽继续运行策略，真实下单点显式改成 `bullet_trade_jq_remote_helper` 的函数。
+
+这个方案只表示“怎么改策略代码”，不是单独的网络部署方案。只要策略运行在聚宽侧，聚宽都需要能访问 `bullet-trade server` 的入口地址和端口；如果 `bullet-trade server` 跑在 QMT 那台 Windows 机器上，通常需要公网 IP、域名、端口映射，或 FRP / VPN 等可达通道。
 
 ## 1. 上传 helper
 
@@ -66,7 +68,7 @@ def initialize(context):
 
 把聚宽原始下单函数显式改成 `bt.xxx`：
 
-| 原聚宽写法 | 方案 A 写法 |
+| 原聚宽写法 | 策略修改方案 1 写法 |
 | --- | --- |
 | `order(...)` | `bt.order(...)` |
 | `order_value(...)` | `bt.order_value(...)` |
@@ -113,7 +115,7 @@ context.portfolio.total_value
 context.portfolio.positions
 ```
 
-所以当策略依赖现金、持仓、市值比例来决定真实下单金额时，要么把这些判断也改成 `bt.get_account()` / `bt.get_positions()`，要么改用 [方案 B：接管聚宽函数](joinquant-live-takeover-usage.md)。
+所以当策略依赖现金、持仓、市值比例来决定真实下单金额时，要么把这些判断也改成 `bt.get_account()` / `bt.get_positions()`，要么改用 [策略修改方案 2：接管聚宽函数](joinquant-live-takeover-usage.md)。
 
 ## 6. 聚宽研究里测试连接
 
