@@ -3,7 +3,7 @@ import asyncio
 import pytest
 
 from bullet_trade.server.adapters import get_adapter
-from bullet_trade.server.adapters.base import AccountRouter
+from bullet_trade.server.adapters.base import AccountRouter, AdapterBundle
 from bullet_trade.server.adapters.big_qmt import (
     BigQmtBrokerAdapter,
     BigQmtDataAdapter,
@@ -79,6 +79,7 @@ def test_big_qmt_adapter_is_registered_and_health_reports_backend(monkeypatch):
     health = app._health_snapshot()["value"]
     assert health["backend_type"] == "big_qmt"
     assert health["qmt"]["actions"]["data.snapshot"]["status"] == "ready"
+    assert health["qmt"]["actions"]["data.current_tick"]["status"] == "ready"
     assert health["qmt"]["actions"]["data.subscribe"]["status"] == "degraded"
     assert health["qmt"]["actions"]["broker.place_order"]["status"] == "unavailable"
     assert health["qmt"]["actions"]["broker.cancel_order"]["status"] == "unavailable"
@@ -155,6 +156,24 @@ async def test_big_qmt_data_adapter_normalizes_gateway_payloads():
 
     events = await adapter.get_split_dividend({"security": "000001.XSHE"})
     assert events["events"] == [{"security": "000001.XSHE"}]
+
+
+@pytest.mark.asyncio
+async def test_server_dispatches_data_current_tick_with_payload():
+    client = _FakeGatewayClient(
+        {
+            "/data/snapshot": {"ticks": {"000001.XSHE": {"lastPrice": 12.3, "time": 1783043331000}}},
+        }
+    )
+    config = _server_config(enable_broker=False)
+    router = AccountRouter(config.accounts)
+    adapter = BigQmtDataAdapter(client)
+    app = ServerApplication(config, router, AdapterBundle(data_adapter=adapter, broker_adapter=None))
+
+    current_tick = await app._dispatch_data("current_tick", {"security": "000001.XSHE"})
+
+    assert current_tick == {"sid": "000001.XSHE", "last_price": 12.3, "dt": 1783043331000}
+    assert client.calls == [("POST", "/data/snapshot", {"security": "000001.XSHE"})]
 
 
 @pytest.mark.asyncio

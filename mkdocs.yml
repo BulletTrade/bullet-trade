@@ -26,6 +26,7 @@ nav:
   - 聚宽接入方案 B：接管聚宽函数: joinquant-live-takeover-usage.md
   - 聚宽模拟盘完全接管设计说明: joinquant-live-takeover.md
   - QMT 服务配置: qmt-server.md
+  - 大 QMT 服务向导: big-qmt-server.md
   - API 文档: api.md
   - 数据源:
       - 数据源指南: data/DATA_PROVIDER_GUIDE.md

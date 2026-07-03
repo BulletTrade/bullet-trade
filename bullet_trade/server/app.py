@@ -213,6 +213,18 @@ class ServerApplication:
     async def _dispatch_data(self, method: str, payload: Dict) -> Dict:
         if not self.adapters.data_adapter:
             raise RuntimeError("数据服务未启用")
+        if method == "current_tick":
+            fn = getattr(self.adapters.data_adapter, "current_tick", None)
+            if fn:
+                return await fn(payload)
+            snapshot_fn = getattr(self.adapters.data_adapter, "get_snapshot", None)
+            if snapshot_fn:
+                return await snapshot_fn(payload)
+            tick_fn = getattr(self.adapters.data_adapter, "get_current_tick", None)
+            if tick_fn:
+                security = payload.get("security") or payload.get("stock") or payload.get("stockcode")
+                return await tick_fn(security)
+            raise ValueError("数据接口 current_tick 未实现")
         fn = getattr(self.adapters.data_adapter, method, None)
         if fn is None:
             fn = getattr(self.adapters.data_adapter, f"get_{method}", None)

@@ -1,7 +1,7 @@
 #encoding:gbk
 # Author: BruceLee
 # Date: 2026-07-02
-# Version: 20260703_trade_days_date_digits
+# Version: 20260703_miniqmt_alignment
 # File: Big QMT embedded gateway strategy sample.
 # Description: Run inside a dedicated Big QMT strategy and expose a
 # BulletTrade-compatible local HTTP/JSON data and trading gateway.
@@ -41,7 +41,7 @@ LISTEN_PORT = 9000
 
 # Build marker shown in startup logs and /health. Update this when copying a new
 # helper build into QMT so tests can prove the running file version.
-GATEWAY_BUILD_ID = "20260703_trade_days_date_digits"
+GATEWAY_BUILD_ID = "20260703_miniqmt_alignment"
 
 # Shared password required by non-health HTTP APIs. Change this to a private
 # local value outside simulation; clients send it as X-BulletTrade-Password or
@@ -64,6 +64,20 @@ ACCOUNT_TYPE = "stock"
 # MiniQMT accepts symbol-less trade-day calls; Big QMT needs a concrete symbol,
 # so use a stable liquid A-share as the equivalent market calendar anchor.
 DEFAULT_TRADE_DAYS_SECURITY = "000001.SZ"
+
+# Match MiniQMT's safety default: history reads first request QMT to prepare
+# local cache, then read local bars. Callers may pass auto_download=false only
+# for explicit diagnostics.
+AUTO_ENSURE_HISTORY_CACHE = True
+
+# When automatic history cache preparation fails, return an error instead of
+# reading potentially stale or placeholder local data.
+HISTORY_FAIL_ON_ENSURE_CACHE_ERROR = True
+
+# Match MiniQMT's index constituent semantics: prefer index-weight APIs over
+# sector lists. Sector list is only a fallback when the broker build lacks the
+# index-weight functions.
+INDEX_WEIGHT_DOWNLOAD_BEFORE_READ = True
 
 # Allow /place_order to call QMT passorder. Set False for data-only or
 # read-only production verification.
@@ -362,6 +376,13 @@ def _to_bool(value: Any, default: bool) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in ("1", "true", "yes", "on")
     return bool(value)
+
+
+def _payload_bool(payload: Dict[str, Any], keys: List[str], default: bool) -> bool:
+    for key in keys:
+        if key in payload:
+            return _to_bool(payload.get(key), default)
+    return default
 
 
 def _security(code: Any, exchange: Any) -> str:
@@ -1288,6 +1309,50 @@ def _get_full_tick(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]
     return {"ticks": _normalize_tick_keys(ticks, context_info), "qmt_codes": qmt_codes, "source": source}
 
 
+def _call_download_history_data(qmt_security: str, period: str, start: Any, end: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+    downloader = _qmt_global("download_history_data")
+    incrementally = payload.get("incrementally")
+    start_text = str(start or "")
+    end_text = str(end or "")
+    if incrementally is None:
+        downloader(qmt_security, period, start_text, end_text)
+    else:
+        try:
+            downloader(qmt_security, period, start_text, end_text, incrementally=_to_bool(incrementally, True))
+        except TypeError:
+            downloader(qmt_security, period, start_text, end_text)
+    return {
+        "security": _from_qmt_security(qmt_security),
+        "qmt_security": qmt_security,
+        "period": period,
+        "start": start,
+        "end": end,
+        "requested": True,
+    }
+
+
+def _auto_ensure_history_cache(qmt_security: str, period: str, start: Any, end: Any, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    enabled = _payload_bool(
+        payload,
+        ["auto_download", "auto_ensure_cache", "ensure_cache"],
+        AUTO_ENSURE_HISTORY_CACHE,
+    )
+    if not enabled:
+        return None
+    started = time.time()
+    info = _call_download_history_data(qmt_security, period, start, end, payload)
+    _emit(
+        "info",
+        "history auto ensure_cache success security=%s period=%s start=%s end=%s cost_ms=%.1f",
+        qmt_security,
+        period,
+        str(start or ""),
+        str(end or ""),
+        (time.time() - started) * 1000.0,
+    )
+    return info
+
+
 def _query_history(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
     security = payload.get("security")
     securities = payload.get("securities") or payload.get("symbols")
@@ -1310,6 +1375,16 @@ def _query_history(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]
     try:
         if context_info is None:
             return _context_not_ready(payload)
+        try:
+            _auto_ensure_history_cache(qmt_security, period, start, end, payload)
+        except QmtApiUnavailable as exc:
+            LOGGER.exception("history auto ensure_cache unavailable: %s", exc)
+            if HISTORY_FAIL_ON_ENSURE_CACHE_ERROR:
+                return _error("QMT_API_NOT_READY", str(exc), payload.get("request_id"))
+        except Exception as exc:
+            LOGGER.exception("history auto ensure_cache failed: %s", exc)
+            if HISTORY_FAIL_ON_ENSURE_CACHE_ERROR:
+                return _error("ENSURE_CACHE_FAILED", str(exc), payload.get("request_id"))
         data = context_info.get_market_data_ex(
             fields,
             [qmt_security],
@@ -1377,6 +1452,94 @@ def _query_trade_days(context_info: Any, payload: Dict[str, Any]) -> Dict[str, A
         return _error("TRADE_DAYS_FAILED", str(exc), payload.get("request_id"))
 
 
+def _extract_instrument_type(raw_type: Any) -> Optional[str]:
+    if isinstance(raw_type, str):
+        cleaned = raw_type.strip().lower()
+        return cleaned or None
+    if isinstance(raw_type, dict):
+        for key, enabled in raw_type.items():
+            if enabled:
+                cleaned = str(key).strip().lower()
+                if cleaned:
+                    return cleaned
+        if len(raw_type) == 1:
+            key = next(iter(raw_type))
+            cleaned = str(key).strip().lower()
+            return cleaned or None
+    return None
+
+
+def _security_type_from_code(qmt_security: str) -> Optional[str]:
+    code = str(qmt_security or "").split(".", 1)[0]
+    suffix = str(qmt_security or "").rsplit(".", 1)[-1].upper() if "." in str(qmt_security or "") else ""
+    if code.startswith(("510", "511", "512", "513", "515", "516", "517", "518", "588", "159")):
+        return "etf"
+    if code.startswith("399") or (suffix == "SH" and code.startswith("000")):
+        return "index"
+    return None
+
+
+def _normalize_security_type(context_info: Any, qmt_security: str, info: Dict[str, Any]) -> str:
+    detectors = []
+    detector = getattr(context_info, "get_instrument_type", None)
+    if callable(detector):
+        detectors.append(detector)
+    global_detector = globals().get("get_instrument_type") or getattr(builtins, "get_instrument_type", None)
+    if callable(global_detector):
+        detectors.append(global_detector)
+    for detector in detectors:
+        try:
+            detected = _extract_instrument_type(detector(qmt_security))
+        except Exception:
+            detected = None
+        if detected:
+            return detected
+    coded = _security_type_from_code(qmt_security)
+    if coded:
+        return coded
+    for key in ("type", "ProductType", "InstrumentType", "SecurityType", "product_type"):
+        detected = _extract_instrument_type(info.get(key))
+        if detected:
+            if "etf" in detected:
+                return "etf"
+            if "fund" in detected or "\u57fa\u91d1" in detected:
+                return "fund"
+            if "index" in detected or "\u6307\u6570" in detected:
+                return "index"
+            return detected
+    return "stock"
+
+
+def _normalize_security_info_value(context_info: Any, security: Any, qmt_security: str, info: Any) -> Dict[str, Any]:
+    value = _basic_value(info)
+    if not isinstance(value, dict):
+        value = {}
+    result = dict(value)
+    jq_security = _from_qmt_security(security or qmt_security)
+    display_name = result.get("display_name") or result.get("InstrumentName") or jq_security
+    name = result.get("name") or result.get("InstrumentID") or jq_security.split(".", 1)[0]
+    start_date = result.get("start_date")
+    if start_date in (None, ""):
+        start_date = _security_date_value(result.get("OpenDate"))
+    end_date = result.get("end_date")
+    if end_date in (None, ""):
+        end_date = _security_date_value(result.get("ExpireDate"), expire=True)
+    if end_date in (None, ""):
+        end_date = "2200-01-01T00:00:00"
+    result["display_name"] = _basic_value(display_name)
+    result["name"] = _basic_value(name)
+    result["start_date"] = _basic_value(start_date)
+    result["end_date"] = _basic_value(end_date)
+    result["type"] = _normalize_security_type(context_info, qmt_security, result)
+    result.setdefault("subtype", None)
+    result.setdefault("parent", None)
+    result["code"] = jq_security
+    result["qmt_code"] = qmt_security
+    result["security"] = jq_security
+    result["qmt_security"] = qmt_security
+    return result
+
+
 def _query_security_info(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
     security = payload.get("security") or payload.get("stockcode")
     if not security:
@@ -1394,13 +1557,7 @@ def _query_security_info(context_info: Any, payload: Dict[str, Any]) -> Dict[str
             info = getter(qmt_security, True)
         except TypeError:
             info = getter(qmt_security)
-        value = _basic_value(info)
-        if isinstance(value, dict):
-            value.setdefault("security", _from_qmt_security(security))
-            value.setdefault("qmt_security", qmt_security)
-            value.setdefault("display_name", value.get("InstrumentName"))
-            value.setdefault("name", value.get("InstrumentName"))
-            value.setdefault("type", value.get("ProductType"))
+        value = _normalize_security_info_value(context_info, security, qmt_security, info)
         return _ok(value, payload.get("request_id"))
     except QmtApiUnavailable as exc:
         LOGGER.exception("get_instrument_detail unavailable: %s", exc)
@@ -1418,27 +1575,8 @@ def _ensure_cache(payload: Dict[str, Any]) -> Dict[str, Any]:
     period = _qmt_period(payload.get("frequency") or payload.get("period") or "1m")
     start = payload.get("start") or payload.get("start_date") or payload.get("start_time") or ""
     end = payload.get("end") or payload.get("end_date") or payload.get("end_time") or ""
-    incrementally = payload.get("incrementally")
     try:
-        downloader = _qmt_global("download_history_data")
-        if incrementally is None:
-            downloader(qmt_security, period, str(start), str(end))
-        else:
-            try:
-                downloader(qmt_security, period, str(start), str(end), incrementally=_to_bool(incrementally, True))
-            except TypeError:
-                downloader(qmt_security, period, str(start), str(end))
-        return _ok(
-            {
-                "security": _from_qmt_security(security),
-                "qmt_security": qmt_security,
-                "period": period,
-                "start": start,
-                "end": end,
-                "requested": True,
-            },
-            payload.get("request_id"),
-        )
+        return _ok(_call_download_history_data(qmt_security, period, start, end, payload), payload.get("request_id"))
     except QmtApiUnavailable as exc:
         LOGGER.exception("download_history_data unavailable: %s", exc)
         return _error("QMT_API_NOT_READY", str(exc), payload.get("request_id"))
@@ -1547,6 +1685,108 @@ def _query_all_securities(context_info: Any, payload: Dict[str, Any]) -> Dict[st
         return _error("ALL_SECURITIES_FAILED", str(exc), payload.get("request_id"))
 
 
+def _call_optional_callable(owner: Any, name: str) -> Optional[Any]:
+    if owner is None:
+        return None
+    value = getattr(owner, name, None)
+    if callable(value):
+        return value
+    return None
+
+
+def _index_weight_codes_from_data(data: Any) -> List[str]:
+    if data is None:
+        return []
+    if isinstance(data, dict):
+        for key in ("stocks", "values", "codes", "stock_codes"):
+            value = data.get(key)
+            if isinstance(value, (list, tuple, set)):
+                return [_from_qmt_security(_to_qmt_security(item)) for item in value if item]
+        return [_from_qmt_security(_to_qmt_security(item)) for item in data.keys() if item]
+    if isinstance(data, (list, tuple, set)):
+        result = []
+        for item in data:
+            if isinstance(item, dict):
+                code = (
+                    item.get("code")
+                    or item.get("stock_code")
+                    or item.get("security")
+                    or item.get("instrument")
+                    or item.get("InstrumentID")
+                )
+            else:
+                code = item
+            if code:
+                result.append(_from_qmt_security(_to_qmt_security(code)))
+        return result
+    columns = getattr(data, "columns", None)
+    if columns is not None:
+        try:
+            column_names = [str(item) for item in list(columns)]
+        except Exception:
+            column_names = []
+        for key in ("code", "stock_code", "security", "instrument", "InstrumentID"):
+            if key in column_names:
+                try:
+                    values = list(data[key])
+                except Exception:
+                    values = []
+                if values:
+                    return [_from_qmt_security(_to_qmt_security(item)) for item in values if item]
+    index = getattr(data, "index", None)
+    if index is not None:
+        try:
+            values = list(index.tolist())
+        except Exception:
+            try:
+                values = list(index)
+            except Exception:
+                values = []
+        if values:
+            return [_from_qmt_security(_to_qmt_security(item)) for item in values if item]
+    return []
+
+
+def _query_index_weight_stocks(context_info: Any, index_symbol: Any) -> List[str]:
+    qmt_index = _to_qmt_security(index_symbol)
+    if INDEX_WEIGHT_DOWNLOAD_BEFORE_READ:
+        downloader = globals().get("download_index_weight") or getattr(builtins, "download_index_weight", None)
+        if callable(downloader):
+            try:
+                downloader()
+            except TypeError:
+                try:
+                    downloader(qmt_index)
+                except Exception:
+                    LOGGER.exception("download_index_weight failed")
+            except Exception:
+                LOGGER.exception("download_index_weight failed")
+    readers = []
+    for owner in (context_info, builtins):
+        reader = _call_optional_callable(owner, "get_index_weight")
+        if reader is not None:
+            readers.append(reader)
+    reader = globals().get("get_index_weight")
+    if callable(reader):
+        readers.append(reader)
+    for reader in readers:
+        try:
+            data = reader(qmt_index)
+        except TypeError:
+            try:
+                data = reader(str(qmt_index))
+            except Exception:
+                LOGGER.exception("get_index_weight failed")
+                continue
+        except Exception:
+            LOGGER.exception("get_index_weight failed")
+            continue
+        codes = _index_weight_codes_from_data(data)
+        if codes:
+            return codes
+    return []
+
+
 def _sector_for_index(index_symbol: Any) -> str:
     text = str(index_symbol or "")
     mapping = {
@@ -1564,12 +1804,35 @@ def _sector_for_index(index_symbol: Any) -> str:
 
 
 def _query_index_stocks(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
-    sector = payload.get("sector") or payload.get("sector_name") or _sector_for_index(payload.get("index_symbol"))
+    index_symbol = payload.get("index_symbol")
+    if index_symbol:
+        values = _query_index_weight_stocks(context_info, index_symbol)
+        if values:
+            return _ok(
+                {
+                    "stocks": values,
+                    "values": values,
+                    "qmt_stocks": [_to_qmt_security(item) for item in values],
+                    "source": "get_index_weight",
+                },
+                payload.get("request_id"),
+            )
+    sector = payload.get("sector") or payload.get("sector_name") or _sector_for_index(index_symbol)
     try:
         if context_info is None:
             return _context_not_ready(payload)
         values = context_info.get_stock_list_in_sector(str(sector)) or []
-        return _ok({"stocks": [_from_qmt_security(item) for item in values], "qmt_stocks": list(values), "sector": sector}, payload.get("request_id"))
+        stocks = [_from_qmt_security(item) for item in values]
+        return _ok(
+            {
+                "stocks": stocks,
+                "values": stocks,
+                "qmt_stocks": list(values),
+                "sector": sector,
+                "source": "sector_fallback",
+            },
+            payload.get("request_id"),
+        )
     except QmtApiUnavailable as exc:
         LOGGER.exception("get_stock_list_in_sector index unavailable: %s", exc)
         return _error("QMT_API_NOT_READY", str(exc), payload.get("request_id"))

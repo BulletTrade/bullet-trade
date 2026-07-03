@@ -103,6 +103,16 @@ class _FakeContext:
         }
 
 
+class _FakeContextWithIndexWeight(_FakeContext):
+    def __init__(self):
+        super().__init__()
+        self.index_weight_call = None
+
+    def get_index_weight(self, index_symbol):
+        self.index_weight_call = index_symbol
+        return {"600000.SH": 0.4, "000001.SZ": 0.6}
+
+
 class _FakeContextTradeDaysFallback(_FakeContext):
     def get_trading_dates(self, security, start, end, count, period):
         self.trade_days_call = (security, start, end, count, period)
@@ -273,6 +283,7 @@ def test_big_qmt_helper_dispatches_non_tick_data_apis(monkeypatch):
     assert context.history_call[0] == ["open", "close"]
     assert context.history_call[1] == ["000001.SZ"]
     assert context.history_call[2]["period"] == "1d"
+    assert download_calls[0][0] == ("000001.SZ", "1d", "", "")
 
     trade_days = helper._dispatch_qmt_action(context, "trade_days", {"security": "000001.XSHE", "count": 1})
     assert trade_days["ok"] is True
@@ -283,6 +294,10 @@ def test_big_qmt_helper_dispatches_non_tick_data_apis(monkeypatch):
     assert security_info["ok"] is True
     assert security_info["value"]["display_name"] == "Ping An Bank"
     assert security_info["value"]["qmt_security"] == "000001.SZ"
+    assert security_info["value"]["qmt_code"] == "000001.SZ"
+    assert security_info["value"]["code"] == "000001.XSHE"
+    assert security_info["value"]["start_date"] == "1991-04-03T00:00:00"
+    assert security_info["value"]["end_date"] == "2200-01-01T00:00:00"
     assert context.security_info_call[0] == "000001.SZ"
 
     cache = helper._dispatch_qmt_action(
@@ -291,7 +306,7 @@ def test_big_qmt_helper_dispatches_non_tick_data_apis(monkeypatch):
         {"security": "000001.XSHE", "frequency": "minute", "start": "20260701", "end": "20260701"},
     )
     assert cache["ok"] is True
-    assert download_calls[0][0] == ("000001.SZ", "1m", "20260701", "20260701")
+    assert download_calls[1][0] == ("000001.SZ", "1m", "20260701", "20260701")
 
     all_securities = helper._dispatch_qmt_action(context, "all_securities", {"types": ["stock"]})
     assert all_securities["ok"] is True
@@ -317,6 +332,7 @@ def test_big_qmt_helper_dispatches_non_tick_data_apis(monkeypatch):
     index_stocks = helper._dispatch_qmt_action(context, "index_stocks", {"index_symbol": "000300.XSHG"})
     assert index_stocks["ok"] is True
     assert index_stocks["value"]["stocks"] == ["000001.XSHE", "000002.XSHE"]
+    assert index_stocks["value"]["source"] == "sector_fallback"
 
     split_dividend = helper._dispatch_qmt_action(
         context,
@@ -336,9 +352,10 @@ def test_big_qmt_helper_dispatches_non_tick_data_apis(monkeypatch):
     ]
 
 
-def test_big_qmt_helper_history_drops_unrequested_stime_column():
+def test_big_qmt_helper_history_drops_unrequested_stime_column(monkeypatch):
     helper = _load_helper()
     context = _FakeContextHistoryWithStime()
+    monkeypatch.setattr(helper, "download_history_data", lambda *args, **kwargs: None, raising=False)
 
     history = helper._dispatch_qmt_action(
         context,
@@ -351,9 +368,10 @@ def test_big_qmt_helper_history_drops_unrequested_stime_column():
     assert history["value"]["records"] == [[1.0, 2.0]]
 
 
-def test_big_qmt_helper_history_uses_miniqmt_ratio_dividend_types():
+def test_big_qmt_helper_history_uses_miniqmt_ratio_dividend_types(monkeypatch):
     helper = _load_helper()
     context = _FakeContext()
+    monkeypatch.setattr(helper, "download_history_data", lambda *args, **kwargs: None, raising=False)
 
     helper._dispatch_qmt_action(
         context,
@@ -368,6 +386,52 @@ def test_big_qmt_helper_history_uses_miniqmt_ratio_dividend_types():
         {"security": "000001.XSHE", "fields": ["open"], "fq": "post", "count": 1},
     )
     assert context.history_call[2]["dividend_type"] == "back_ratio"
+
+
+def test_big_qmt_helper_history_returns_error_when_auto_ensure_fails():
+    helper = _load_helper()
+    context = _FakeContext()
+
+    history = helper._dispatch_qmt_action(
+        context,
+        "history",
+        {"security": "000001.XSHE", "fields": ["open"], "count": 1},
+    )
+
+    assert history["ok"] is False
+    assert history["code"] == "QMT_API_NOT_READY"
+    assert context.history_call is None
+
+
+def test_big_qmt_helper_history_allows_explicit_auto_download_false():
+    helper = _load_helper()
+    context = _FakeContext()
+
+    history = helper._dispatch_qmt_action(
+        context,
+        "history",
+        {"security": "000001.XSHE", "fields": ["open"], "count": 1, "auto_download": False},
+    )
+
+    assert history["ok"] is True
+    assert context.history_call[1] == ["000001.SZ"]
+
+
+def test_big_qmt_helper_index_stocks_prefers_index_weight(monkeypatch):
+    helper = _load_helper()
+    context = _FakeContextWithIndexWeight()
+    download_calls = []
+    monkeypatch.setattr(helper, "download_index_weight", lambda *args, **kwargs: download_calls.append(args), raising=False)
+
+    response = helper._dispatch_qmt_action(context, "index_stocks", {"index_symbol": "000300.XSHG"})
+
+    assert response["ok"] is True
+    assert response["value"]["stocks"] == ["600000.XSHG", "000001.XSHE"]
+    assert response["value"]["values"] == ["600000.XSHG", "000001.XSHE"]
+    assert response["value"]["source"] == "get_index_weight"
+    assert context.index_weight_call == "000300.SH"
+    assert context.sector_calls == []
+    assert download_calls == [()]
 
 
 def test_big_qmt_helper_history_rounds_adjusted_prices_like_miniqmt():

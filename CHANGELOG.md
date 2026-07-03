@@ -5,6 +5,22 @@
 
 ## [未发布]
 
+## [0.9.1] - 2026-07-03
+
+### 修复
+- **大 QMT 当前价接口**：修复 `data.current_tick` 在 server 分发层把完整 payload 传给 `get_current_tick(symbol)` 导致请求失败的问题；大 QMT 后端现在通过快照路径返回 `sid/last_price/dt`，保持上层策略取当前价语义可用。
+- **大 QMT 历史行情缓存**：大 QMT helper 的 `data.history` 默认先调用大 QMT 内置 `download_history_data`，再读取 `get_market_data_ex`，对齐 MiniQMT “先下载/确保缓存，再读取”的安全口径。
+
+### 增强
+- **大 QMT 证券信息归一化**：`data.security_info` 补齐 `code/qmt_code/display_name/name/start_date/end_date/type/subtype/parent` 等 MiniQMT 兼容字段，减少上层策略和 V2 网关适配差异。
+- **大 QMT 指数成分口径**：`data.get_index_stocks` 优先使用 `download_index_weight` / `get_index_weight`，仅在不可用时回退 sector 列表，避免指数成分与 MiniQMT 口径不一致。
+
+### 文档
+- **大 QMT 对齐说明**：补充大 QMT helper 的历史数据预下载、当前价、证券信息和指数成分兼容口径，以及对应顶部配置参数说明。
+
+### 测试
+- **大 QMT 对齐回归**：新增 helper 和 server adapter 回归测试，覆盖 history 自动下载失败保护、显式关闭自动下载、`security_info` 标准字段、index weight 优先级和 `data.current_tick` 分发。
+
 ## [0.9.0] - 2026-07-03
 
 ### 新增

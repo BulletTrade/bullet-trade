@@ -97,6 +97,9 @@ helpers/big_qmt_gateway_strategy_sample.py
 | `GATEWAY_SECRET` | 可选增强认证密钥 | 可先保留默认，正式环境建议改 |
 | `ACCOUNT_ID` | QMT 资金账号 | 改成当前大 QMT 登录账号 |
 | `ACCOUNT_TYPE` | 账户类型 | 股票账户用 `stock` |
+| `AUTO_ENSURE_HISTORY_CACHE` | `data.history` 是否先触发历史行情下载 | 默认 `True`，对齐 MiniQMT |
+| `HISTORY_FAIL_ON_ENSURE_CACHE_ERROR` | 自动下载失败时是否直接返回错误 | 默认 `True`，避免读取旧缓存或空数据 |
+| `INDEX_WEIGHT_DOWNLOAD_BEFORE_READ` | 指数成分读取前是否先下载指数权重 | 默认 `True`，优先对齐 MiniQMT 成分股口径 |
 | `ENABLE_TRADING` | 是否允许下单 | 仿真测试可设 `True`，只读验证设 `False` |
 | `ENABLE_CANCEL_ORDER` | 是否允许按订单号撤单 | 需要撤单时设 `True` |
 | `RUN_HTTP_IN_BACKGROUND_THREAD` | 是否后台线程运行 HTTP | 默认按 helper 注释使用，不要随意改 |
@@ -219,7 +222,19 @@ bullet-trade live strategies/demo_strategy.py --broker qmt-remote
 - `broker.trades`：能获取成交。
 - 仿真环境下测试限价单、市价单、撤单、订单备注和虚拟子账户过滤。
 
-## 10. 常见问题
+## 10. MiniQMT 对齐口径
+
+大 QMT helper 和 `--server-type big_qmt` 的目标是对上层继续提供 MiniQMT 兼容的 `qmt-remote` 协议。关键数据接口按下面口径处理：
+
+- `data.history`：默认先调用大 QMT 内置 `download_history_data`，再调用 `get_market_data_ex` 读取本地行情。调用方只有在明确诊断缓存问题时才建议传 `auto_download=false`。
+- `data.current_tick`：保留当前价接口，返回结构与快照保持一致，至少包含 `sid`、`last_price`、`dt`。
+- `data.security_info`：返回聚宽风格 `code` 和 QMT 风格 `qmt_code`，同时补齐 `display_name`、`name`、`start_date`、`end_date`、`type`、`subtype`、`parent`。
+- `data.get_index_stocks`：优先使用 `download_index_weight` / `get_index_weight` 获取指数权重成分；如果当前大 QMT 环境不支持，再回退到板块列表。
+- `data.trade_days`：输出日期保持 MiniQMT 兼容格式，避免不同后端返回纯数字日期导致上层对比失败。
+
+这几个接口都应该通过 `58620` 的 `qmt-remote` 服务访问，不要让策略直接调用 `9000` helper。
+
+## 11. 常见问题
 
 ### 为什么 helper 日志里显示启动后又停止
 
@@ -261,3 +276,7 @@ module autostart disabled
 上层尽量保持同一套 `qmt-remote` 协议。大 QMT 后端负责把大 QMT helper 返回值归一化成 MiniQMT 兼容口径，例如日期格式、行情字段、复权数据、订单和成交结构。
 
 新增能力应优先放在大 QMT adapter/helper 内，不应为了大 QMT 随意修改策略引擎。
+
+### 大 QMT 的历史数据是否也需要下载
+
+需要。正式口径和 MiniQMT 一样：先确保本地缓存，再读取历史行情。`AUTO_ENSURE_HISTORY_CACHE=True` 时，helper 会在 `data.history` 里自动调用下载函数；如果下载失败且 `HISTORY_FAIL_ON_ENSURE_CACHE_ERROR=True`，接口会返回错误，而不是继续读可能不完整的数据。

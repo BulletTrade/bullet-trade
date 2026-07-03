@@ -27,6 +27,7 @@ from .qmt import dataframe_to_payload, dict_payload
 _DATA_ACTIONS = (
     "data.history",
     "data.snapshot",
+    "data.current_tick",
     "data.live_current",
     "data.trade_days",
     "data.security_info",
