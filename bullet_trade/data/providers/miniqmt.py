@@ -230,6 +230,71 @@ class MiniQMTProvider(DataProvider):
                 pass
         xt.download_history_data(stock_code=security, period=period)
 
+    def ensure_cache(
+        self,
+        security: str,
+        frequency: str = "1m",
+        start: Optional[Union[str, datetime, Date]] = None,
+        end: Optional[Union[str, datetime, Date]] = None,
+        auto_download: bool = True,
+        count: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """
+        显式触发 MiniQMT 本地历史数据下载，用于服务端 ensure_cache 接口。
+
+        Args:
+            security: 聚宽或 QMT 格式证券代码。
+            frequency: 框架 frequency 或 QMT period。
+            start: 可选下载起始时间。
+            end: 可选下载结束时间。
+            auto_download: False 时只返回归一化元信息，不触发下载。
+            count: 可选条数，用于回测数据会话下载去重。
+
+        Returns:
+            Dict[str, Any]: 与大 QMT gateway 对齐的下载请求元信息。
+        """
+        qmt_security = self._normalize_security_code(security)
+        period = self._normalize_period(frequency)
+        source_period = "1m" if self._minute_resample_group(period) is not None else period
+        source_count = count
+        if source_period != period and count is not None:
+            try:
+                source_count = int(count) * int(period[:-1])
+            except Exception:
+                source_count = count
+
+        if isinstance(auto_download, str):
+            should_download = auto_download.strip().lower() in ("1", "true", "yes", "on")
+        else:
+            should_download = bool(auto_download)
+
+        requested = False
+        handled_by_session = False
+        if should_download:
+            xt = self._ensure_xtdata()
+            handled_by_session = self._prepare_backtest_history_data(
+                xt,
+                security=qmt_security,
+                period=source_period,
+                start_date=start,
+                end_date=end,
+                count=source_count,
+            )
+            if not handled_by_session:
+                self._download_history_data(xt, qmt_security, source_period, start, end)
+            requested = True
+
+        return {
+            "security": self._to_jq_code(qmt_security),
+            "qmt_security": qmt_security,
+            "period": period,
+            "download_period": source_period,
+            "start": start,
+            "end": end,
+            "requested": requested,
+            "handled_by_session": handled_by_session,
+        }
+
     def _prepare_backtest_history_data(
         self,
         xt: Any,

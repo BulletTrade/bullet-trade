@@ -62,6 +62,16 @@ def _round_price_to_tick(price: float, tick: float) -> float:
     return float(f"{round(price / tick) * tick:.6f}")
 
 
+def _to_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 def _clamp_market_protect_price(
     security: str,
     price: float,
@@ -376,11 +386,11 @@ class QmtDataAdapter(RemoteDataAdapter):
         return dict_payload(info or {})
 
     async def ensure_cache(self, payload: Dict) -> Dict:
-        security = payload.get("security")
+        security = payload.get("security") or payload.get("stockcode")
         frequency = payload.get("frequency") or payload.get("period") or "1m"
-        start = payload.get("start")
-        end = payload.get("end")
-        auto = bool(payload.get("auto_download", True))
+        start = payload.get("start") or payload.get("start_date") or payload.get("start_time")
+        end = payload.get("end") or payload.get("end_date") or payload.get("end_time")
+        auto = _to_bool(payload.get("auto_download", True), True)
         result = await self._run_guarded_qmt_call(
             self.provider.ensure_cache,
             security,
@@ -388,6 +398,7 @@ class QmtDataAdapter(RemoteDataAdapter):
             start,
             end,
             auto_download=auto,
+            count=payload.get("count"),
         )
         return {"dtype": "dict", "value": result or {}}
 

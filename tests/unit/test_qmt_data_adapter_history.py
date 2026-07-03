@@ -8,6 +8,7 @@ class _FakeProvider:
     def __init__(self) -> None:
         self.last_call = None
         self.last_trade_days_call = None
+        self.last_ensure_cache_call = None
 
     def get_price(
         self,
@@ -45,6 +46,25 @@ class _FakeProvider:
             "count": count,
         }
         return [pd.Timestamp("2025-01-02"), pd.Timestamp("2025-01-03")]
+
+    def ensure_cache(
+        self,
+        security,
+        frequency,
+        start=None,
+        end=None,
+        auto_download=True,
+        count=None,
+    ):
+        self.last_ensure_cache_call = {
+            "security": security,
+            "frequency": frequency,
+            "start": start,
+            "end": end,
+            "auto_download": auto_download,
+            "count": count,
+        }
+        return {"requested": bool(auto_download), "security": security}
 
 
 @pytest.mark.unit
@@ -140,4 +160,42 @@ async def test_qmt_data_adapter_get_trade_days_passes_count_and_fallback_keys(mo
     assert resp == {
         "dtype": "list",
         "values": ["2025-01-02 00:00:00", "2025-01-03 00:00:00"],
+    }
+
+
+@pytest.mark.unit
+@pytest.mark.asyncio
+async def test_qmt_data_adapter_ensure_cache_passes_aliases(monkeypatch):
+    async def _run_now(func, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr("bullet_trade.server.adapters.qmt._run_in_qmt_executor", _run_now)
+    fake_provider = _FakeProvider()
+    monkeypatch.setattr(
+        "bullet_trade.server.adapters.qmt.MiniQMTProvider", lambda _cfg: fake_provider
+    )
+    adapter = QmtDataAdapter()
+
+    resp = await adapter.ensure_cache(
+        {
+            "stockcode": "000001.XSHE",
+            "period": "minute",
+            "start_date": "2026-07-03",
+            "end_time": "20260703150000",
+            "auto_download": "false",
+            "count": 10,
+        }
+    )
+
+    assert fake_provider.last_ensure_cache_call == {
+        "security": "000001.XSHE",
+        "frequency": "minute",
+        "start": "2026-07-03",
+        "end": "20260703150000",
+        "auto_download": False,
+        "count": 10,
+    }
+    assert resp == {
+        "dtype": "dict",
+        "value": {"requested": False, "security": "000001.XSHE"},
     }
