@@ -1,6 +1,7 @@
 import asyncio
 import concurrent.futures
 import threading
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -185,6 +186,40 @@ def test_server_session_request_timeout_ignores_invalid_env(monkeypatch):
     monkeypatch.setenv("QMT_SERVER_REQUEST_TIMEOUT", "-1")
 
     assert session._request_timeout_for("broker.account", {}) == 60.0
+
+
+def test_server_session_treats_winerror64_as_expected_disconnect():
+    """Windows 对端断开不应按 session 异常打印 ERROR。"""
+
+    exc = OSError("指定的网络名不再可用。")
+    exc.winerror = 64
+
+    assert ClientSession._is_expected_disconnect(exc) is True
+
+
+def test_server_session_logs_idle_disconnect_as_debug(monkeypatch):
+    """空闲连接断开只写 DEBUG；请求处理中断开保留 WARNING。"""
+
+    records = []
+    monkeypatch.setattr(
+        "bullet_trade.server.session.log",
+        SimpleNamespace(
+            debug=lambda msg: records.append(("debug", msg)),
+            warning=lambda msg: records.append(("warning", msg)),
+        ),
+    )
+    session = ClientSession.__new__(ClientSession)
+    session.session_id = "stest"
+    session._current_request = None
+
+    session._log_expected_disconnect(OSError("指定的网络名不再可用。"))
+
+    session._current_request = "data.history"
+    session._log_expected_disconnect(OSError("指定的网络名不再可用。"))
+
+    assert records[0][0] == "debug"
+    assert records[1][0] == "warning"
+    assert "current_request=data.history" in records[1][1]
 
 
 def test_stub_server_history(stub_server):

@@ -146,11 +146,18 @@ helpers/big_qmt_gateway_strategy_sample.py
 
 如果只看到 `module loaded` 后策略结束，通常说明这个运行方式没有调用 `init(ContextInfo)`，优先检查是否勾选了“启动本地 Python”，以及是否是从策略交易运行项启动。
 
-## 7. 启动 bullet-trade server
+## 7. 启动 BulletTrade qmt-remote server
 
-大 QMT helper 启动后，在同一台 Windows 机器上启动 `bullet-trade server`。
+大 QMT helper 启动后，如果上层策略要继续按 `qmt-remote` 协议访问行情和交易，就需要在同一台 Windows 机器上再启动一个 `bullet-trade server`。
 
-示例 `.env.bigqmt`：
+这里容易误会：
+
+- 大 QMT 本身不读取 `.env.bigqmt`。
+- 大 QMT 里的 helper 只读策略文件顶部那些大写参数，例如 `ACCOUNT_ID`、`GATEWAY_PASSWORD`、`LISTEN_PORT`。
+- `.env.bigqmt` 只是给外部 Python 进程 `bullet-trade server` 用的启动配置，目的是告诉它怎么连接大 QMT helper，以及对外用什么 token 提供 `58620` 服务。
+- 这个文件不是必须叫 `.env.bigqmt`，也不是必须用文件；你也可以用系统环境变量或命令行参数。文档用 `.env.bigqmt` 只是为了和客户端 `.env` 分开，避免混在一起。
+
+示例 `bullet-trade server` 配置文件：
 
 ```env
 QMT_SERVER_TOKEN=change_me_server_token
@@ -176,6 +183,9 @@ bullet-trade --env-file .env.bigqmt server --server-type big_qmt --listen 0.0.0.
 - `QMT_SERVER_TOKEN` 是上层策略连接 `58620` 时使用的 token。
 - `BIG_QMT_GATEWAY_PASSWORD` 必须和 helper 顶部的 `GATEWAY_PASSWORD` 一致。
 - `BIG_QMT_ENABLE_TRADING=false` 时只提供数据和账户查询，不允许下单。
+
+如果你只是想验证大 QMT helper 本身是否启动，看到 `listen success listen=127.0.0.1:9000` 就已经说明 helper 在大 QMT 里跑起来了。  
+但如果要让 BulletTrade 策略、AIStocks V2 或聚宽 helper 继续使用原来的 `qmt-remote` 接口，就还需要这个 `bullet-trade server` 作为中间层。
 
 ## 8. 策略侧仍使用 qmt-remote
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import errno
 import os
 import secrets
 import time
@@ -45,14 +46,34 @@ class ClientSession:
         try:
             await self._handshake()
             await self._loop()
-        except asyncio.IncompleteReadError:
-            pass
+        except asyncio.IncompleteReadError as exc:
+            self._log_expected_disconnect(exc)
         except ProtocolError as exc:
             log.warning(f"session {self.session_id} 协议错误: {exc}")
         except Exception as exc:
+            if self._is_expected_disconnect(exc):
+                self._log_expected_disconnect(exc)
+                return
             log.error(f"session {self.session_id} 异常: {exc}")
         finally:
             await self.close()
+
+    def _log_expected_disconnect(self, exc: BaseException) -> None:
+        message = f"session {self.session_id} 客户端断开: {exc}"
+        if self._current_request:
+            log.warning(f"{message}, current_request={self._current_request}")
+        else:
+            log.debug(message)
+
+    @staticmethod
+    def _is_expected_disconnect(exc: BaseException) -> bool:
+        if isinstance(exc, (asyncio.IncompleteReadError, ConnectionResetError, BrokenPipeError, ConnectionAbortedError)):
+            return True
+        if not isinstance(exc, OSError):
+            return False
+        if getattr(exc, "winerror", None) in (64, 10053, 10054):
+            return True
+        return exc.errno in (errno.ECONNRESET, errno.EPIPE, errno.ECONNABORTED)
 
     async def _handshake(self) -> None:
         log.debug(f"[SESSION] {self.session_id} 等待握手...")

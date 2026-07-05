@@ -236,7 +236,9 @@ QMT_SERVER_SUB_ACCOUNT=demo@main
 
 这些配置作用在 `bullet-trade server` 进程。
 
-`QMT_SERVER_TYPE=qmt` 是 MiniQMT/xtquant 后端；`QMT_SERVER_TYPE=big_qmt` 或 CLI `--server-type big_qmt` 是大 QMT helper 后端。大 QMT 还需要配置 `BIG_QMT_GATEWAY_*`，完整步骤见 [大 QMT 服务向导](big-qmt-server.md)。
+`QMT_SERVER_TYPE=qmt` 是 MiniQMT/xtquant 后端；`QMT_SERVER_TYPE=big_qmt` 或 CLI `--server-type big_qmt` 是大 QMT helper 后端。
+
+注意：大 QMT 本身不读这里的 `.env`。大 QMT helper 的账号、端口和密码在策略文件顶部参数里配置。这里的 `BIG_QMT_GATEWAY_*` 是外部 `bullet-trade server` 进程用来连接大 QMT helper 的配置，完整步骤见 [大 QMT 服务向导](big-qmt-server.md)。
 
 | 变量 | 默认 | 作用 |
 | --- | --- | --- |
@@ -293,7 +295,7 @@ bullet_trade/config/security_overrides.json
 
 - 本地 MiniQMT：只配 `DEFAULT_DATA_PROVIDER`、`DEFAULT_BROKER`、`QMT_DATA_PATH`、`QMT_ACCOUNT_ID`。
 - MiniQMT 远程 server：只配 `QMT_DATA_PATH`、`QMT_ACCOUNT_ID`、`QMT_SERVER_TOKEN`。
-- 大 QMT 远程 server：先按 [大 QMT 服务向导](big-qmt-server.md) 配 helper，再配 `BIG_QMT_GATEWAY_URL`、`BIG_QMT_GATEWAY_PASSWORD`、`QMT_SERVER_TOKEN`。
+- 大 QMT 远程 server：先按 [大 QMT 服务向导](big-qmt-server.md) 在大 QMT 里启动 helper；外部 `bullet-trade server` 再配 `BIG_QMT_GATEWAY_URL`、`BIG_QMT_GATEWAY_PASSWORD`、`QMT_SERVER_TOKEN`。
 - 远程客户端：只配 `DEFAULT_DATA_PROVIDER`、`DEFAULT_BROKER`、`QMT_SERVER_HOST`、`QMT_SERVER_PORT`、`QMT_SERVER_TOKEN`。
 
 其他配置先不写进 `.env` 也可以，但需要查的时候，上面的索引应该都能找到。
