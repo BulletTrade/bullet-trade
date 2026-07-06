@@ -165,9 +165,6 @@ QMT_SERVER_TOKEN=change_me_server_token
 BIG_QMT_GATEWAY_URL=http://127.0.0.1:9000
 BIG_QMT_GATEWAY_PASSWORD=change_me_gateway_password
 BIG_QMT_GATEWAY_TIMEOUT_SECONDS=30
-
-BIG_QMT_ENABLE_TRADING=true
-BIG_QMT_ENABLE_CANCEL_ORDER=true
 ```
 
 启动命令：
@@ -182,7 +179,8 @@ bullet-trade --env-file .env.bigqmt server --server-type big_qmt --listen 0.0.0.
 - `BIG_QMT_GATEWAY_URL` 指向大 QMT helper 的 `9000` 端口。
 - `QMT_SERVER_TOKEN` 是上层策略连接 `58620` 时使用的 token。
 - `BIG_QMT_GATEWAY_PASSWORD` 必须和 helper 顶部的 `GATEWAY_PASSWORD` 一致。
-- `BIG_QMT_ENABLE_TRADING=false` 时只提供数据和账户查询，不允许下单。
+- `--enable-broker` 启用券商接口；是否真正允许下单和撤单，由 helper 顶部的 `ENABLE_TRADING`、`ENABLE_CANCEL_ORDER` 决定。
+- 如果只想提供行情和账户查询，启动 server 时使用 `--disable-broker`，或者把 helper 顶部 `ENABLE_TRADING=False`。
 
 如果你只是想验证大 QMT helper 本身是否启动，看到 `listen success listen=127.0.0.1:9000` 就已经说明 helper 在大 QMT 里跑起来了。  
 但如果要让 BulletTrade 策略、AIStocks V2 或聚宽 helper 继续使用原来的 `qmt-remote` 接口，就还需要这个 `bullet-trade server` 作为中间层。
@@ -267,15 +265,15 @@ module autostart disabled
 
 ### 为什么下单报权限或不可用
 
-检查两层开关：
+先检查 helper 顶部的真实交易开关：
 
 - helper 顶部 `ENABLE_TRADING=True`
-- server 侧 `.env.bigqmt` 里 `BIG_QMT_ENABLE_TRADING=true`
 
-撤单同理检查：
+撤单同理：
 
 - helper 顶部 `ENABLE_CANCEL_ORDER=True`
-- server 侧 `.env.bigqmt` 里 `BIG_QMT_ENABLE_CANCEL_ORDER=true`
+
+如果想让整个 `58620` 服务不提供券商接口，启动 `bullet-trade server` 时使用 `--disable-broker`。
 
 ### 为什么密码不匹配
 

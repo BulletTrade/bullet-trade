@@ -65,9 +65,6 @@ def _server_config(enable_data=True, enable_broker=True):
 
 
 def test_big_qmt_adapter_is_registered_and_health_reports_backend(monkeypatch):
-    monkeypatch.delenv("BIG_QMT_ENABLE_TRADING", raising=False)
-    monkeypatch.delenv("BIG_QMT_ENABLE_CANCEL_ORDER", raising=False)
-
     config = _server_config()
     router = AccountRouter(config.accounts)
     bundle = build_big_qmt_bundle(config, router)
@@ -81,8 +78,8 @@ def test_big_qmt_adapter_is_registered_and_health_reports_backend(monkeypatch):
     assert health["qmt"]["actions"]["data.snapshot"]["status"] == "ready"
     assert health["qmt"]["actions"]["data.current_tick"]["status"] == "ready"
     assert health["qmt"]["actions"]["data.subscribe"]["status"] == "degraded"
-    assert health["qmt"]["actions"]["broker.place_order"]["status"] == "unavailable"
-    assert health["qmt"]["actions"]["broker.cancel_order"]["status"] == "unavailable"
+    assert health["qmt"]["actions"]["broker.place_order"]["status"] == "ready"
+    assert health["qmt"]["actions"]["broker.cancel_order"]["status"] == "ready"
 
 
 @pytest.mark.asyncio
@@ -288,30 +285,34 @@ async def test_big_qmt_broker_adapter_normalizes_account_positions_orders_trades
 
 
 @pytest.mark.asyncio
-async def test_big_qmt_trading_and_cancel_are_disabled_by_default():
+async def test_big_qmt_trading_and_cancel_forward_by_default():
+    client = _FakeGatewayClient(
+        {
+            "/place_order": {"order_id": "O-default", "m_nOrderStatus": 50},
+            "/cancel_order": {"success": True},
+        },
+    )
     config = _server_config()
     router = AccountRouter(config.accounts)
     ctx = router.get("default")
-    adapter = BigQmtBrokerAdapter(config, router, _FakeGatewayClient({}))
+    adapter = BigQmtBrokerAdapter(config, router, client)
 
-    with pytest.raises(BigQmtGatewayError) as place_error:
-        await adapter.place_order(ctx, {"security": "000001.XSHE", "amount": 100, "side": "BUY"})
-    assert place_error.value.code == "TRADING_DISABLED"
+    order = await adapter.place_order(ctx, {"security": "000001.XSHE", "amount": 100, "side": "BUY"})
+    cancel = await adapter.cancel_order(ctx, "O-default")
 
-    with pytest.raises(BigQmtGatewayError) as cancel_error:
-        await adapter.cancel_order(ctx, "O1")
-    assert cancel_error.value.code == "CANCEL_ORDER_DISABLED"
+    assert order["order_id"] == "O-default"
+    assert cancel["value"]["success"] is True
+    assert client.calls[0][1] == "/place_order"
+    assert client.calls[1][1] == "/cancel_order"
 
 
 @pytest.mark.asyncio
 async def test_big_qmt_trading_and_cancel_forward_account_payload_when_enabled():
-    gateway_config = BigQmtGatewayConfig(enable_trading=True, enable_cancel_order=True)
     client = _FakeGatewayClient(
         {
             "/place_order": {"order_id": "O2", "m_nOrderStatus": 50},
             "/cancel_order": {"success": True},
         },
-        config=gateway_config,
     )
     config = _server_config()
     router = AccountRouter(config.accounts)
@@ -342,7 +343,6 @@ async def test_big_qmt_trading_and_cancel_forward_account_payload_when_enabled()
 
 @pytest.mark.asyncio
 async def test_big_qmt_place_order_confirms_submission_in_adapter():
-    gateway_config = BigQmtGatewayConfig(enable_trading=True)
     orders_calls = 0
 
     def _orders(_payload):
@@ -377,7 +377,6 @@ async def test_big_qmt_place_order_confirms_submission_in_adapter():
             },
             "/orders": _orders,
         },
-        config=gateway_config,
     )
     config = _server_config()
     router = AccountRouter(config.accounts)
@@ -409,7 +408,6 @@ async def test_big_qmt_place_order_confirms_submission_in_adapter():
 
 @pytest.mark.asyncio
 async def test_big_qmt_place_order_skips_known_order_ids_when_confirming():
-    gateway_config = BigQmtGatewayConfig(enable_trading=True)
     orders_calls = 0
 
     def _orders(_payload):
@@ -452,7 +450,6 @@ async def test_big_qmt_place_order_skips_known_order_ids_when_confirming():
             },
             "/orders": _orders,
         },
-        config=gateway_config,
     )
     config = _server_config()
     router = AccountRouter(config.accounts)
@@ -479,7 +476,6 @@ async def test_big_qmt_place_order_skips_known_order_ids_when_confirming():
 
 @pytest.mark.asyncio
 async def test_big_qmt_place_order_waits_for_non_empty_order_id():
-    gateway_config = BigQmtGatewayConfig(enable_trading=True)
     orders_calls = 0
 
     def _orders(_payload):
@@ -510,7 +506,6 @@ async def test_big_qmt_place_order_waits_for_non_empty_order_id():
             },
             "/orders": _orders,
         },
-        config=gateway_config,
     )
     config = _server_config()
     router = AccountRouter(config.accounts)
@@ -535,7 +530,6 @@ async def test_big_qmt_place_order_waits_for_non_empty_order_id():
 
 @pytest.mark.asyncio
 async def test_big_qmt_place_order_matches_new_order_when_gateway_tag_is_stale():
-    gateway_config = BigQmtGatewayConfig(enable_trading=True)
     orders_calls = 0
 
     def _orders(_payload):
@@ -585,7 +579,6 @@ async def test_big_qmt_place_order_matches_new_order_when_gateway_tag_is_stale()
             },
             "/orders": _orders,
         },
-        config=gateway_config,
     )
     config = _server_config()
     router = AccountRouter(config.accounts)
@@ -615,7 +608,6 @@ async def test_big_qmt_place_order_matches_new_order_when_gateway_tag_is_stale()
 
 @pytest.mark.asyncio
 async def test_big_qmt_place_order_returns_submit_unknown_when_not_visible():
-    gateway_config = BigQmtGatewayConfig(enable_trading=True)
     client = _FakeGatewayClient(
         {
             "/place_order": {
@@ -627,7 +619,6 @@ async def test_big_qmt_place_order_returns_submit_unknown_when_not_visible():
             },
             "/orders": {"orders": []},
         },
-        config=gateway_config,
     )
     config = _server_config()
     router = AccountRouter(config.accounts)

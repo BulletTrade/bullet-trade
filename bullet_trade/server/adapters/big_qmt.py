@@ -10,7 +10,7 @@ from datetime import date, datetime
 from typing import Any, Dict, Iterable, List, Optional
 from uuid import uuid4
 
-from bullet_trade.utils.env_loader import get_env, get_env_bool, get_env_float
+from bullet_trade.utils.env_loader import get_env, get_env_float
 
 from ..config import ServerConfig
 from . import register_adapter
@@ -81,8 +81,6 @@ class BigQmtGatewayConfig:
     password: Optional[str] = None
     secret: Optional[str] = None
     timeout_seconds: float = 10.0
-    enable_trading: bool = False
-    enable_cancel_order: bool = False
     action_status: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
@@ -103,16 +101,8 @@ def load_big_qmt_gateway_config(server_config: ServerConfig) -> BigQmtGatewayCon
         password=get_env("BIG_QMT_GATEWAY_PASSWORD", get_env("BIG_QMT_GATEWAY_TOKEN")),
         secret=get_env("BIG_QMT_GATEWAY_SECRET"),
         timeout_seconds=max(0.1, float(timeout or 10.0)),
-        enable_trading=get_env_bool(
-            "BIG_QMT_ENABLE_TRADING",
-            get_env_bool("BIG_QMT_GATEWAY_ENABLE_TRADING", False),
-        ),
-        enable_cancel_order=get_env_bool(
-            "BIG_QMT_ENABLE_CANCEL_ORDER",
-            get_env_bool("BIG_QMT_GATEWAY_ENABLE_CANCEL_ORDER", False),
-        ),
     )
-    cfg.action_status = _build_action_status(server_config, cfg)
+    cfg.action_status = _build_action_status(server_config)
     return cfg
 
 
@@ -225,8 +215,8 @@ class BigQmtGatewayClient:
             "ready": ready,
             "state": state,
             "gateway_url": self.config.base_url,
-            "trading_enabled": self.config.enable_trading,
-            "cancel_order_enabled": self.config.enable_cancel_order,
+            "trading_enabled": _health_bool(health, "trading_enabled"),
+            "cancel_order_enabled": _health_bool(health, "cancel_order_enabled"),
             "last_error": self._last_error,
             "last_success_at": self._last_success_at,
             "last_failure_at": self._last_failure_at,
@@ -408,8 +398,6 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
         return self._apply_local_order_tag(_normalize_order(_extract_dict(data)))
 
     async def place_order(self, account: AccountContext, payload: Dict) -> Dict:
-        if not self.client.config.enable_trading:
-            raise BigQmtGatewayError("big QMT gateway 当前未启用交易提交", code="TRADING_DISABLED")
         request = self._account_payload(account)
         request.update(payload or {})
         _ensure_virtual_account_remark(request)
@@ -595,8 +583,6 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
         return result
 
     async def cancel_order(self, account: AccountContext, order_id: str) -> Dict:
-        if not self.client.config.enable_cancel_order:
-            raise BigQmtGatewayError("big QMT gateway 当前未启用按订单号撤单", code="CANCEL_ORDER_DISABLED")
         payload = self._account_payload(account)
         payload["order_id"] = order_id
         data = await self.client.post("/cancel_order", payload)
@@ -625,7 +611,6 @@ def build_big_qmt_bundle(config: ServerConfig, router: AccountRouter) -> Adapter
 
 def _build_action_status(
     server_config: ServerConfig,
-    gateway_config: BigQmtGatewayConfig,
 ) -> Dict[str, Dict[str, Any]]:
     status: Dict[str, Dict[str, Any]] = {}
     for action in _DATA_ACTIONS:
@@ -640,11 +625,11 @@ def _build_action_status(
             status[action] = _status("ready", "")
     for action in _BROKER_READ_ACTIONS:
         status[action] = _status("ready" if server_config.enable_broker else "unavailable", "broker module disabled")
-    place_state = "ready" if server_config.enable_broker and gateway_config.enable_trading else "unavailable"
-    place_reason = "" if place_state == "ready" else "BIG_QMT_ENABLE_TRADING is false"
+    place_state = "ready" if server_config.enable_broker else "unavailable"
+    place_reason = "" if place_state == "ready" else "broker module disabled"
     status["broker.place_order"] = _status(place_state, place_reason)
-    cancel_state = "ready" if server_config.enable_broker and gateway_config.enable_cancel_order else "unavailable"
-    cancel_reason = "" if cancel_state == "ready" else "BIG_QMT_ENABLE_CANCEL_ORDER is false"
+    cancel_state = "ready" if server_config.enable_broker else "unavailable"
+    cancel_reason = "" if cancel_state == "ready" else "broker module disabled"
     status["broker.cancel_order"] = _status(cancel_state, cancel_reason)
     status["admin.health"] = _status("ready", "")
     status["admin.print_account"] = _status(
@@ -659,6 +644,17 @@ def _status(state: str, reason: str) -> Dict[str, Any]:
     if state != "ready" and reason:
         result["reason"] = reason
     return result
+
+
+def _health_bool(payload: Dict[str, Any], key: str) -> Optional[bool]:
+    if key not in payload:
+        return None
+    value = payload.get(key)
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value.strip().lower() in ("true", "1", "yes", "on")
+    return bool(value)
 
 
 def _is_dict_payload(value: Any) -> bool:
