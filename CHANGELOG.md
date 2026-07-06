@@ -5,6 +5,17 @@
 
 ## [未发布]
 
+## [0.9.2] - 2026-07-06
+
+### 修复
+- **大 QMT 交易配置简化**：移除 `bullet-trade server` 侧重复的 `BIG_QMT_ENABLE_TRADING` / `BIG_QMT_ENABLE_CANCEL_ORDER` 障碍，`--server-type big_qmt --enable-broker` 默认直接把下单和撤单转发给大 QMT helper，避免 helper 已允许交易但 server 暗中拦单。
+
+### 文档
+- **大 QMT 部署说明**：更新 `.env.bigqmt` 示例和排障说明，明确 server 只负责连接 helper 和提供 `58620` 服务，真实交易/撤单权限由 helper 顶部 `ENABLE_TRADING` / `ENABLE_CANCEL_ORDER` 控制。
+
+### 测试
+- **大 QMT server adapter 回归**：更新 Big QMT adapter 单元测试，覆盖默认转发下单、撤单和健康检查 action 状态。
+
 ## [0.9.1] - 2026-07-03
 
 ### 修复
