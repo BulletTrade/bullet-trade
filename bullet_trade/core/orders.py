@@ -5,7 +5,7 @@
 """
 
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Any, Dict, Optional, Union
 from datetime import datetime
 import uuid
 import asyncio
@@ -139,6 +139,7 @@ def order(
     price: Optional[float] = None,
     style: Optional[Union[OrderStyle, MarketOrderStyle, LimitOrderStyle]] = None,
     wait_timeout: Optional[float] = None,
+    extra: Optional[Dict[str, Any]] = None,
 ) -> Optional[Order]:
     """
     按股数下单
@@ -152,6 +153,7 @@ def order(
             None（默认）使用全局 TRADE_MAX_WAIT_TIME（默认16秒）；
             >0 同步等待指定秒数；0 异步立即返回。
             回测模式下此参数无效。
+        extra: 传给 live broker 的订单扩展字段，例如 order_remark / strategy_name。
 
     Returns:
         Order对象，如果下单失败返回None
@@ -184,6 +186,8 @@ def order(
         wait_timeout=wait_timeout,
     )
     _record_requested_order_price(order_obj, price, resolved_style)
+    if extra:
+        order_obj.extra.update(dict(extra))
     
     _order_queue.append(order_obj)
     _register_order_snapshot(order_obj)
