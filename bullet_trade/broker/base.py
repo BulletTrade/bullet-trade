@@ -85,6 +85,7 @@ class BrokerBase(ABC):
         remark: Optional[str] = None,
         *,
         market: bool = False,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         买入
@@ -96,6 +97,7 @@ class BrokerBase(ABC):
             wait_timeout: 本次下单等待超时（秒），None 表示使用默认配置
             remark: 订单备注（可选）
             market: 是否按市价委托（由券商映射到对应价格类型）
+            extra: 订单扩展字段（可选），用于远程网关透传审计信息
             
         Returns:
             订单ID
@@ -112,6 +114,7 @@ class BrokerBase(ABC):
         remark: Optional[str] = None,
         *,
         market: bool = False,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> str:
         """
         卖出
@@ -123,6 +126,7 @@ class BrokerBase(ABC):
             wait_timeout: 本次下单等待超时（秒），None 表示使用默认配置
             remark: 订单备注（可选）
             market: 是否按市价委托（由券商映射到对应价格类型）
+            extra: 订单扩展字段（可选），用于远程网关透传审计信息
             
         Returns:
             订单ID

@@ -11,6 +11,17 @@ from ..core.globals import log
 
 DEFAULT_REMOTE_RPC_TIMEOUT_SECONDS = 60.0
 DEFAULT_PLACE_ORDER_TIMEOUT_MARGIN_SECONDS = 30.0
+ORDER_EXTRA_PAYLOAD_KEYS = frozenset(
+    {
+        "signal_batch_id",
+        "execution_batch_id",
+        "strategy_name",
+        "client_id",
+        "request_id",
+        "idempotency_key",
+        "order_remark",
+    }
+)
 
 
 def _env(key: str, default: Optional[str] = None) -> Optional[str]:
@@ -198,8 +209,9 @@ class RemoteQmtBroker(BrokerBase):
         remark: Optional[str] = None,
         *,
         market: bool = False,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> str:
-        return await self._place_order("BUY", security, amount, price, wait_timeout, remark, market)
+        return await self._place_order("BUY", security, amount, price, wait_timeout, remark, market, extra)
 
     async def sell(
         self,
@@ -210,8 +222,9 @@ class RemoteQmtBroker(BrokerBase):
         remark: Optional[str] = None,
         *,
         market: bool = False,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> str:
-        return await self._place_order("SELL", security, amount, price, wait_timeout, remark, market)
+        return await self._place_order("SELL", security, amount, price, wait_timeout, remark, market, extra)
 
     async def cancel_order(self, order_id: str) -> bool:
         loop = asyncio.get_running_loop()
@@ -260,10 +273,11 @@ class RemoteQmtBroker(BrokerBase):
         wait_timeout: Optional[float],
         remark: Optional[str] = None,
         market: bool = False,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> asyncio.Future:
         loop = asyncio.get_running_loop()
         return loop.run_in_executor(
-            None, self._place_order_sync, side, security, amount, price, wait_timeout, remark, market
+            None, self._place_order_sync, side, security, amount, price, wait_timeout, remark, market, extra
         )
 
     def _place_order_sync(
@@ -275,6 +289,7 @@ class RemoteQmtBroker(BrokerBase):
         wait_timeout: Optional[float],
         remark: Optional[str] = None,
         market: bool = False,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> str:
         self._last_warning = None
         payload = self._base_payload()
@@ -294,6 +309,7 @@ class RemoteQmtBroker(BrokerBase):
             payload["market"] = True
         if remark:
             payload["order_remark"] = remark
+        self._merge_order_extra_payload(payload, extra)
         payload.update(
             {
                 "security": security,
@@ -335,6 +351,19 @@ class RemoteQmtBroker(BrokerBase):
             raise RuntimeError(f"远程券商下单失败: order_id={order_id} status={status} response={resp}")
         self._last_order_responses[str(order_id)] = dict(resp)
         return str(order_id)
+
+    def _merge_order_extra_payload(self, payload: Dict[str, Any], extra: Optional[Dict[str, Any]]) -> None:
+        """把订单审计扩展字段白名单透传到远端下单 payload。"""
+
+        if not isinstance(extra, dict):
+            return
+        for key in ORDER_EXTRA_PAYLOAD_KEYS:
+            value = extra.get(key)
+            if value in (None, ""):
+                continue
+            if key == "order_remark" and payload.get("order_remark"):
+                continue
+            payload[key] = value
 
     def get_last_order_response(self, order_id: str) -> Dict[str, Any]:
         """读取最近一次下单响应。

@@ -725,24 +725,35 @@ class LiveEngine:
                         f"委托价={price_repr}（{price_mode}），风格={style_name}, 数量={plan.amount}"
                     )
                     remark = self._prepare_order_metadata(order)
+                    order_extra = self._order_extra_payload(order)
                     order_id: Optional[str] = None
                     if plan.is_buy:
+                        order_kwargs = {
+                            "wait_timeout": plan.wait_timeout,
+                            "remark": remark,
+                            "market": market_flag,
+                        }
+                        if order_extra and self._broker_method_accepts_extra(self.broker.buy):
+                            order_kwargs["extra"] = order_extra
                         order_id = await self.broker.buy(
                             plan.security,
                             plan.amount,
                             price_arg,
-                            wait_timeout=plan.wait_timeout,
-                            remark=remark,
-                            market=market_flag,
+                            **order_kwargs,
                         )
                     else:
+                        order_kwargs = {
+                            "wait_timeout": plan.wait_timeout,
+                            "remark": remark,
+                            "market": market_flag,
+                        }
+                        if order_extra and self._broker_method_accepts_extra(self.broker.sell):
+                            order_kwargs["extra"] = order_extra
                         order_id = await self.broker.sell(
                             plan.security,
                             plan.amount,
                             price_arg,
-                            wait_timeout=plan.wait_timeout,
-                            remark=remark,
-                            market=market_flag,
+                            **order_kwargs,
                         )
                     try:
                         setattr(order, "_broker_order_id", order_id)
@@ -892,6 +903,26 @@ class LiveEngine:
             return remark
         except Exception:
             return None
+
+    def _order_extra_payload(self, order: Order) -> Dict[str, Any]:
+        """读取订单扩展字段副本，供支持 extra 的 broker 透传。"""
+
+        try:
+            extra = getattr(order, "extra", None)
+            return dict(extra) if isinstance(extra, dict) else {}
+        except Exception:
+            return {}
+
+    def _broker_method_accepts_extra(self, method: Callable[..., Any]) -> bool:
+        """判断 broker 方法是否接受 extra，兼容外部自定义 broker。"""
+
+        try:
+            parameters = inspect.signature(method).parameters
+        except (TypeError, ValueError):
+            return False
+        if "extra" in parameters:
+            return True
+        return any(param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values())
 
     def _normalize_status(self, status: Optional[object]) -> Optional[str]:
         if status is None:

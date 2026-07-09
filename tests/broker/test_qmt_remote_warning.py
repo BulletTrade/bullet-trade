@@ -139,6 +139,43 @@ def test_remote_qmt_broker_market_order_with_price_keeps_explicit_protect_price(
     assert payload["style"] == {"type": "market", "protect_price": 10.5}
 
 
+def test_remote_qmt_broker_forwards_order_extra_metadata(monkeypatch):
+    """远程券商下单应把 live 订单扩展审计字段透传到 server。"""
+
+    monkeypatch.setenv("QMT_SERVER_TOKEN", "dummy-token")
+    broker = RemoteQmtBroker(account_id="acc")
+    fake_conn = _FakeConn()
+    broker._connection = fake_conn  # type: ignore
+    broker.connect()
+
+    broker._place_order_sync(
+        "BUY",
+        "000001.XSHE",
+        100,
+        10.5,
+        16,
+        remark="sub:btsim_byf_b2|signal:113/exec:151",
+        extra={
+            "signal_batch_id": 113,
+            "execution_batch_id": 151,
+            "strategy_name": "btsim_byf_b2",
+            "request_id": "sigexec-151-BUY-000001.XSHE",
+            "idempotency_key": "sigexec-151-BUY-000001.XSHE",
+            "order_price": 10.5,
+        },
+    )
+
+    action, payload = fake_conn.requests[0]
+    assert action == "broker.place_order"
+    assert payload["order_remark"] == "sub:btsim_byf_b2|signal:113/exec:151"
+    assert payload["signal_batch_id"] == 113
+    assert payload["execution_batch_id"] == 151
+    assert payload["strategy_name"] == "btsim_byf_b2"
+    assert payload["request_id"] == "sigexec-151-BUY-000001.XSHE"
+    assert payload["idempotency_key"] == "sigexec-151-BUY-000001.XSHE"
+    assert "order_price" not in payload
+
+
 def test_remote_qmt_broker_place_order_rpc_timeout_has_margin(monkeypatch):
     """单笔等待窗口应自动扩展远程下单 RPC timeout。"""
 

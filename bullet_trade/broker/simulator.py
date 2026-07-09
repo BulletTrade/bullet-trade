@@ -87,8 +87,10 @@ class SimulatorBroker(BrokerBase):
         remark: Optional[str] = None,
         *,
         market: bool = False,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> str:
         """买入：在后台线程执行以避免阻塞事件循环"""
+        _ = extra
         return await asyncio.to_thread(self._buy_sync, security, amount, price, market, remark)
 
     def _buy_sync(
@@ -138,8 +140,10 @@ class SimulatorBroker(BrokerBase):
         remark: Optional[str] = None,
         *,
         market: bool = False,
+        extra: Optional[Dict[str, Any]] = None,
     ) -> str:
         """卖出"""
+        _ = extra
         return await asyncio.to_thread(self._sell_sync, security, amount, price, market, remark)
 
     def _sell_sync(
