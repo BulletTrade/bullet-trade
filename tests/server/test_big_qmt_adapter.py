@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 import pytest
 
@@ -13,6 +14,23 @@ from bullet_trade.server.adapters.big_qmt import (
 )
 from bullet_trade.server.app import ServerApplication
 from bullet_trade.server.config import AccountConfig, ServerConfig
+
+
+def test_big_qmt_server_env_example_contains_account_route_and_timeout_order():
+    path = Path(__file__).resolve().parents[2] / "env.bigqmt.example"
+    values = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip()
+
+    assert values["QMT_SERVER_TYPE"] == "big_qmt"
+    assert values["QMT_SERVER_ACCOUNTS"].startswith("default=")
+    assert int(values["QMT_SERVER_REQUEST_TIMEOUT_SECONDS"]) > int(
+        values["BIG_QMT_GATEWAY_TIMEOUT_SECONDS"]
+    )
 
 
 class _FakeGatewayClient:

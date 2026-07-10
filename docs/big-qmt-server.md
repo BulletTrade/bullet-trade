@@ -83,7 +83,7 @@ helpers/big_qmt_gateway_strategy_sample.py
 ```
 
 保存前先检查顶部参数。
-由于我们是监听的本机端口，实际上也没有什么太多的安全隐患，但是记得把 ACCOUNT_ID 改了。
+由于 helper 默认只监听本机，网络暴露风险较小；实体账号以 sidecar 的 `QMT_SERVER_ACCOUNTS` 为正式路由，helper 顶部 `ACCOUNT_ID` 建议设置为同一账号，方便直接调试和 `ContextInfo.set_account`。
 <img src="assets/big-qmt-3-modify-strategy-and-save.png" alt="修改 helper 参数并保存" width="900">
 
 常用参数：
@@ -95,7 +95,7 @@ helpers/big_qmt_gateway_strategy_sample.py
 | `GATEWAY_BUILD_ID` | 启动日志和 `/health` 里的版本标识 | 每次升级 helper 后更新 |
 | `GATEWAY_PASSWORD` | BulletTrade 访问 helper 的密码 | 必须改成私有值，并和 server 侧一致 |
 | `GATEWAY_SECRET` | 可选增强认证密钥 | 可先保留默认，正式环境建议改 |
-| `ACCOUNT_ID` | QMT 资金账号 | 改成当前大 QMT 登录账号 |
+| `ACCOUNT_ID` | QMT 资金账号 | 建议与 sidecar `QMT_SERVER_ACCOUNTS` 一致；所有请求都显式传账号时可留占位值 |
 | `ACCOUNT_TYPE` | 账户类型 | 股票账户用 `stock` |
 | `INDEX_WEIGHT_DOWNLOAD_BEFORE_READ` | 指数成分读取前是否先下载指数权重 | 默认 `True`，优先对齐 MiniQMT 成分股口径 |
 | `ENABLE_TRADING` | 是否允许下单 | 仿真测试可设 `True`，只读验证设 `False` |
@@ -160,6 +160,7 @@ helpers/big_qmt_gateway_strategy_sample.py
 
 ```env
 QMT_SERVER_TOKEN=change_me_server_token
+QMT_SERVER_ACCOUNTS=default=change_me_account_id:stock
 
 BIG_QMT_GATEWAY_URL=http://127.0.0.1:9000
 BIG_QMT_GATEWAY_PASSWORD=change_me_gateway_password
@@ -178,6 +179,7 @@ bullet-trade --env-file .env.bigqmt server --server-type big_qmt --listen 0.0.0.
 - `--server-type big_qmt` 表示后端连接大 QMT helper。
 - `BIG_QMT_GATEWAY_URL` 指向大 QMT helper 的 `9000` 端口。
 - `QMT_SERVER_TOKEN` 是上层策略连接 `58620` 时使用的 token。
+- `QMT_SERVER_ACCOUNTS` 是 58620 的实体账号路由，格式为 `逻辑名=QMT账号:账户类型`；broker 请求会把它传给 helper。
 - `BIG_QMT_GATEWAY_PASSWORD` 必须和 helper 顶部的 `GATEWAY_PASSWORD` 一致。
 - 如果 helper 顶部 `GATEWAY_SECRET` 已改成非占位值，还必须设置相同的 `BIG_QMT_GATEWAY_SECRET`。
 - 外层 `QMT_SERVER_REQUEST_TIMEOUT_SECONDS` 必须大于 `BIG_QMT_GATEWAY_TIMEOUT_SECONDS`；客户端超时不会取消已经进入 QMT 主线程的同步调用。
