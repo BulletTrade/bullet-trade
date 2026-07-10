@@ -97,13 +97,12 @@ helpers/big_qmt_gateway_strategy_sample.py
 | `GATEWAY_SECRET` | 可选增强认证密钥 | 可先保留默认，正式环境建议改 |
 | `ACCOUNT_ID` | QMT 资金账号 | 改成当前大 QMT 登录账号 |
 | `ACCOUNT_TYPE` | 账户类型 | 股票账户用 `stock` |
-| `AUTO_ENSURE_HISTORY_CACHE` | `data.history` 是否先触发历史行情下载 | 默认 `True`，对齐 MiniQMT |
-| `HISTORY_FAIL_ON_ENSURE_CACHE_ERROR` | 自动下载失败时是否直接返回错误 | 默认 `True`，避免读取旧缓存或空数据 |
 | `INDEX_WEIGHT_DOWNLOAD_BEFORE_READ` | 指数成分读取前是否先下载指数权重 | 默认 `True`，优先对齐 MiniQMT 成分股口径 |
 | `ENABLE_TRADING` | 是否允许下单 | 仿真测试可设 `True`，只读验证设 `False` |
 | `ENABLE_CANCEL_ORDER` | 是否允许按订单号撤单 | 需要撤单时设 `True` |
-| `RUN_HTTP_IN_BACKGROUND_THREAD` | 是否后台线程运行 HTTP | 默认按 helper 注释使用，不要随意改 |
+| `RUN_HTTP_IN_BACKGROUND_THREAD` | 是否后台线程运行 HTTP | 正式模型必须为 `False`，由 QMT 主线程 direct dispatch |
 | `AUTO_START_HTTP_ON_MODULE_LOAD` | 模块加载时是否自启动 HTTP | 正式运行通常保持 `False` |
+| `SLOW_ACTION_WARNING_SECONDS` | direct-dispatch 慢请求告警阈值 | 默认 `5` 秒 |
 | `LOG_DIR` / `LOG_FILE_NAME` | helper 日志位置 | 默认即可，排查时看日志 |
 
 特别注意：
@@ -157,14 +156,15 @@ helpers/big_qmt_gateway_strategy_sample.py
 - `.env.bigqmt` 只是给外部 Python 进程 `bullet-trade server` 用的启动配置，目的是告诉它怎么连接大 QMT helper，以及对外用什么 token 提供 `58620` 服务。
 - 这个文件不是必须叫 `.env.bigqmt`，也不是必须用文件；你也可以用系统环境变量或命令行参数。文档用 `.env.bigqmt` 只是为了和客户端 `.env` 分开，避免混在一起。
 
-示例 `bullet-trade server` 配置文件：
+仓库中的完整模板是 `env.bigqmt.example`。生产复制配置项时必须替换 token/password，且不要提交真实密钥。最小示例：
 
 ```env
 QMT_SERVER_TOKEN=change_me_server_token
 
 BIG_QMT_GATEWAY_URL=http://127.0.0.1:9000
 BIG_QMT_GATEWAY_PASSWORD=change_me_gateway_password
-BIG_QMT_GATEWAY_TIMEOUT_SECONDS=30
+BIG_QMT_GATEWAY_TIMEOUT_SECONDS=120
+QMT_SERVER_REQUEST_TIMEOUT_SECONDS=150
 ```
 
 启动命令：
@@ -179,6 +179,8 @@ bullet-trade --env-file .env.bigqmt server --server-type big_qmt --listen 0.0.0.
 - `BIG_QMT_GATEWAY_URL` 指向大 QMT helper 的 `9000` 端口。
 - `QMT_SERVER_TOKEN` 是上层策略连接 `58620` 时使用的 token。
 - `BIG_QMT_GATEWAY_PASSWORD` 必须和 helper 顶部的 `GATEWAY_PASSWORD` 一致。
+- 如果 helper 顶部 `GATEWAY_SECRET` 已改成非占位值，还必须设置相同的 `BIG_QMT_GATEWAY_SECRET`。
+- 外层 `QMT_SERVER_REQUEST_TIMEOUT_SECONDS` 必须大于 `BIG_QMT_GATEWAY_TIMEOUT_SECONDS`；客户端超时不会取消已经进入 QMT 主线程的同步调用。
 - `--enable-broker` 启用券商接口；是否真正允许下单和撤单，由 helper 顶部的 `ENABLE_TRADING`、`ENABLE_CANCEL_ORDER` 决定。
 - 如果只想提供行情和账户查询，启动 server 时使用 `--disable-broker`，或者把 helper 顶部 `ENABLE_TRADING=False`。
 
@@ -234,7 +236,7 @@ bullet-trade live strategies/demo_strategy.py --broker qmt-remote
 
 大 QMT helper 和 `--server-type big_qmt` 的目标是对上层继续提供 MiniQMT 兼容的 `qmt-remote` 协议。关键数据接口按下面口径处理：
 
-- `data.history`：默认先调用大 QMT 内置 `download_history_data`，再调用 `get_market_data_ex` 读取本地行情。调用方只有在明确诊断缓存问题时才建议传 `auto_download=false`。
+- `data.history`：每次都先调用大 QMT 内置 `download_history_data`，再调用 `get_market_data_ex` 读取本地行情。请求参数不能跳过下载；下载失败直接返回受控错误，避免把缺失数据当成成功结果。
 - `data.current_tick`：保留当前价接口，返回结构与快照保持一致，至少包含 `sid`、`last_price`、`dt`。
 - `data.security_info`：返回聚宽风格 `code` 和 QMT 风格 `qmt_code`，同时补齐 `display_name`、`name`、`start_date`、`end_date`、`type`、`subtype`、`parent`。
 - `data.get_index_stocks`：优先使用 `download_index_weight` / `get_index_weight` 获取指数权重成分；如果当前大 QMT 环境不支持，再回退到板块列表。
@@ -287,4 +289,4 @@ module autostart disabled
 
 ### 大 QMT 的历史数据是否也需要下载
 
-需要。正式口径和 MiniQMT 一样：先确保本地缓存，再读取历史行情。`AUTO_ENSURE_HISTORY_CACHE=True` 时，helper 会在 `data.history` 里自动调用下载函数；如果下载失败且 `HISTORY_FAIL_ON_ENSURE_CACHE_ERROR=True`，接口会返回错误，而不是继续读可能不完整的数据。
+需要。正式口径和 MiniQMT 一样：每次先确保本地缓存，再读取历史行情。helper 会在 `data.history` 里先调用下载函数；如果下载失败，接口直接返回错误，而不是继续读可能不完整的数据。盘前预热用于降低延迟，但不能替代本次下载确认。

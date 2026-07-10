@@ -200,6 +200,11 @@ def test_runtime_reports_context_missing_for_current_tick_without_context():
     assert response["ok"] is False
     assert response["code"] == "QMT_CONTEXT_NOT_READY"
     assert runtime.request_queue.qsize() == 0
+    health = runtime.health()
+    assert health["current_action"] is None
+    assert health["last_action"] == "current_tick"
+    assert health["last_action_request_id"] == "r-no-context"
+    assert health["last_action_elapsed_ms"] >= 0.0
 
 
 def test_runtime_dispatches_account_actions_without_context(monkeypatch):
@@ -403,9 +408,16 @@ def test_big_qmt_helper_history_returns_error_when_auto_ensure_fails():
     assert context.history_call is None
 
 
-def test_big_qmt_helper_history_allows_explicit_auto_download_false():
+def test_big_qmt_helper_history_ignores_auto_download_false_for_correctness(monkeypatch):
     helper = _load_helper()
     context = _FakeContext()
+    download_calls = []
+    monkeypatch.setattr(
+        helper,
+        "download_history_data",
+        lambda *args, **kwargs: download_calls.append((args, kwargs)),
+        raising=False,
+    )
 
     history = helper._dispatch_qmt_action(
         context,
@@ -414,6 +426,7 @@ def test_big_qmt_helper_history_allows_explicit_auto_download_false():
     )
 
     assert history["ok"] is True
+    assert len(download_calls) == 1
     assert context.history_call[1] == ["000001.SZ"]
 
 

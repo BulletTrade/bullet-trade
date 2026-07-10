@@ -1,7 +1,7 @@
 #encoding:gbk
 # Author: BruceLee
-# Date: 2026-07-02
-# Version: 20260703_miniqmt_alignment
+# Date: 2026-07-10
+# Version: 20260710_direct_dispatch_observability
 # File: Big QMT embedded gateway strategy sample.
 # Description: Run inside a dedicated Big QMT strategy and expose a
 # BulletTrade-compatible local HTTP/JSON data and trading gateway.
@@ -41,7 +41,7 @@ LISTEN_PORT = 9000
 
 # Build marker shown in startup logs and /health. Update this when copying a new
 # helper build into QMT so tests can prove the running file version.
-GATEWAY_BUILD_ID = "20260703_miniqmt_alignment"
+GATEWAY_BUILD_ID = "20260710_direct_dispatch_observability"
 
 # Shared password required by non-health HTTP APIs. Change this to a private
 # local value outside simulation; clients send it as X-BulletTrade-Password or
@@ -65,14 +65,8 @@ ACCOUNT_TYPE = "stock"
 # so use a stable liquid A-share as the equivalent market calendar anchor.
 DEFAULT_TRADE_DAYS_SECURITY = "000001.SZ"
 
-# Match MiniQMT's safety default: history reads first request QMT to prepare
-# local cache, then read local bars. Callers may pass auto_download=false only
-# for explicit diagnostics.
-AUTO_ENSURE_HISTORY_CACHE = True
-
-# When automatic history cache preparation fails, return an error instead of
-# reading potentially stale or placeholder local data.
-HISTORY_FAIL_ON_ENSURE_CACHE_ERROR = True
+# History reads always request QMT to download/refresh the matching local cache
+# before reading bars. This correctness rule cannot be disabled per request.
 
 # Match MiniQMT's index constituent semantics: prefer index-weight APIs over
 # sector lists. Sector list is only a fallback when the broker build lacks the
@@ -164,6 +158,9 @@ AUTO_START_HTTP_ON_MODULE_LOAD = False
 
 # Default per-request wait time when dispatching queued QMT actions.
 REQUEST_TIMEOUT_SECONDS = 10
+
+# Log a warning when one direct-dispatch QMT action exceeds this duration.
+SLOW_ACTION_WARNING_SECONDS = 5.0
 
 # Maximum accepted HTTP JSON body size in bytes.
 MAX_REQUEST_BODY_BYTES = 1024 * 1024
@@ -1332,13 +1329,6 @@ def _call_download_history_data(qmt_security: str, period: str, start: Any, end:
 
 
 def _auto_ensure_history_cache(qmt_security: str, period: str, start: Any, end: Any, payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    enabled = _payload_bool(
-        payload,
-        ["auto_download", "auto_ensure_cache", "ensure_cache"],
-        AUTO_ENSURE_HISTORY_CACHE,
-    )
-    if not enabled:
-        return None
     started = time.time()
     info = _call_download_history_data(qmt_security, period, start, end, payload)
     _emit(
@@ -1379,12 +1369,10 @@ def _query_history(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]
             _auto_ensure_history_cache(qmt_security, period, start, end, payload)
         except QmtApiUnavailable as exc:
             LOGGER.exception("history auto ensure_cache unavailable: %s", exc)
-            if HISTORY_FAIL_ON_ENSURE_CACHE_ERROR:
-                return _error("QMT_API_NOT_READY", str(exc), payload.get("request_id"))
+            return _error("QMT_API_NOT_READY", str(exc), payload.get("request_id"))
         except Exception as exc:
             LOGGER.exception("history auto ensure_cache failed: %s", exc)
-            if HISTORY_FAIL_ON_ENSURE_CACHE_ERROR:
-                return _error("ENSURE_CACHE_FAILED", str(exc), payload.get("request_id"))
+            return _error("ENSURE_CACHE_FAILED", str(exc), payload.get("request_id"))
         data = context_info.get_market_data_ex(
             fields,
             [qmt_security],
@@ -2418,8 +2406,19 @@ class _GatewayRuntime:
         self.ioloop = None
         self.http_thread = None
         self.direct_dispatch = False
+        self.current_action = None
+        self.current_request_id = None
+        self.current_action_started_at = None
+        self.last_action = None
+        self.last_action_request_id = None
+        self.last_action_elapsed_ms = None
+        self.last_action_finished_at = None
 
     def _dispatch_now(self, action: str, payload: Dict[str, Any], request_id: str) -> Dict[str, Any]:
+        started_at = time.time()
+        self.current_action = action
+        self.current_request_id = request_id
+        self.current_action_started_at = started_at
         try:
             _emit(
                 "info",
@@ -2429,15 +2428,11 @@ class _GatewayRuntime:
                 self.context_info is not None,
             )
             response = _dispatch_qmt_action(self.context_info, action, payload)
-            self.last_success_at = time.time()
-            _emit(
-                "info",
-                "dispatch done action=%s request_id=%s ok=%s code=%s",
-                action,
-                request_id,
-                response.get("ok"),
-                response.get("code") or "",
-            )
+            if response.get("ok"):
+                self.last_success_at = time.time()
+                self.last_error = None
+            else:
+                self.last_error = str(response.get("message") or response.get("code") or "")
             return response
         except Exception as exc:
             LOGGER.exception("direct dispatch failed: %s", exc)
@@ -2449,6 +2444,28 @@ class _GatewayRuntime:
                 "QMT_ACTION_FAILED",
                 "%s\n%s" % (exc, traceback.format_exc()),
                 request_id,
+            )
+        finally:
+            finished_at = time.time()
+            elapsed_ms = max(0.0, (finished_at - started_at) * 1000.0)
+            self.last_action = action
+            self.last_action_request_id = request_id
+            self.last_action_elapsed_ms = elapsed_ms
+            self.last_action_finished_at = finished_at
+            self.current_action = None
+            self.current_request_id = None
+            self.current_action_started_at = None
+            level = (
+                "warning"
+                if elapsed_ms >= max(0.0, SLOW_ACTION_WARNING_SECONDS * 1000.0)
+                else "info"
+            )
+            _emit(
+                level,
+                "dispatch done action=%s request_id=%s elapsed_ms=%.1f",
+                action,
+                request_id,
+                elapsed_ms,
             )
 
     def submit(self, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2509,6 +2526,7 @@ class _GatewayRuntime:
             job["event"].set()
 
     def health(self) -> Dict[str, Any]:
+        now = time.time()
         context_ready = self.context_info is not None
         qmt_api_ready = _qmt_global_available("get_trade_detail_data")
         account_configured = not _is_placeholder_account_id(ACCOUNT_ID)
@@ -2548,6 +2566,19 @@ class _GatewayRuntime:
             "stop_http_on_qmt_stop": STOP_HTTP_ON_QMT_STOP,
             "queue_size": self.request_queue.qsize(),
             "queue_max_size": MAX_QUEUE_SIZE,
+            "current_action": self.current_action,
+            "current_request_id": self.current_request_id,
+            "current_action_started_at": self.current_action_started_at,
+            "current_action_busy_ms": (
+                max(0.0, (now - self.current_action_started_at) * 1000.0)
+                if self.current_action_started_at is not None
+                else None
+            ),
+            "last_action": self.last_action,
+            "last_action_request_id": self.last_action_request_id,
+            "last_action_elapsed_ms": self.last_action_elapsed_ms,
+            "last_action_finished_at": self.last_action_finished_at,
+            "slow_action_warning_seconds": SLOW_ACTION_WARNING_SECONDS,
             "last_error": self.last_error,
             "last_success_at": self.last_success_at,
             "uptime_seconds": max(0.0, time.time() - self.started_at),
@@ -2591,6 +2622,7 @@ class _GatewayHandler(tornado.web.RequestHandler):
         self._handle_action(action, payload)
 
     def _handle_action(self, action: str, payload: Dict[str, Any]) -> None:
+        started_at = time.time()
         request_id = payload.get("request_id") or self._request_id()
         if not _check_password(self.request.headers):
             _emit("warning", "auth failed action=%s request_id=%s remote=%s", action, request_id, self.request.remote_ip)
@@ -2603,12 +2635,13 @@ class _GatewayHandler(tornado.web.RequestHandler):
             status = 404
         _emit(
             "info",
-            "http response action=%s request_id=%s status=%s ok=%s code=%s",
+            "http response action=%s request_id=%s status=%s ok=%s code=%s elapsed_ms=%.1f",
             action,
             request_id,
             status,
             response.get("ok"),
             response.get("code") or "",
+            max(0.0, (time.time() - started_at) * 1000.0),
         )
         self._send_json(status, response)
 
