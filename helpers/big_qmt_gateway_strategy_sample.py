@@ -1,7 +1,7 @@
 #encoding:gbk
 # Author: BruceLee
 # Date: 2026-07-10
-# Version: 20260710_direct_dispatch_observability
+# Version: 20260710_daily_log_rotation_5d
 # File: Big QMT embedded gateway strategy sample.
 # Description: Run inside a dedicated Big QMT strategy and expose a
 # BulletTrade-compatible local HTTP/JSON data and trading gateway.
@@ -12,6 +12,7 @@
 
 import json
 import logging
+from logging.handlers import TimedRotatingFileHandler
 import os
 import queue
 import sys
@@ -41,7 +42,7 @@ LISTEN_PORT = 9000
 
 # Build marker shown in startup logs and /health. Update this when copying a new
 # helper build into QMT so tests can prove the running file version.
-GATEWAY_BUILD_ID = "20260710_direct_dispatch_observability"
+GATEWAY_BUILD_ID = "20260710_daily_log_rotation_5d"
 
 # Shared password required by non-health HTTP APIs. Change this to a private
 # local value outside simulation; clients send it as X-BulletTrade-Password or
@@ -185,6 +186,19 @@ LOG_DIR = ""
 # Log file name created under LOG_DIR or the resolved default directory.
 LOG_FILE_NAME = "bt_big_qmt_gateway.log"
 
+# Rotate the helper log at local midnight. TimedRotatingFileHandler is part of
+# the Python 3.6 standard library and does not add a QMT whitelist dependency.
+LOG_ROTATE_WHEN = "midnight"
+
+# Rotate once per LOG_ROTATE_WHEN interval.
+LOG_ROTATE_INTERVAL = 1
+
+# Keep five completed daily log files in addition to the current active file.
+LOG_BACKUP_COUNT = 5
+
+# False means rotation follows the Windows/QMT machine local timezone.
+LOG_ROTATE_UTC = False
+
 
 def _boot_print(message: str) -> None:
     try:
@@ -228,16 +242,41 @@ def _setup_logger() -> logging.Logger:
     logger.setLevel(LOG_LEVEL)
     formatter = logging.Formatter("%(asctime)s %(levelname)s %(message)s")
     file_exists = False
-    for handler in logger.handlers:
+    for handler in list(logger.handlers):
         if getattr(handler, "baseFilename", None) == LOG_FILE:
-            file_exists = True
-            handler.setLevel(LOG_LEVEL)
-            handler.setFormatter(formatter)
+            if isinstance(handler, TimedRotatingFileHandler):
+                file_exists = True
+                handler.backupCount = LOG_BACKUP_COUNT
+                handler.setLevel(LOG_LEVEL)
+                handler.setFormatter(formatter)
+            else:
+                # QMT may reload a strategy in the same interpreter. Replace a
+                # stale plain FileHandler so rotation takes effect immediately.
+                logger.removeHandler(handler)
+                try:
+                    handler.close()
+                except Exception:
+                    pass
     if not file_exists:
         try:
-            file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+            file_handler = TimedRotatingFileHandler(
+                LOG_FILE,
+                when=LOG_ROTATE_WHEN,
+                interval=LOG_ROTATE_INTERVAL,
+                backupCount=LOG_BACKUP_COUNT,
+                encoding="utf-8",
+                delay=True,
+                utc=LOG_ROTATE_UTC,
+            )
         except TypeError:
-            file_handler = logging.FileHandler(LOG_FILE)
+            file_handler = TimedRotatingFileHandler(
+                LOG_FILE,
+                when=LOG_ROTATE_WHEN,
+                interval=LOG_ROTATE_INTERVAL,
+                backupCount=LOG_BACKUP_COUNT,
+                delay=True,
+                utc=LOG_ROTATE_UTC,
+            )
         except Exception as exc:
             _boot_print("file logger disabled log_file=%s error=%s" % (LOG_FILE, exc))
             file_handler = None
@@ -278,8 +317,12 @@ def _emit(level: str, message: str, *args: Any) -> None:
 
 _emit(
     "info",
-    "logger ready log_file=%s cwd=%s file=%s",
+    "logger ready log_file=%s rotate=%s interval=%s backups=%s utc=%s cwd=%s file=%s",
     LOG_FILE,
+    LOG_ROTATE_WHEN,
+    LOG_ROTATE_INTERVAL,
+    LOG_BACKUP_COUNT,
+    LOG_ROTATE_UTC,
     os.getcwd(),
     globals().get("__file__", "<no __file__>"),
 )
@@ -2530,6 +2573,10 @@ class _GatewayRuntime:
         context_ready = self.context_info is not None
         qmt_api_ready = _qmt_global_available("get_trade_detail_data")
         account_configured = not _is_placeholder_account_id(ACCOUNT_ID)
+        try:
+            log_file_size_bytes = os.path.getsize(LOG_FILE)
+        except Exception:
+            log_file_size_bytes = 0
         return {
             "ready": context_ready or qmt_api_ready,
             "http_alive": self.ioloop is not None,
@@ -2550,6 +2597,11 @@ class _GatewayRuntime:
             "gateway_build_id": GATEWAY_BUILD_ID,
             "listen": "%s:%s" % (LISTEN_HOST, LISTEN_PORT),
             "log_file": LOG_FILE,
+            "log_file_size_bytes": log_file_size_bytes,
+            "log_rotate_when": LOG_ROTATE_WHEN,
+            "log_rotate_interval": LOG_ROTATE_INTERVAL,
+            "log_backup_count": LOG_BACKUP_COUNT,
+            "log_rotate_utc": LOG_ROTATE_UTC,
             "account_id": ACCOUNT_ID,
             "account_type": ACCOUNT_TYPE,
             "account_configured": account_configured,

@@ -1,4 +1,5 @@
 import importlib.util
+from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -188,6 +189,29 @@ def test_runtime_health_reports_gateway_build_id():
     health = runtime.health()
 
     assert health["gateway_build_id"] == helper.GATEWAY_BUILD_ID
+
+
+def test_helper_uses_daily_log_rotation_with_five_backups():
+    helper = _load_helper()
+
+    handlers = [
+        handler
+        for handler in helper.LOGGER.handlers
+        if isinstance(handler, TimedRotatingFileHandler)
+    ]
+
+    assert handlers
+    assert helper.LOG_ROTATE_WHEN == "midnight"
+    assert helper.LOG_ROTATE_INTERVAL == 1
+    assert helper.LOG_BACKUP_COUNT == 5
+    assert handlers[0].backupCount == 5
+
+    health = helper._GatewayRuntime().health()
+    assert health["log_rotate_when"] == "midnight"
+    assert health["log_rotate_interval"] == 1
+    assert health["log_backup_count"] == 5
+    assert health["log_rotate_utc"] is False
+    assert health["log_file_size_bytes"] >= 0
 
 
 def test_runtime_reports_context_missing_for_current_tick_without_context():

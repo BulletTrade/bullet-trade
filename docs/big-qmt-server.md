@@ -103,7 +103,10 @@ helpers/big_qmt_gateway_strategy_sample.py
 | `RUN_HTTP_IN_BACKGROUND_THREAD` | 是否后台线程运行 HTTP | 正式模型必须为 `False`，由 QMT 主线程 direct dispatch |
 | `AUTO_START_HTTP_ON_MODULE_LOAD` | 模块加载时是否自启动 HTTP | 正式运行通常保持 `False` |
 | `SLOW_ACTION_WARNING_SECONDS` | direct-dispatch 慢请求告警阈值 | 默认 `5` 秒 |
-| `LOG_DIR` / `LOG_FILE_NAME` | helper 日志位置 | 默认即可，排查时看日志 |
+| `LOG_DIR` / `LOG_FILE_NAME` | helper 当前活动日志位置 | 默认即可，排查时看日志 |
+| `LOG_ROTATE_WHEN` / `LOG_ROTATE_INTERVAL` | 日志切分周期 | 默认本机午夜、每天一次 |
+| `LOG_BACKUP_COUNT` | 已完成的历史日志保留数量 | 默认 `5`，即当前文件外再保留最近 5 个日文件 |
+| `LOG_ROTATE_UTC` | 是否按 UTC 切分日志 | 默认 `False`，按 Windows/QMT 本地时间 |
 
 特别注意：
 
@@ -185,6 +188,17 @@ bullet-trade --env-file .env.bigqmt server --server-type big_qmt --listen 0.0.0.
 - 外层 `QMT_SERVER_REQUEST_TIMEOUT_SECONDS` 必须大于 `BIG_QMT_GATEWAY_TIMEOUT_SECONDS`；客户端超时不会取消已经进入 QMT 主线程的同步调用。
 - `--enable-broker` 启用券商接口；是否真正允许下单和撤单，由 helper 顶部的 `ENABLE_TRADING`、`ENABLE_CANCEL_ORDER` 决定。
 - 如果只想提供行情和账户查询，启动 server 时使用 `--disable-broker`，或者把 helper 顶部 `ENABLE_TRADING=False`。
+
+实体账号的实际传递顺序如下：
+
+```text
+客户端/V2 请求 account_key=default
+  -> 58620 用 QMT_SERVER_ACCOUNTS 解析出实体 account_id/account_type
+  -> big_qmt adapter 在每个 account/position/order/trade/place/cancel 请求中携带实体账号
+  -> helper 优先使用请求里的 account_id；只有请求没有账号时才回退到顶部 ACCOUNT_ID
+```
+
+因此 `/health` 中 `account_configured=false` 只表示 helper 顶部 `ACCOUNT_ID` 仍是占位值，不表示经 58620 转发的请求没有实体账号。正常 sidecar 请求只要配置了 `QMT_SERVER_ACCOUNTS` 就能查询和交易；直接访问 helper 且没有传 `account_id` 时会返回 `ACCOUNT_NOT_CONFIGURED`。正式环境仍建议把 helper `ACCOUNT_ID` 设置为同一实体账号，减少直接调试和错误配置时的歧义。
 
 如果你只是想验证大 QMT helper 本身是否启动，看到 `listen success listen=127.0.0.1:9000` 就已经说明 helper 在大 QMT 里跑起来了。  
 但如果要让 BulletTrade 策略、AIStocks V2 或聚宽 helper 继续使用原来的 `qmt-remote` 接口，就还需要这个 `bullet-trade server` 作为中间层。
@@ -278,6 +292,18 @@ module autostart disabled
 - helper 顶部 `ENABLE_CANCEL_ORDER=True`
 
 如果想让整个 `58620` 服务不提供券商接口，启动 `bullet-trade server` 时使用 `--disable-broker`。
+
+### helper 日志为什么会越来越大
+
+build `20260710_daily_log_rotation_5d` 起，helper 使用 Python 3.6 标准库 `TimedRotatingFileHandler`：
+
+- 每天按 Windows/QMT 本地午夜切分一次；
+- 当前活动文件仍叫 `bt_big_qmt_gateway.log`；
+- 轮转文件使用日期后缀；
+- 当前文件之外保留最近 5 个已完成日文件；
+- `/health` 返回 `log_file_size_bytes`、`log_rotate_when`、`log_backup_count` 等字段。
+
+升级前已经很大的活动日志不会在启动时直接删除。它会在下一个午夜进入轮转，再按保留数量逐日淘汰。如果需要立即释放空间，应先停止 helper，人工归档或删除旧日志，再启动新版 helper；不要在 helper 正写入时强制删除或改名。
 
 ### 为什么密码不匹配
 
