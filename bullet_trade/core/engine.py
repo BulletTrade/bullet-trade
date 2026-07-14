@@ -1766,7 +1766,7 @@ class BacktestEngine:
 
             # 直接调用 provider 的 get_price，绕过 api 层的 avoid_future_data 检查
             # 这是因为停牌判断是元数据，不应受回测模式限制
-            provider = data_api._provider
+            provider = data_api.get_data_provider()
 
             # 获取 check_date 前后的数据
             start = check_date - timedelta(days=5)

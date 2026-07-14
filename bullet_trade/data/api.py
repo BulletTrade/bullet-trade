@@ -9,6 +9,7 @@ import inspect
 import json
 import os
 import re
+import threading
 from datetime import date as Date
 from datetime import datetime
 from datetime import time as Time
@@ -36,6 +37,8 @@ _cache_forced_off_warned = False
 # 按名称缓存 provider 实例与认证状态，避免重复初始化/认证
 _provider_cache: Dict[str, DataProvider] = {}
 _provider_auth_attempted: Dict[str, bool] = {}
+_provider_init_lock = threading.RLock()
+_pending_default_provider_name: Optional[str] = None
 
 
 def _normalize_provider_name(name: Optional[str]) -> str:
@@ -108,21 +111,69 @@ def _create_provider(
     raise ValueError(f"未知的数据提供者: {provider_name}")
 
 
-def _ensure_auth():
-    """确保数据提供者已认证"""
+def _get_default_provider() -> DataProvider:
+    """按需创建并返回默认数据提供者。
+
+    Returns:
+        DataProvider: 当前默认数据提供者实例。
+
+    Side Effects:
+        首次调用时读取当前环境配置、创建 provider、绑定 SDK 回退并写入 provider 缓存。
+        该函数只负责构造，不执行认证或业务请求；初始化锁用于避免并发首次调用创建多个连接实例。
+    """
+    global _provider, _auth_attempted, _pending_default_provider_name
+    provider = _provider
+    if provider is not None:
+        return provider
+
+    with _provider_init_lock:
+        if _provider is None:
+            config = get_data_provider_config()
+            normalized = _normalize_provider_name(
+                _pending_default_provider_name or config.get("default") or "jqdata"
+            )
+            provider = _provider_cache.get(normalized)
+            if provider is None:
+                provider = _create_provider(provider_name=normalized)
+                _provider_cache[normalized] = provider
+                _provider_auth_attempted[normalized] = False
+            _bind_sdk_fallback(provider, normalized)
+            _provider = provider
+            _auth_attempted = _provider_auth_attempted.get(normalized, False)
+            _pending_default_provider_name = None
+            _maybe_disable_cache_for_live(provider)
+        provider = _provider
+        if provider is None:  # pragma: no cover - 初始化锁内的防御性保护
+            raise RuntimeError("默认数据提供者初始化失败")
+        return provider
+
+
+def _ensure_auth() -> DataProvider:
+    """确保默认数据提供者已经创建并完成一次认证。
+
+    Returns:
+        DataProvider: 当前默认数据提供者实例。
+
+    Side Effects:
+        默认 provider 尚未创建时会惰性创建；认证成功后更新全局认证状态。
+        认证失败时沿用既有行为打印错误并保留重试机会。
+    """
     global _auth_attempted
-    if not _auth_attempted:
-        try:
-            _provider.auth()
-            _auth_attempted = True
-            _provider_auth_attempted[
-                _normalize_provider_name(getattr(_provider, "name", None))
-            ] = True
-        except Exception as e:
-            # 认证失败，但不设置 _auth_attempted = True
-            # 这样下次调用时还会重试
-            print(f"数据源认证失败: {e}")
-            # 不设置 _auth_attempted，允许重试
+    with _provider_init_lock:
+        provider = _get_default_provider()
+        if not _auth_attempted:
+            try:
+                provider.auth()
+                _auth_attempted = True
+                _provider_auth_attempted[
+                    _normalize_provider_name(getattr(provider, "name", None))
+                ] = True
+            except Exception as e:
+                # 认证失败，但不设置 _auth_attempted = True
+                # 这样下次调用时还会重试
+                print(f"数据源认证失败: {e}")
+                # 不设置 _auth_attempted，允许重试
+        return provider
 
 
 def _ensure_auth_for(
@@ -132,20 +183,21 @@ def _ensure_auth_for(
     确保指定 provider 已认证，按名称跟踪认证状态。
     """
     name = _normalize_provider_name(provider_name or getattr(provider, "name", ""))
-    attempted = _provider_auth_attempted.get(name, False)
-    if attempted:
-        return
-    try:
-        provider.auth()
-        _provider_auth_attempted[name] = True
-        if provider is _provider:
-            # 同步全局默认数据源的认证标记
-            globals()["_auth_attempted"] = True
-    except Exception as exc:
-        message = f"{name} 数据源认证失败: {exc}"
-        if raise_on_fail:
-            raise RuntimeError(message) from exc
-        print(message)
+    with _provider_init_lock:
+        attempted = _provider_auth_attempted.get(name, False)
+        if attempted:
+            return
+        try:
+            provider.auth()
+            _provider_auth_attempted[name] = True
+            if provider is _provider:
+                # 同步全局默认数据源的认证标记
+                globals()["_auth_attempted"] = True
+        except Exception as exc:
+            message = f"{name} 数据源认证失败: {exc}"
+            if raise_on_fail:
+                raise RuntimeError(message) from exc
+            print(message)
 
 
 def _sdk_fallback_targets(
@@ -239,9 +291,7 @@ def _bind_sdk_fallback(provider: DataProvider, provider_name: str) -> None:
     setattr(provider, "_sdk_fallback", _resolver)
 
 
-_provider: DataProvider = _create_provider()
-_bind_sdk_fallback(_provider, _normalize_provider_name(getattr(_provider, "name", None)))
-_provider_cache[_normalize_provider_name(getattr(_provider, "name", None))] = _provider
+_provider: Optional[DataProvider] = None
 _auth_attempted = False
 _security_info_cache: Dict[Any, "SecurityInfo"] = {}
 _security_overrides_loaded = False
@@ -293,41 +343,51 @@ def set_data_provider(provider: Union[DataProvider, str], **provider_kwargs) -> 
     支持直接传入 DataProvider 实例，或传入 provider 名称（如 'jqdata'、'tushare'、'miniqmt'）。
     """
     global _provider, _auth_attempted, _security_info_cache, _cache_forced_off_warned
+    global _pending_default_provider_name
     if isinstance(provider, DataProvider):
-        _provider = provider
+        selected_provider = provider
     else:
-        _provider = _create_provider(provider_name=provider, overrides=provider_kwargs)
+        selected_provider = _create_provider(provider_name=provider, overrides=provider_kwargs)
 
-    normalized = _normalize_provider_name(getattr(_provider, "name", None))
-    _bind_sdk_fallback(_provider, normalized)
-    _provider_cache[normalized] = _provider
-    _provider_auth_attempted[normalized] = False
-    _auth_attempted = False
-    _security_info_cache = {}
-    _cache_forced_off_warned = False
-    _maybe_disable_cache_for_live(_provider)
-    try:
-        _provider.auth()
-        _auth_attempted = True
-    except Exception:
-        _auth_attempted = True
-        pass
+    normalized = _normalize_provider_name(getattr(selected_provider, "name", None))
+    _bind_sdk_fallback(selected_provider, normalized)
+    with _provider_init_lock:
+        _provider = selected_provider
+        _provider_cache[normalized] = selected_provider
+        _provider_auth_attempted[normalized] = False
+        _auth_attempted = False
+        _pending_default_provider_name = None
+        _security_info_cache = {}
+        _cache_forced_off_warned = False
+        _maybe_disable_cache_for_live(selected_provider)
+        try:
+            selected_provider.auth()
+            _provider_auth_attempted[normalized] = True
+            _auth_attempted = True
+        except Exception:
+            # 保留显式设置 provider 的既有容错语义：认证错误由后续业务调用处理。
+            _auth_attempted = True
 
 
 def reload_data_provider_from_env(provider_name: Optional[str] = None) -> None:
     """
-    根据最新环境变量刷新数据提供者实例。
+    使当前数据提供者失效，并在下一次真实数据调用时根据最新环境变量重建。
+
+    仅刷新配置不会创建 provider 或建立远程连接；显式 provider_name 会作为下一次
+    默认 provider 初始化的覆盖值使用。
     """
     global _provider, _auth_attempted, _security_info_cache, _cache_forced_off_warned
-    _provider = _create_provider(provider_name=provider_name, overrides=None)
-    normalized = _normalize_provider_name(getattr(_provider, "name", None))
-    _bind_sdk_fallback(_provider, normalized)
-    _provider_cache[normalized] = _provider
-    _provider_auth_attempted[normalized] = False
-    _auth_attempted = False
-    _security_info_cache = {}
-    _cache_forced_off_warned = False
-    _maybe_disable_cache_for_live(_provider)
+    global _pending_default_provider_name
+    with _provider_init_lock:
+        _provider = None
+        _provider_cache.clear()
+        _provider_auth_attempted.clear()
+        _auth_attempted = False
+        _pending_default_provider_name = (
+            _normalize_provider_name(provider_name) if provider_name else None
+        )
+        _security_info_cache = {}
+        _cache_forced_off_warned = False
 
 
 def get_data_provider(provider_name: Optional[str] = None) -> DataProvider:
@@ -337,22 +397,24 @@ def get_data_provider(provider_name: Optional[str] = None) -> DataProvider:
     - 传入 provider_name：按名称缓存并返回对应实例，不修改全局默认。
     """
     if provider_name is None:
-        _maybe_disable_cache_for_live()
-        _ensure_auth()
-        _bind_sdk_fallback(_provider, _normalize_provider_name(getattr(_provider, "name", None)))
-        return _provider
+        with _provider_init_lock:
+            provider = _ensure_auth()
+            _maybe_disable_cache_for_live(provider)
+            _bind_sdk_fallback(provider, _normalize_provider_name(getattr(provider, "name", None)))
+            return provider
 
     normalized = _normalize_provider_name(provider_name)
-    provider = _provider_cache.get(normalized)
-    if provider is None:
-        provider = _create_provider(provider_name=normalized, overrides=None)
-        _provider_cache[normalized] = provider
-        _provider_auth_attempted[normalized] = False
-
-    _bind_sdk_fallback(provider, normalized)
-    _maybe_disable_cache_for_live(provider)
-    _ensure_auth_for(provider, normalized, raise_on_fail=True)
-    return provider
+    with _provider_init_lock:
+        cached_provider = _provider_cache.get(normalized)
+        if cached_provider is None:
+            cached_provider = _create_provider(provider_name=normalized, overrides=None)
+            _provider_cache[normalized] = cached_provider
+            _provider_auth_attempted[normalized] = False
+        provider = cached_provider
+        _bind_sdk_fallback(provider, normalized)
+        _maybe_disable_cache_for_live(provider)
+        _ensure_auth_for(provider, normalized, raise_on_fail=True)
+        return provider
 
 
 def set_current_context(context):
@@ -629,7 +691,7 @@ def _resolve_fq_ref_date(
 
 def _call_provider_get_price(**kwargs) -> pd.DataFrame:
     """兼容旧 provider：只透传其支持的参数。"""
-    provider = _provider
+    provider = _get_default_provider()
     get_price = provider.get_price
     try:
         sig = inspect.signature(get_price)
@@ -723,15 +785,16 @@ def _call_provider_get_split_dividend_with_security_fallback(
     Returns:
         List[Dict[str, Any]]: 标准化后的分红/拆分事件列表。
     """
+    provider = _get_default_provider()
     if not isinstance(security, str):
-        return _provider.get_split_dividend(security, start_date=start_date, end_date=end_date)
+        return provider.get_split_dividend(security, start_date=start_date, end_date=end_date)
 
     last_exc: Optional[Exception] = None
     had_successful_call = False
     candidates = list(dict.fromkeys(_candidate_security_keys(security)))
     for idx, candidate in enumerate(candidates):
         try:
-            result = _provider.get_split_dividend(
+            result = provider.get_split_dividend(
                 candidate,
                 start_date=start_date,
                 end_date=end_date,
@@ -1190,7 +1253,7 @@ def _round_dynamic_pre_result(df: pd.DataFrame, security: str) -> pd.DataFrame:
     Returns:
         pd.DataFrame: 四舍五入后的行情表；provider 不支持时原样返回。
     """
-    round_fn = getattr(_provider, "_round_price_result", None)
+    round_fn = getattr(_get_default_provider(), "_round_price_result", None)
     if not callable(round_fn):
         return df
     try:
@@ -1255,7 +1318,7 @@ def _try_get_price_from_backtest_session(
             force_no_engine=force_no_engine,
         )
 
-    provider_name = _normalize_provider_name(getattr(_provider, "name", None))
+    provider_name = _normalize_provider_name(getattr(_get_default_provider(), "name", None))
     if provider_name in ("miniqmt", "remote_qmt"):
         return None
     freq_key = _price_block_frequency_key(frequency)
@@ -1357,7 +1420,7 @@ def _try_get_dynamic_pre_price_from_backtest_session(
         session.record_degradation("price_block_dynamic_pre_no_context")
         return None
 
-    provider_name = _normalize_provider_name(getattr(_provider, "name", None))
+    provider_name = _normalize_provider_name(getattr(_get_default_provider(), "name", None))
     if provider_name in ("miniqmt", "remote_qmt"):
         return None
     freq_key = _price_block_frequency_key(frequency)
@@ -1800,10 +1863,11 @@ class LiveCurrentData:
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        requires_live = bool(getattr(_provider, "requires_live_data", False))
+        provider = _get_default_provider()
+        requires_live = bool(getattr(provider, "requires_live_data", False))
         snap = None
         try:
-            get_fn = getattr(_provider, "get_live_current", None)
+            get_fn = getattr(provider, "get_live_current", None)
             if callable(get_fn):
                 snap = get_fn(security)
         except Exception:
@@ -1835,7 +1899,7 @@ class LiveCurrentData:
             )
         else:
             if requires_live:
-                provider_name = getattr(_provider, "name", "unknown")
+                provider_name = getattr(provider, "name", "unknown")
                 raise RuntimeError(f"数据源 {provider_name} 未返回 {security} 的实时行情，请检查行情订阅/连接")
             data = self._fallback[security]
 
@@ -1929,7 +1993,7 @@ def _ensure_history_view(api_name: str, date_value: Optional[Date]) -> None:
         return
     if date_value is None:
         return
-    provider_name = getattr(_provider, "name", "")
+    provider_name = getattr(_get_default_provider(), "name", "")
     unsupported = _HISTORY_VIEW_UNSUPPORTED.get(provider_name, set())
     if api_name in unsupported:
         raise UserError(f"{provider_name} 数据源不支持 {api_name} 的历史视角，回测中不可用")
@@ -2042,9 +2106,9 @@ def get_security_info(security: str, date: Optional[Union[str, datetime]] = None
     if cached is not None:
         return cached
 
-    _ensure_auth()
+    provider = _ensure_auth()
 
-    info_fn = getattr(_provider, "get_security_info", None)
+    info_fn = getattr(provider, "get_security_info", None)
     if not callable(info_fn):
         empty = SecurityInfo(security, {})
         _security_info_cache[cache_key] = empty
@@ -2543,7 +2607,7 @@ def _raise_if_empty_minute_data(
     if not isinstance(result, pd.DataFrame) or not result.empty:
         return
     try:
-        trade_days = _provider.get_trade_days(end_date=end_date.date(), count=1)
+        trade_days = _get_default_provider().get_trade_days(end_date=end_date.date(), count=1)
     except Exception:
         trade_days = []
     if not trade_days:
@@ -2554,7 +2618,7 @@ def _raise_if_empty_minute_data(
         return
     if last_day != end_date.date():
         return
-    provider_name = getattr(_provider, "name", "") or "unknown"
+    provider_name = getattr(_get_default_provider(), "name", "") or "unknown"
     provider_note = ""
     if "qmt" in provider_name.lower():
         provider_note = "，miniQMT 免费版可能仅有近一年数据"
@@ -2691,7 +2755,7 @@ def get_bars(
         raise UserError("fq_ref_date 必须为 None 或 datetime.date 类型")
 
     try:
-        return _provider.get_bars(
+        return _get_default_provider().get_bars(
             security=security,
             count=count,
             unit=unit,
@@ -2746,7 +2810,7 @@ def get_ticks(
         count = 1
 
     try:
-        return _provider.get_ticks(
+        return _get_default_provider().get_ticks(
             security=security,
             end_dt=resolved_end,
             start_dt=resolved_start,
@@ -2776,7 +2840,9 @@ def get_current_tick(
     target_dt = _ensure_not_future_dt(target_dt, "get_current_tick.dt")
 
     use_price_proxy = bool(
-        _current_context and not _is_live_mode() and getattr(_provider, "name", "") == "jqdatasdk"
+        _current_context
+        and not _is_live_mode()
+        and getattr(_get_default_provider(), "name", "") == "jqdatasdk"
     )
 
     if use_price_proxy:
@@ -2825,14 +2891,15 @@ def get_current_tick(
             return pd.DataFrame() if df else None
 
     try:
-        result = _provider.get_current_tick(security, dt=target_dt, df=df)
+        result = _get_default_provider().get_current_tick(security, dt=target_dt, df=df)
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取 tick 快照失败: {e}")
         result = None
 
-    if _is_live_mode() and getattr(_provider, "requires_live_data", False) and not result:
-        provider_name = getattr(_provider, "name", "unknown")
+    provider = _get_default_provider()
+    if _is_live_mode() and getattr(provider, "requires_live_data", False) and not result:
+        provider_name = getattr(provider, "name", "unknown")
         raise RuntimeError(f"数据源 {provider_name} 未返回实时 tick，请检查行情订阅/连接")
     return result
 
@@ -2868,7 +2935,7 @@ def get_extras(
     if isinstance(security_list, str):
         security_list = [security_list]
     try:
-        return _provider.get_extras(
+        return _get_default_provider().get_extras(
             info,
             security_list,
             start_date=resolved_start,
@@ -2918,7 +2985,9 @@ def get_fundamentals(
             if _current_context.current_dt.time() < Time(15, 0):
                 raise FutureDataError("avoid_future_data=True时，回测中get_fundamentals取估值表数据需在15:00之后")
     try:
-        return _provider.get_fundamentals(query_object, date=resolved_date, statDate=statDate)
+        return _get_default_provider().get_fundamentals(
+            query_object, date=resolved_date, statDate=statDate
+        )
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取财务数据失败: {e}")
@@ -2951,7 +3020,7 @@ def get_fundamentals_continuously(
                     "avoid_future_data=True时，回测中get_fundamentals_continuously取估值表数据需在15:00之后"
                 )
     try:
-        return _provider.get_fundamentals_continuously(
+        return _get_default_provider().get_fundamentals_continuously(
             query_object, end_date=resolved_end, count=count, panel=panel
         )
     except Exception as e:
@@ -2977,7 +3046,9 @@ def _fallback_fundamentals_continuously(
     for day in trade_days:
         day_date = pd.to_datetime(day).date()
         try:
-            df = _provider.get_fundamentals(query_object, date=day_date, statDate=None)
+            df = _get_default_provider().get_fundamentals(
+                query_object, date=day_date, statDate=None
+            )
         except Exception as exc:
             _raise_if_not_implemented(exc)
             _raise_permission_error(exc, "get_fundamentals")
@@ -3006,7 +3077,7 @@ def get_trade_day(security: Union[str, List[str]], query_dt: Union[str, datetime
     resolved_dt = _resolve_context_dt(query_dt, default_to_context=False)
     resolved_dt = _ensure_not_future_dt(resolved_dt, "get_trade_day.query_dt")
     try:
-        return _provider.get_trade_day(security, resolved_dt or query_dt)
+        return _get_default_provider().get_trade_day(security, resolved_dt or query_dt)
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取交易日失败: {e}")
@@ -3022,7 +3093,7 @@ def get_index_weights(index_id: str, date: Optional[Union[str, datetime]] = None
     resolved_date = _ensure_not_future_date(resolved_date, "get_index_weights.date")
     _ensure_history_view("get_index_weights", resolved_date)
     try:
-        return _provider.get_index_weights(index_id, date=resolved_date)
+        return _get_default_provider().get_index_weights(index_id, date=resolved_date)
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取指数权重失败: {e}")
@@ -3040,7 +3111,7 @@ def get_industry_stocks(
     resolved_date = _ensure_not_future_date(resolved_date, "get_industry_stocks.date")
     _ensure_history_view("get_industry_stocks", resolved_date)
     try:
-        return _provider.get_industry_stocks(industry_code, date=resolved_date)
+        return _get_default_provider().get_industry_stocks(industry_code, date=resolved_date)
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取行业成分股失败: {e}")
@@ -3058,7 +3129,7 @@ def get_industry(
     resolved_date = _ensure_not_future_date(resolved_date, "get_industry.date")
     _ensure_history_view("get_industry", resolved_date)
     try:
-        return _provider.get_industry(security, date=resolved_date)
+        return _get_default_provider().get_industry(security, date=resolved_date)
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取行业信息失败: {e}")
@@ -3074,7 +3145,7 @@ def get_concept_stocks(concept_code: str, date: Optional[Union[str, datetime]] =
     resolved_date = _ensure_not_future_date(resolved_date, "get_concept_stocks.date")
     _ensure_history_view("get_concept_stocks", resolved_date)
     try:
-        return _provider.get_concept_stocks(concept_code, date=resolved_date)
+        return _get_default_provider().get_concept_stocks(concept_code, date=resolved_date)
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取概念成分股失败: {e}")
@@ -3092,7 +3163,7 @@ def get_concept(
     resolved_date = _ensure_not_future_date(resolved_date, "get_concept.date")
     _ensure_history_view("get_concept", resolved_date)
     try:
-        return _provider.get_concept(security, date=resolved_date)
+        return _get_default_provider().get_concept(security, date=resolved_date)
     except Exception as e:
         _raise_if_not_implemented(e)
         _raise_permission_error(e, "get_concept")
@@ -3108,7 +3179,7 @@ def get_fund_info(security: str, date: Optional[Union[str, datetime]] = None) ->
     resolved_date = _resolve_context_date(date, default_to_context=True)
     resolved_date = _ensure_not_future_date(resolved_date, "get_fund_info.date")
     try:
-        return _provider.get_fund_info(security, date=resolved_date)
+        return _get_default_provider().get_fund_info(security, date=resolved_date)
     except Exception as e:
         _raise_if_not_implemented(e)
         _raise_permission_error(e, "get_fund_info")
@@ -3125,7 +3196,7 @@ def get_margincash_stocks(date: Optional[Union[str, datetime]] = None) -> Any:
     resolved_date = _ensure_not_future_date(resolved_date, "get_margincash_stocks.date")
     _ensure_history_view("get_margincash_stocks", resolved_date)
     try:
-        return _provider.get_margincash_stocks(resolved_date)
+        return _get_default_provider().get_margincash_stocks(resolved_date)
     except Exception as e:
         _raise_if_not_implemented(e)
         _raise_permission_error(e, "get_margincash_stocks")
@@ -3142,7 +3213,7 @@ def get_marginsec_stocks(date: Optional[Union[str, datetime]] = None) -> Any:
     resolved_date = _ensure_not_future_date(resolved_date, "get_marginsec_stocks.date")
     _ensure_history_view("get_marginsec_stocks", resolved_date)
     try:
-        return _provider.get_marginsec_stocks(resolved_date)
+        return _get_default_provider().get_marginsec_stocks(resolved_date)
     except Exception as e:
         _raise_if_not_implemented(e)
         _raise_permission_error(e, "get_marginsec_stocks")
@@ -3158,7 +3229,7 @@ def get_dominant_future(underlying_symbol: str, date: Optional[Union[str, dateti
     resolved_date = _resolve_context_date(date, default_to_context=True)
     resolved_date = _ensure_not_future_date(resolved_date, "get_dominant_future.date")
     try:
-        return _provider.get_dominant_future(underlying_symbol, resolved_date)
+        return _get_default_provider().get_dominant_future(underlying_symbol, resolved_date)
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取主力合约失败: {e}")
@@ -3175,7 +3246,7 @@ def get_future_contracts(
     resolved_date = _resolve_context_date(date, default_to_context=True)
     resolved_date = _ensure_not_future_date(resolved_date, "get_future_contracts.date")
     try:
-        return _provider.get_future_contracts(underlying_symbol, resolved_date)
+        return _get_default_provider().get_future_contracts(underlying_symbol, resolved_date)
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取期货合约失败: {e}")
@@ -3204,7 +3275,7 @@ def get_billboard_list(
         ):
             raise FutureDataError("avoid_future_data=True时，回测中get_billboard_list只能在收盘后获取当日数据")
     try:
-        return _provider.get_billboard_list(
+        return _get_default_provider().get_billboard_list(
             stock_list=stock_list,
             start_date=resolved_start,
             end_date=resolved_end,
@@ -3232,7 +3303,7 @@ def get_locked_shares(
         resolved_start = resolved_end
     resolved_end = _ensure_not_future_date(resolved_end, "get_locked_shares.end_date")
     try:
-        return _provider.get_locked_shares(
+        return _get_default_provider().get_locked_shares(
             stock_list=stock_list,
             start_date=resolved_start,
             end_date=resolved_end,
@@ -3323,7 +3394,9 @@ def get_trade_days(
         count = 1
 
     try:
-        trade_days = _provider.get_trade_days(start_date=start_date, end_date=end_date, count=count)
+        trade_days = _get_default_provider().get_trade_days(
+            start_date=start_date, end_date=end_date, count=count
+        )
         return [pd.to_datetime(d) for d in trade_days]
     except Exception as e:
         _raise_if_not_implemented(e)
@@ -3349,7 +3422,7 @@ def get_all_securities(
     _ensure_history_view("get_all_securities", resolved_date)
 
     try:
-        return _provider.get_all_securities(types=types, date=resolved_date)
+        return _get_default_provider().get_all_securities(types=types, date=resolved_date)
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取标的信息失败: {e}")
@@ -3375,7 +3448,7 @@ def get_index_stocks(index_symbol: str, date: Optional[Union[str, datetime]] = N
     try:
         for idx, candidate in enumerate(candidates):
             try:
-                result = _provider.get_index_stocks(candidate, date=resolved_date)
+                result = _get_default_provider().get_index_stocks(candidate, date=resolved_date)
                 if idx > 0:
                     log.debug(f"指数代码兼容成功: {index_symbol} -> {candidate}")
                 return result
@@ -3469,7 +3542,7 @@ def _infer_security_type(security: str, ref_date: Optional[Date]) -> str:
     try:
         check_date = ref_date or (_current_context.current_dt.date() if _current_context else None)
         for t in ["stock", "etf", "lof", "fund", "fja", "fjb"]:
-            df = _provider.get_all_securities(types=t, date=check_date)
+            df = _get_default_provider().get_all_securities(types=t, date=check_date)
             if not df.empty and security in df.index:
                 return t
     except Exception:

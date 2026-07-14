@@ -57,6 +57,61 @@ def test_get_data_provider_by_name_reuses_cache(monkeypatch):
 
 
 @pytest.mark.unit
+def test_default_provider_reuses_named_instance_created_first(monkeypatch):
+    """验证先按名称获取默认源时，后续默认获取不会重复创建或认证。
+
+    Args:
+        monkeypatch: pytest 提供的隔离补丁工具。
+    """
+    created = []
+
+    def _fake_create(provider_name=None, overrides=None):
+        """记录创建参数并返回新的测试 provider。
+
+        Args:
+            provider_name: 工厂收到的 provider 名称。
+            overrides: 工厂收到的覆盖配置。
+
+        Returns:
+            DummyProvider: 新的测试 provider。
+        """
+        created.append((provider_name, overrides))
+        return DummyProvider()
+
+    monkeypatch.setattr(data_api, "_provider", None)
+    monkeypatch.setattr(data_api, "_auth_attempted", False)
+    monkeypatch.setattr(data_api, "_create_provider", _fake_create)
+    monkeypatch.setattr(data_api, "_provider_cache", {})
+    monkeypatch.setattr(data_api, "_provider_auth_attempted", {})
+    monkeypatch.setattr(data_api, "get_data_provider_config", lambda: {"default": "dummy"})
+
+    named = data_api.get_data_provider("dummy")
+    default = data_api.get_data_provider()
+
+    assert default is named
+    assert created == [("dummy", None)]
+    assert named.auth_calls == 1
+
+
+@pytest.mark.unit
+def test_set_data_provider_reuses_authenticated_instance_by_name(monkeypatch):
+    """验证显式设置后的默认与具名访问均不会重复认证。"""
+    provider = DummyProvider()
+    monkeypatch.setattr(data_api, "_provider", None)
+    monkeypatch.setattr(data_api, "_auth_attempted", False)
+    monkeypatch.setattr(data_api, "_provider_cache", {})
+    monkeypatch.setattr(data_api, "_provider_auth_attempted", {})
+    monkeypatch.setattr(data_api, "_pending_default_provider_name", None)
+
+    data_api.set_data_provider(provider)
+
+    assert data_api.get_data_provider() is provider
+    assert data_api.get_data_provider("dummy") is provider
+    assert provider.auth_calls == 1
+    assert data_api._provider_auth_attempted == {"dummy": True}
+
+
+@pytest.mark.unit
 def test_get_data_provider_auth_failure(monkeypatch):
     def _fake_create(provider_name=None, overrides=None):
         return DummyProvider(should_fail=True)
