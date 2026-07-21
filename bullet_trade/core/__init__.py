@@ -28,6 +28,20 @@ from .risk_control import (
     RiskController, RiskStats,
     get_global_risk_controller, reset_global_risk_controller
 )
+from .security_id import (
+    SECURITY_ID_SCHEME_VERSION,
+    JoinQuantSecurityIdAdapter,
+    QmtSecurityIdAdapter,
+    SecurityCodeSource,
+    SecurityCodeTarget,
+    SecurityExchange,
+    SecurityId,
+    SecurityIdErrorCode,
+    SecurityIdValidationError,
+    ThsSecurityIdAdapter,
+    format_security_id,
+    parse_security_id,
+)
 # 注意：为避免导入环，核心包初始化阶段不导入 engine/optimizer
 # 需要时请从具体模块导入：
 # from bullet_trade.core.engine import create_backtest, BacktestEngine
@@ -52,4 +66,10 @@ __all__ = [
     # 风控
     'RiskController', 'RiskStats',
     'get_global_risk_controller', 'reset_global_risk_controller',
+    # 证券身份契约
+    'SECURITY_ID_SCHEME_VERSION',
+    'SecurityCodeSource', 'SecurityCodeTarget', 'SecurityExchange', 'SecurityId',
+    'SecurityIdErrorCode', 'SecurityIdValidationError',
+    'JoinQuantSecurityIdAdapter', 'QmtSecurityIdAdapter', 'ThsSecurityIdAdapter',
+    'format_security_id', 'parse_security_id',
 ]

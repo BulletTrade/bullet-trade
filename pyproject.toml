@@ -106,7 +106,7 @@ version = {attr = "bullet_trade.__version__.__version__"}
 
 [tool.setuptools.package-data]
 "bullet_trade.reporting" = ["templates/*.html"]
-"bullet_trade" = ["notebook/**/*.ipynb", "notebook/**/*.md"]
+"bullet_trade" = ["notebook/**/*.ipynb", "notebook/**/*.md", "contracts/**/*.json"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

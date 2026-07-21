@@ -10,6 +10,7 @@ include env.backtest.example
 include env.live.example
 recursive-include bullet_trade/notebook *.ipynb
 recursive-include bullet_trade/notebook *.md
+recursive-include bullet_trade/contracts *.json
 recursive-include helpers *.py
 
 # 排除文件
