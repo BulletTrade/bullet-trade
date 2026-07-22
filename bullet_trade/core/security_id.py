@@ -24,6 +24,12 @@ _SYMBOL_PATTERN = re.compile(r"^[A-Z0-9]+(?:-[A-Z0-9]+)*$")
 _SUFFIXED_CODE_PATTERN = re.compile(
     r"^(?P<symbol>[A-Z0-9]+(?:-[A-Z0-9]+)*)\.(?P<suffix>[A-Z0-9]+)$"
 )
+_CASE_SENSITIVE_SUFFIXED_CODE_PATTERN = re.compile(
+    r"^(?P<symbol>[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*)\.(?P<suffix>[A-Za-z0-9]+)$"
+)
+_FUTURES_CANONICAL_SYMBOL_PATTERN = re.compile(
+    r"^(?P<product>[A-Z]+?)(?P<continuous>JQ)?(?P<rest>[0-9].*)$"
+)
 
 
 class SecurityExchange(str, Enum):
@@ -37,6 +43,7 @@ class SecurityExchange(str, Enum):
     XDCE = "XDCE"
     XZCE = "XZCE"
     XINE = "XINE"
+    GFEX = "GFEX"
 
 
 class SecurityIdErrorCode(str, Enum):
@@ -99,41 +106,70 @@ _QMT_SUFFIX_TO_EXCHANGE = {
     "SH": SecurityExchange.XSHG,
     "SZ": SecurityExchange.XSHE,
     "BJ": SecurityExchange.BSE,
+    "SF": SecurityExchange.XSGE,
+    "IF": SecurityExchange.CCFX,
+    "DF": SecurityExchange.XDCE,
+    "ZF": SecurityExchange.XZCE,
+    "INE": SecurityExchange.XINE,
+    "GF": SecurityExchange.GFEX,
+}
+_QMT_DISPLAY_SUFFIX_TO_EXCHANGE = {
     "SHFE": SecurityExchange.XSGE,
     "CFFEX": SecurityExchange.CCFX,
     "DCE": SecurityExchange.XDCE,
     "CZCE": SecurityExchange.XZCE,
     "INE": SecurityExchange.XINE,
+    "GFEX": SecurityExchange.GFEX,
 }
 _LEGACY_SUFFIX_TO_EXCHANGE = {
     **_CANONICAL_SUFFIX_TO_EXCHANGE,
     **_QMT_SUFFIX_TO_EXCHANGE,
+    **_QMT_DISPLAY_SUFFIX_TO_EXCHANGE,
     "XSHF": SecurityExchange.XSGE,
 }
 _QMT_EXCHANGE_TO_SUFFIX = {
     SecurityExchange.XSHG: "SH",
     SecurityExchange.XSHE: "SZ",
     SecurityExchange.BSE: "BJ",
-    SecurityExchange.XSGE: "SHFE",
-    SecurityExchange.CCFX: "CFFEX",
-    SecurityExchange.XDCE: "DCE",
-    SecurityExchange.XZCE: "CZCE",
+    SecurityExchange.XSGE: "SF",
+    SecurityExchange.CCFX: "IF",
+    SecurityExchange.XDCE: "DF",
+    SecurityExchange.XZCE: "ZF",
     SecurityExchange.XINE: "INE",
+    SecurityExchange.GFEX: "GF",
 }
+_QMT_LOWERCASE_PRODUCT_EXCHANGES = frozenset(
+    {
+        SecurityExchange.XSGE,
+        SecurityExchange.XDCE,
+        SecurityExchange.XINE,
+        SecurityExchange.GFEX,
+    }
+)
+_FUTURES_EXCHANGES = frozenset(
+    {
+        SecurityExchange.XSGE,
+        SecurityExchange.CCFX,
+        SecurityExchange.XDCE,
+        SecurityExchange.XZCE,
+        SecurityExchange.XINE,
+        SecurityExchange.GFEX,
+    }
+)
 _THS_SUPPORTED_EXCHANGES = frozenset(
     {SecurityExchange.XSHG, SecurityExchange.XSHE, SecurityExchange.BSE}
 )
 
 
-def _normalize_required_text(value: Any, field_name: str) -> str:
-    """验证必填文本并只做大小写规范化。
+def _validate_required_text(value: Any, field_name: str) -> str:
+    """验证必填文本并保留原始大小写。
 
     Args:
         value: 待验证输入。
         field_name: 诊断文本中的字段名称。
 
     Returns:
-        str: 大写后的非空文本。
+        str: 保留原始大小写的非空文本。
 
     Raises:
         SecurityIdValidationError: 输入不是文本、为空或含首尾空白。
@@ -154,7 +190,24 @@ def _normalize_required_text(value: Any, field_name: str) -> str:
             SecurityIdErrorCode.INVALID_FORMAT,
             "{0} 不得含首尾空白".format(field_name),
         )
-    return value.upper()
+    return value
+
+
+def _normalize_required_text(value: Any, field_name: str) -> str:
+    """验证必填文本并转换为 canonical 大写形式。
+
+    Args:
+        value: 待验证输入。
+        field_name: 诊断文本中的字段名称。
+
+    Returns:
+        str: 大写后的非空文本。
+
+    Raises:
+        SecurityIdValidationError: 输入不是文本、为空或含首尾空白。
+    """
+
+    return _validate_required_text(value, field_name).upper()
 
 
 def _normalize_symbol(value: Any) -> str:
@@ -254,6 +307,81 @@ def _parse_suffixed_code(
             "未知交易所后缀: {0}".format(suffix),
         )
     return SecurityId(symbol=symbol, exchange=exchange)
+
+
+def _format_qmt_symbol(security_id: "SecurityId") -> str:
+    """按 QMT 交易所标准格式化证券主体的大小写。
+
+    Args:
+        security_id: 已校验的 canonical 证券身份。
+
+    Returns:
+        str: 不含市场后缀的 QMT 原生 symbol。
+
+    Raises:
+        SecurityIdValidationError: 期货 symbol 无法识别品种前缀和合约月份。
+    """
+
+    if security_id.exchange not in _FUTURES_EXCHANGES:
+        return security_id.symbol
+    matched = _FUTURES_CANONICAL_SYMBOL_PATTERN.fullmatch(security_id.symbol)
+    if matched is None:
+        raise SecurityIdValidationError(
+            SecurityIdErrorCode.INVALID_SYMBOL,
+            "QMT 期货 symbol 必须包含品种字母和合约数字",
+        )
+    product = matched.group("product")
+    if security_id.exchange in _QMT_LOWERCASE_PRODUCT_EXCHANGES:
+        product = product.lower()
+    continuous = matched.group("continuous") or ""
+    return "{0}{1}{2}".format(product, continuous, matched.group("rest"))
+
+
+def _parse_qmt_code(value: Any) -> "SecurityId":
+    """解析 QMT 原生代码并严格校验期货 symbol 大小写。
+
+    Args:
+        value: QMT 的 ``symbol.market`` 原生代码。
+
+    Returns:
+        SecurityId: 收敛后的 canonical 领域身份。
+
+    Raises:
+        SecurityIdValidationError: 缺少市场、后缀错误或期货大小写不符合交易所标准。
+    """
+
+    raw = _validate_required_text(value, "security")
+    if "." not in raw:
+        raise SecurityIdValidationError(
+            SecurityIdErrorCode.MISSING_EXCHANGE,
+            "qmt 代码缺少交易所后缀",
+        )
+    matched = _CASE_SENSITIVE_SUFFIXED_CODE_PATTERN.fullmatch(raw)
+    if matched is None:
+        raise SecurityIdValidationError(
+            SecurityIdErrorCode.INVALID_FORMAT,
+            "qmt 代码格式不符合 security-id/v1",
+        )
+    suffix = matched.group("suffix").upper()
+    exchange = _QMT_SUFFIX_TO_EXCHANGE.get(suffix)
+    if exchange is None:
+        if suffix in _LEGACY_SUFFIX_TO_EXCHANGE:
+            raise SecurityIdValidationError(
+                SecurityIdErrorCode.EXCHANGE_NOT_ALLOWED,
+                "qmt 边界不允许后缀 {0}".format(suffix),
+            )
+        raise SecurityIdValidationError(
+            SecurityIdErrorCode.UNKNOWN_EXCHANGE,
+            "未知交易所后缀: {0}".format(suffix),
+        )
+    raw_symbol = matched.group("symbol")
+    identity = SecurityId(symbol=raw_symbol, exchange=exchange)
+    if raw_symbol != _format_qmt_symbol(identity):
+        raise SecurityIdValidationError(
+            SecurityIdErrorCode.INVALID_SYMBOL,
+            "QMT 期货 symbol 大小写不符合交易所标准",
+        )
+    return identity
 
 
 def _normalize_exchange_metadata(value: Any) -> SecurityExchange:
@@ -563,7 +691,7 @@ class QmtSecurityIdAdapter:
             SecurityIdValidationError: 输入不是已登记 QMT 格式。
         """
 
-        return _parse_suffixed_code(value, _QMT_SUFFIX_TO_EXCHANGE, "qmt")
+        return _parse_qmt_code(value)
 
     @staticmethod
     def format(security_id: SecurityId) -> str:
@@ -586,7 +714,7 @@ class QmtSecurityIdAdapter:
                 SecurityIdErrorCode.ADAPTER_UNSUPPORTED,
                 "QMT adapter 不支持交易所 {0}".format(security_id.exchange.value),
             )
-        return "{0}.{1}".format(security_id.symbol, suffix)
+        return "{0}.{1}".format(_format_qmt_symbol(security_id), suffix)
 
 
 class ThsSecurityIdAdapter:
@@ -607,12 +735,17 @@ class ThsSecurityIdAdapter:
             SecurityIdValidationError: 缺少交易所、代码含后缀或市场不受支持。
         """
 
-        symbol = _normalize_symbol(value)
         normalized_exchange = _normalize_exchange_metadata(exchange)
         if normalized_exchange not in _THS_SUPPORTED_EXCHANGES:
             raise SecurityIdValidationError(
                 SecurityIdErrorCode.ADAPTER_UNSUPPORTED,
                 "THS 股票模拟 adapter 不支持交易所 {0}".format(normalized_exchange.value),
+            )
+        symbol = _normalize_symbol(value)
+        if not symbol.isdigit():
+            raise SecurityIdValidationError(
+                SecurityIdErrorCode.INVALID_SYMBOL,
+                "THS 股票模拟 adapter 只接受数字证券代码",
             )
         return SecurityId(symbol=symbol, exchange=normalized_exchange)
 
@@ -635,6 +768,11 @@ class ThsSecurityIdAdapter:
             raise SecurityIdValidationError(
                 SecurityIdErrorCode.ADAPTER_UNSUPPORTED,
                 "THS 股票模拟 adapter 不支持交易所 {0}".format(security_id.exchange.value),
+            )
+        if not security_id.symbol.isdigit():
+            raise SecurityIdValidationError(
+                SecurityIdErrorCode.INVALID_SYMBOL,
+                "THS 股票模拟 adapter 只接受数字证券代码",
             )
         return security_id.symbol
 

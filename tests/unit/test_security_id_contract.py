@@ -192,8 +192,8 @@ def test_security_id_orders_by_canonical_components() -> None:
 def test_core_package_exports_authoritative_contract() -> None:
     """公共 core 包必须导出同一个 SecurityId 类型和版本常量。"""
 
-    from bullet_trade.core import SecurityId as ExportedSecurityId
     from bullet_trade.core import SECURITY_ID_SCHEME_VERSION as exported_version
+    from bullet_trade.core import SecurityId as ExportedSecurityId
 
     assert ExportedSecurityId is SecurityId
     assert exported_version == SECURITY_ID_SCHEME_VERSION

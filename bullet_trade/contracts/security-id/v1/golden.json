@@ -91,13 +91,13 @@
     {
       "id": "shfe_future_qmt_lowercase",
       "source": "qmt",
-      "input": "rb2610.SHFE",
+      "input": "rb2610.SF",
       "expected": {
         "serialized": {"scheme_version": "security-id/v1", "symbol": "RB2610", "exchange": "XSGE", "canonical": "RB2610.XSGE"},
         "formats": {
           "canonical": {"ok": true, "value": "RB2610.XSGE"},
           "jq": {"ok": true, "value": "RB2610.XSGE"},
-          "qmt": {"ok": true, "value": "RB2610.SHFE"},
+          "qmt": {"ok": true, "value": "rb2610.SF"},
           "ths": {"ok": false, "error": "adapter_unsupported"}
         },
         "idempotency_identity": "security-id/v1|RB2610.XSGE",
@@ -107,13 +107,13 @@
     {
       "id": "cffex_future_qmt",
       "source": "qmt",
-      "input": "IF2609.CFFEX",
+      "input": "IF2609.IF",
       "expected": {
         "serialized": {"scheme_version": "security-id/v1", "symbol": "IF2609", "exchange": "CCFX", "canonical": "IF2609.CCFX"},
         "formats": {
           "canonical": {"ok": true, "value": "IF2609.CCFX"},
           "jq": {"ok": true, "value": "IF2609.CCFX"},
-          "qmt": {"ok": true, "value": "IF2609.CFFEX"},
+          "qmt": {"ok": true, "value": "IF2609.IF"},
           "ths": {"ok": false, "error": "adapter_unsupported"}
         },
         "idempotency_identity": "security-id/v1|IF2609.CCFX",
@@ -123,13 +123,13 @@
     {
       "id": "dce_future_qmt_lowercase",
       "source": "qmt",
-      "input": "m2609.DCE",
+      "input": "m2609.DF",
       "expected": {
         "serialized": {"scheme_version": "security-id/v1", "symbol": "M2609", "exchange": "XDCE", "canonical": "M2609.XDCE"},
         "formats": {
           "canonical": {"ok": true, "value": "M2609.XDCE"},
           "jq": {"ok": true, "value": "M2609.XDCE"},
-          "qmt": {"ok": true, "value": "M2609.DCE"},
+          "qmt": {"ok": true, "value": "m2609.DF"},
           "ths": {"ok": false, "error": "adapter_unsupported"}
         },
         "idempotency_identity": "security-id/v1|M2609.XDCE",
@@ -139,13 +139,13 @@
     {
       "id": "czce_future_qmt",
       "source": "qmt",
-      "input": "SR609.CZCE",
+      "input": "SR609.ZF",
       "expected": {
         "serialized": {"scheme_version": "security-id/v1", "symbol": "SR609", "exchange": "XZCE", "canonical": "SR609.XZCE"},
         "formats": {
           "canonical": {"ok": true, "value": "SR609.XZCE"},
           "jq": {"ok": true, "value": "SR609.XZCE"},
-          "qmt": {"ok": true, "value": "SR609.CZCE"},
+          "qmt": {"ok": true, "value": "SR609.ZF"},
           "ths": {"ok": false, "error": "adapter_unsupported"}
         },
         "idempotency_identity": "security-id/v1|SR609.XZCE",
@@ -161,11 +161,43 @@
         "formats": {
           "canonical": {"ok": true, "value": "SC2609.XINE"},
           "jq": {"ok": true, "value": "SC2609.XINE"},
-          "qmt": {"ok": true, "value": "SC2609.INE"},
+          "qmt": {"ok": true, "value": "sc2609.INE"},
           "ths": {"ok": false, "error": "adapter_unsupported"}
         },
         "idempotency_identity": "security-id/v1|SC2609.XINE",
         "semantic_signature": "fa266c8be2583540d6930123eac78c52d4b0d230feebb425deeb2c5e48cc569b"
+      }
+    },
+    {
+      "id": "gfex_future_qmt_lowercase",
+      "source": "qmt",
+      "input": "lc2609.GF",
+      "expected": {
+        "serialized": {"scheme_version": "security-id/v1", "symbol": "LC2609", "exchange": "GFEX", "canonical": "LC2609.GFEX"},
+        "formats": {
+          "canonical": {"ok": true, "value": "LC2609.GFEX"},
+          "jq": {"ok": true, "value": "LC2609.GFEX"},
+          "qmt": {"ok": true, "value": "lc2609.GF"},
+          "ths": {"ok": false, "error": "adapter_unsupported"}
+        },
+        "idempotency_identity": "security-id/v1|LC2609.GFEX",
+        "semantic_signature": "2fc48647d8dae28b8ce17beb12ab8047b879bce906448ac497495e632ba7184f"
+      }
+    },
+    {
+      "id": "shfe_continuous_qmt_case",
+      "source": "qmt",
+      "input": "rbJQ00.SF",
+      "expected": {
+        "serialized": {"scheme_version": "security-id/v1", "symbol": "RBJQ00", "exchange": "XSGE", "canonical": "RBJQ00.XSGE"},
+        "formats": {
+          "canonical": {"ok": true, "value": "RBJQ00.XSGE"},
+          "jq": {"ok": true, "value": "RBJQ00.XSGE"},
+          "qmt": {"ok": true, "value": "rbJQ00.SF"},
+          "ths": {"ok": false, "error": "adapter_unsupported"}
+        },
+        "idempotency_identity": "security-id/v1|RBJQ00.XSGE",
+        "semantic_signature": "1980e4bf151ece32f78de8e31f32baa1054d56721b349857e9e01b5bcfe47a10"
       }
     },
     {
@@ -177,7 +209,7 @@
         "formats": {
           "canonical": {"ok": true, "value": "IO2607-C-3800.CCFX"},
           "jq": {"ok": true, "value": "IO2607-C-3800.CCFX"},
-          "qmt": {"ok": true, "value": "IO2607-C-3800.CFFEX"},
+          "qmt": {"ok": true, "value": "IO2607-C-3800.IF"},
           "ths": {"ok": false, "error": "adapter_unsupported"}
         },
         "idempotency_identity": "security-id/v1|IO2607-C-3800.CCFX",
@@ -193,7 +225,7 @@
         "formats": {
           "canonical": {"ok": true, "value": "CU2610.XSGE"},
           "jq": {"ok": true, "value": "CU2610.XSGE"},
-          "qmt": {"ok": true, "value": "CU2610.SHFE"},
+          "qmt": {"ok": true, "value": "cu2610.SF"},
           "ths": {"ok": false, "error": "adapter_unsupported"}
         },
         "idempotency_identity": "security-id/v1|CU2610.XSGE",
@@ -209,6 +241,10 @@
     {"id": "ths_future_is_not_supported", "source": "ths", "input": "RB2610", "exchange": "SHFE", "expected_error": "adapter_unsupported"},
     {"id": "canonical_rejects_qmt_suffix", "source": "canonical", "input": "510180.SH", "expected_error": "exchange_not_allowed"},
     {"id": "qmt_rejects_canonical_suffix", "source": "qmt", "input": "510180.XSHG", "expected_error": "exchange_not_allowed"},
+    {"id": "qmt_rejects_display_suffix", "source": "qmt", "input": "rb2610.SHFE", "expected_error": "exchange_not_allowed"},
+    {"id": "qmt_rejects_wrong_shfe_symbol_case", "source": "qmt", "input": "RB2610.SF", "expected_error": "invalid_symbol"},
+    {"id": "qmt_rejects_wrong_czce_symbol_case", "source": "qmt", "input": "sr609.ZF", "expected_error": "invalid_symbol"},
+    {"id": "ths_rejects_letters_on_stock_exchange", "source": "ths", "input": "RB2610", "exchange": "SH", "expected_error": "invalid_symbol"},
     {"id": "unknown_exchange", "source": "canonical", "input": "AAPL.NASDAQ", "expected_error": "unknown_exchange"},
     {"id": "invalid_symbol_character", "source": "canonical", "input": "ABC_DEF.XSHG", "expected_error": "invalid_format"},
     {"id": "multiple_dots", "source": "canonical", "input": "510180.SH.XSHG", "expected_error": "invalid_format"},
