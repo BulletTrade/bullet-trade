@@ -138,6 +138,7 @@ class FakePriceProvider:
 
     name = "fake"
     requires_live_data = False
+    supports_dynamic_pre_price_basis = True
 
     def __init__(self, frame: pd.DataFrame) -> None:
         """

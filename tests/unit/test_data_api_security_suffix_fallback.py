@@ -10,6 +10,8 @@ from bullet_trade.data.providers.base import DataProvider
 
 
 class SuffixFallbackProvider(DataProvider):
+    supports_dynamic_pre_price_basis = True
+
     def __init__(self):
         self.price_calls = []
         self.info_calls = []

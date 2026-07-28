@@ -14,6 +14,7 @@ class TushareProvider(DataProvider):
     """基于 tushare.pro 的数据提供者，字段与复权口径对齐兼容层约定。"""
 
     name: str = "tushare"
+    supports_dynamic_pre_price_basis: bool = True
     _TS_SUFFIX_TO_JQ = {"SH": "XSHG", "SZ": "XSHE"}
     _JQ_SUFFIX_TO_TS = {"XSHG": "SH", "XSHE": "SZ"}
 

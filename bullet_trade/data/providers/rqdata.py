@@ -26,6 +26,7 @@ class RQDataProvider(DataProvider):
     """米筐 RQData 数据源，负责把 rqdatac 返回值转换为 BulletTrade 兼容格式。"""
 
     name: str = "rqdata"
+    supports_dynamic_pre_price_basis: bool = True
     _DEFAULT_PRICE_FIELDS: List[str] = ["open", "close", "high", "low", "volume", "money"]
     _FIELD_TO_RQ: Dict[str, str] = {
         "money": "total_turnover",

@@ -102,6 +102,7 @@ class RemoteQmtProvider(DataProvider):
     """
 
     name = "qmt-remote"
+    supports_dynamic_pre_price_basis: bool = True
     requires_live_data = True
 
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:

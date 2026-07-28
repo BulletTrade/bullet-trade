@@ -21,6 +21,12 @@ import pandas as pd
 from ..core.exceptions import FutureDataError, UserError
 from ..core.globals import log
 from ..core.models import SecurityUnitData
+from ..core.price_basis import (
+    EffectivePriceBasis,
+    PriceBasisDataError,
+    PriceBasisError,
+    resolve_effective_price_basis,
+)
 from ..core.settings import get_settings
 from ..utils.env_loader import get_data_provider_config
 from .backtest_session import get_current_backtest_data_session
@@ -666,27 +672,85 @@ def _extract_close_series(df: Any, security: str) -> Optional[pd.Series]:
 def _resolve_fq_ref_date(
     current_dt: Union[datetime, Date, Any], use_real_price: bool
 ) -> Optional[Date]:
-    """按聚宽语义返回前复权参考日期。"""
+    """按回测业务日解析前复权参考日，并限制显式未来日期。
+
+    Args:
+        current_dt: 当前回测业务时刻。
+        use_real_price: 为 True 时默认直接锚定当前业务日；否则读取 fq_ref_date。
+
+    Returns:
+        Optional[date]: 不晚于当前业务日的参考日；业务时刻非法时返回 None。
+
+    Side Effects:
+        use_real_price=False 时读取当前策略 settings，不读取宿主机日期。
+    """
+
+    try:
+        if isinstance(current_dt, datetime):
+            business_date = current_dt.date()
+        elif isinstance(current_dt, Date):
+            business_date = current_dt
+        else:
+            business_date = pd.to_datetime(current_dt).date()
+    except Exception:
+        return None
     if use_real_price:
-        try:
-            if isinstance(current_dt, datetime):
-                return current_dt.date()
-            if isinstance(current_dt, Date):
-                return current_dt
-            return pd.to_datetime(current_dt).date()
-        except Exception:
-            return None
+        return business_date
+
     raw = _get_setting("fq_ref_date")
     if raw is None:
-        return Date.today()
-    if isinstance(raw, datetime):
-        return raw.date()
-    if isinstance(raw, Date):
-        return raw
+        return business_date
     try:
-        return pd.to_datetime(raw).date()
+        requested = raw.date() if isinstance(raw, datetime) else pd.to_datetime(raw).date()
     except Exception:
-        return Date.today()
+        requested = business_date
+    return min(requested, business_date)
+
+
+def resolve_context_effective_price_basis(context: Optional[Any] = None) -> EffectivePriceBasis:
+    """为当前回测上下文解析并缓存不可变有效价格口径。
+
+    Args:
+        context: 可选回测上下文；为空时使用数据 API 当前上下文。
+
+    Returns:
+        EffectivePriceBasis: 当前 provider 明确支持、与业务时刻绑定的价格口径。
+
+    Raises:
+        PriceBasisError: provider 未声明或不支持所需口径。
+        ValueError: 上下文、业务时刻或显式参考日非法。
+
+    Side Effects:
+        把成功口径写入 context.effective_price_basis；不会认证、联网或切换 provider。
+    """
+
+    target_context = context if context is not None else _current_context
+    if target_context is None or getattr(target_context, "current_dt", None) is None:
+        raise PriceBasisDataError(
+            "PRICE_BASIS_CONTEXT_MISSING",
+            "回测上下文缺少业务时刻，无法解析有效价格口径",
+        )
+    provider = _get_default_provider()
+    use_real_price = bool(_get_setting("use_real_price"))
+    requested_reference = (
+        get_settings().options.get("pre_factor_ref_date") if use_real_price else None
+    )
+    try:
+        resolved = resolve_effective_price_basis(
+            provider=provider,
+            business_time=target_context.current_dt,
+            use_real_price=use_real_price,
+            pre_factor_ref_date=requested_reference,
+        )
+    except PriceBasisError as exc:
+        target_context.price_basis_failure = exc.as_dict()
+        raise
+    cached = getattr(target_context, "effective_price_basis", None)
+    if isinstance(cached, EffectivePriceBasis) and cached == resolved:
+        return cached
+    target_context.effective_price_basis = resolved
+    target_context.price_basis_failure = None
+    return resolved
 
 
 def _call_provider_get_price(**kwargs) -> pd.DataFrame:
@@ -1571,17 +1635,39 @@ def _fetch_pre_close(
     current_dt: datetime,
     use_real_price: bool,
     force_no_engine: bool,
+    price_basis: Optional[EffectivePriceBasis] = None,
 ) -> Optional[float]:
+    """获取与当前行情同口径的上一收盘价。
+
+    Args:
+        security: 证券代码。
+        current_dt: 当前回测业务时刻。
+        use_real_price: 兼容旧调用的真实价格设置。
+        force_no_engine: 是否禁用 provider 内部价格引擎。
+        price_basis: 当前行情已解析的有效价格口径；为空时沿用旧前复权逻辑。
+
+    Returns:
+        Optional[float]: 上一有效收盘价，无法获取时返回 None。
+
+    Side Effects:
+        只读调用当前 provider；不会切换 provider。
+    """
+
+    fq = price_basis.fq if price_basis is not None else "pre"
     kwargs: Dict[str, Any] = {
         "security": security,
         "end_date": current_dt,
         "frequency": "daily",
         "fields": ["close"],
         "count": 2,
-        "fq": "pre",
+        "fq": fq,
     }
-    pre_ref = _resolve_fq_ref_date(current_dt, use_real_price)
-    if pre_ref is not None:
+    pre_ref = (
+        price_basis.pre_factor_ref_date
+        if price_basis is not None
+        else _resolve_fq_ref_date(current_dt, use_real_price)
+    )
+    if fq == "pre" and pre_ref is not None:
         kwargs.update(
             prefer_engine=not force_no_engine,
             pre_factor_ref_date=pre_ref,
@@ -1640,7 +1726,27 @@ def _apply_limit_fallback(
     low_limit: float,
     use_real_price: bool,
     force_no_engine: bool,
+    price_basis: Optional[EffectivePriceBasis] = None,
 ) -> Tuple[float, float]:
+    """按当前有效价格口径补齐涨跌停边界。
+
+    Args:
+        security: 证券代码。
+        current_dt: 当前回测业务时刻。
+        last_price: 当前行情最新价。
+        high_limit: provider 返回的涨停价。
+        low_limit: provider 返回的跌停价。
+        use_real_price: 兼容旧调用的真实价格设置。
+        force_no_engine: 是否禁用 provider 内部价格引擎。
+        price_basis: 当前行情共享的有效价格口径。
+
+    Returns:
+        tuple: 补齐后的 ``(high_limit, low_limit)``。
+
+    Side Effects:
+        缺边界时只读查询同一 provider 的上一收盘价。
+    """
+
     if high_limit > 0 and low_limit > 0:
         return high_limit, low_limit
 
@@ -1648,7 +1754,13 @@ def _apply_limit_fallback(
     if ratio is None:
         return high_limit, low_limit
 
-    pre_close = _fetch_pre_close(security, current_dt, use_real_price, force_no_engine)
+    pre_close = _fetch_pre_close(
+        security,
+        current_dt,
+        use_real_price,
+        force_no_engine,
+        price_basis=price_basis,
+    )
     base_price = (
         pre_close if pre_close and pre_close > 0 else (last_price if last_price > 0 else None)
     )
@@ -1664,24 +1776,225 @@ def _apply_limit_fallback(
     return high_limit, low_limit
 
 
+def _extract_effective_price_row(
+    frame: pd.DataFrame,
+    security: str,
+) -> Tuple[Optional[pd.Series], Optional[Date]]:
+    """从 provider 的兼容行情格式中提取末行价格与业务日期。
+
+    Args:
+        frame: provider 返回的单标的宽表、MultiIndex 宽表或 time/code 长表。
+        security: 调用方请求的证券代码，用于筛选兼容后缀列或长表记录。
+
+    Returns:
+        tuple: ``(末行字段 Series, 行业务日期)``；没有可用数据时返回 ``(None, None)``。
+
+    Side Effects:
+        无；不会修改输入 DataFrame。
+    """
+
+    if not isinstance(frame, pd.DataFrame) or frame.empty:
+        return None, None
+    if "time" in frame.columns and "code" in frame.columns:
+        candidates = set(_candidate_security_keys(security))
+        selected = frame[frame["code"].astype(str).isin(candidates)]
+        if selected.empty:
+            selected = frame
+        row = selected.iloc[-1]
+        try:
+            row_date = pd.to_datetime(row.get("time")).date()
+        except Exception:
+            row_date = None
+        return row, row_date
+
+    if isinstance(frame.columns, pd.MultiIndex):
+        values: Dict[str, Any] = {}
+        for field in ("open", "close", "high_limit", "low_limit", "paused"):
+            for candidate in _candidate_security_keys(security):
+                column = (field, candidate)
+                if column in frame.columns:
+                    values[field] = frame[column].iloc[-1]
+                    break
+        if not values:
+            return None, None
+        row = pd.Series(values)
+    else:
+        row = frame.iloc[-1]
+    try:
+        row_date = pd.to_datetime(frame.index[-1]).date()
+    except Exception:
+        row_date = None
+    return row, row_date
+
+
+def _validate_dynamic_pre_reference_point(
+    *,
+    security: str,
+    basis: EffectivePriceBasis,
+    adjusted_frame: pd.DataFrame,
+    fetch_kwargs: Dict[str, Any],
+) -> None:
+    """验证动态前复权在参考日当前点与未复权真实价格等价。
+
+    Args:
+        security: 当前证券代码。
+        basis: 已解析且 provider 声明支持的动态前复权口径。
+        adjusted_frame: 按 basis 获取的当前行情。
+        fetch_kwargs: 本次 provider 请求参数，用于同 provider 获取未复权证明点。
+
+    Returns:
+        None；通过验证或当前响应尚未包含参考日时正常返回。
+
+    Raises:
+        PriceBasisDataError: 参考日存在但 raw 证明点缺失或价格字段不等价。
+
+    Side Effects:
+        仅在响应含参考日时向同一 provider 追加一次 ``fq=none`` 只读查询；不切换数据源。
+    """
+
+    if basis.fq != "pre" or basis.pre_factor_ref_date is None:
+        return
+    adjusted_row, adjusted_date = _extract_effective_price_row(adjusted_frame, security)
+    if adjusted_row is None or adjusted_date != basis.pre_factor_ref_date:
+        return
+
+    raw_kwargs = dict(fetch_kwargs)
+    raw_kwargs["fq"] = "none"
+    raw_kwargs.pop("pre_factor_ref_date", None)
+    raw_kwargs.pop("prefer_engine", None)
+    try:
+        raw_frame = _call_provider_get_price_with_security_fallback(**raw_kwargs)
+    except Exception as exc:
+        raise PriceBasisDataError(
+            "PRICE_BASIS_REFERENCE_FETCH_FAILED",
+            f"数据源 {basis.provider} 未能返回动态前复权参考日的未复权证明点",
+            basis=basis,
+        ) from exc
+    raw_row, raw_date = _extract_effective_price_row(raw_frame, security)
+    if raw_row is None or raw_date != basis.pre_factor_ref_date:
+        raise PriceBasisDataError(
+            "PRICE_BASIS_REFERENCE_MISSING",
+            f"数据源 {basis.provider} 缺少动态前复权参考日的可比行情",
+            basis=basis,
+        )
+
+    tolerance = max(1e-8, 0.51 * (10 ** (-get_tick_decimals(security))))
+    compared = 0
+    for field in ("open", "close", "high_limit", "low_limit"):
+        try:
+            adjusted_value = float(adjusted_row.get(field))
+            raw_value = float(raw_row.get(field))
+        except (TypeError, ValueError):
+            continue
+        if pd.isna(adjusted_value) or pd.isna(raw_value):
+            continue
+        if adjusted_value <= 0 or raw_value <= 0:
+            continue
+        compared += 1
+        if abs(adjusted_value - raw_value) > tolerance:
+            raise PriceBasisDataError(
+                "PRICE_BASIS_REFERENCE_MISMATCH",
+                f"数据源 {basis.provider} 的动态前复权参考点与未复权行情不等价",
+                basis=basis,
+            )
+    if compared == 0:
+        raise PriceBasisDataError(
+            "PRICE_BASIS_REFERENCE_FIELDS_MISSING",
+            f"数据源 {basis.provider} 未返回可验证的参考日价格字段",
+            basis=basis,
+        )
+
+
+def _fetch_effective_price_frame(
+    *,
+    security: str,
+    basis: EffectivePriceBasis,
+    fetch_kwargs: Dict[str, Any],
+) -> pd.DataFrame:
+    """按有效价格口径从当前 provider 取得并验证行情。
+
+    Args:
+        security: 当前证券代码。
+        basis: 当前业务时刻共享的冻结价格口径。
+        fetch_kwargs: 除 security 外的 provider get_price 参数。
+
+    Returns:
+        pd.DataFrame: 可供当前行情、保护价和撮合共同使用的价格表。
+
+    Raises:
+        PriceBasisDataError: provider 查询失败或动态前复权参考点不等价。
+
+    Side Effects:
+        只读调用当前 provider；不会静默切换 provider 或放宽价格边界。
+    """
+
+    kwargs = {**fetch_kwargs, "security": security}
+    try:
+        frame = _call_provider_get_price_with_security_fallback(**kwargs)
+    except PriceBasisError:
+        raise
+    except Exception as exc:
+        raise PriceBasisDataError(
+            "PRICE_BASIS_FETCH_FAILED",
+            f"数据源 {basis.provider} 未能按有效价格口径返回行情",
+            basis=basis,
+        ) from exc
+    _validate_dynamic_pre_reference_point(
+        security=security,
+        basis=basis,
+        adjusted_frame=frame,
+        fetch_kwargs=kwargs,
+    )
+    return frame
+
+
 class BacktestCurrentData:
     """当前行情（回测/非 tick 路径）。延迟加载，按 (security, time) 缓存。"""
 
-    def __init__(self, context):
+    def __init__(self, context: Any, *, enforce_effective_price_basis: bool = True) -> None:
+        """初始化延迟行情容器。
+
+        Args:
+            context: 提供 current_dt 的策略上下文。
+            enforce_effective_price_basis: 回测路径为 True；实盘 tick 失败后的兼容回退为 False。
+
+        Returns:
+            None。
+
+        Side Effects:
+            仅初始化进程内缓存，不读取行情。
+        """
+
         self._context = context
+        self._enforce_effective_price_basis = bool(enforce_effective_price_basis)
         self._cache: Dict[Any, SecurityUnitData] = {}
 
     def __getitem__(self, security: str) -> SecurityUnitData:
         current_dt = self._context.current_dt
-        cache_key = (security, current_dt)
+        if not self._enforce_effective_price_basis:
+            provider = _get_default_provider()
+            price_basis = EffectivePriceBasis.create(
+                use_real_price=False,
+                provider=str(getattr(provider, "name", "") or provider.__class__.__name__),
+                business_time=current_dt,
+            )
+        else:
+            price_basis = resolve_context_effective_price_basis(self._context)
+        cache_key = (security, current_dt, price_basis)
+        session_key = (
+            "current_data",
+            security,
+            current_dt,
+            price_basis.fq,
+            price_basis.pre_factor_ref_date,
+            price_basis.provider,
+        )
         data_session = None
         if not _is_live_mode():
             data_session = get_current_backtest_data_session()
         if data_session is not None:
             data_session.advance_bar(current_dt)
-            session_value = data_session.get_current_bar_value(
-                ("current_data", security, current_dt)
-            )
+            session_value = data_session.get_current_bar_value(session_key)
             if session_value is not None:
                 return session_value
         if cache_key in self._cache:
@@ -1715,28 +2028,26 @@ class BacktestCurrentData:
 
             def _build_fetch_kwargs(freq_text: str) -> Dict[str, Any]:
                 kw = dict(
-                    security=security,
                     end_date=current_dt,
                     frequency=freq_text,
                     fields=fields,
                     count=1,
-                    fq="pre",
                 )
-                pre_ref = _resolve_fq_ref_date(current_date or current_dt, use_real_price)
-                if pre_ref is not None:
-                    kw.update(
-                        prefer_engine=not force_no_engine,
-                        pre_factor_ref_date=pre_ref,
-                        force_no_engine=force_no_engine,
-                    )
+                kw.update(price_basis.provider_kwargs(force_no_engine=bool(force_no_engine)))
                 return kw
 
             if use_minute:
-                df = _call_provider_get_price_with_security_fallback(
-                    **_build_fetch_kwargs("minute")
+                df = _fetch_effective_price_frame(
+                    security=security,
+                    basis=price_basis,
+                    fetch_kwargs=_build_fetch_kwargs("minute"),
                 )
             else:
-                df = _call_provider_get_price_with_security_fallback(**_build_fetch_kwargs("daily"))
+                df = _fetch_effective_price_frame(
+                    security=security,
+                    basis=price_basis,
+                    fetch_kwargs=_build_fetch_kwargs("daily"),
+                )
 
             if not df.empty:
                 if "time" in df.columns and "code" in df.columns:
@@ -1792,7 +2103,9 @@ class BacktestCurrentData:
                     and current_date is not None
                     and row_date == current_date
                 )
-                last_price = open_price if should_use_open else close_price
+                last_price = (
+                    float(open_price) if should_use_open and open_price is not None else close_price
+                )
 
                 high_limit, low_limit = _apply_limit_fallback(
                     security,
@@ -1802,6 +2115,7 @@ class BacktestCurrentData:
                     low_limit,
                     use_real_price,
                     force_no_engine,
+                    price_basis=price_basis,
                 )
 
                 data = SecurityUnitData(
@@ -1815,19 +2129,27 @@ class BacktestCurrentData:
                 data = SecurityUnitData(security=security, last_price=0.0)
                 log.debug(f"{security}无数据")
 
+        except PriceBasisError as exc:
+            if self._enforce_effective_price_basis:
+                self._context.price_basis_failure = exc.as_dict()
+                raise
+            log.debug(f"实盘兼容回退未获取到 {security} 历史行情: {exc}")
+            data = SecurityUnitData(security=security, last_price=0.0)
         except Exception as e:
             log.debug(f"获取{security}数据失败: {e}")
             data = SecurityUnitData(security=security, last_price=0.0)
 
         self._cache[cache_key] = data
         if data_session is not None:
-            data_session.set_current_bar_value(("current_data", security, current_dt), data)
+            data_session.set_current_bar_value(session_key, data)
         return data
 
     def __contains__(self, security: str) -> bool:
         try:
             data = self.__getitem__(security)
             return data.last_price > 0
+        except PriceBasisError:
+            raise
         except Exception:
             return False
 
@@ -1847,7 +2169,7 @@ class LiveCurrentData:
     def __init__(self, context):
         self._context = context
         self._cache: Dict[Any, SecurityUnitData] = {}
-        self._fallback = BacktestCurrentData(context)
+        self._fallback = BacktestCurrentData(context, enforce_effective_price_basis=False)
 
     @staticmethod
     def _to_qmt_code(code: str) -> str:
@@ -2272,6 +2594,9 @@ def get_price(
     use_real_price = _get_setting("use_real_price")
 
     current_dt = _current_context.current_dt
+    effective_basis: Optional[EffectivePriceBasis] = None
+    if use_real_price and fq == "pre":
+        effective_basis = resolve_context_effective_price_basis(_current_context)
 
     # 检查参数冲突：start_date 和 count 不能同时使用（与聚宽保持一致）
     if count is not None and start_date is not None:
@@ -2340,23 +2665,15 @@ def get_price(
     if session_price is not None:
         return session_price
 
-    # 真实价格模式：使用当前回测时间作为复权参考日期
-    # 注意：当 panel=False 时跳过真实价格模式，因为 get_price_engine 不支持 panel 参数
-    # 此时直接使用标准的 get_price，它正确支持 panel=False 返回长表格式
-    if use_real_price and fq == "pre" and panel:
+    # 真实价格模式：所有返回形态都使用当前回测时间作为复权参考日期。
+    if use_real_price and fq == "pre":
         # 使用当前回测日期作为复权参考日期，以获得当时的真实价格
-
-        # 确保 pre_factor_ref_date 是 datetime.date 类型
-        if isinstance(current_dt, Date) and not isinstance(current_dt, datetime):
-            pre_factor_ref_date = current_dt
-        elif isinstance(current_dt, datetime):
-            pre_factor_ref_date = current_dt.date()
-        else:
-            try:
-                pre_factor_ref_date = pd.to_datetime(current_dt).date()
-            except:
-                log.warning(f"无法转换 current_dt 为 date 类型: {current_dt}, 使用今天日期")
-                pre_factor_ref_date = Date.today()
+        if effective_basis is None:  # pragma: no cover - 前置解析后的防御性保护
+            raise PriceBasisDataError(
+                "PRICE_BASIS_NOT_RESOLVED",
+                "动态前复权请求缺少已解析的有效价格口径",
+            )
+        pre_factor_ref_date = effective_basis.pre_factor_ref_date
 
         raw_df = None
         final = None
@@ -2393,10 +2710,15 @@ def get_price(
             else:
                 raw_df = _coerce_price_result_to_dataframe(result)
                 final = _make_compatible_dataframe(raw_df, fields)
+        except PriceBasisError:
+            raise
         except Exception as e:
             _raise_if_not_implemented(e)
-            log.warning(f"真实价格模式调用失败: {e}，回退到标准复权")
-            final = None
+            raise PriceBasisDataError(
+                "PRICE_BASIS_FETCH_FAILED",
+                f"数据源 {effective_basis.provider} 未能按动态前复权口径返回行情",
+                basis=effective_basis,
+            ) from e
         if final is not None:
             _raise_if_empty_minute_data(avoid_future, freq, raw_df, security, end_date)
             return final
@@ -2677,6 +2999,8 @@ def attribute_history(
             fq=fq,
             count=count,
         )
+    except PriceBasisError:
+        raise
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取历史数据失败: {e}")

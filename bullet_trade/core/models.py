@@ -408,6 +408,8 @@ class Context:
         previous_dt: 前一个时间点
         previous_date: 前一个交易日（date 类型）
         run_params: 运行参数
+        effective_price_basis: 当前业务时刻已证明的不可变有效价格口径
+        price_basis_failure: 最近一次价格口径失败的脱敏诊断
         subportfolios: 子账户
     """
     portfolio: Portfolio
@@ -415,6 +417,8 @@ class Context:
     previous_dt: Optional[datetime] = None
     previous_date: Optional[date] = None
     run_params: Dict[str, Any] = field(default_factory=dict)
+    effective_price_basis: Optional[Any] = None
+    price_basis_failure: Optional[Dict[str, Any]] = None
     
     @property
     def subportfolios(self):

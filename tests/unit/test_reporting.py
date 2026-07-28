@@ -3,6 +3,7 @@
 """
 
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -10,10 +11,45 @@ import pandas as pd
 import pytest
 
 from bullet_trade.core import analysis as analysis_module
-from bullet_trade.core.analysis import generate_html_report, generate_report, load_results_from_directory
+from bullet_trade.core.analysis import (
+    generate_html_report,
+    generate_report,
+    load_results_from_directory,
+)
 from bullet_trade.reporting import ReportGenerationError, generate_cli_report
 
 pytestmark = pytest.mark.unit
+
+
+def _normalize_plotly_unicode(html: str) -> str:
+    """把 Plotly JSON 的 ``\\uXXXX`` 转义转成可断言的 Unicode 文本。
+
+    Args:
+        html: ``generate_html_report`` 返回的完整 HTML。
+
+    Returns:
+        仅将 JSON Unicode 转义还原后的测试文本。
+    """
+
+    return re.sub(
+        r"\\u([0-9a-fA-F]{4})",
+        lambda matched: chr(int(matched.group(1), 16)),
+        html,
+    )
+
+
+def _contains_plotly_text(html: str, value: str) -> bool:
+    """判断 Plotly HTML 是否包含指定轴标题，兼容 Unicode 原文与 JSON 转义。
+
+    Args:
+        html: ``generate_html_report`` 返回的完整 HTML。
+        value: 期望出现在 Plotly ``title.text`` 中的中文标题。
+
+    Returns:
+        标题以原文或 ``ensure_ascii`` JSON 转义形式存在时返回 True。
+    """
+
+    return f'"text":"{value}"' in _normalize_plotly_unicode(html)
 
 
 def _prepare_results_dir(tmp_path: Path) -> Path:
@@ -149,9 +185,9 @@ def test_generate_html_report_includes_benchmark_and_run_context(tmp_path):
     assert "return raw.toFixed(1) + '%'" in html
     assert "回撤 / 超额收益 (%)" not in html
     assert '"yaxis3"' not in html
-    assert '"text":"回撤 (%)"' in html
-    assert '"text":"资产 / 超额资产 (元)"' in html
-    assert '超额资产 (元)' in html
+    assert _contains_plotly_text(html, "回撤 (%)")
+    assert _contains_plotly_text(html, "资产 / 超额资产 (元)")
+    assert "超额资产 (元)" in _normalize_plotly_unicode(html)
 
 
 def test_analysis_resample_aliases_work_across_supported_pandas_versions():

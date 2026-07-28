@@ -59,6 +59,7 @@ _FINANCE_TABLE_STUB = _FinanceTableStub()
 
 class JQDataProvider(DataProvider):
     name: str = "jqdatasdk"
+    supports_dynamic_pre_price_basis: bool = True
     _DEFAULT_PRICE_FIELDS: List[str] = ['open', 'close', 'high', 'low', 'volume', 'money']
     _PRICE_SCALE_FIELDS: Set[str] = {
         'open', 'close', 'high', 'low', 'avg', 'price', 'high_limit', 'low_limit', 'pre_close'

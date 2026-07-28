@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pandas as pd
 import pytest
 
@@ -165,7 +167,13 @@ def _stub_provider() -> EasyTdxProvider:
 
 def _fake_provider() -> EasyTdxProvider:
     """创建注入 fake client 的 provider。"""
-    return EasyTdxProvider({"mac_client_cls": FakeMacClient, "timeout": 1.0})
+    return EasyTdxProvider(
+        {
+            "easy_tdx": SimpleNamespace(MacClient=FakeMacClient),
+            "mac_client_cls": FakeMacClient,
+            "timeout": 1.0,
+        }
+    )
 
 
 @pytest.mark.unit

@@ -22,6 +22,7 @@ class MiniQMTProvider(DataProvider):
     """
 
     name: str = "miniqmt"
+    supports_dynamic_pre_price_basis: bool = True
     requires_live_data: bool = True
     _SUFFIX_TO_QMT: Dict[str, str] = {
         "SZ": "SZ",

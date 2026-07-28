@@ -80,6 +80,7 @@ class EasyTdxProvider(DataProvider):
     """通达信在线行情数据源，负责把 easy_tdx 输出转换为聚宽兼容格式。"""
 
     name: str = "easy_tdx"
+    supports_dynamic_pre_price_basis: bool = True
     requires_live_data: bool = False
     _MAX_DAILY_FETCH = 50000
     _MAX_INTRADAY_FETCH = 50000

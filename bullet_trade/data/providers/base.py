@@ -1,5 +1,6 @@
 from abc import ABC, abstractmethod
 from typing import Union, List, Optional, Dict, Any
+from datetime import date as Date
 from datetime import datetime
 import pandas as pd
 
@@ -13,6 +14,35 @@ class DataProvider(ABC):
     name: str = "base"
     # 是否要求实时行情必须由 provider 提供（用于 live 模式防止回落到历史数据）
     requires_live_data: bool = False
+    # 未复权是 DataProvider 基础合同；动态前复权必须由具体 provider 显式声明。
+    supports_unadjusted_price_basis: bool = True
+    supports_dynamic_pre_price_basis: bool = False
+
+    def supports_effective_price_basis(
+        self,
+        *,
+        fq: str,
+        pre_factor_ref_date: Optional[Union[str, datetime, Date]] = None,
+    ) -> bool:
+        """证明当前 provider 是否支持指定有效价格口径。
+
+        Args:
+            fq: 规范化复权口径，目前支持 ``none`` 与 ``pre``。
+            pre_factor_ref_date: 动态前复权参考日；``pre`` 口径必须提供。
+
+        Returns:
+            bool: provider 明确支持并承诺失败关闭时返回 True，否则返回 False。
+
+        Side Effects:
+            无；该能力检查不得认证、联网或切换数据源。
+        """
+
+        normalized = str(fq or "none").strip().lower()
+        if normalized == "none":
+            return bool(self.supports_unadjusted_price_basis)
+        if normalized == "pre" and pre_factor_ref_date is not None:
+            return bool(self.supports_dynamic_pre_price_basis)
+        return False
 
     def auth(self, user: Optional[str] = None, pwd: Optional[str] = None, host: Optional[str] = None, port: Optional[int] = None) -> None:
         """执行数据源认证或初始化。可选。默认读取环境变量，也可传入账号参数。"""

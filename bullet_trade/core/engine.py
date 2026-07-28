@@ -32,6 +32,7 @@ from ..data.api import get_security_info, set_current_context
 from .globals import g, log, reset_globals
 from .models import Context, Order, OrderStatus, Portfolio, Position, Trade
 from .orders import LimitOrderStyle, MarketOrderStyle, clear_order_queue, get_order_queue
+from .price_basis import EffectivePriceBasis, PriceBasisDataError, PriceBasisError  # noqa: E402
 from .scheduler import (
     generate_daily_schedule,
     get_market_periods,
@@ -177,6 +178,8 @@ class BacktestEngine:
         self._benchmark_base_price: Optional[float] = None
         self._trade_calendar: Dict[date, Dict[str, Any]] = {}
         self._trade_seq = 0
+        self.effective_price_basis: Optional[EffectivePriceBasis] = None
+        self.price_basis_failures: List[Dict[str, Any]] = []
         market_cfg = get_live_trade_config()
         self._market_buy_percent = float(
             market_cfg.get("market_buy_price_percent", _DEFAULT_MARKET_BUY_PERCENT)
@@ -651,6 +654,8 @@ class BacktestEngine:
         self.run_finished_at = None
         self.runtime_seconds = None
         self._benchmark_base_price = None
+        self.effective_price_basis = None
+        self.price_basis_failures = []
 
         log.info("=" * 60)
         log.info(
@@ -1634,74 +1639,41 @@ class BacktestEngine:
     def _resolve_base_exec_price(
         self, security: str, current_dt: datetime, fq_mode: str
     ) -> Optional[float]:
-        """根据时间窗口解析撮合的基准价。
-        - 09:25-09:30: 当日未复权开盘价
-        - 09:31-15:00: 当前分钟未复权收盘价
-        - 其他时段: 未复权日收盘价
-        返回 None 表示无法获取。
+        """从共享当前行情快照解析撮合基准价。
+
+        Args:
+            security: 证券代码。
+            current_dt: 当前回测业务时刻，必须与 context.current_dt 一致。
+            fq_mode: 调用方期望复权口径；必须等于上下文已解析口径。
+
+        Returns:
+            Optional[float]: 当前行情快照的可比价格；缺少有效价格时返回 None。
+
+        Raises:
+            PriceBasisDataError: 调用时刻或复权口径与共享上下文不一致。
+
+        Side Effects:
+            延迟读取当前行情；不会额外选择 provider 或请求另一种复权口径。
         """
-        try:
-            t = current_dt.time() if isinstance(current_dt, datetime) else None
-            if t and (Time(9, 25) <= t < Time(9, 31)):
-                # # 优先尝试 09:30 分钟价（若存在），否则回退到日开
-                # try:
-                #     dfm = api_get_price(
-                #         security=security,
-                #         end_date=current_dt,
-                #         frequency='minute',
-                #         fields=['close'],
-                #         count=1,
-                #         fq=fq_mode
-                #     )
-                #     if not dfm.empty:
-                #         rowm = dfm.iloc[-1]
-                #         if isinstance(dfm.index, pd.DatetimeIndex):
-                #             last_ts = dfm.index[-1]
-                #             # 若最后一行时间早于当前时间，仍可作为近似基准
-                #             if last_ts <= pd.Timestamp(current_dt):
-                #                 val = float(rowm.get('close') or 0.0)
-                #                 if val > 0:
-                #                     return val
-                # except Exception:
-                #     pass
-                dfp = api_get_price(
-                    security=security,
-                    end_date=current_dt,
-                    frequency="daily",
-                    fields=["open"],
-                    count=1,
-                    fq=fq_mode,
-                )
-                if not dfp.empty:
-                    rowp = dfp.iloc[-1]
-                    return float(rowp.get("open") or 0.0)
-            elif t and (Time(9, 31) <= t < Time(15, 0)):
-                dfp = api_get_price(
-                    security=security,
-                    end_date=current_dt,
-                    frequency="minute",
-                    fields=["close"],
-                    count=1,
-                    fq=fq_mode,
-                )
-                if not dfp.empty:
-                    rowp = dfp.iloc[-1]
-                    return float(rowp.get("close") or 0.0)
-            else:
-                dfp = api_get_price(
-                    security=security,
-                    end_date=current_dt,
-                    frequency="daily",
-                    fields=["close"],
-                    count=1,
-                    fq=fq_mode,
-                )
-                if not dfp.empty:
-                    rowp = dfp.iloc[-1]
-                    return float(rowp.get("close") or 0.0)
-        except Exception:
-            return None
-        return None
+
+        from ..data.api import get_current_data, resolve_context_effective_price_basis
+
+        if self.context is None or self.context.current_dt != current_dt:
+            raise PriceBasisDataError(
+                "PRICE_BASIS_BUSINESS_TIME_MISMATCH",
+                "撮合业务时刻与回测上下文不一致",
+            )
+        basis = resolve_context_effective_price_basis(self.context)
+        if str(fq_mode or "none").lower() != basis.fq:
+            raise PriceBasisDataError(
+                "PRICE_BASIS_FQ_MISMATCH",
+                "撮合请求复权口径与当前行情有效口径不一致",
+                basis=basis,
+            )
+        snapshot = get_current_data()[security]
+        self.effective_price_basis = basis
+        price = float(getattr(snapshot, "last_price", 0.0) or 0.0)
+        return price if price > 0 else None
 
     def _load_corporate_actions(
         self, code: str, start_date: datetime.date, end_date: datetime.date
@@ -1844,8 +1816,6 @@ class BacktestEngine:
 
         log.info(f"处理 {len(orders)} 个订单")
 
-        settings = get_settings()
-
         # 获取当前行情数据容器（延迟加载）
         from ..data.api import get_current_data
 
@@ -1873,9 +1843,6 @@ class BacktestEngine:
                 orders = new_orders
         except Exception as ex:
             log.debug(f"目标订单预处理失败: {ex}")
-        use_real_price = bool(settings.options.get("use_real_price"))
-        fq_mode = "pre" if use_real_price else "none"
-
         for order in orders:
             try:
                 self._register_order(order)
@@ -1886,6 +1853,13 @@ class BacktestEngine:
                     continue
 
                 security_data = current_data[order.security]
+                price_basis = getattr(self.context, "effective_price_basis", None)
+                if isinstance(price_basis, EffectivePriceBasis):
+                    self.effective_price_basis = price_basis
+                    try:
+                        order.extra["effective_price_basis"] = price_basis.as_dict()
+                    except Exception:
+                        pass
                 try:
                     sec_info = get_security_info(order.security)
                 except Exception:
@@ -1896,15 +1870,9 @@ class BacktestEngine:
                     order.status = OrderStatus.canceled
                     continue
 
-                # 解析执行价基准（封装逻辑便于维护与测试）
+                # 撮合与保护价直接共享当前行情快照，禁止再次请求另一种复权口径。
                 current_dt = self.context.current_dt
-                base_exec_price = self._resolve_base_exec_price(order.security, current_dt, fq_mode)
-
-                current_price = (
-                    float(base_exec_price)
-                    if base_exec_price and base_exec_price > 0
-                    else security_data.last_price
-                )
+                current_price = float(security_data.last_price)
                 if current_price <= 0:
                     log.warning(f"{order.security} 价格无效: {current_price}")
                     order.status = OrderStatus.rejected
@@ -2205,6 +2173,17 @@ class BacktestEngine:
                 except Exception:
                     pass
 
+            except PriceBasisError as exc:
+                diagnostic = exc.as_dict()
+                self.price_basis_failures.append(diagnostic)
+                if self.context is not None:
+                    self.context.price_basis_failure = diagnostic
+                try:
+                    order.extra["price_basis_failure"] = diagnostic
+                except Exception:
+                    pass
+                log.error(f"处理订单失败: {order.security}, 价格口径: {exc}")
+                order.status = OrderStatus.rejected
             except Exception as e:
                 log.error(f"处理订单失败: {order.security}, 错误: {e}")
                 order.status = OrderStatus.rejected
