@@ -94,10 +94,16 @@
   },
 
   "by_code": {
-    "_comment": "具体代码级覆盖，优先级最高。主要用于：1.货币基金 2.跨境ETF的T+0 3.黄金ETF的T+0",
+    "_comment": "具体代码级覆盖，优先级最高。主要用于货币、债券、跨境、黄金和商品基金的T+规则",
     
+    "511010.XSHG": { "name": "国债ETF", "category": "fund", "tplus": 0 },
+    "511360.XSHG": { "name": "短融ETF", "category": "fund", "tplus": 0 },
+    "511380.XSHG": { "name": "转债ETF", "category": "fund", "tplus": 0 },
+    "511520.XSHG": { "name": "政金债ETF", "category": "fund", "tplus": 0 },
     "511880.XSHG": { "name": "银华日利ETF", "category": "money_market_fund", "tplus": 0, "slippage": 0.0 },
+    "511990.XSHG": { "name": "华宝添益ETF", "category": "money_market_fund", "tplus": 0, "slippage": 0.0 },
     
+    "510610.XSHG": { "name": "上证能源ETF", "category": "fund", "tplus": 1 },
     "513030.XSHG": { "name": "德国DAX30ETF", "category": "fund", "tplus": 0 },
     "513050.XSHG": { "name": "中概互联网ETF", "category": "fund", "tplus": 0 },
     "510900.XSHG": { "name": "H股ETF", "category": "fund", "tplus": 0 },
@@ -112,6 +118,7 @@
     "513600.XSHG": { "name": "恒生金融业ETF", "category": "fund", "tplus": 0 },
     "513160.XSHG": { "name": "港股科技30ETF", "category": "fund", "tplus": 0 },
     "513100.XSHG": { "name": "国泰纳斯达克100ETF", "category": "fund", "tplus": 0 },
+    "513180.XSHG": { "name": "恒生科技ETF", "category": "fund", "tplus": 0 },
     "513150.XSHG": { "name": "港股通科技ETF华泰柏瑞", "category": "fund", "tplus": 0 },
     "513020.XSHG": { "name": "港股科技ETF", "category": "fund", "tplus": 0 },
     "513860.XSHG": { "name": "港股通科技ETF", "category": "fund", "tplus": 0 },
@@ -126,6 +133,7 @@
     "159636.XSHE": { "name": "港股通科技30ETF", "category": "fund", "tplus": 0 },
     "513200.XSHG": { "name": "港股通医药ETF", "category": "fund", "tplus": 0 },
     "513500.XSHG": { "name": "标普500ETF", "category": "fund", "tplus": 0 },
+    "513000.XSHG": { "name": "日经225ETF", "category": "fund", "tplus": 0 },
     "159718.XSHE": { "name": "港股医药ETF", "category": "fund", "tplus": 0 },
     "513700.XSHG": { "name": "香港医药ETF", "category": "fund", "tplus": 0 },
     "159776.XSHE": { "name": "港股通医药ETF", "category": "fund", "tplus": 0 },
@@ -145,6 +153,7 @@
     "513900.XSHG": { "name": "恒生互联网科技业ETF", "category": "fund", "tplus": 0 },
     "513320.XSHG": { "name": "恒生新经济ETF", "category": "fund", "tplus": 0 },
     "513330.XSHG": { "name": "恒生互联网ETF", "category": "fund", "tplus": 0 },
+    "162411.XSHE": { "name": "华宝油气LOF", "category": "fund", "tplus": 0 },
     
     "518680.XSHG": { "name": "华安黄金ETF", "category": "fund", "tplus": 0 },
     "159834.XSHE": { "name": "金ETF", "category": "fund", "tplus": 0 },
