@@ -1,0 +1,64 @@
+[
+  {
+    "endpoint": "daily",
+    "source_table": "daily",
+    "target_table": "stk_daily",
+    "mode": "append",
+    "dimension_type": "trade_date",
+    "start_date": "20100101",
+    "sync_all": true,
+    "sleep_seconds": 0.3
+  },
+  {
+    "endpoint": "adj_factor",
+    "source_table": "adj_factor",
+    "target_table": "stk_adj_factor",
+    "mode": "append",
+    "dimension_type": "trade_date",
+    "start_date": "20100101",
+    "sync_all": true,
+    "sleep_seconds": 0.3
+  },
+  {
+    "endpoint": "fund_daily",
+    "source_table": "fund_daily",
+    "target_table": "etf_daily",
+    "mode": "append",
+    "dimension_type": "trade_date",
+    "start_date": "20100101",
+    "sync_all": true,
+    "sleep_seconds": 0.3
+  },
+  {
+    "endpoint": "fund_adj",
+    "source_table": "fund_adj",
+    "target_table": "fund_adj_factor",
+    "mode": "append",
+    "dimension_type": "trade_date",
+    "start_date": "20100101",
+    "sync_all": true,
+    "sleep_seconds": 0.3
+  },
+  {
+    "endpoint": "stock_basic",
+    "source_table": "stock_basic",
+    "target_table": "stk_info",
+    "mode": "overwrite",
+    "dimension_type": "none"
+  },
+  {
+    "endpoint": "etf_basic",
+    "method": "etf_basic",
+    "source_table": "etf_basic",
+    "target_table": "etf_basic_info",
+    "mode": "overwrite",
+    "dimension_type": "none"
+  },
+  {
+    "endpoint": "index_basic",
+    "source_table": "index_basic",
+    "target_table": "idx_basic_info",
+    "mode": "overwrite",
+    "dimension_type": "none"
+  }
+]

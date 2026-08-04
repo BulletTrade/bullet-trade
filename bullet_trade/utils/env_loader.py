@@ -173,6 +173,8 @@ def get_data_provider_config() -> dict:
             "token": get_env("TUSHARE_TOKEN"),
             "cache_dir": cache_dir_for("tushare"),
             "tushare_custom_url": get_env("TUSHARE_CUSTOM_URL"),
+            #tushare_duckdb_path 用于 tushare_duckdb模块数据源，若未设置则使用默认tushare模块
+            "tushare_duckdb_path": get_env("tushare_duckdb_path"),
         },
         "qmt": {
             "data_dir": get_env("QMT_DATA_PATH"),
