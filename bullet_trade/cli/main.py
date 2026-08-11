@@ -210,14 +210,19 @@ def create_parser():
     )
 
     # live 命令（待实现）
+    from bullet_trade.broker.registry import list_brokers
+
     live_parser = subparsers.add_parser("live", help="实盘交易")
     live_parser.add_argument("strategy_file", type=str, help="策略文件路径")
     live_parser.add_argument(
         "--broker",
         type=str,
-        choices=["qmt", "qmt-remote", "simulator"],
+        choices=list(list_brokers()),
         default=None,
-        help="券商类型（默认读取 DEFAULT_BROKER）",
+        help=(
+            "券商类型：qmt、qmt-remote、simulator、huaxin（huaxin 仅预览骨架、"
+            "当前不可交易；默认读取 DEFAULT_BROKER）"
+        ),
     )
     live_parser.add_argument("--log-dir", type=str, default=None, help="覆盖 LOG_DIR，优先于 .env")
     live_parser.add_argument(
@@ -311,6 +316,15 @@ def create_parser():
         "--no-access-log", dest="access_log", action="store_false", help="关闭请求访问日志"
     )
 
+    # 华鑫 native 显式离线工具；配置解析不会加载 SDK、编译或联网
+    from bullet_trade.integrations.huaxin.cli import configure_parser as configure_huaxin_parser
+
+    huaxin_parser = subparsers.add_parser(
+        "huaxin",
+        help="华鑫第一方 native bridge 离线诊断与显式构建",
+    )
+    configure_huaxin_parser(huaxin_parser)
+
     # jupyterlab / lab 命令
     lab_parser = subparsers.add_parser(
         "lab", aliases=["jupyterlab"], help="启动 BulletTrade 研究环境 (JupyterLab)"
@@ -378,6 +392,10 @@ def main():
         from bullet_trade.server.cli import run_server_command
 
         return run_server_command(args)
+    elif args.command == "huaxin":
+        from bullet_trade.integrations.huaxin.cli import run_arguments
+
+        return run_arguments(args)
     elif args.command in ("lab", "jupyterlab"):
         from bullet_trade.cli.jupyterlab import run_lab
 

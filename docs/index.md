@@ -33,6 +33,7 @@ BulletTrade 是一套兼容聚宽 API 的量化研究与交易框架，支持多
 - [回测引擎](backtest.md)：真实价格成交、分红送股处理、聚宽代码示例与 CLI 回测。
 - [参数优化](optimize.md)：多进程并行参数寻优，自动找出最优策略参数。
 - [实盘引擎](live.md)：本地 QMT 独立实盘与远程实盘流程。
+- [华鑫 TORA 接入（第一阶段）](huaxin.md)：同包 BYO C++ SDK 架构、当前离线 build/doctor、三种产品角色、数据路由边界和生产/仿真门禁。
 - [交易支撑](trade-support.md)：聚宽模拟盘接入、远程 QMT 服务与 helper 用法。
 - [QMT 服务配置](qmt-server.md)：bullet-trade server 的完整说明。
 - [大 QMT 服务向导](big-qmt-server.md)：在大 QMT 策略中运行 helper，并启动兼容 `qmt-remote` 的服务。

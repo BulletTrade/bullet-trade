@@ -20,7 +20,7 @@ import hashlib
 import inspect
 import unicodedata
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 import pandas as pd
 
 from .async_scheduler import AsyncScheduler, OverlapStrategy
@@ -69,8 +69,16 @@ from ..utils.env_loader import (
     get_live_trade_config,
     parse_bool,
 )
-from ..broker import BrokerBase, QmtBroker, RemoteQmtBroker
-from ..broker.simulator import SimulatorBroker
+from ..broker import BrokerBase, create_broker
+from ..market_data import (
+    CapabilityRequest,
+    DataCapabilityUnavailableError,
+    DataSourceRouter,
+    RouteDecision,
+    StrategyCapabilityPreflight,
+    StrategyCapabilityProfile,
+    StrategyCapabilityRequirements,
+)
 from .live_runtime import (
     init_live_runtime,
     start_g_autosave,
@@ -185,6 +193,8 @@ class LiveEngine:
         broker_factory: Optional[Callable[[], BrokerBase]] = None,
         now_provider: Optional[Callable[[], datetime]] = None,
         sleep_provider: Optional[Callable[[float], Awaitable[None]]] = None,
+        data_source_router: Optional[DataSourceRouter] = None,
+        strategy_capability_requirements: Optional[StrategyCapabilityRequirements] = None,
     ):
         self.strategy_path = Path(strategy_file).resolve()
         self.broker_name = broker_name
@@ -192,6 +202,12 @@ class LiveEngine:
         self._broker_factory = broker_factory
         self._now = now_provider or datetime.now
         self._sleep = sleep_provider
+        self.data_source_router = data_source_router
+        self.strategy_capability_requirements = strategy_capability_requirements
+        self.strategy_capability_preflight: Optional[StrategyCapabilityPreflight] = None
+        self._dynamic_capability_decisions: Dict[str, RouteDecision] = {}
+        self._startup_phase = "created"
+        self._market_callbacks_enabled = False
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._stop_event: Optional[asyncio.Event] = None
@@ -320,6 +336,8 @@ class LiveEngine:
 
     async def _bootstrap(self) -> None:
         log.info("🧠 初始化 Live 引擎")
+        self._startup_phase = "preflight"
+        self._market_callbacks_enabled = False
         if not self.strategy_path.exists():
             raise FileNotFoundError(f"策略文件不存在: {self.strategy_path}")
 
@@ -335,11 +353,16 @@ class LiveEngine:
             if self.process_initialize_func is None:
                 self.process_initialize_func = getattr(module, 'process_initialize', None)
             self.after_code_changed_func = getattr(module, 'after_code_changed', None)
+            if self.strategy_capability_requirements is None:
+                self.strategy_capability_requirements = (
+                    self._read_static_strategy_capability_requirements(module)
+                )
         else:
             self.handle_tick_func = None
             self.after_code_changed_func = None
 
         self._ensure_broker_created()
+        self._preflight_live_components()
         self._acquire_live_locks()
 
         init_live_runtime(self.config.runtime_dir)
@@ -352,6 +375,7 @@ class LiveEngine:
         set_current_context(self.context)
         self.context.run_params['run_type'] = 'LIVE'
         self.context.run_params['is_live'] = True
+        self.context.require_data_capabilities = self.require_data_capabilities
 
         current_hash = self._compute_strategy_hash()
         restored_runtime = runtime_restored()
@@ -361,6 +385,15 @@ class LiveEngine:
             metadata_applied = self._restore_strategy_metadata(metadata)
             if not metadata_applied:
                 log.warning("检测到历史 g 状态但缺少策略元数据，将重新执行 initialize()")
+            elif (
+                "strategy_capability_requirements" not in metadata
+                and self._callable_references_capability_api(self.initialize_func)
+            ):
+                metadata_applied = False
+                log.warning(
+                    "历史策略元数据缺少能力声明，且 initialize() 引用了 "
+                    "require_data_capabilities，本次将重新执行 initialize()"
+                )
 
         log.debug(
             "LiveEngine restore status: restored_runtime=%s, metadata_applied=%s",
@@ -368,6 +401,7 @@ class LiveEngine:
             metadata_applied,
         )
 
+        self._startup_phase = "initialize"
         if not restored_runtime or not metadata_applied:
             await self._call_hook(self.initialize_func)
 
@@ -384,9 +418,14 @@ class LiveEngine:
         if hash_changed and self.after_code_changed_func:
             await self._call_hook(self.after_code_changed_func)
 
+        self._finalize_strategy_capabilities()
+
+        self._startup_phase = "connecting"
         self._init_broker()
+        self._startup_phase = "ready"
 
         await self._call_hook(self.process_initialize_func)
+        self._market_callbacks_enabled = True
 
         self._dedupe_scheduler_tasks()
 
@@ -427,6 +466,8 @@ class LiveEngine:
 
     async def _shutdown(self) -> None:
         log.info("🛑 正在关闭 Live 引擎")
+        self._market_callbacks_enabled = False
+        self._startup_phase = "stopped"
         if self._stop_event:
             self._stop_event.set()
         for task in self._background_tasks:
@@ -655,16 +696,39 @@ class LiveEngine:
             if not self.broker:
                 log.error("暂无券商实例，无法执行订单")
                 return
-            try:
-                current_data = get_current_data()
-            except Exception as exc:
-                log.warning(f"获取 current_data 失败，订单无法执行: {exc}")
+            eligible_orders: List[Order] = []
+            for order in orders:
+                try:
+                    self.validate_order_request(
+                        self._order_requires_realtime_snapshot(order)
+                    )
+                except Exception as exc:
+                    log.error(f"订单能力门禁拒绝 {order.security}: {exc}")
+                    try:
+                        order.status = OrderStatus.rejected
+                    except Exception:
+                        pass
+                    continue
+                eligible_orders.append(order)
+            if not eligible_orders:
                 return
+            current_data = None
+            if any(self._order_requires_realtime_snapshot(order) for order in eligible_orders):
+                try:
+                    current_data = get_current_data()
+                except Exception as exc:
+                    log.warning(f"获取 current_data 失败，需实时价订单无法执行: {exc}")
             open_position_symbols = self._get_open_position_symbols()
             pending_new_positions: Set[str] = set()
             submitted_buys: Dict[str, Dict[str, Any]] = {}
-            for order in orders:
+            for order in eligible_orders:
                 self._register_order(order)
+                if self._order_requires_realtime_snapshot(order) and current_data is None:
+                    try:
+                        order.status = OrderStatus.rejected
+                    except Exception:
+                        pass
+                    continue
                 plan = self._build_order_plan(order, current_data)
                 if not plan:
                     try:
@@ -1646,22 +1710,62 @@ class LiveEngine:
             result[tid] = trade
         return result
 
-    def _build_order_plan(self, order: Order, current_data) -> Optional[_ResolvedOrder]:
-        try:
-            snapshot = current_data[order.security]
-        except Exception:
-            log.warning(f"无法获取 {order.security} 的实时行情，忽略订单")
-            return None
-        if snapshot.paused:
-            log.warning(f"{order.security} 停牌，取消订单")
-            return None
-        last_price = float(snapshot.last_price or 0.0)
-        if last_price <= 0:
-            fallback = snapshot.high_limit or snapshot.low_limit
-            if not fallback or fallback <= 0:
-                log.warning(f"{order.security} 缺少可用价格，忽略订单")
+    @staticmethod
+    def _order_requires_realtime_snapshot(order: Order) -> bool:
+        """判断订单数量或保护价是否必须使用新鲜实时快照。
+
+        Args:
+            order: 待规划的 BulletTrade 订单。
+
+        Returns:
+            bool: 价值/目标价值或非明确限价意图返回 True。
+        """
+
+        is_value_intent = hasattr(order, "_target_value")
+        is_explicit_limit = isinstance(getattr(order, "style", None), LimitOrderStyle)
+        return is_value_intent or not is_explicit_limit
+
+    def _build_order_plan(self, order: Order, current_data: Any) -> Optional[_ResolvedOrder]:
+        """把公共订单转换为券商可执行的数量、方向和价格计划。
+
+        Args:
+            order: 待规划的 BulletTrade 订单。
+            current_data: 需实时价意图的快照集；明确股数限价时可为 None。
+
+        Returns:
+            Optional[_ResolvedOrder]: 可执行计划；停牌、缺价或无数量时为 None。
+
+        Side Effects:
+            只读取持仓和快照，不向 Broker 发送委托。
+        """
+
+        snapshot = None
+        style_obj = getattr(order, "style", None)
+        requires_snapshot = self._order_requires_realtime_snapshot(order)
+        if requires_snapshot:
+            try:
+                snapshot = current_data[order.security]
+            except Exception:
+                log.warning(f"无法获取 {order.security} 的实时行情，忽略订单")
                 return None
-            last_price = float(fallback)
+            if snapshot.paused:
+                log.warning(f"{order.security} 停牌，取消订单")
+                return None
+            last_price = float(snapshot.last_price or 0.0)
+            if last_price <= 0:
+                fallback = snapshot.high_limit or snapshot.low_limit
+                if not fallback or fallback <= 0:
+                    log.warning(f"{order.security} 缺少可用价格，忽略订单")
+                    return None
+                last_price = float(fallback)
+        elif isinstance(style_obj, LimitOrderStyle):
+            last_price = float(style_obj.price)
+            if last_price <= 0:
+                log.warning(f"{order.security} 限价必须大于 0，忽略订单")
+                return None
+        else:
+            log.error(f"{order.security} 订单意图缺少实时快照和明确限价")
+            return None
 
         amount, is_buy = self._resolve_order_amount(order, last_price)
         if amount <= 0:
@@ -1681,7 +1785,6 @@ class LiveEngine:
             return None
 
         exec_price: Optional[float] = None
-        style_obj = getattr(order, "style", None)
         if isinstance(style_obj, LimitOrderStyle):
             is_market = False
         elif isinstance(style_obj, MarketOrderStyle):
@@ -1691,6 +1794,7 @@ class LiveEngine:
         if isinstance(style_obj, LimitOrderStyle):
             exec_price = float(style_obj.price)
         elif isinstance(style_obj, MarketOrderStyle) and style_obj.limit_price is not None:
+            assert snapshot is not None
             exec_price = pricing.clamp_price_to_trade_bounds(
                 order.security,
                 float(style_obj.limit_price),
@@ -1700,6 +1804,7 @@ class LiveEngine:
                 is_buy,
             )
         else:
+            assert snapshot is not None
             percent = self._resolve_price_percent(style_obj, is_buy)
             try:
                 exec_price = pricing.compute_market_protect_price(
@@ -1782,39 +1887,25 @@ class LiveEngine:
     # ------------------------------------------------------------------
 
     def _create_broker(self) -> BrokerBase:
+        """创建当前 LiveEngine 使用的券商实例。
+
+        Returns:
+            由显式 ``broker_factory`` 或全局券商注册表构造、尚未连接的券商实例。
+
+        Raises:
+            ValueError: 配置的券商名称尚未注册时抛出。
+            RuntimeError: 已注册券商缺少必需配置时抛出。
+
+        Side Effects:
+            仅构造对象，不调用 ``connect``，因此不会在策略初始化前建立网络连接。
+        """
+
         if self._broker_factory:
             return self._broker_factory()
 
         cfg = get_broker_config()
         name = (self.broker_name or cfg.get('default') or 'simulator').lower()
-
-        if name == 'qmt':
-            qcfg = cfg.get('qmt') or {}
-            account_id = qcfg.get('account_id')
-            if not account_id:
-                raise RuntimeError("缺少 QMT_ACCOUNT_ID，请在 .env.live 中配置")
-            return QmtBroker(
-                account_id=account_id,
-                account_type=qcfg.get('account_type', 'stock'),
-                data_path=qcfg.get('data_path'),
-                session_id=qcfg.get('session_id'),
-                auto_subscribe=qcfg.get('auto_subscribe'),
-            )
-        if name == 'qmt-remote':
-            rcfg = cfg.get('qmt-remote') or {}
-            return RemoteQmtBroker(
-                account_id=rcfg.get('account_id') or rcfg.get('account_key') or 'remote',
-                account_type=rcfg.get('account_type', 'stock'),
-                config=rcfg,
-            )
-        if name == 'simulator':
-            scfg = cfg.get('simulator') or {}
-            return SimulatorBroker(
-                account_id=scfg.get('account_id', 'simulator'),
-                account_type=scfg.get('account_type', 'stock'),
-                initial_cash=scfg.get('initial_cash', 1_000_000),
-            )
-        raise ValueError(f"未知券商类型: {name}")
+        return create_broker(name, cfg)
 
     # ------------------------------------------------------------------
     # Tick 订阅
@@ -1919,7 +2010,7 @@ class LiveEngine:
         """
         数据源推送 tick 时的直通回调：不拆分、不加工，直接转发给策略的 handle_tick。
         """
-        if not self.handle_tick_func or not self._loop:
+        if not self._market_callbacks_enabled or not self.handle_tick_func or not self._loop:
             return
         try:
             asyncio.run_coroutine_threadsafe(self._call_hook(self.handle_tick_func, data), self._loop)  # type: ignore[arg-type]
@@ -2078,6 +2169,285 @@ class LiveEngine:
     def _ensure_broker_created(self) -> None:
         if self.broker is None:
             self.broker = self._create_broker()
+
+    @staticmethod
+    def _normalize_strategy_capability_profile(value: Any) -> StrategyCapabilityProfile:
+        """把字符串或枚举规范化为策略能力画像。
+
+        Args:
+            value: ``StrategyCapabilityProfile`` 或其字符串值。
+
+        Returns:
+            StrategyCapabilityProfile: 规范化后的画像枚举。
+
+        Raises:
+            ValueError: 画像名称不在公开枚举中时抛出。
+        """
+
+        if isinstance(value, StrategyCapabilityProfile):
+            return value
+        return StrategyCapabilityProfile(str(value).strip().lower())
+
+    @staticmethod
+    def _callable_references_capability_api(callback: Optional[Callable]) -> bool:
+        """检查策略回调是否静态引用能力声明 API。
+
+        Args:
+            callback: 已加载的 ``initialize`` 回调，可以为 None。
+
+        Returns:
+            bool: 代码对象或其嵌套代码引用
+            ``require_data_capabilities`` 时为 True。
+
+        Side Effects:
+            无；不执行策略回调，仅检查 Python 代码对象。
+        """
+
+        root_code = getattr(callback, "__code__", None)
+        if root_code is None:
+            return False
+        pending = [root_code]
+        while pending:
+            code = pending.pop()
+            if "require_data_capabilities" in code.co_names:
+                return True
+            pending.extend(item for item in code.co_consts if inspect.iscode(item))
+        return False
+
+    def _read_static_strategy_capability_requirements(
+        self, module: Any
+    ) -> Optional[StrategyCapabilityRequirements]:
+        """从策略模块读取无副作用的静态能力声明。
+
+        Args:
+            module: 已加载但尚未执行 ``initialize`` 的策略模块。
+
+        Returns:
+            Optional[StrategyCapabilityRequirements]: 已校验声明；未声明时为 None。
+
+        Raises:
+            TypeError: 声明不是公开对象、字符串或映射时抛出。
+            ValueError: 画像、版本或能力集合不合法时抛出。
+
+        Side Effects:
+            只读取模块属性，不初始化 Provider、Feed 或 Broker。
+        """
+
+        declaration = getattr(module, "STRATEGY_CAPABILITY_REQUIREMENTS", None)
+        if declaration is None:
+            profile_value = getattr(module, "STRATEGY_CAPABILITY_PROFILE", None)
+            if profile_value is None:
+                return None
+            profile = self._normalize_strategy_capability_profile(profile_value)
+            return StrategyCapabilityRequirements.for_profile(profile)
+        if isinstance(declaration, StrategyCapabilityRequirements):
+            return declaration
+        if isinstance(declaration, str):
+            profile = self._normalize_strategy_capability_profile(declaration)
+            return StrategyCapabilityRequirements.for_profile(profile)
+        if isinstance(declaration, Mapping):
+            profile = self._normalize_strategy_capability_profile(
+                declaration.get("profile", StrategyCapabilityProfile.EXECUTION_ONLY.value)
+            )
+            schema_version = str(declaration.get("schema_version", "1"))
+            if "required" in declaration or "optional" in declaration:
+                return StrategyCapabilityRequirements(
+                    profile=profile,
+                    required=tuple(declaration.get("required", ())),
+                    optional=tuple(declaration.get("optional", ())),
+                    schema_version=schema_version,
+                )
+            return StrategyCapabilityRequirements.for_profile(
+                profile=profile,
+                add_required=tuple(declaration.get("add_required", ())),
+                add_optional=tuple(declaration.get("add_optional", ())),
+                remove_required=tuple(declaration.get("remove_required", ())),
+                schema_version=schema_version,
+            )
+        raise TypeError(
+            "STRATEGY_CAPABILITY_REQUIREMENTS 必须是 "
+            "StrategyCapabilityRequirements、profile 字符串或映射"
+        )
+
+    def require_data_capabilities(
+        self,
+        required: Sequence[str] = (),
+        optional: Sequence[str] = (),
+        profile: Optional[Any] = None,
+        schema_version: Optional[str] = None,
+    ) -> StrategyCapabilityRequirements:
+        """在 ``initialize`` 内追加本策略的原子数据能力要求。
+
+        Args:
+            required: 缺失或未就绪时必须停止启动的 capability ID。
+            optional: 缺失时只记录诊断、不阻断启动的 capability ID。
+            profile: 可选画像；必须与已声明画像一致。
+            schema_version: 可选声明版本；必须与已声明版本一致。
+
+        Returns:
+            StrategyCapabilityRequirements: 合并、去重后的不可变要求。
+
+        Raises:
+            RuntimeError: 在 ``initialize`` 之外尝试改变能力合同时抛出。
+            ValueError: 画像或版本与已有静态声明冲突时抛出。
+
+        Side Effects:
+            只更新引擎内存中的待预检清单，不解析路由、不连网且不调用 Broker。
+        """
+
+        if self._startup_phase != "initialize":
+            raise RuntimeError("数据能力要求只能在策略 initialize 阶段追加")
+        current = self.strategy_capability_requirements
+        requested_profile = (
+            self._normalize_strategy_capability_profile(profile)
+            if profile is not None
+            else None
+        )
+        if current is None:
+            current = StrategyCapabilityRequirements(
+                profile=requested_profile or StrategyCapabilityProfile.EXECUTION_ONLY,
+                required=(),
+                optional=(),
+                schema_version=schema_version or "1",
+            )
+        elif requested_profile is not None and requested_profile is not current.profile:
+            raise ValueError(
+                f"能力画像冲突: existing={current.profile.value}, "
+                f"requested={requested_profile.value}"
+            )
+        if schema_version is not None and str(schema_version) != current.schema_version:
+            raise ValueError(
+                f"能力声明版本冲突: existing={current.schema_version}, "
+                f"requested={schema_version}"
+            )
+        merged_required = set(current.required)
+        merged_required.update(str(item) for item in required)
+        merged_optional = set(current.optional)
+        merged_optional.update(str(item) for item in optional)
+        merged_optional.difference_update(merged_required)
+        self.strategy_capability_requirements = StrategyCapabilityRequirements(
+            profile=current.profile,
+            required=tuple(merged_required),
+            optional=tuple(merged_optional),
+            schema_version=current.schema_version,
+        )
+        return self.strategy_capability_requirements
+
+    def _preflight_strategy_capabilities(
+        self,
+    ) -> Optional[StrategyCapabilityPreflight]:
+        """对当前策略要求解析唯一 owner 并检查 readiness。
+
+        Returns:
+            Optional[StrategyCapabilityPreflight]: 固定的路由快照；未声明时为 None。
+
+        Raises:
+            DataCapabilityUnavailableError: 存在必需能力但未配置 Router 时抛出。
+            DataCapabilityError: Router 报告 owner 缺失或 readiness 不满足时原样抛出。
+
+        Side Effects:
+            只读取 manifest 和路由状态，不初始化 owner 或执行数据查询。
+        """
+
+        requirements = self.strategy_capability_requirements
+        if requirements is None:
+            return None
+        router = self.data_source_router
+        if router is None and requirements.required:
+            raise DataCapabilityUnavailableError(
+                requirements.required[0], "router_not_configured"
+            )
+        return (router or DataSourceRouter()).preflight(requirements)
+
+    def _finalize_strategy_capabilities(self) -> None:
+        """在 ``initialize`` 返回后固定最终能力路由快照。
+
+        Returns:
+            None。
+
+        Raises:
+            DataCapabilityError: 新增必需能力无 owner 或未就绪时抛出。
+
+        Side Effects:
+            替换 ``strategy_capability_preflight`` 快照；不连接 Broker 或 Feed。
+        """
+
+        self.strategy_capability_preflight = self._preflight_strategy_capabilities()
+
+    def validate_broker_write_request(self, operation: str) -> None:
+        """确保一次实盘写意图不会穿过启动预检边界。
+
+        Args:
+            operation: 用于稳定错误信息的写操作名。
+
+        Returns:
+            None；引擎尚未启动的兼容测试态或已 ready 时正常返回。
+
+        Raises:
+            RuntimeError: initialize、连接、关闭或预检阶段请求写操作时抛出。
+        """
+
+        if self._startup_phase not in {"created", "ready"}:
+            raise RuntimeError(
+                f"实盘写请求被拒绝: operation={operation}, "
+                f"startup_phase={self._startup_phase}"
+            )
+
+    def validate_order_request(
+        self, requires_realtime_snapshot: bool
+    ) -> Optional[RouteDecision]:
+        """在订单入队前检查启动阶段和按需实时价能力。
+
+        Args:
+            requires_realtime_snapshot: 价值单、目标价值或市价保护价意图为 True。
+
+        Returns:
+            Optional[RouteDecision]: 能力合同已启用时的实时快照路由；
+            明确股数限价或旧兼容模式下为 None。
+
+        Raises:
+            RuntimeError: 启动预检尚未完成时抛出。
+            DataCapabilityError: 需要实时价但 owner 缺失、过期或未就绪时抛出。
+
+        Side Effects:
+            仅缓存 RouteDecision 供诊断，不读数据且不调用 Broker。
+        """
+
+        self.validate_broker_write_request("order")
+        capability_contract_enabled = (
+            self.data_source_router is not None
+            or self.strategy_capability_requirements is not None
+        )
+        if not requires_realtime_snapshot or not capability_contract_enabled:
+            return None
+        if self.data_source_router is None:
+            raise DataCapabilityUnavailableError(
+                "realtime.snapshot.l1",
+                "router_not_configured_for_price_dependent_order",
+            )
+        decision = self.data_source_router.resolve(
+            CapabilityRequest(capability_id="realtime.snapshot.l1")
+        )
+        self._dynamic_capability_decisions[decision.capability_id] = decision
+        return decision
+
+    def _preflight_live_components(self) -> None:
+        """在策略 initialize 和任何网络连接前检查实盘组件。
+
+        Returns:
+            None；全部组件的本地前置条件满足时正常返回。
+
+        Raises:
+            RuntimeError: 券商平台、依赖、bundle、ABI 或策略必需路由未就绪时抛出。
+
+        Side Effects:
+            调用 BrokerBase.preflight 并读取 capability manifest；禁止编译、监听、柜台连接和交易写操作。
+        """
+
+        self._ensure_broker_created()
+        assert self.broker is not None
+        self.broker.preflight()
+        self.strategy_capability_preflight = self._preflight_strategy_capabilities()
 
     def _acquire_live_locks(self) -> None:
         if self._runtime_lock and self._instance_lock:
@@ -2304,6 +2674,26 @@ class LiveEngine:
                     strategy,
                 )
 
+    def _serialize_strategy_capability_requirements(self) -> Optional[Dict[str, Any]]:
+        """把当前最终策略能力要求转为可持久化字典。
+
+        Returns:
+            Optional[Dict[str, Any]]: 含版本、画像和能力集的字典；未声明时为 None。
+
+        Side Effects:
+            无；只读取不可变的内存声明。
+        """
+
+        requirements = self.strategy_capability_requirements
+        if requirements is None:
+            return None
+        return {
+            "schema_version": requirements.schema_version,
+            "profile": requirements.profile.value,
+            "required": list(requirements.required),
+            "optional": list(requirements.optional),
+        }
+
     def _snapshot_strategy_metadata(self, strategy_hash: Optional[str]) -> None:
         try:
             metadata = {
@@ -2312,6 +2702,9 @@ class LiveEngine:
                 "settings": self._collect_settings_snapshot(),
                 "tasks": self._collect_scheduler_tasks_snapshot(),
             }
+            capability_requirements = self._serialize_strategy_capability_requirements()
+            if capability_requirements is not None:
+                metadata["strategy_capability_requirements"] = capability_requirements
             if self._strategy_start_date:
                 metadata["strategy_start_date"] = self._strategy_start_date.isoformat()
             persist_strategy_metadata(metadata)
@@ -2511,6 +2904,35 @@ class LiveEngine:
                     self._strategy_start_date = parsed_start_date
                 else:
                     log.debug(f"策略起始日格式无效: {raw_start_date}")
+            raw_requirements = meta.get("strategy_capability_requirements")
+            if raw_requirements:
+                restored = self._read_static_strategy_capability_requirements(
+                    type(
+                        "_RestoredCapabilityModule",
+                        (),
+                        {"STRATEGY_CAPABILITY_REQUIREMENTS": raw_requirements},
+                    )
+                )
+                if restored is not None:
+                    current = self.strategy_capability_requirements
+                    if current is None:
+                        self.strategy_capability_requirements = restored
+                    else:
+                        if current.profile is not restored.profile:
+                            raise ValueError("持久化能力画像与当前静态声明冲突")
+                        if current.schema_version != restored.schema_version:
+                            raise ValueError("持久化能力版本与当前静态声明冲突")
+                        required = set(current.required).union(restored.required)
+                        optional = set(current.optional).union(restored.optional)
+                        optional.difference_update(required)
+                        self.strategy_capability_requirements = (
+                            StrategyCapabilityRequirements(
+                                profile=current.profile,
+                                required=tuple(required),
+                                optional=tuple(optional),
+                                schema_version=current.schema_version,
+                            )
+                        )
             self._apply_settings_snapshot(meta.get('settings') or {})
             self._apply_scheduler_tasks_snapshot(meta.get('tasks') or [])
             return True

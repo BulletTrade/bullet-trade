@@ -81,6 +81,45 @@ def _current_live_engine():
     return None
 
 
+def require_data_capabilities(
+    required: Sequence[str] = (),
+    optional: Sequence[str] = (),
+    profile: Optional[str] = None,
+    schema_version: Optional[str] = None,
+) -> Any:
+    """在策略 ``initialize`` 内声明新增的必需和可选数据能力。
+
+    Args:
+        required: 缺失或未就绪时必须停止启动的 capability ID。
+        optional: 缺失时仅保留诊断的 capability ID。
+        profile: 可选 execution_only、realtime_microstructure_signal 或 research_live。
+        schema_version: 可选声明版本，必须与静态声明一致。
+
+    Returns:
+        Any: LiveEngine 合并后的不可变 ``StrategyCapabilityRequirements``。
+
+    Raises:
+        RuntimeError: 不在 LiveEngine ``initialize`` 阶段或引擎不支持时抛出。
+        ValueError: 画像或版本与静态声明冲突时抛出。
+
+    Side Effects:
+        只追加内存中的待预检清单，不读数据、不连网且不触发交易。
+    """
+
+    engine = _current_live_engine()
+    if engine is None:
+        raise RuntimeError("require_data_capabilities 只能在 LiveEngine initialize 中使用")
+    collector = getattr(engine, "require_data_capabilities", None)
+    if not callable(collector):
+        raise RuntimeError("当前 LiveEngine 不支持策略能力声明")
+    return collector(
+        required=required,
+        optional=optional,
+        profile=profile,
+        schema_version=schema_version,
+    )
+
+
 def subscribe(security: Union[str, Sequence[str]], frequency: str) -> None:
     """
     订阅标的的 tick 事件。
@@ -245,6 +284,26 @@ def set_tick_handler(handler: Callable[[Any, Dict[str, Any]], None]) -> None:
     """
     global _tick_handler
     _tick_handler = handler
+
+
+def _forward_remote_tick(context: Any, tick: Dict[str, Any]) -> None:
+    """把 qmt-remote 推送的标准 tick 原样转发给策略回调。
+
+    Args:
+        context: 远程数据源注册时绑定的最小策略上下文。
+        tick: 已由 ``RemoteQmtProvider`` 规范化的 tick 字典。
+
+    Returns:
+        None: 本函数只做同步回调转发，不产生返回值。
+
+    Side Effects:
+        已注册处理函数时会同步调用 ``handler(context, tick)``；未注册时静默返回。
+    """
+
+    handler = _tick_handler
+    if handler is None:
+        return
+    handler(context, tick)
 
 
 def _to_qmt_code(code: str) -> str:
@@ -517,6 +576,8 @@ __all__ = [
     'get_split_dividend',
     'set_data_provider', 'get_data_provider',
     'read_file', 'write_file',
+    # Live 能力声明
+    'require_data_capabilities',
     # Tick 订阅占位
     'subscribe', 'unsubscribe', 'unsubscribe_all',
 ]

@@ -231,6 +231,14 @@ def get_broker_config() -> dict:
             "account_key": get_env("QMT_SERVER_ACCOUNT_KEY"),
             "sub_account_id": get_env("QMT_SERVER_SUB_ACCOUNT"),
         },
+        "huaxin": {
+            "account_id": get_env("HUAXIN_ACCOUNT_ID"),
+            "account_type": get_env("HUAXIN_ACCOUNT_TYPE", "stock"),
+            "bundle_path": get_env("HUAXIN_NATIVE_BUNDLE"),
+            "runtime_mode": get_env("HUAXIN_RUNTIME_MODE", "server"),
+            "enable_trading": get_env_bool("HUAXIN_ENABLE_TRADING", False),
+            "enable_cancel": get_env_bool("HUAXIN_ENABLE_CANCEL", False),
+        },
     }
 
 

@@ -303,6 +303,7 @@ class BacktestEngine:
         from .api import get_open_orders as _get_open_orders
         from .api import get_orders as _get_orders
         from .api import get_trades as _get_trades
+        from .api import require_data_capabilities as _require_data_capabilities
         from .api import subscribe as _subscribe
         from .api import unsubscribe as _unsubscribe
         from .api import unsubscribe_all as _unsubscribe_all
@@ -371,6 +372,7 @@ class BacktestEngine:
         module.unsubscribe = _unsubscribe
         module.unsubscribe_all = _unsubscribe_all
         module.get_current_tick = _get_current_tick
+        module.require_data_capabilities = _require_data_capabilities
 
         # 注入订单函数
         module.order = order

@@ -133,6 +133,31 @@ def _record_requested_order_price(
     extra.setdefault("requested_order_price", float(requested_price))
 
 
+def _validate_live_order_request(requires_realtime_snapshot: bool) -> None:
+    """在订单入队前调用 LiveEngine 的启动阶段和数据能力门禁。
+
+    Args:
+        requires_realtime_snapshot: 订单数量或市价保护价是否依赖新鲜快照。
+
+    Returns:
+        None；回测引擎、旧兼容引擎或预检通过时正常返回。
+
+    Raises:
+        RuntimeError: LiveEngine 尚处于 initialize/预检/关闭阶段时抛出。
+        DataCapabilityError: 启用能力合同且实时快照 owner 不可用时抛出。
+
+    Side Effects:
+        可在 LiveEngine 中记录一个 RouteDecision，不会把订单加入队列。
+    """
+
+    engine = get_current_engine()
+    if not engine or not getattr(engine, "is_live", False):
+        return
+    validator = getattr(engine, "validate_order_request", None)
+    if callable(validator):
+        validator(requires_realtime_snapshot)
+
+
 def order(
     security: str,
     amount: int,
@@ -173,6 +198,8 @@ def order(
         resolved_style = LimitOrderStyle(price)
     else:
         resolved_style = MarketOrderStyle()
+
+    _validate_live_order_request(not isinstance(resolved_style, LimitOrderStyle))
 
     order_obj = Order(
         order_id=_generate_order_id(),
@@ -227,6 +254,9 @@ def cancel_order(order_or_id: Union[Order, str]) -> bool:
     if isinstance(order_or_id, Order):
         broker_id = getattr(order_or_id, "_broker_order_id", None)
     if engine and getattr(engine, "broker", None) and broker_id:
+        write_validator = getattr(engine, "validate_broker_write_request", None)
+        if callable(write_validator):
+            write_validator("cancel_order")
         try:
             result = engine.broker.cancel_order(str(broker_id))
             if inspect.isawaitable(result):
@@ -304,6 +334,8 @@ def order_value(
     else:
         resolved_style = MarketOrderStyle()
 
+    _validate_live_order_request(True)
+
     order_obj = Order(
         order_id=_generate_order_id(),
         security=security,
@@ -362,6 +394,8 @@ def order_target(
     else:
         resolved_style = MarketOrderStyle()
 
+    _validate_live_order_request(not isinstance(resolved_style, LimitOrderStyle))
+
     order_obj = Order(
         order_id=_generate_order_id(),
         security=security,
@@ -419,6 +453,8 @@ def order_target_value(
         resolved_style = LimitOrderStyle(price)
     else:
         resolved_style = MarketOrderStyle()
+
+    _validate_live_order_request(True)
 
     order_obj = Order(
         order_id=_generate_order_id(),

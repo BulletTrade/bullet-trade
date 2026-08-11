@@ -1,6 +1,7 @@
 import pytest
 
 
+from bullet_trade.core import api as core_api
 from bullet_trade.core.api import get_current_tick, subscribe, unsubscribe, unsubscribe_all
 from bullet_trade.core.runtime import set_current_engine
 
@@ -98,3 +99,30 @@ def test_get_current_tick_routes_to_live_engine():
         assert snap["last_price"] == 1.23
     finally:
         set_current_engine(None)
+
+
+def test_forward_remote_tick_preserves_context_and_payload(monkeypatch):
+    """验证 qmt-remote tick 转发不改写上下文和载荷。"""
+
+    received = []
+    context = object()
+    tick = {"sid": "000001.XSHE", "last_price": 12.34}
+    monkeypatch.setattr(
+        core_api,
+        "_tick_handler",
+        lambda ctx, data: received.append((ctx, data)),
+    )
+
+    core_api._forward_remote_tick(context, tick)
+
+    assert received == [(context, tick)]
+
+
+def test_forward_remote_tick_without_handler_is_noop(monkeypatch):
+    """验证未注册策略 handler 时远程 tick 可安全丢弃。"""
+
+    monkeypatch.setattr(core_api, "_tick_handler", None)
+
+    result = core_api._forward_remote_tick(object(), {"sid": "000001.XSHE"})
+
+    assert result is None

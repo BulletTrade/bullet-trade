@@ -46,6 +46,7 @@ from bullet_trade.core.orders import (
 from bullet_trade.core.risk_control import RiskController
 from bullet_trade.core.runtime import set_current_engine
 from bullet_trade.data.providers.base import DataProvider
+from bullet_trade.data.providers.remote_qmt import RemoteQmtProvider
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 V2_BRIDGE_PATH = WORKSPACE_ROOT / "strategies" / "bt_strategies" / "sim" / "common" / "v2_bridge.py"
@@ -1530,6 +1531,72 @@ async def test_handle_tick_hook_receives_context(tmp_path):
     assert payload["context"] is engine.context
     assert payload["tick"]["sid"] == "000001.XSHE"
     await engine._shutdown()
+
+
+@pytest.mark.asyncio
+async def test_live_engine_remote_provider_tick_contract(monkeypatch, tmp_path):
+    """验证 qmt-remote 单参数回调可完成订阅并注入 LiveEngine context。"""
+
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={
+            "runtime_dir": str(tmp_path / "runtime"),
+            "g_autosave_enabled": False,
+            "account_sync_enabled": False,
+            "order_sync_enabled": False,
+            "tick_sync_enabled": False,
+            "risk_check_enabled": False,
+            "broker_heartbeat_interval": 0,
+        },
+    )
+    provider = object.__new__(RemoteQmtProvider)
+    provider._tick_callback = None
+    provider._tick_context = None
+    subscriptions = []
+
+    def _subscribe_ticks(symbols):
+        """记录 LiveEngine 同步给远程 provider 的证券列表。"""
+
+        subscriptions.append(list(symbols))
+        return {"ok": True}
+
+    provider.subscribe_ticks = _subscribe_ticks
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.get_data_provider",
+        lambda: provider,
+    )
+    loop = asyncio.get_running_loop()
+    engine._loop = loop
+    engine._market_callbacks_enabled = True
+    engine._tick_symbols.add("000001.XSHE")
+    received = {}
+    completed = asyncio.Event()
+
+    async def _handler(context, tick):
+        """记录策略最终收到的真实 LiveEngine context 与 tick。"""
+
+        received["context"] = context
+        received["tick"] = tick
+        completed.set()
+
+    engine.handle_tick_func = _handler
+
+    engine._sync_provider_subscription()
+    provider._handle_tick_event(
+        {"symbol": "000001.SZ", "lastPrice": 10.01, "time": "09:31:00"}
+    )
+    await asyncio.wait_for(completed.wait(), timeout=1)
+
+    assert subscriptions == [["000001.XSHE"]]
+    assert engine._provider_tick_callback_bound is True
+    assert received["context"] is engine.context
+    assert received["tick"] == {
+        "sid": "000001.XSHE",
+        "last_price": 10.01,
+        "dt": "09:31:00",
+    }
 
 
 @pytest.mark.asyncio

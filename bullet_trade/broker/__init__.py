@@ -7,6 +7,16 @@ BulletTrade 实盘交易模块
 from .base import BrokerBase
 from .qmt import QmtBroker
 from .qmt_remote import RemoteQmtBroker
+from .registry import BrokerRegistry, create_broker, list_brokers, register_broker
 from .simulator import SimulatorBroker
 
-__all__ = ['BrokerBase', 'QmtBroker', 'RemoteQmtBroker', 'SimulatorBroker']
+__all__ = [
+    'BrokerBase',
+    'BrokerRegistry',
+    'QmtBroker',
+    'RemoteQmtBroker',
+    'SimulatorBroker',
+    'create_broker',
+    'list_brokers',
+    'register_broker',
+]

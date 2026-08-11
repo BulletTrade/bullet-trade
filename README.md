@@ -46,6 +46,7 @@
 - [配置总览](docs/config.md)：回测/本地实盘/远程实盘/聚宽接入的环境变量一览。
 - [回测引擎](docs/backtest.md)：真实价格成交、分红送股处理、聚宽代码示例与 CLI 回测。
 - [实盘引擎](docs/live.md)：本地 QMT 独立实盘与远程实盘流程。
+- [华鑫 TORA 接入（第一阶段）](docs/huaxin.md)：同一个 `bullet-trade` 包内的 BYO C++ SDK 架构、离线 build/doctor、能力边界和生产/仿真安全门禁；当前不代表真实华鑫后端已经 ready。
 - [交易支撑](docs/trade-support.md)：聚宽模拟盘接入、远程 QMT 服务与 helper 用法。
 - [QMT 服务配置](docs/qmt-server.md)：bullet-trade server 的完整说明。
 - [数据源指南](docs/data/DATA_PROVIDER_GUIDE.md)：聚宽、MiniQMT、Tushare、RQData/easy_tdx Beta 以及自定义 Provider 配置。

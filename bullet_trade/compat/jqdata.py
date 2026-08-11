@@ -62,6 +62,8 @@ __all__ = [
     'get_billboard_list', 'get_locked_shares',
     'get_split_dividend',
     'set_data_provider', 'get_data_provider',
+    # Live 能力声明
+    'require_data_capabilities',
     # 研究文件读写
     'read_file', 'write_file',
     # Tick 订阅与快照（占位/最小实现）

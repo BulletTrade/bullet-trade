@@ -1,0 +1,110 @@
+"""
+作者: BruceLee
+
+文件职责: 汇总 BulletTrade 独立市场数据能力、路由、订阅、事件、Feed 与注册表合同。
+主要输入: 调用方从本包导入的公开类型、工厂和错误类型。
+主要输出: 稳定且不触发网络、SDK 加载或 backend 初始化的公共 Python API。
+上游关系: 由 capability、models、feed 和 registry 模块提供具体实现。
+下游关系: 供未来 LiveEngine、Huaxin integration、远程协议、策略和测试按需导入。
+关键配置约定: 导入本包必须保持无副作用；本切片不注册任何厂商 backend。
+"""
+
+from .capability import (
+    CapabilityDeclaration,
+    CapabilityManifest,
+    CapabilityReadiness,
+    CapabilityRequest,
+    CapabilitySupport,
+    DataCapabilityError,
+    DataCapabilityExecutionError,
+    DataCapabilityNotReadyError,
+    DataCapabilityRouteError,
+    DataCapabilityUnavailableError,
+    DataSourceRouter,
+    ProviderLocation,
+    RouteDecision,
+    RouteRule,
+    StrategyCapabilityPreflight,
+    StrategyCapabilityProfile,
+    StrategyCapabilityRequirements,
+)
+from .feed import (
+    FeedNotConnectedError,
+    MarketDataFeedError,
+    MarketEventCallback,
+    MockRealtimeMarketDataFeed,
+    RealtimeDataUnavailableError,
+    RealtimeMarketDataFeed,
+    SubscriptionConflictError,
+    SubscriptionNotFoundError,
+    TickCallback,
+)
+from .models import (
+    FeedHealth,
+    FieldProfile,
+    MarketDataLevel,
+    MarketEvent,
+    MarketEventType,
+    MarketSubscriptionReceipt,
+    MarketSubscriptionSpec,
+    SubscriptionItemResult,
+    SubscriptionItemState,
+    SubscriptionSelector,
+    SubscriptionState,
+)
+from .registry import (
+    FeedFactory,
+    MarketDataFeedAlreadyRegisteredError,
+    MarketDataFeedRegistration,
+    MarketDataFeedRegistry,
+    MarketDataFeedRegistryError,
+    UnknownMarketDataFeedError,
+    default_market_data_feed_registry,
+)
+
+__all__ = [
+    "CapabilityDeclaration",
+    "CapabilityManifest",
+    "CapabilityReadiness",
+    "CapabilityRequest",
+    "CapabilitySupport",
+    "DataCapabilityError",
+    "DataCapabilityExecutionError",
+    "DataCapabilityNotReadyError",
+    "DataCapabilityRouteError",
+    "DataCapabilityUnavailableError",
+    "DataSourceRouter",
+    "FeedFactory",
+    "FeedHealth",
+    "FeedNotConnectedError",
+    "FieldProfile",
+    "MarketDataFeedAlreadyRegisteredError",
+    "MarketDataFeedError",
+    "MarketDataFeedRegistration",
+    "MarketDataFeedRegistry",
+    "MarketDataFeedRegistryError",
+    "MarketDataLevel",
+    "MarketEvent",
+    "MarketEventCallback",
+    "MarketEventType",
+    "MarketSubscriptionReceipt",
+    "MarketSubscriptionSpec",
+    "MockRealtimeMarketDataFeed",
+    "ProviderLocation",
+    "RealtimeDataUnavailableError",
+    "RealtimeMarketDataFeed",
+    "RouteDecision",
+    "RouteRule",
+    "StrategyCapabilityPreflight",
+    "StrategyCapabilityProfile",
+    "StrategyCapabilityRequirements",
+    "SubscriptionConflictError",
+    "SubscriptionItemResult",
+    "SubscriptionItemState",
+    "SubscriptionNotFoundError",
+    "SubscriptionSelector",
+    "SubscriptionState",
+    "TickCallback",
+    "UnknownMarketDataFeedError",
+    "default_market_data_feed_registry",
+]

@@ -645,6 +645,48 @@ def test_remote_data_provider_security_info_supports_flat_response():
     assert info["type"] == "etf"
 
 
+def test_remote_data_provider_dispatches_standard_tick_callback():
+    """验证远程 provider 按标准单参数合同向 LiveEngine 分发 tick。"""
+
+    from bullet_trade.data.providers.remote_qmt import RemoteQmtProvider
+
+    provider = object.__new__(RemoteQmtProvider)
+    provider._tick_callback = None
+    provider._tick_context = None
+    received = []
+    provider.set_tick_callback(lambda tick: received.append(tick))
+
+    provider._handle_tick_event(
+        {"symbol": "000001.SZ", "lastPrice": 12.34, "time": "09:30:00"}
+    )
+
+    assert received == [
+        {"sid": "000001.XSHE", "last_price": 12.34, "dt": "09:30:00"}
+    ]
+
+
+def test_remote_data_provider_preserves_legacy_context_callback():
+    """验证远程 provider 仍兼容 Core API 的双参数回调。"""
+
+    from bullet_trade.data.providers.remote_qmt import RemoteQmtProvider
+
+    provider = object.__new__(RemoteQmtProvider)
+    provider._tick_callback = None
+    provider._tick_context = None
+    received = []
+    context = object()
+    provider.set_tick_callback(
+        lambda ctx, tick: received.append((ctx, tick)),
+        context,
+    )
+
+    provider._handle_tick_event({"sid": "600000.SH", "last_price": 8.76})
+
+    assert received == [
+        (context, {"sid": "600000.XSHG", "last_price": 8.76, "dt": None})
+    ]
+
+
 @pytest.mark.asyncio
 async def test_remote_qmt_broker_full_flow(stub_server):
     account_key = stub_server.accounts[0].key if stub_server.accounts else "default"
