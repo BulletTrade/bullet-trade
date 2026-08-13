@@ -197,6 +197,7 @@ QMT_SERVER_SUB_ACCOUNT=demo@main
 | `QMT_SERVER_RPC_TIMEOUT` | `60` | 远程 QMT 客户端默认 RPC 超时，只保护网络响应，不代表等待成交时间。 |
 | `QMT_PLACE_ORDER_TIMEOUT_MARGIN` | `30` | 远程下单请求超时相对订单等待窗口的默认余量。 |
 | `EVENT_TIME_OUT` | `60` | 策略事件超时秒数。 |
+| `BT_LIVE_FAIL_ON_SCHEDULE_ERROR` | `false` | 调度任务报错时拒绝该批委托、锁死后续新委托并让 LiveEngine 异常退出；查询和已知订单撤单仍可执行。生产环境建议显式设为 `true`。 |
 | `STRATEGY_NAME` | 空 | 策略名称，用于订单备注和日志标识；未设置时通常用策略文件名。 |
 | `SCHEDULER_MARKET_PERIODS` | 空 | 覆盖交易时段，例如 `09:30-11:30,13:00-15:00`。 |
 | `ACCOUNT_SYNC_ENABLED` / `ACCOUNT_SYNC_INTERVAL` | `true` / `60` | 账户后台同步开关和间隔秒数。 |
