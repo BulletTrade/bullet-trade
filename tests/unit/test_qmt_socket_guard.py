@@ -187,6 +187,83 @@ def test_qmt_guard_default_max_delay_limits_long_outage_probe_rate(monkeypatch):
 
 
 @pytest.mark.unit
+def test_qmt_guard_constructs_after_closed_loop_and_keeps_single_flight():
+    """验证关闭旧 loop 后可同步构造 guard，且并发探针仍保持单飞。
+
+    Args:
+        None。
+
+    Returns:
+        None。
+
+    Side Effects:
+        创建并关闭两个本地 asyncio event loop，不连接真实 QMT。
+    """
+
+    async def _finish_prior_loop() -> None:
+        """让前序 asyncio.run 正常完成并关闭其 event loop。
+
+        Args:
+            None。
+
+        Returns:
+            None。
+        """
+
+        await asyncio.sleep(0)
+
+    async def _exercise_single_flight(guard: QmtAvailabilityGuard) -> None:
+        """并发申请探针并验证释放后可在新周期再次获取。
+
+        Args:
+            guard: 在旧 event loop 关闭后同步构造的保护器。
+
+        Returns:
+            None。
+        """
+
+        attempts = await asyncio.gather(*(guard.acquire_probe() for _ in range(8)))
+        assert attempts.count(True) == 1
+        assert attempts.count(False) == 7
+
+        guard.release_probe()
+        guard.schedule_probe_now("测试释放后的下一次探针")
+        assert await guard.acquire_probe() is True
+        guard.release_probe()
+
+    errors = []
+
+    def _run_guard_lifecycle() -> None:
+        """在独立线程重现 Python 3.9 的 event loop 生命周期。
+
+        Args:
+            None。
+
+        Returns:
+            None。
+
+        Side Effects:
+            在当前测试线程创建并关闭两个 event loop，异常会写入 errors。
+        """
+
+        try:
+            asyncio.run(_finish_prior_loop())
+            guard = QmtAvailabilityGuard(config=_guard_config(), name="loop-lifecycle")
+            guard.schedule_probe_now("测试同步构造后的首次探针")
+            asyncio.run(_exercise_single_flight(guard))
+        except BaseException as exc:
+            errors.append(exc)
+
+    worker = threading.Thread(target=_run_guard_lifecycle, name="qmt-guard-loop-test")
+    worker.start()
+    worker.join(timeout=5)
+
+    assert worker.is_alive() is False
+    if errors:
+        raise errors[0]
+
+
+@pytest.mark.unit
 def test_qmt_broker_connect_failure_is_single_attempt_and_cleans_trader(monkeypatch):
     """验证 QMT broker 连接失败不会无限重试，并会清理本次 trader。
 
