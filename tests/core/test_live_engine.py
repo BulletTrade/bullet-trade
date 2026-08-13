@@ -14,6 +14,7 @@ from datetime import time as Time
 from datetime import timedelta
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
+from unittest.mock import AsyncMock
 
 import pandas as pd
 import pytest
@@ -1419,6 +1420,109 @@ async def test_live_engine_event_timeout_drops_minute(tmp_path, caplog):
     assert "事件超时丢弃" in caplog.text
     assert engine._last_schedule_dt == datetime(2025, 1, 2, 9, 31)
     await engine._shutdown()
+
+
+def test_live_config_reads_opt_in_schedule_error_guard(monkeypatch):
+    """验证正式 producer 可通过环境变量显式启用调度失败退出。"""
+    monkeypatch.setenv("BT_LIVE_FAIL_ON_SCHEDULE_ERROR", "true")
+
+    config = LiveConfig.load()
+
+    assert config.fail_on_schedule_error is True
+
+
+@pytest.mark.asyncio
+async def test_live_engine_schedule_error_guard_preserves_cursor(tmp_path, monkeypatch):
+    """验证开启保护后任务错误会在游标持久化前使引擎失败。"""
+    strategy = _write_strategy(tmp_path)
+    scheduled = datetime(2025, 1, 2, 9, 31)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={
+            "runtime_dir": str(tmp_path / "runtime"),
+            "fail_on_schedule_error": True,
+        },
+    )
+    engine.async_scheduler = AsyncMock()
+    engine.async_scheduler.trigger.return_value = {"daily__publish_09:31:00": {"error": ""}}
+    persisted: list[datetime] = []
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.persist_scheduler_cursor",
+        lambda value: persisted.append(value),
+    )
+
+    with pytest.raises(RuntimeError, match="daily__publish_09:31:00"):
+        await engine._handle_minute_tick(scheduled)
+
+    assert engine._last_schedule_dt is None
+    assert persisted == []
+
+
+@pytest.mark.asyncio
+async def test_live_engine_schedule_trigger_error_guard_stops_before_cursor_and_events(
+    tmp_path, monkeypatch
+):
+    """验证开启保护后调度器自身异常不会被吞掉或推进本分钟。"""
+    strategy = _write_strategy(tmp_path)
+    scheduled = datetime(2025, 1, 2, 9, 31)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={
+            "runtime_dir": str(tmp_path / "runtime"),
+            "fail_on_schedule_error": True,
+        },
+    )
+    engine.async_scheduler = AsyncMock()
+    engine.async_scheduler.trigger.side_effect = RuntimeError("trigger failed")
+    engine._maybe_emit_market_events = AsyncMock()
+    engine._maybe_handle_data = AsyncMock()
+    engine._process_orders = AsyncMock()
+    persisted: list[datetime] = []
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.persist_scheduler_cursor",
+        lambda value: persisted.append(value),
+    )
+
+    with pytest.raises(RuntimeError, match="调度器触发失败"):
+        await engine._handle_minute_tick(scheduled)
+
+    assert engine._last_schedule_dt is None
+    assert persisted == []
+    engine._maybe_emit_market_events.assert_not_awaited()
+    engine._maybe_handle_data.assert_not_awaited()
+    engine._process_orders.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_live_engine_schedule_error_default_keeps_existing_behavior(tmp_path, monkeypatch):
+    """验证默认未启用保护时仍保持原有的记录错误并推进游标语义。"""
+    strategy = _write_strategy(tmp_path)
+    scheduled = datetime(2025, 1, 2, 9, 31)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={"runtime_dir": str(tmp_path / "runtime")},
+    )
+    engine.async_scheduler = AsyncMock()
+    engine.async_scheduler.trigger.return_value = {
+        "daily__publish_09:31:00": {"error": "publish failed"}
+    }
+    engine._maybe_emit_market_events = AsyncMock()
+    engine._maybe_handle_data = AsyncMock()
+    engine._process_orders = AsyncMock()
+    persisted: list[datetime] = []
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.persist_scheduler_cursor",
+        lambda value: persisted.append(value),
+    )
+
+    await engine._handle_minute_tick(scheduled)
+
+    assert engine.config.fail_on_schedule_error is False
+    assert engine._last_schedule_dt == scheduled
+    assert persisted == [scheduled]
 
 
 @pytest.mark.asyncio

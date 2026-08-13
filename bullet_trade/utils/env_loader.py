@@ -295,6 +295,8 @@ def get_live_trade_config() -> dict:
 
     - event_time_out: 策略事件超时秒数（默认 60）
 
+    - fail_on_schedule_error: 调度任务返回错误时是否让 LiveEngine 异常退出（默认 False）
+
     - strategy_name: 策略名称（用于实盘订单备注标识，可选）
 
     - scheduler_market_periods: 交易时段覆写字符串（如 '09:30-11:30,13:00-15:00'）
@@ -321,6 +323,7 @@ def get_live_trade_config() -> dict:
         "order_max_volume": get_env_int("ORDER_MAX_VOLUME", 1_000_000),
         "trade_max_wait_time": get_env_int("TRADE_MAX_WAIT_TIME", 16),
         "event_time_out": get_env_int("EVENT_TIME_OUT", 60),
+        "fail_on_schedule_error": get_env_bool("BT_LIVE_FAIL_ON_SCHEDULE_ERROR", False),
         "strategy_name": get_env("STRATEGY_NAME"),
         "scheduler_market_periods": get_env("SCHEDULER_MARKET_PERIODS"),
         "account_sync_interval": get_env_int("ACCOUNT_SYNC_INTERVAL", 60),

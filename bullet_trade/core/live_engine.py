@@ -122,6 +122,7 @@ class LiveConfig:
     calendar_skip_weekend: bool = True
     calendar_retry_minutes: int = 1
     portfolio_refresh_throttle_ms: int = 200
+    fail_on_schedule_error: bool = False
 
     @classmethod
     def load(cls, overrides: Optional[Dict[str, Any]] = None) -> "LiveConfig":
@@ -152,6 +153,7 @@ class LiveConfig:
             calendar_skip_weekend=parse_bool(raw.get('calendar_skip_weekend'), default=True),
             calendar_retry_minutes=int(raw.get('calendar_retry_minutes', 1)),
             portfolio_refresh_throttle_ms=int(raw.get('portfolio_refresh_throttle_ms', 200)),
+            fail_on_schedule_error=parse_bool(raw.get('fail_on_schedule_error'), default=False),
         )
 
 
@@ -561,15 +563,27 @@ class LiveEngine:
             persist_scheduler_cursor(scheduled)
             return
 
+        schedule_results: Dict[str, Any] = {}
         try:
             if self.async_scheduler:
-                await self.async_scheduler.trigger(
+                schedule_results = await self.async_scheduler.trigger(
                     scheduled,
                     self.context,
                     is_bar=self._is_bar_time(scheduled),
                 )
         except Exception as exc:
             log.error(f"异步调度执行失败: {exc}", exc_info=True)
+            if self.config.fail_on_schedule_error:
+                raise RuntimeError("异步调度器触发失败，拒绝推进调度游标") from exc
+
+        if self.config.fail_on_schedule_error:
+            schedule_errors = {
+                task_id: str(result.get('error') or '未提供错误信息')
+                for task_id, result in schedule_results.items()
+                if isinstance(result, dict) and 'error' in result
+            }
+            if schedule_errors:
+                raise RuntimeError(f"调度任务执行失败，拒绝推进调度游标: {schedule_errors}")
 
         await self._maybe_emit_market_events(scheduled)
         await self._maybe_handle_data(scheduled)
