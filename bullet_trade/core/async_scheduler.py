@@ -8,6 +8,8 @@
 """
 
 import asyncio
+import contextvars
+import functools
 from typing import Callable, Optional, Dict, List, Any, Tuple, Sequence
 from datetime import date, datetime, time as Time
 from dataclasses import dataclass, field
@@ -247,7 +249,16 @@ class AsyncScheduleTask:
             else:
                 # 同步函数：在线程池中执行
                 loop = asyncio.get_event_loop()
-                result = await loop.run_in_executor(None, self.func, *args, **kwargs)
+                # 显式传播 ContextVar，确保安全调度批次等调用上下文不会
+                # 在线程池边界丢失；partial 同时保留关键字参数兼容。
+                call_context = contextvars.copy_context()
+                call = functools.partial(
+                    call_context.run,
+                    self.func,
+                    *args,
+                    **kwargs,
+                )
+                result = await loop.run_in_executor(None, call)
             
             self._run_count += 1
             self._last_run = datetime.now()

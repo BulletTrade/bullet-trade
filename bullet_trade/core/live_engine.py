@@ -10,6 +10,7 @@ LiveEngine
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 import os
 import re
 import sys
@@ -92,7 +93,16 @@ from .live_runtime import (
     load_strategy_metadata,
     persist_strategy_metadata,
 )
-from .orders import get_order_queue, clear_order_queue, MarketOrderStyle, LimitOrderStyle
+from .orders import (
+    get_order_queue,
+    MarketOrderStyle,
+    LimitOrderStyle,
+    _complete_order_batch,
+    _drain_order_queue,
+    _order_batch_scope,
+    _OrderBatchContext,
+    _reject_order_batch,
+)
 from .live_lock import (
     ManagedLiveLock,
     build_lock_metadata,
@@ -210,6 +220,8 @@ class LiveEngine:
         self._dynamic_capability_decisions: Dict[str, RouteDecision] = {}
         self._startup_phase = "created"
         self._market_callbacks_enabled = False
+        self._schedule_batch_active = False
+        self._schedule_batch_failed_reason: Optional[str] = None
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._stop_event: Optional[asyncio.Event] = None
@@ -605,26 +617,55 @@ class LiveEngine:
             return
 
         schedule_results: Dict[str, Any] = {}
+        schedule_batch: Optional[_OrderBatchContext] = None
+        schedule_failed = False
+        schedule_scope = (
+            _order_batch_scope()
+            if self.config.fail_on_schedule_error
+            else nullcontext(None)
+        )
         try:
-            if self.async_scheduler:
-                schedule_results = await self.async_scheduler.trigger(
-                    scheduled,
-                    self.context,
-                    is_bar=self._is_bar_time(scheduled),
-                )
-        except Exception as exc:
-            log.error(f"异步调度执行失败: {exc}", exc_info=True)
-            if self.config.fail_on_schedule_error:
-                raise RuntimeError("异步调度器触发失败，拒绝推进调度游标") from exc
+            with schedule_scope as schedule_batch:
+                self._schedule_batch_active = self.config.fail_on_schedule_error
+                try:
+                    if self.async_scheduler:
+                        schedule_results = await self.async_scheduler.trigger(
+                            scheduled,
+                            self.context,
+                            is_bar=self._is_bar_time(scheduled),
+                        )
+                except Exception as exc:
+                    log.error(f"异步调度执行失败: {exc}", exc_info=True)
+                    if self.config.fail_on_schedule_error:
+                        schedule_failed = True
+                        self._reject_schedule_batch_orders(
+                            schedule_batch,
+                            "scheduler_trigger_failed",
+                        )
+                        raise RuntimeError(
+                            "异步调度器触发失败，拒绝推进调度游标"
+                        ) from exc
 
-        if self.config.fail_on_schedule_error:
-            schedule_errors = {
-                task_id: str(result.get('error') or '未提供错误信息')
-                for task_id, result in schedule_results.items()
-                if isinstance(result, dict) and 'error' in result
-            }
-            if schedule_errors:
-                raise RuntimeError(f"调度任务执行失败，拒绝推进调度游标: {schedule_errors}")
+                if self.config.fail_on_schedule_error:
+                    schedule_errors = {
+                        task_id: str(result.get('error') or '未提供错误信息')
+                        for task_id, result in schedule_results.items()
+                        if isinstance(result, dict) and 'error' in result
+                    }
+                    if schedule_errors:
+                        schedule_failed = True
+                        self._reject_schedule_batch_orders(
+                            schedule_batch,
+                            "scheduler_task_failed",
+                        )
+                        raise RuntimeError(
+                            "调度任务执行失败，拒绝推进调度游标: "
+                            f"{schedule_errors}"
+                        )
+        finally:
+            self._schedule_batch_active = False
+            if schedule_batch is not None and not schedule_failed:
+                _complete_order_batch(schedule_batch)
 
         await self._maybe_emit_market_events(scheduled)
         await self._maybe_handle_data(scheduled)
@@ -632,6 +673,50 @@ class LiveEngine:
 
         self._last_schedule_dt = scheduled
         persist_scheduler_cursor(scheduled)
+
+    def should_defer_order_processing(self) -> bool:
+        """判断订单入口是否应等待当前安全调度批次结束。
+
+        Returns:
+            bool: 调度失败保护开启且批次未完成时返回 True。
+
+        Side Effects:
+            无；仅读取引擎的调度批次状态。
+        """
+        return (
+            self._schedule_batch_active
+            or self._schedule_batch_failed_reason is not None
+        )
+
+    def _reject_schedule_batch_orders(
+        self,
+        schedule_batch: _OrderBatchContext,
+        reason: str,
+    ) -> None:
+        """拒绝并移除本次失败调度批次中新建的订单。
+
+        Args:
+            schedule_batch: 由当前调度执行上下文传播的唯一批次状态。
+            reason: 写入订单扩展信息的稳定拒绝原因。
+
+        Returns:
+            None。
+
+        Side Effects:
+            原子锁死本引擎的新订单写入，并只拒绝、移除带当前批次
+            token 的订单；其他来源订单保持原状态和顺序。
+        """
+        rejected_count = _reject_order_batch(
+            schedule_batch,
+            self,
+            reason,
+        )
+        if rejected_count:
+            log.error(
+                "调度批次失败，已拒绝且移除本批新增订单: count=%s reason=%s",
+                rejected_count,
+                reason,
+            )
 
     def _is_bar_time(self, dt: datetime) -> bool:
         """
@@ -698,15 +783,20 @@ class LiveEngine:
     # ------------------------------------------------------------------
 
     async def _process_orders(self, current_dt: datetime) -> None:
+        if self.should_defer_order_processing():
+            return
         lock = self._order_lock or asyncio.Lock()
         if self._order_lock is None:
             self._order_lock = lock
         async with lock:
-            orders = list(get_order_queue())
+            # 处理协程可能在批次开始前通过外层检查，
+            # 随后阻塞等待订单锁。
+            # 获得锁后必须复检，避免取走并提交安全批次中的订单。
+            if self.should_defer_order_processing():
+                return
+            orders = _drain_order_queue()
             if not orders:
                 return
-            # 先清空已取出的队列，避免后续处理时误清除新加入的订单
-            clear_order_queue()
             if not self.broker:
                 log.error("暂无券商实例，无法执行订单")
                 return
@@ -2401,6 +2491,16 @@ class LiveEngine:
             RuntimeError: initialize、连接、关闭或预检阶段请求写操作时抛出。
         """
 
+        if (
+            operation == "order"
+            and self._schedule_batch_failed_reason is not None
+        ):
+            raise RuntimeError(
+                "实盘写请求被拒绝: "
+                f"operation={operation}, "
+                "schedule_batch_state=failed, "
+                f"reason={self._schedule_batch_failed_reason}"
+            )
         if self._startup_phase not in {"created", "ready"}:
             raise RuntimeError(
                 f"实盘写请求被拒绝: operation={operation}, "
