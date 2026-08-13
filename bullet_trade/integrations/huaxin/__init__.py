@@ -18,12 +18,21 @@ from .errors import (
     HuaxinNativeUnavailableError,
     HuaxinTradingDisabledError,
 )
-from .native import ABI_VERSION, NativeBridge, NativeEvent, NativeHealth, NativeRuntime
+from .native import (
+    ABI_VERSION,
+    FIELD_SET_VERSION,
+    VENDOR_SCHEMA_ID,
+    NativeBridge,
+    NativeEvent,
+    NativeHealth,
+    NativeRuntime,
+)
 
 __all__ = [
     "ABI_VERSION",
     "BuildResult",
     "DoctorReport",
+    "FIELD_SET_VERSION",
     "HuaxinAbiError",
     "HuaxinBuildError",
     "HuaxinBundleError",
@@ -35,6 +44,7 @@ __all__ = [
     "NativeEvent",
     "NativeHealth",
     "NativeRuntime",
+    "VENDOR_SCHEMA_ID",
     "build_native_bridge",
     "doctor",
     "verify_bundle",

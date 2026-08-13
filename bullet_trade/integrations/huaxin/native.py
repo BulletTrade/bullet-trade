@@ -20,29 +20,65 @@ from .errors import (
     HUAXIN_NATIVE_UNAVAILABLE,
     NATIVE_ABI_INCOMPATIBLE,
     NATIVE_CALL_FAILED,
+    VENDOR_SCHEMA_INCOMPATIBLE,
     HuaxinAbiError,
     HuaxinNativeCallError,
     HuaxinNativeUnavailableError,
 )
 
-ABI_VERSION = 1
+ABI_VERSION = 2
+VENDOR_SCHEMA_ID = "bullet_trade.huaxin.offline_fake.v1"
+FIELD_SET_VERSION = "1"
+VENDOR_SCHEMA_ID_CAPACITY = 64
+FIELD_SET_VERSION_CAPACITY = 32
 EVENT_PAYLOAD_CAPACITY = 192
+REQUEST_PAYLOAD_CAPACITY = 192
 MAX_DRAIN_EVENTS = 4096
+REQUEST_TYPE_PING = 1
+
+NATIVE_RESULT_ABI_INCOMPATIBLE = -2
+NATIVE_RESULT_STRUCT_SIZE_INCOMPATIBLE = -3
+NATIVE_RESULT_SCHEMA_INCOMPATIBLE = -6
+NATIVE_RESULT_BUFFER_OWNERSHIP_ERROR = -7
+
+
+class _SchemaIdentity(ctypes.Structure):
+    """映射固定长度、显式字节数的 C ABI schema 身份。
+
+    该结构只嵌入其他 POD，不独立传给 native；关键状态是不依赖 NUL 结尾的
+    vendor schema ID 和 field-set version。
+    """
+
+    _fields_ = [
+        ("vendor_schema_id_size", ctypes.c_uint32),
+        ("field_set_version_size", ctypes.c_uint32),
+        ("vendor_schema_id", ctypes.c_uint8 * VENDOR_SCHEMA_ID_CAPACITY),
+        ("field_set_version", ctypes.c_uint8 * FIELD_SET_VERSION_CAPACITY),
+    ]
 
 
 class _CreateOptions(ctypes.Structure):
-    """映射 C ABI 的 runtime 创建参数结构。"""
+    """映射 caller-owned 的 C ABI v2 runtime 创建参数结构。
+
+    由 ``NativeBridge.create`` 在栈式 ctypes 内存中构造；native 只在调用期间读取，
+    关键状态包含精确 ABI/结构大小、容量和 schema 身份。
+    """
 
     _fields_ = [
         ("abi_version", ctypes.c_uint32),
         ("struct_size", ctypes.c_uint32),
         ("queue_capacity", ctypes.c_uint32),
         ("reserved", ctypes.c_uint32),
+        ("schema", _SchemaIdentity),
     ]
 
 
 class _Health(ctypes.Structure):
-    """映射 C ABI 的离线 health 结构。"""
+    """映射 caller-owned 的 C ABI v2 离线 health 输出结构。
+
+    Python 先初始化 ABI/大小/schema，native 再填充水位；关键状态不包含任何账号、
+    SDK 路径或厂商对象。
+    """
 
     _fields_ = [
         ("abi_version", ctypes.c_uint32),
@@ -52,11 +88,34 @@ class _Health(ctypes.Structure):
         ("queue_size", ctypes.c_uint32),
         ("reserved", ctypes.c_uint32),
         ("dropped_events", ctypes.c_uint64),
+        ("schema", _SchemaIdentity),
+    ]
+
+
+class _Request(ctypes.Structure):
+    """映射 caller-owned 的只读 fake POD 请求结构。
+
+    由 ``NativeRuntime.submit_request`` 构造并仅在同步 C 调用期间借给 bridge；关键状态
+    包含稳定 request ID、请求类型、schema 以及不依赖文本终止符的 bytes payload。
+    """
+
+    _fields_ = [
+        ("abi_version", ctypes.c_uint32),
+        ("struct_size", ctypes.c_uint32),
+        ("request_type", ctypes.c_uint32),
+        ("payload_size", ctypes.c_uint32),
+        ("request_id", ctypes.c_uint64),
+        ("schema", _SchemaIdentity),
+        ("payload", ctypes.c_uint8 * REQUEST_PAYLOAD_CAPACITY),
     ]
 
 
 class _Event(ctypes.Structure):
-    """映射 C ABI 的固定容量事件结构。"""
+    """映射 bridge-owned batch 内的无指针 C ABI v2 事件 POD。
+
+    由 native 连续缓冲区持有直至显式 free；关键状态包含 request/sequence/int64 时间、
+    schema 身份和显式长度 payload，Python 必须先复制再释放 batch。
+    """
 
     _fields_ = [
         ("abi_version", ctypes.c_uint32),
@@ -65,28 +124,182 @@ class _Event(ctypes.Structure):
         ("payload_size", ctypes.c_uint32),
         ("sequence", ctypes.c_uint64),
         ("received_ns", ctypes.c_int64),
+        ("request_id", ctypes.c_uint64),
+        ("schema", _SchemaIdentity),
         ("payload", ctypes.c_uint8 * EVENT_PAYLOAD_CAPACITY),
+    ]
+
+
+class _EventBatch(ctypes.Structure):
+    """映射需显式释放的 bridge-owned 批量事件描述符。
+
+    Python 负责描述符内存，bridge 负责 ``events`` 指向的连续数组；关键状态包含数量、
+    stride、schema 和不可复制的 ownership token，生命周期以 free 函数闭环。
+    """
+
+    _fields_ = [
+        ("abi_version", ctypes.c_uint32),
+        ("struct_size", ctypes.c_uint32),
+        ("event_count", ctypes.c_uint32),
+        ("event_stride", ctypes.c_uint32),
+        ("schema", _SchemaIdentity),
+        ("events", ctypes.POINTER(_Event)),
+        ("ownership_token", ctypes.c_uint64),
     ]
 
 
 @dataclass(frozen=True)
 class NativeHealth:
-    """表示 fake/offline runtime 的不可变 health 快照。"""
+    """表示 fake/offline runtime 的不可变 health 快照。
+
+    由 ``NativeRuntime.health`` 从严格校验后的 C POD 创建；关键状态包含有界队列水位、
+    丢弃计数和显式 vendor schema/field-set，不持有 native 内存。
+    """
 
     state: int
     queue_capacity: int
     queue_size: int
     dropped_events: int
+    vendor_schema_id: str
+    field_set_version: str
 
 
 @dataclass(frozen=True)
 class NativeEvent:
-    """表示从 native 有界队列 drain 出的自有事件副本。"""
+    """表示从 native 有界队列 drain 出的 Python 自有事件副本。
+
+    由 runtime 在释放 bridge-owned batch 前逐字段复制；关键状态保留 uint64 request/sequence、
+    int64 接收时间、schema 身份及原始 bytes payload。
+    """
 
     event_type: int
     sequence: int
     received_ns: int
+    request_id: int
+    vendor_schema_id: str
+    field_set_version: str
     payload: bytes
+
+
+def _schema_identity() -> _SchemaIdentity:
+    """构造当前 wrapper 明确要求的 schema 身份 POD。
+
+    Args:
+        无。
+
+    Returns:
+        _SchemaIdentity: 带显式长度且未依赖 NUL 结尾的 C ABI 字节结构。
+
+    Side Effects:
+        仅分配 Python 管理的 ctypes 内存，不调用 native。
+    """
+
+    vendor_schema = VENDOR_SCHEMA_ID.encode("utf-8")
+    field_set = FIELD_SET_VERSION.encode("utf-8")
+    if len(vendor_schema) > VENDOR_SCHEMA_ID_CAPACITY:
+        raise RuntimeError("VENDOR_SCHEMA_ID 超过 C ABI 固定容量")
+    if len(field_set) > FIELD_SET_VERSION_CAPACITY:
+        raise RuntimeError("FIELD_SET_VERSION 超过 C ABI 固定容量")
+    identity = _SchemaIdentity(
+        vendor_schema_id_size=len(vendor_schema),
+        field_set_version_size=len(field_set),
+    )
+    identity.vendor_schema_id[: len(vendor_schema)] = vendor_schema
+    identity.field_set_version[: len(field_set)] = field_set
+    return identity
+
+
+def _decode_schema_identity(identity: _SchemaIdentity, operation: str) -> tuple:
+    """严格解码 native 返回的 schema 身份并拒绝越界长度。
+
+    Args:
+        identity: 来自 health、event 或 batch 的嵌入 schema POD。
+        operation: 当前检查阶段，用于脱敏诊断。
+
+    Returns:
+        tuple: ``(vendor_schema_id, field_set_version)`` 两个 UTF-8 文本。
+
+    Raises:
+        HuaxinAbiError: 长度越界、UTF-8 非法或值与 wrapper 合同不一致。
+
+    Side Effects:
+        无。
+    """
+
+    vendor_size = int(identity.vendor_schema_id_size)
+    field_set_size = int(identity.field_set_version_size)
+    if vendor_size > VENDOR_SCHEMA_ID_CAPACITY or field_set_size > FIELD_SET_VERSION_CAPACITY:
+        raise HuaxinAbiError(
+            VENDOR_SCHEMA_INCOMPATIBLE,
+            "native schema 身份长度超过 C ABI 固定容量",
+            {"operation": operation},
+        )
+    try:
+        vendor_schema_id = bytes(identity.vendor_schema_id[:vendor_size]).decode(
+            "utf-8", errors="strict"
+        )
+        field_set_version = bytes(identity.field_set_version[:field_set_size]).decode(
+            "utf-8", errors="strict"
+        )
+    except UnicodeDecodeError as exc:
+        raise HuaxinAbiError(
+            VENDOR_SCHEMA_INCOMPATIBLE,
+            "native schema 身份不是合法 UTF-8",
+            {"operation": operation},
+        ) from exc
+    if vendor_schema_id != VENDOR_SCHEMA_ID or field_set_version != FIELD_SET_VERSION:
+        raise HuaxinAbiError(
+            VENDOR_SCHEMA_INCOMPATIBLE,
+            "native vendor schema 或 field-set 与 wrapper 不一致",
+            {
+                "operation": operation,
+                "expected_vendor_schema_id": VENDOR_SCHEMA_ID,
+                "actual_vendor_schema_id": vendor_schema_id,
+                "expected_field_set_version": FIELD_SET_VERSION,
+                "actual_field_set_version": field_set_version,
+            },
+        )
+    return vendor_schema_id, field_set_version
+
+
+def _validate_native_struct(
+    value: ctypes.Structure,
+    structure_type: Type[ctypes.Structure],
+    operation: str,
+) -> None:
+    """验证 native 返回 POD 的 ABI major、精确结构大小和 schema。
+
+    Args:
+        value: 已由 native 填充的 ctypes 结构。
+        structure_type: 当前合同预期的 ctypes 结构类型。
+        operation: 当前操作名称，用于脱敏错误详情。
+
+    Returns:
+        None。
+
+    Raises:
+        HuaxinAbiError: ABI、结构大小或 schema 任一不匹配。
+
+    Side Effects:
+        无。
+    """
+
+    actual_abi = int(getattr(value, "abi_version"))
+    actual_size = int(getattr(value, "struct_size"))
+    expected_size = ctypes.sizeof(structure_type)
+    if actual_abi != ABI_VERSION or actual_size != expected_size:
+        raise HuaxinAbiError(
+            NATIVE_ABI_INCOMPATIBLE,
+            "native 返回结构的 ABI 或大小不兼容",
+            {
+                "operation": operation,
+                "expected_abi": ABI_VERSION,
+                "actual_abi": actual_abi,
+                "expected_size": expected_size,
+                "actual_size": actual_size,
+            },
+        )
+    _decode_schema_identity(getattr(value, "schema"), operation)
 
 
 def _configure_signatures(library: ctypes.CDLL) -> None:
@@ -107,6 +320,10 @@ def _configure_signatures(library: ctypes.CDLL) -> None:
     library.bt_huaxin_abi_version.restype = ctypes.c_uint32
     library.bt_huaxin_bridge_version.argtypes = []
     library.bt_huaxin_bridge_version.restype = ctypes.c_char_p
+    library.bt_huaxin_vendor_schema_id.argtypes = []
+    library.bt_huaxin_vendor_schema_id.restype = ctypes.c_char_p
+    library.bt_huaxin_field_set_version.argtypes = []
+    library.bt_huaxin_field_set_version.restype = ctypes.c_char_p
     library.bt_huaxin_error_message.argtypes = [ctypes.c_int32]
     library.bt_huaxin_error_message.restype = ctypes.c_char_p
     library.bt_huaxin_create.argtypes = [
@@ -118,17 +335,27 @@ def _configure_signatures(library: ctypes.CDLL) -> None:
     library.bt_huaxin_destroy.restype = ctypes.c_int32
     library.bt_huaxin_get_health.argtypes = [ctypes.c_void_p, ctypes.POINTER(_Health)]
     library.bt_huaxin_get_health.restype = ctypes.c_int32
-    library.bt_huaxin_drain.argtypes = [
+    library.bt_huaxin_submit_request.argtypes = [
         ctypes.c_void_p,
-        ctypes.POINTER(_Event),
-        ctypes.c_uint32,
-        ctypes.POINTER(ctypes.c_uint32),
+        ctypes.POINTER(_Request),
     ]
-    library.bt_huaxin_drain.restype = ctypes.c_int32
+    library.bt_huaxin_submit_request.restype = ctypes.c_int32
+    library.bt_huaxin_drain_event_batch.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(_EventBatch),
+    ]
+    library.bt_huaxin_drain_event_batch.restype = ctypes.c_int32
+    library.bt_huaxin_free_event_batch.argtypes = [ctypes.POINTER(_EventBatch)]
+    library.bt_huaxin_free_event_batch.restype = ctypes.c_int32
 
 
 class NativeBridge:
-    """代表一个已通过 bundle 完整性校验并被显式加载的 C ABI bridge。"""
+    """代表已通过 bundle 与 ABI v2 身份校验的显式 C bridge。
+
+    核心协作对象是 ``verify_bundle``、ctypes 动态库和 ``NativeRuntime``；关键状态包含
+    制品路径、不可变 manifest 视图及配置好签名的库对象，构造本身不创建 runtime。
+    """
 
     def __init__(
         self,
@@ -188,7 +415,57 @@ class NativeBridge:
                 "Python wrapper 与 native bridge ABI 不一致",
                 {"expected": ABI_VERSION, "actual": actual_abi},
             )
+        actual_vendor_schema = cls._decode_static_text(
+            library.bt_huaxin_vendor_schema_id(), "vendor_schema_id"
+        )
+        actual_field_set = cls._decode_static_text(
+            library.bt_huaxin_field_set_version(), "field_set_version"
+        )
+        if actual_vendor_schema != VENDOR_SCHEMA_ID or actual_field_set != FIELD_SET_VERSION:
+            raise HuaxinAbiError(
+                VENDOR_SCHEMA_INCOMPATIBLE,
+                "Python wrapper 与 native bridge schema 身份不一致",
+                {
+                    "expected_vendor_schema_id": VENDOR_SCHEMA_ID,
+                    "actual_vendor_schema_id": actual_vendor_schema,
+                    "expected_field_set_version": FIELD_SET_VERSION,
+                    "actual_field_set_version": actual_field_set,
+                },
+            )
         return cls(artifact_path, library, manifest)
+
+    @staticmethod
+    def _decode_static_text(raw: Optional[bytes], field_name: str) -> str:
+        """解码由 bridge 静态存储持有的非空 UTF-8 文本。
+
+        Args:
+            raw: ``c_char_p`` 返回的 bytes 或空指针对应的 None。
+            field_name: 当前字段名，用于受控诊断。
+
+        Returns:
+            str: 解码后的文本。
+
+        Raises:
+            HuaxinAbiError: 指针为空或 bytes 不是合法 UTF-8。
+
+        Side Effects:
+            无；静态文本归 bridge 所有，Python 不释放。
+        """
+
+        if raw is None:
+            raise HuaxinAbiError(
+                NATIVE_ABI_INCOMPATIBLE,
+                "native bridge 缺少必需静态身份文本",
+                {"field": field_name},
+            )
+        try:
+            return raw.decode("utf-8", errors="strict")
+        except UnicodeDecodeError as exc:
+            raise HuaxinAbiError(
+                NATIVE_ABI_INCOMPATIBLE,
+                "native bridge 静态身份文本不是合法 UTF-8",
+                {"field": field_name},
+            ) from exc
 
     def abi_version(self) -> int:
         """
@@ -213,7 +490,41 @@ class NativeBridge:
         """
 
         raw = self._library.bt_huaxin_bridge_version()
-        return raw.decode("utf-8", errors="strict") if raw else ""
+        return self._decode_static_text(raw, "bridge_version")
+
+    def vendor_schema_id(self) -> str:
+        """读取 bridge 明确声明的 vendor schema ID。
+
+        Args:
+            无。
+
+        Returns:
+            str: 与所有 v2 POD 共同使用的 schema ID。
+
+        Side Effects:
+            无；返回值来自 bridge 静态存储的 Python 副本。
+        """
+
+        return self._decode_static_text(
+            self._library.bt_huaxin_vendor_schema_id(), "vendor_schema_id"
+        )
+
+    def field_set_version(self) -> str:
+        """读取 bridge 明确声明的 field-set version。
+
+        Args:
+            无。
+
+        Returns:
+            str: 与所有 v2 POD 共同使用的字段集版本。
+
+        Side Effects:
+            无；返回值来自 bridge 静态存储的 Python 副本。
+        """
+
+        return self._decode_static_text(
+            self._library.bt_huaxin_field_set_version(), "field_set_version"
+        )
 
     def create(self, queue_capacity: int = 64) -> "NativeRuntime":
         """
@@ -237,6 +548,7 @@ class NativeBridge:
             struct_size=ctypes.sizeof(_CreateOptions),
             queue_capacity=queue_capacity,
             reserved=0,
+            schema=_schema_identity(),
         )
         handle = ctypes.c_void_p()
         result = int(self._library.bt_huaxin_create(ctypes.byref(options), ctypes.byref(handle)))
@@ -272,10 +584,19 @@ class NativeBridge:
             "native_code": result,
             "native_message": native_message,
         }
-        if result in (-2, -3):
+        if result in (
+            NATIVE_RESULT_ABI_INCOMPATIBLE,
+            NATIVE_RESULT_STRUCT_SIZE_INCOMPATIBLE,
+        ):
             raise HuaxinAbiError(
                 NATIVE_ABI_INCOMPATIBLE,
                 "native C ABI 版本或结构大小不兼容",
+                details,
+            )
+        if result == NATIVE_RESULT_SCHEMA_INCOMPATIBLE:
+            raise HuaxinAbiError(
+                VENDOR_SCHEMA_INCOMPATIBLE,
+                "native vendor schema 或 field-set 不兼容",
                 details,
             )
         raise HuaxinNativeCallError(
@@ -341,15 +662,65 @@ class NativeRuntime:
                 queue_size=0,
                 reserved=0,
                 dropped_events=0,
+                schema=_schema_identity(),
             )
             result = int(self._bridge._library.bt_huaxin_get_health(handle, ctypes.byref(raw)))
             self._bridge._raise_for_result(result, "health")
+            _validate_native_struct(raw, _Health, "health")
+            vendor_schema_id, field_set_version = _decode_schema_identity(raw.schema, "health")
             return NativeHealth(
                 state=int(raw.state),
                 queue_capacity=int(raw.queue_capacity),
                 queue_size=int(raw.queue_size),
                 dropped_events=int(raw.dropped_events),
+                vendor_schema_id=vendor_schema_id,
+                field_set_version=field_set_version,
             )
+
+    def submit_request(
+        self,
+        request_id: int,
+        payload: bytes = b"",
+        request_type: int = REQUEST_TYPE_PING,
+    ) -> None:
+        """同步提交一个版本化 fake POD 请求。
+
+        Args:
+            request_id: 非零 uint64 请求标识，由调用方生成并用于关联回执。
+            payload: 最多 192 字节的原始二进制负载，可包含 NUL。
+            request_type: 稳定请求类型；当前离线合同只支持 ping。
+
+        Returns:
+            None。
+
+        Raises:
+            TypeError: payload 不是 bytes。
+            ValueError: request_id 或 payload 越出固定合同范围。
+            HuaxinNativeCallError: native 拒绝请求或队列已满。
+
+        Side Effects:
+            获取生命周期锁并让 native fake runtime 入队一个请求完成事件；不联网、不交易。
+        """
+
+        if not isinstance(payload, bytes):
+            raise TypeError("payload 必须为 bytes")
+        if request_id < 1 or request_id > (1 << 64) - 1:
+            raise ValueError("request_id 必须为非零 uint64")
+        if len(payload) > REQUEST_PAYLOAD_CAPACITY:
+            raise ValueError(f"payload 不能超过 {REQUEST_PAYLOAD_CAPACITY} 字节")
+        raw = _Request(
+            abi_version=ABI_VERSION,
+            struct_size=ctypes.sizeof(_Request),
+            request_type=request_type,
+            payload_size=len(payload),
+            request_id=request_id,
+            schema=_schema_identity(),
+        )
+        raw.payload[: len(payload)] = payload
+        with self._lock:
+            handle = self._require_handle()
+            result = int(self._bridge._library.bt_huaxin_submit_request(handle, ctypes.byref(raw)))
+            self._bridge._raise_for_result(result, "submit_request")
 
     def drain(self, max_events: int) -> List[NativeEvent]:
         """
@@ -370,30 +741,94 @@ class NativeRuntime:
             raise ValueError(f"max_events 必须位于 1 到 {MAX_DRAIN_EVENTS}")
         with self._lock:
             handle = self._require_handle()
-            event_array = (_Event * max_events)()
-            count = ctypes.c_uint32(0)
-            result = int(
-                self._bridge._library.bt_huaxin_drain(
-                    handle,
-                    event_array,
-                    ctypes.c_uint32(max_events),
-                    ctypes.byref(count),
-                )
+            batch = _EventBatch(
+                abi_version=ABI_VERSION,
+                struct_size=ctypes.sizeof(_EventBatch),
+                event_count=0,
+                event_stride=0,
+                schema=_schema_identity(),
+                events=None,
+                ownership_token=0,
             )
-            self._bridge._raise_for_result(result, "drain")
-            events: List[NativeEvent] = []
-            for index in range(int(count.value)):
-                raw = event_array[index]
-                payload_size = min(int(raw.payload_size), EVENT_PAYLOAD_CAPACITY)
-                events.append(
-                    NativeEvent(
-                        event_type=int(raw.event_type),
-                        sequence=int(raw.sequence),
-                        received_ns=int(raw.received_ns),
-                        payload=bytes(raw.payload[:payload_size]),
+            try:
+                result = int(
+                    self._bridge._library.bt_huaxin_drain_event_batch(
+                        handle,
+                        ctypes.c_uint32(max_events),
+                        ctypes.byref(batch),
                     )
                 )
-            return events
+                self._bridge._raise_for_result(result, "drain_event_batch")
+                _validate_native_struct(batch, _EventBatch, "drain_event_batch")
+                count = int(batch.event_count)
+                if count > max_events:
+                    raise HuaxinAbiError(
+                        NATIVE_ABI_INCOMPATIBLE,
+                        "native batch 数量超过调用方上限",
+                        {"operation": "drain_event_batch"},
+                    )
+                event_address = ctypes.cast(batch.events, ctypes.c_void_p).value
+                ownership_token = int(batch.ownership_token)
+                if count == 0:
+                    if event_address or ownership_token:
+                        raise HuaxinAbiError(
+                            NATIVE_ABI_INCOMPATIBLE,
+                            "native 空 batch 携带了所有权指针",
+                            {"operation": "drain_event_batch"},
+                        )
+                    return []
+                if (
+                    int(batch.event_stride) != ctypes.sizeof(_Event)
+                    or not event_address
+                    or not ownership_token
+                ):
+                    raise HuaxinAbiError(
+                        NATIVE_ABI_INCOMPATIBLE,
+                        "native batch stride 或所有权描述符不兼容",
+                        {"operation": "drain_event_batch"},
+                    )
+
+                events: List[NativeEvent] = []
+                for index in range(count):
+                    raw = batch.events[index]
+                    _validate_native_struct(raw, _Event, "drain_event")
+                    payload_size = int(raw.payload_size)
+                    if payload_size > EVENT_PAYLOAD_CAPACITY:
+                        raise HuaxinAbiError(
+                            NATIVE_ABI_INCOMPATIBLE,
+                            "native event payload 长度超过固定容量",
+                            {"operation": "drain_event"},
+                        )
+                    vendor_schema_id, field_set_version = _decode_schema_identity(
+                        raw.schema, "drain_event"
+                    )
+                    events.append(
+                        NativeEvent(
+                            event_type=int(raw.event_type),
+                            sequence=int(raw.sequence),
+                            received_ns=int(raw.received_ns),
+                            request_id=int(raw.request_id),
+                            vendor_schema_id=vendor_schema_id,
+                            field_set_version=field_set_version,
+                            payload=bytes(raw.payload[:payload_size]),
+                        )
+                    )
+                return events
+            finally:
+                cleanup_batch = _EventBatch(
+                    abi_version=ABI_VERSION,
+                    struct_size=ctypes.sizeof(_EventBatch),
+                    event_count=int(batch.event_count),
+                    event_stride=int(batch.event_stride),
+                    schema=_schema_identity(),
+                    events=batch.events,
+                    ownership_token=int(batch.ownership_token),
+                )
+                free_result = int(
+                    self._bridge._library.bt_huaxin_free_event_batch(ctypes.byref(cleanup_batch))
+                )
+                if free_result != 0:
+                    self._bridge._raise_for_result(free_result, "free_event_batch")
 
     def close(self) -> None:
         """

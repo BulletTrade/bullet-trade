@@ -37,7 +37,7 @@ from .errors import (
     HuaxinBundleError,
     HuaxinError,
 )
-from .native import ABI_VERSION
+from .native import ABI_VERSION, FIELD_SET_VERSION, VENDOR_SCHEMA_ID
 
 MANIFEST_SCHEMA_VERSION = 1
 SUPPORTED_BUILD_MODE = "offline_fake"
@@ -456,6 +456,8 @@ def build_native_bridge(
             "source": source_snapshot,
             "bridge": {
                 "abi_version": ABI_VERSION,
+                "vendor_schema_id": VENDOR_SCHEMA_ID,
+                "field_set_version": FIELD_SET_VERSION,
                 "artifact": staged_artifact.relative_to(stage_bundle).as_posix(),
                 "sha256": artifact_hash,
                 "vendor_sdk_linked": False,
@@ -569,11 +571,20 @@ def verify_bundle(bundle_path: Path) -> Tuple[Dict[str, Any], Path]:
         )
 
     bridge = manifest.get("bridge")
-    if not isinstance(bridge, dict) or bridge.get("abi_version") != ABI_VERSION:
+    if (
+        not isinstance(bridge, dict)
+        or bridge.get("abi_version") != ABI_VERSION
+        or bridge.get("vendor_schema_id") != VENDOR_SCHEMA_ID
+        or bridge.get("field_set_version") != FIELD_SET_VERSION
+    ):
         raise HuaxinBundleError(
             BRIDGE_BUNDLE_INVALID,
-            "华鑫 native manifest ABI 不兼容",
-            {"expected_abi": ABI_VERSION},
+            "华鑫 native manifest ABI 或 schema 身份不兼容",
+            {
+                "expected_abi": ABI_VERSION,
+                "expected_vendor_schema_id": VENDOR_SCHEMA_ID,
+                "expected_field_set_version": FIELD_SET_VERSION,
+            },
         )
     artifact_relative = bridge.get("artifact")
     if not isinstance(artifact_relative, str) or not artifact_relative:
