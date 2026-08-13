@@ -155,7 +155,7 @@ class QmtBroker(BrokerBase):
 
         self._xt_imported = True
         session_id = self._session_id or int(time.time() * 1000)
-        self._session_id = session_id
+        self._session_id = max(session_id + 1, int(time.time() * 1000))
         trader = None
         callback = None
         account = None

@@ -296,12 +296,13 @@ def test_qmt_broker_connect_failure_is_single_attempt_and_cleans_trader(monkeypa
 
     _install_fake_xtquant(monkeypatch, _FailingTrader)
 
-    broker = QmtBroker(account_id="demo", data_path="C:/qmt")
+    broker = QmtBroker(account_id="demo", data_path="C:/qmt", session_id=2026081101)
     with pytest.raises(RuntimeError, match="connect"):
         broker.connect()
 
     assert len(instances) == 1
     trader = instances[0]
+    assert trader.session_id == 2026081101
     assert trader.connect_calls == 1
     assert trader.unregister_calls == 1
     assert trader.disconnect_calls == 1
@@ -310,6 +311,11 @@ def test_qmt_broker_connect_failure_is_single_attempt_and_cleans_trader(monkeypa
     assert broker._xt_account is None
     assert broker._xt_callback is None
     assert broker.is_connected is False
+
+    with pytest.raises(RuntimeError, match="connect"):
+        broker.connect()
+    assert len(instances) == 2
+    assert instances[1].session_id > trader.session_id
 
 
 @pytest.mark.unit
