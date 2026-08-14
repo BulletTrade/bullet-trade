@@ -821,6 +821,10 @@ def test_public_source_controls_bypass_full_data_capacity_with_provenance() -> N
     assert after_take.control_inflight_depth == 2
     assert after_take.control_outstanding_depth == 2
     assert after_take.control_delivery_inflight is True
+    with pytest.raises(MarketEventControlDrainError) as inflight_error:
+        queue.drain_data()
+    assert inflight_error.value.code == "RELIABLE_CONTROL_DELIVERY_IN_FLIGHT"
+    queue.ack_control(delivery.delivery_id)
     assert queue.drain_data() == (retained,)
 
 
@@ -1313,6 +1317,69 @@ def test_legacy_control_drain_defaults_fail_closed_and_never_clears_inflight() -
 
     legacy_queue.put_nowait(_source_gap(62))
     assert legacy_queue.drain_control() == (_source_gap(62),)
+
+
+def test_data_drain_fails_closed_while_control_is_pending() -> None:
+    """验证 pending 控制未进入可靠 delivery 前普通数据不能先被取走。
+
+    Args:
+        无。
+
+    Returns:
+        None。
+
+    Side Effects:
+        写入一个普通事件和一个来源 gap，触发受控异常后可靠 ACK 并取回数据。
+    """
+    queue = BoundedMarketEventQueue(capacity=2)
+    retained = _transaction(70)
+    queue.put_nowait(retained)
+    queue.put_nowait(_source_gap(70))
+    before = queue.metrics()
+
+    with pytest.raises(MarketEventControlDrainError) as pending_error:
+        queue.drain_data()
+
+    after = queue.metrics()
+    assert pending_error.value.code == "RELIABLE_CONTROL_DELIVERY_PENDING"
+    assert after.data_depth == before.data_depth == 1
+    assert after.control_pending_depth == before.control_pending_depth == 1
+    assert after.drained_count == before.drained_count == 0
+    _take_and_ack_controls(queue)
+    assert queue.drain_data() == (retained,)
+
+
+def test_data_drain_fails_closed_while_control_delivery_is_inflight() -> None:
+    """验证控制 delivery 未 ACK 时普通数据不能绕过稳定重试窗口。
+
+    Args:
+        无。
+
+    Returns:
+        None。
+
+    Side Effects:
+        创建一个 in-flight 控制 delivery，触发受控异常后精确 ACK 并取回数据。
+    """
+    queue = BoundedMarketEventQueue(capacity=2)
+    retained = _transaction(71)
+    queue.put_nowait(retained)
+    queue.put_nowait(_source_gap(71))
+    delivery = queue.take_control()
+    assert delivery is not None
+    before = queue.metrics()
+
+    with pytest.raises(MarketEventControlDrainError) as inflight_error:
+        queue.drain_data()
+
+    after = queue.metrics()
+    assert inflight_error.value.code == "RELIABLE_CONTROL_DELIVERY_IN_FLIGHT"
+    assert after.data_depth == before.data_depth == 1
+    assert after.control_inflight_depth == before.control_inflight_depth == 1
+    assert after.drained_count == before.drained_count == 0
+    assert queue.take_control() is delivery
+    queue.ack_control(delivery.delivery_id)
+    assert queue.drain_data() == (retained,)
 
 
 def test_new_controls_wait_in_next_window_while_delivery_is_inflight() -> None:

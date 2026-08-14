@@ -112,15 +112,16 @@ class MarketEventControlAckError(RuntimeError):
 class MarketEventControlDrainError(RuntimeError):
     """表示兼容 drain 可能破坏可靠控制投递合同而被拒绝。
 
-    与 ``drain``/``drain_control`` 协作；默认禁止 pending fire-and-forget，且无论是否
-    开启兼容模式都禁止绕过 ACK 清除 in-flight delivery。
+    与 ``drain``/``drain_control``/``drain_data`` 协作；默认禁止 pending
+    fire-and-forget，且无论是否开启兼容模式都禁止普通数据越过尚未可靠 ACK 的控制。
     """
 
     def __init__(self, code: str) -> None:
         """保存 drain 失败的稳定错误码。
 
         Args:
-            code: ``LEGACY_CONTROL_DRAIN_DISABLED`` 或
+            code: ``LEGACY_CONTROL_DRAIN_DISABLED``、
+                ``RELIABLE_CONTROL_DELIVERY_PENDING`` 或
                 ``RELIABLE_CONTROL_DELIVERY_IN_FLIGHT``。
 
         Returns:
@@ -1046,7 +1047,7 @@ class BoundedMarketEventQueue:
             return self._drain_control_unreliable_locked()
 
     def drain_data(self, max_items: Optional[int] = None) -> Tuple[MarketEvent, ...]:
-        """按到达顺序取出普通数据，不隐式确认或清除任何控制边界。
+        """仅在没有待可靠投递控制时按到达顺序取出普通数据。
 
         Args:
             max_items: 最多取出的普通事件数；None 表示取完，零表示不取。
@@ -1056,12 +1057,19 @@ class BoundedMarketEventQueue:
 
         Raises:
             ValueError: max_items 不是非负整数或 None 时抛出。
+            MarketEventControlDrainError: 存在 pending 或 in-flight 控制时抛出，确保
+                普通数据不能越过尚未可靠 ACK 的 gap/degraded 边界。
 
         Side Effects:
-            从普通数据区移除已返回事件并增加 drained_count。
+            成功时从普通数据区移除已返回事件并增加 drained_count；失败时普通数据和
+            控制状态均保持不变。
         """
         self._validate_max_items(max_items)
         with self._lock:
+            if self._inflight_control is not None:
+                raise MarketEventControlDrainError("RELIABLE_CONTROL_DELIVERY_IN_FLIGHT")
+            if self._pending_controls:
+                raise MarketEventControlDrainError("RELIABLE_CONTROL_DELIVERY_PENDING")
             return self._drain_data_locked(max_items)
 
     def metrics(self) -> MarketEventQueueMetrics:
