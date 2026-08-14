@@ -19,6 +19,7 @@ from bullet_trade.market_data import (
     CapabilityManifest,
     CapabilityReadiness,
     CapabilitySupport,
+    DepthSnapshotEvent,
     MarketDataLevel,
     MarketEvent,
     MarketEventType,
@@ -29,8 +30,35 @@ from bullet_trade.market_data import (
     SubscriptionSelector,
     SubscriptionState,
 )
+from bullet_trade.market_data.health import MarketUpdateExpectation
 
 pytestmark = pytest.mark.unit
+
+
+def _continuous_update_policy(
+    security: str,
+    level: MarketDataLevel,
+    event: MarketEvent,
+    raw_age_seconds: float,
+) -> MarketUpdateExpectation:
+    """
+    为既有 Feed 合同测试声明持续交易中的显式更新窗口。
+
+    Args:
+        security: 当前标准证券代码。
+        level: 当前精确行情级别。
+        event: 最近一次受控 gateway 事件。
+        raw_age_seconds: 事件到当前的单调时钟原始 age。
+
+    Returns:
+        MarketUpdateExpectation: 始终预期继续更新且无暂停时长的测试 policy。
+    """
+    del security, level, raw_age_seconds
+    return MarketUpdateExpectation(
+        expected=True,
+        market_state="continuous_trading",
+        effective_source_age_seconds=0.0 if event.exchange_time is not None else None,
+    )
 
 
 def _capability(
@@ -100,7 +128,11 @@ def _feed(l2_full_market: bool = False) -> MockRealtimeMarketDataFeed:
         location=ProviderLocation.LOCAL,
         capabilities=declarations,
     )
-    return MockRealtimeMarketDataFeed(manifest, limits={"max_symbols": 100})
+    return MockRealtimeMarketDataFeed(
+        manifest,
+        limits={"max_symbols": 100},
+        update_expectation_policy=_continuous_update_policy,
+    )
 
 
 def test_mock_feed_lifecycle_separates_support_and_readiness() -> None:
@@ -113,6 +145,33 @@ def test_mock_feed_lifecycle_separates_support_and_readiness() -> None:
     feed.connect()
     first_epoch = feed.health().session_epoch
     assert feed.manifest.get("realtime.snapshot.l2").support is CapabilitySupport.SUPPORTED
+    assert feed.manifest.get("realtime.snapshot.l2").readiness is CapabilityReadiness.UNAVAILABLE
+    feed.subscribe(
+        MarketSubscriptionSpec(
+            request_id="lifecycle-l2",
+            selector="symbols",
+            symbols=("600000.XSHG",),
+            level="l2",
+            event_types=("snapshot_l2",),
+        )
+    )
+    now = datetime.now()
+    feed.publish_event(
+        DepthSnapshotEvent(
+            provider="mock",
+            capability_key="realtime.snapshot.l2",
+            event_type="snapshot_l2",
+            level="l2",
+            exchange="XSHG",
+            session_epoch=first_epoch,
+            security="600000.XSHG",
+            raw_security_code="600000",
+            payload={"last_price": 10.0},
+            gateway_received_at=now,
+            client_received_at=now,
+            exchange_time=now,
+        )
+    )
     assert feed.manifest.get("realtime.snapshot.l2").readiness is CapabilityReadiness.READY
 
     feed.disconnect()
@@ -207,11 +266,26 @@ def test_callbacks_and_snapshot_cache_only_receive_confirmed_scope() -> None:
         )
     )
 
+    tick_time = datetime.now()
     assert (
-        feed.publish_tick("000001.XSHE", "XSHE", {"sid": "000001.XSHE", "last_price": 9.9}) is False
+        feed.publish_tick(
+            "000001.XSHE",
+            "XSHE",
+            {"sid": "000001.XSHE", "last_price": 9.9},
+            received_at=tick_time,
+            exchange_time=tick_time,
+        )
+        is False
     )
     assert (
-        feed.publish_tick("600000.XSHG", "XSHG", {"sid": "600000.XSHG", "last_price": 10.1}) is True
+        feed.publish_tick(
+            "600000.XSHG",
+            "XSHG",
+            {"sid": "600000.XSHG", "last_price": 10.1},
+            received_at=tick_time,
+            exchange_time=tick_time,
+        )
+        is True
     )
     assert tick_events == [{"sid": "600000.XSHG", "last_price": 10.1}]
     assert len(typed_events) == 1
@@ -227,7 +301,7 @@ def test_callbacks_and_snapshot_cache_only_receive_confirmed_scope() -> None:
         )
     )
     now = datetime.now()
-    snapshot = MarketEvent(
+    snapshot = DepthSnapshotEvent(
         provider="mock",
         capability_key="realtime.snapshot.l2",
         event_type="snapshot_l2",
@@ -235,10 +309,12 @@ def test_callbacks_and_snapshot_cache_only_receive_confirmed_scope() -> None:
         exchange="XSHG",
         session_epoch=feed.health().session_epoch,
         security="600000.XSHG",
+        raw_security_code="600000",
         asset_type="stock",
         payload={"last_price": 10.2, "bid": [10.1]},
         gateway_received_at=now,
         client_received_at=now,
+        exchange_time=now,
     )
     assert feed.publish_event(snapshot) is True
     assert feed.get_market_snapshot("600000.XSHG", MarketDataLevel.L2) is snapshot

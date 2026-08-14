@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime
 from enum import Enum
@@ -996,6 +997,31 @@ class ConnectionStateEvent(MarketEvent):
 
 
 @dataclass(frozen=True)
+class FeedEventTimes:
+    """保存 Feed 在某个模块或原子能力上最近一次事件的时间证据。"""
+
+    last_gateway_received_at: Optional[datetime] = None
+    last_client_received_at: Optional[datetime] = None
+    last_exchange_time: Optional[datetime] = None
+    gateway_age_seconds: Optional[float] = None
+
+    def __post_init__(self) -> None:
+        """
+        校验由单调时钟计算的 gateway age 为有限非负数。
+
+        Returns:
+            None: 时间证据验证完成后返回。
+
+        Raises:
+            ValueError: gateway_age_seconds 为负数、NaN 或无穷值时抛出。
+        """
+        if self.gateway_age_seconds is not None and (
+            self.gateway_age_seconds < 0 or not math.isfinite(self.gateway_age_seconds)
+        ):
+            raise ValueError("gateway_age_seconds 必须是有限非负数")
+
+
+@dataclass(frozen=True)
 class FeedHealth:
     """暴露 Feed 连接、能力、订阅、时效和基础队列指标的脱敏健康快照。"""
 
@@ -1005,12 +1031,26 @@ class FeedHealth:
     session_epoch: Optional[str]
     active_subscriptions: Mapping[str, MarketSubscriptionReceipt]
     capability_readiness: Mapping[str, CapabilityReadiness]
+    module_readiness: Mapping[str, CapabilityReadiness] = field(default_factory=dict)
+    capability_event_times: Mapping[str, FeedEventTimes] = field(default_factory=dict)
+    module_event_times: Mapping[str, FeedEventTimes] = field(default_factory=dict)
     reconnect_count: int = 0
     last_gateway_received_at: Optional[datetime] = None
     last_client_received_at: Optional[datetime] = None
     last_exchange_time: Optional[datetime] = None
     queue_depth: int = 0
+    queue_control_depth: int = 0
     queue_capacity: int = 0
+    queue_control_capacity: int = 0
+    queue_control_scope_depth: int = 0
+    queue_control_scope_capacity: int = 0
+    queue_control_overflow_count: int = 0
+    queue_high_watermark: int = 0
+    queue_overflow_count: int = 0
+    queue_coalesced_count: int = 0
+    queue_loss_boundary_count: int = 0
+    queue_degraded: bool = False
+    queue_overflow_by_event_type: Mapping[str, int] = field(default_factory=dict)
     gap_count: int = 0
     reasons: Tuple[str, ...] = ()
     schema_version: str = "1"
@@ -1026,13 +1066,62 @@ class FeedHealth:
         schema_version = self.schema_version.strip()
         if not provider or not manifest_version or not schema_version:
             raise ValueError("health provider、manifest_version 和 schema_version 不能为空")
-        if min(self.reconnect_count, self.queue_depth, self.queue_capacity, self.gap_count) < 0:
+        counters = (
+            self.reconnect_count,
+            self.queue_depth,
+            self.queue_control_depth,
+            self.queue_capacity,
+            self.queue_control_capacity,
+            self.queue_control_scope_depth,
+            self.queue_control_scope_capacity,
+            self.queue_control_overflow_count,
+            self.queue_high_watermark,
+            self.queue_overflow_count,
+            self.queue_coalesced_count,
+            self.queue_loss_boundary_count,
+            self.gap_count,
+        )
+        if min(counters) < 0:
             raise ValueError("health 计数不能为负数")
         if self.queue_capacity and self.queue_depth > self.queue_capacity:
             raise ValueError("queue_depth 不能大于 queue_capacity")
+        if self.queue_capacity and self.queue_high_watermark > self.queue_capacity:
+            raise ValueError("queue_high_watermark 不能大于 queue_capacity")
+        if self.queue_control_capacity and self.queue_control_depth > self.queue_control_capacity:
+            raise ValueError("queue_control_depth 不能大于 queue_control_capacity")
+        if (
+            self.queue_control_scope_capacity
+            and self.queue_control_scope_depth > self.queue_control_scope_capacity
+        ):
+            raise ValueError("queue_control_scope_depth 不能大于 queue_control_scope_capacity")
         readiness: Dict[str, CapabilityReadiness] = {}
         for capability_id, state in self.capability_readiness.items():
             readiness[capability_id] = CapabilityReadiness(state)
+        module_readiness: Dict[str, CapabilityReadiness] = {}
+        for module, state in self.module_readiness.items():
+            normalized_module = str(module).strip().lower()
+            if not normalized_module:
+                raise ValueError("module_readiness 不能包含空模块名")
+            module_readiness[normalized_module] = CapabilityReadiness(state)
+        capability_times = {
+            str(capability_id).strip(): times
+            for capability_id, times in self.capability_event_times.items()
+        }
+        module_times = {
+            str(module).strip().lower(): times for module, times in self.module_event_times.items()
+        }
+        if any(not key for key in capability_times) or any(not key for key in module_times):
+            raise ValueError("event_times 不能包含空键")
+        if any(not isinstance(value, FeedEventTimes) for value in capability_times.values()):
+            raise ValueError("capability_event_times 必须包含 FeedEventTimes")
+        if any(not isinstance(value, FeedEventTimes) for value in module_times.values()):
+            raise ValueError("module_event_times 必须包含 FeedEventTimes")
+        overflow_by_event_type: Dict[str, int] = {}
+        for event_type, count in self.queue_overflow_by_event_type.items():
+            normalized_event_type = str(event_type).strip()
+            if not normalized_event_type or isinstance(count, bool) or int(count) < 0:
+                raise ValueError("queue_overflow_by_event_type 包含非法键或计数")
+            overflow_by_event_type[normalized_event_type] = int(count)
         object.__setattr__(self, "provider", provider)
         object.__setattr__(self, "manifest_version", manifest_version)
         object.__setattr__(self, "schema_version", schema_version)
@@ -1040,6 +1129,14 @@ class FeedHealth:
             self, "active_subscriptions", MappingProxyType(dict(self.active_subscriptions))
         )
         object.__setattr__(self, "capability_readiness", MappingProxyType(readiness))
+        object.__setattr__(self, "module_readiness", MappingProxyType(module_readiness))
+        object.__setattr__(self, "capability_event_times", MappingProxyType(capability_times))
+        object.__setattr__(self, "module_event_times", MappingProxyType(module_times))
+        object.__setattr__(
+            self,
+            "queue_overflow_by_event_type",
+            MappingProxyType(overflow_by_event_type),
+        )
         object.__setattr__(self, "reasons", _normalize_strings(self.reasons, "reasons"))
 
 
@@ -1048,6 +1145,7 @@ __all__ = [
     "ConnectionStateEvent",
     "ConsolidatedTickEvent",
     "DepthSnapshotEvent",
+    "FeedEventTimes",
     "FeedHealth",
     "FieldProfile",
     "IopvEvent",

@@ -15,6 +15,14 @@ from typing import List
 
 import pytest
 
+from bullet_trade.market_data.capability import (
+    CapabilityDeclaration,
+    CapabilityManifest,
+    CapabilityReadiness,
+    CapabilitySupport,
+    ProviderLocation,
+)
+from bullet_trade.market_data.feed import MockRealtimeMarketDataFeed
 from bullet_trade.market_data.models import (
     CompatibilityTickEvent,
     ConnectionStateEvent,
@@ -30,7 +38,11 @@ from bullet_trade.market_data.models import (
     SourceSequence,
     TransactionEvent,
 )
-from bullet_trade.market_data.queue import BoundedMarketEventQueue, QueuePutOutcome
+from bullet_trade.market_data.queue import (
+    BoundedMarketEventQueue,
+    MarketEventControlCapacityError,
+    QueuePutOutcome,
+)
 
 pytestmark = pytest.mark.unit
 
@@ -43,6 +55,8 @@ def _transaction(
     stream_id: str = "transaction-stream",
     channel_id: str = "channel-1",
     security: str = "600000.XSHG",
+    session_epoch: str = "epoch-1",
+    provider: str = "mock",
 ) -> TransactionEvent:
     """构造带明确通道序列的脱敏逐笔成交事件。
 
@@ -51,6 +65,8 @@ def _transaction(
         stream_id: 事件所属 stream ID。
         channel_id: 事件所属 channel ID。
         security: 标准证券代码。
+        session_epoch: 事件所属的连接会话 epoch。
+        provider: 事件所属的实时数据后端。
 
     Returns:
         TransactionEvent: 可用于验证无损入队或 loss boundary 的 L2 事件。
@@ -60,12 +76,12 @@ def _transaction(
     """
     raw_security = security.split(".", 1)[0]
     return TransactionEvent(
-        provider="mock",
+        provider=provider,
         capability_key="realtime.stream.transaction",
         event_type=MarketEventType.TRANSACTION,
         level=MarketDataLevel.L2,
         exchange="XSHG",
-        session_epoch="epoch-1",
+        session_epoch=session_epoch,
         security=security,
         raw_security_code=raw_security,
         stream_id=stream_id,
@@ -79,12 +95,21 @@ def _transaction(
 def _loss_sensitive_l2_event(
     event_type: MarketEventType,
     sequence: int,
+    *,
+    session_epoch: str = "epoch-1",
+    stream_id: str = "loss-sensitive-stream",
+    channel_id: str = "channel-1",
+    security: str = "600000.XSHG",
 ) -> MarketEvent:
     """构造必须通过 gap 暴露队列损失的三类 L2 逐笔事件。
 
     Args:
         event_type: transaction、order_detail 或 consolidated_tick。
         sequence: 写入原始 MainSeq 的序号。
+        session_epoch: 事件所属的连接会话 epoch。
+        stream_id: 事件所属 stream ID。
+        channel_id: 事件所属 channel ID。
+        security: 标准证券代码。
 
     Returns:
         MarketEvent: 对应具体类型、带完整连续性作用域的逐笔事件。
@@ -116,11 +141,11 @@ def _loss_sensitive_l2_event(
         event_type=event_type,
         level=MarketDataLevel.L2,
         exchange="XSHG",
-        session_epoch="epoch-1",
-        security="600000.XSHG",
-        raw_security_code="600000",
-        stream_id="loss-sensitive-stream",
-        channel_id="channel-1",
+        session_epoch=session_epoch,
+        security=security,
+        raw_security_code=security.split(".", 1)[0],
+        stream_id=stream_id,
+        channel_id=channel_id,
         source_sequence=SourceSequence(components={"MainSeq": sequence}),
         payload={"price": 10.0, "sequence": sequence},
         gateway_received_at=_BASE_TIME + timedelta(microseconds=sequence),
@@ -411,8 +436,8 @@ def test_repeated_overflow_aggregates_exact_first_last_boundary_in_fixed_slots()
     assert queue.metrics().control_depth == 2
 
 
-def test_multiple_loss_scopes_are_marked_without_fabricating_single_stream_order() -> None:
-    """验证多个通道同时丢失时控制事件显式标记聚合，而不伪造跨通道总序。
+def test_multiple_securities_in_one_scope_keep_real_control_identity() -> None:
+    """验证同一通道多证券可有界聚合，但控制事件仍保留真实 epoch 和通道。
 
     Args:
         无。
@@ -421,24 +446,237 @@ def test_multiple_loss_scopes_are_marked_without_fabricating_single_stream_order
         None。
 
     Side Effects:
-        在满队列上生成两个不同 stream/channel 的损失点并 drain 控制事件。
+        在满队列上生成同 stream/channel 不同证券的损失并 drain 控制事件。
     """
     queue = BoundedMarketEventQueue(capacity=1)
     queue.put_nowait(_transaction(1))
-    queue.put_nowait(_transaction(2, stream_id="stream-a", channel_id="channel-a"))
-    queue.put_nowait(_transaction(9, stream_id="stream-b", channel_id="channel-b"))
+    queue.put_nowait(_transaction(2, security="600000.XSHG"))
+    queue.put_nowait(_transaction(9, security="600001.XSHG"))
 
     gap, degraded = queue.drain_control()
 
-    assert gap.payload["multiple_scopes"] is True
-    assert gap.stream_id == "multiple-streams"
-    assert gap.channel_id == "multiple-channels"
-    assert gap.payload["first_lost"]["stream_id"] == "stream-a"
-    assert gap.payload["last_lost"]["stream_id"] == "stream-b"
-    assert gap.source_sequence.ordering_scope == "queue_arrival"
-    assert gap.source_sequence["queue_loss_index"] == 2
-    assert degraded.payload["multiple_scopes"] is True
+    assert gap.provider == "mock"
+    assert gap.capability_key == "realtime.stream.transaction"
+    assert gap.level is MarketDataLevel.L2
+    assert gap.session_epoch == "epoch-1"
+    assert gap.stream_id == "transaction-stream"
+    assert gap.channel_id == "channel-1"
+    assert gap.exchange == "XSHG"
+    assert gap.security is None
+    assert gap.payload["multiple_scopes"] is False
+    assert gap.payload["multiple_securities"] is True
+    assert gap.payload["first_lost"]["security"] == "600000.XSHG"
+    assert gap.payload["last_lost"]["security"] == "600001.XSHG"
+    assert gap.source_sequence["MainSeq"] == 9
+    assert degraded.session_epoch == "epoch-1"
+    assert degraded.stream_id == "transaction-stream"
+    assert degraded.channel_id == "channel-1"
+    assert degraded.security is None
+    assert degraded.payload["multiple_scopes"] is False
+    assert degraded.payload["multiple_securities"] is True
     assert degraded.payload["loss_count"] == 2
+
+
+def test_different_provider_capability_and_epoch_emit_independent_controls() -> None:
+    """验证跨 provider、capability 或 epoch 的损失分别发布真实身份。
+
+    Args:
+        无。
+
+    Returns:
+        None。
+
+    Side Effects:
+        在容量一的本地队列上产生四个控制 scope 并一次 drain。
+    """
+    queue = BoundedMarketEventQueue(capacity=1, control_scope_capacity=4)
+    queue.put_nowait(_transaction(1))
+    losses = (
+        _loss_sensitive_l2_event(
+            MarketEventType.TRANSACTION,
+            2,
+            session_epoch="epoch-1",
+            stream_id="transaction-stream",
+        ),
+        _loss_sensitive_l2_event(
+            MarketEventType.ORDER_DETAIL,
+            3,
+            session_epoch="epoch-1",
+            stream_id="order-detail-stream",
+        ),
+        _loss_sensitive_l2_event(
+            MarketEventType.TRANSACTION,
+            4,
+            session_epoch="epoch-2",
+            stream_id="transaction-stream",
+        ),
+        _transaction(
+            5,
+            provider="secondary",
+            session_epoch="epoch-1",
+            stream_id="transaction-stream",
+        ),
+    )
+    for event in losses:
+        assert queue.put_nowait(event).outcome is QueuePutOutcome.OVERFLOW
+
+    controls = queue.drain_control()
+    gaps = controls[::2]
+    degraded_events = controls[1::2]
+    expected_identities = tuple(
+        (
+            event.provider,
+            event.capability_key,
+            event.session_epoch,
+            event.stream_id,
+            event.channel_id,
+        )
+        for event in losses
+    )
+    gap_identities = tuple(
+        (
+            event.provider,
+            event.capability_key,
+            event.session_epoch,
+            event.stream_id,
+            event.channel_id,
+        )
+        for event in gaps
+    )
+    degraded_identities = tuple(
+        (
+            event.provider,
+            event.capability_key,
+            event.session_epoch,
+            event.stream_id,
+            event.channel_id,
+        )
+        for event in degraded_events
+    )
+
+    assert len(controls) == 8
+    assert gap_identities == expected_identities
+    assert degraded_identities == expected_identities
+    assert all(event.exchange == "XSHG" for event in controls)
+    assert all(event.payload["multiple_scopes"] is False for event in controls)
+    assert queue.metrics().control_scope_depth == 0
+
+
+def test_control_scope_capacity_exhaustion_fails_closed() -> None:
+    """验证队外 scope 容量耗尽时明确抛错，不把新 epoch 损失静默并入旧事件。
+
+    Args:
+        无。
+
+    Returns:
+        None。
+
+    Side Effects:
+        使本地控制路径达到配置上限并读取累计指标。
+    """
+    queue = BoundedMarketEventQueue(capacity=1, control_scope_capacity=1)
+    queue.put_nowait(_transaction(1))
+    assert queue.put_nowait(_transaction(2, session_epoch="epoch-1")).accepted is False
+
+    with pytest.raises(MarketEventControlCapacityError) as exc_info:
+        queue.put_nowait(_transaction(3, session_epoch="epoch-2"))
+
+    metrics = queue.metrics()
+    assert exc_info.value.control_scope_capacity == 1
+    assert exc_info.value.scope_key[3] == "epoch-2"
+    assert metrics.overflow_count == 2
+    assert metrics.control_overflow_count == 1
+    assert metrics.control_scope_depth == 1
+    assert metrics.control_depth == 2
+    assert tuple(event.session_epoch for event in queue.drain_control()) == (
+        "epoch-1",
+        "epoch-1",
+    )
+
+
+def test_queue_controls_keep_identity_shape_accepted_by_feed_gate() -> None:
+    """验证队列生成的 gap/degraded 保留当前 Feed 可接收的完整身份。
+
+    Args:
+        无。
+
+    Returns:
+        None。
+
+    Side Effects:
+        连接无 SDK Mock Feed，将本地队列控制事件投递到内存 callback。
+    """
+    capability_id = "realtime.stream.transaction"
+    manifest = CapabilityManifest(
+        provider="mock",
+        manifest_version="queue-control-v1",
+        location=ProviderLocation.LOCAL,
+        capabilities={
+            capability_id: CapabilityDeclaration(
+                capability_id=capability_id,
+                semantic_class=capability_id,
+                support=CapabilitySupport.SUPPORTED,
+                readiness=CapabilityReadiness.UNAVAILABLE,
+                markets=("XSHG",),
+                asset_types=("stock",),
+                continuous=True,
+            )
+        },
+    )
+    feed = MockRealtimeMarketDataFeed(
+        manifest,
+        negotiated_event_types=(MarketEventType.TRANSACTION,),
+    )
+    feed.connect()
+    session_epoch = feed.health().session_epoch
+    assert session_epoch is not None
+
+    queue = BoundedMarketEventQueue(capacity=1)
+    queue.put_nowait(_transaction(1, session_epoch=session_epoch))
+    queue.put_nowait(
+        _transaction(
+            2,
+            session_epoch=session_epoch,
+            stream_id="feed-stream",
+            channel_id="feed-channel",
+        )
+    )
+    controls = queue.drain_control()
+    delivered: List[MarketEvent] = []
+    feed.set_market_event_callback(delivered.append)
+
+    for control in controls:
+        assert control.session_epoch == session_epoch
+        assert control.capability_key == capability_id
+        assert control.stream_id == "feed-stream"
+        assert control.channel_id == "feed-channel"
+        assert feed.publish_event(control) is True
+
+    assert tuple(event.event_type for event in delivered) == (
+        MarketEventType.STREAM_GAP,
+        MarketEventType.STREAM_STATUS,
+    )
+    assert tuple(
+        (
+            event.provider,
+            event.capability_key,
+            event.level,
+            event.session_epoch,
+            event.stream_id,
+            event.channel_id,
+        )
+        for event in delivered
+    ) == tuple(
+        (
+            event.provider,
+            event.capability_key,
+            event.level,
+            event.session_epoch,
+            event.stream_id,
+            event.channel_id,
+        )
+        for event in controls
+    )
 
 
 def test_drain_does_not_fabricate_continuity_recovery() -> None:
@@ -544,6 +782,10 @@ def test_capacity_and_drain_limits_fail_closed() -> None:
     """
     with pytest.raises(ValueError, match="capacity"):
         BoundedMarketEventQueue(capacity=0)
+    with pytest.raises(ValueError, match="control_scope_capacity"):
+        BoundedMarketEventQueue(capacity=1, control_scope_capacity=0)
+    with pytest.raises(ValueError, match="control_scope_capacity"):
+        BoundedMarketEventQueue(capacity=1, control_scope_capacity=True)
 
     queue = BoundedMarketEventQueue(capacity=1)
     with pytest.raises(ValueError, match="max_items"):

@@ -7,7 +7,8 @@
 上游关系: 由 realtime feed、native bridge drain 线程或远程 market-data writer 投递事件。
 下游关系: 供 EventBus、网络 writer、health 与完整 L2 门禁消费数据和 gap/degraded 控制事件。
 关键配置约定: 普通数据按事件数硬限界；仅 L1/L2 快照和 IOPV 可按
-Provider/epoch/stream/channel/证券/事件类型合并；控制路径固定为队外聚合槽且不自动恢复连续性。
+Provider/epoch/stream/channel/证券/事件类型合并；控制路径按真实通道 scope
+有界聚合，超出容量立即 fail closed，且不自动恢复连续性。
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from datetime import datetime
 from enum import Enum
 from threading import RLock
 from types import MappingProxyType
-from typing import Any, Callable, Dict, Mapping, Optional, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Tuple
 
 from .models import (
     ConnectionStateEvent,
@@ -40,6 +41,34 @@ class QueuePutOutcome(str, Enum):
     ENQUEUED = "enqueued"
     COALESCED = "coalesced"
     OVERFLOW = "overflow"
+
+
+class MarketEventControlCapacityError(RuntimeError):
+    """表示新的连续性 scope 无法进入已满的队外控制路径。
+
+    与 ``BoundedMarketEventQueue`` 协作，在普通数据已丢失且无法为新 scope
+    保留 gap/degraded 槽时立即中止上游快速路径；异常不含业务 payload 或凭据。
+    """
+
+    def __init__(self, scope_key: Tuple[Any, ...], control_scope_capacity: int) -> None:
+        """保存被拒绝的脱敏 scope 和配置容量。
+
+        Args:
+            scope_key: Provider、能力、级别、epoch、stream、channel 和市场组成的键。
+            control_scope_capacity: 队外控制路径可同时保留的 scope 数。
+
+        Returns:
+            None。
+
+        Side Effects:
+            初始化异常消息与可诊断属性；不修改队列。
+        """
+        self.scope_key = scope_key
+        self.control_scope_capacity = control_scope_capacity
+        super().__init__(
+            "MARKET_EVENT_CONTROL_CAPACITY_EXHAUSTED: "
+            f"scope={scope_key!r}, capacity={control_scope_capacity}"
+        )
 
 
 @dataclass(frozen=True)
@@ -76,6 +105,9 @@ class MarketEventQueueMetrics:
     overflow_count: int
     loss_boundary_count: int
     control_emitted_count: int
+    control_scope_capacity: int
+    control_scope_depth: int
+    control_overflow_count: int
     degraded: bool
     overflow_by_event_type: Mapping[str, int]
 
@@ -161,6 +193,9 @@ class _LossPoint:
         Side Effects:
             无；只复制事件的身份、通道、时间与原始序列引用。
         """
+        source_sequence = event.source_sequence
+        if not isinstance(source_sequence, SourceSequence):
+            source_sequence = SourceSequence(components=source_sequence)
         return cls(
             provider=event.provider,
             capability_key=event.capability_key,
@@ -172,7 +207,7 @@ class _LossPoint:
             session_epoch=event.session_epoch,
             stream_id=event.stream_id,
             channel_id=event.channel_id,
-            source_sequence=event.source_sequence,
+            source_sequence=source_sequence,
             gateway_received_at=event.gateway_received_at,
             queue_loss_index=queue_loss_index,
         )
@@ -185,7 +220,7 @@ class _LossPoint:
             无。
 
         Returns:
-            Tuple[Any, ...]: Provider、能力、级别、市场、epoch、stream、channel 和证券。
+            Tuple[Any, ...]: Provider、能力、级别、epoch、stream、channel 和市场。
 
         Side Effects:
             无。
@@ -193,12 +228,11 @@ class _LossPoint:
         return (
             self.provider,
             self.capability_key,
-            self.level,
-            self.exchange,
+            self.level.value,
             self.session_epoch,
             self.stream_id,
             self.channel_id,
-            self.security,
+            self.exchange,
         )
 
     def as_payload(self) -> Mapping[str, Any]:
@@ -237,7 +271,7 @@ class _LossAccumulator:
     """在固定控制槽内聚合尚未送达的首末损失边界。
 
     由有界队列在锁内维护并最终转换为 gap/degraded 控制事件；关键状态仅保存首末损失点、
-    计数、事件类型统计和多作用域标志，不保存全部丢失事件。
+    计数、事件类型统计和多证券标志，不保存全部丢失事件。
     """
 
     first: _LossPoint
@@ -246,8 +280,8 @@ class _LossAccumulator:
     first_gap: Optional[_LossPoint]
     last_gap: Optional[_LossPoint]
     gap_loss_count: int
-    multiple_scopes: bool
-    multiple_gap_scopes: bool
+    multiple_securities: bool
+    multiple_gap_securities: bool
     event_type_counts: Dict[str, int]
 
     @classmethod
@@ -271,8 +305,8 @@ class _LossAccumulator:
             first_gap=gap_point,
             last_gap=gap_point,
             gap_loss_count=1 if gap_point is not None else 0,
-            multiple_scopes=False,
-            multiple_gap_scopes=False,
+            multiple_securities=False,
+            multiple_gap_securities=False,
             event_type_counts={point.event_type.value: 1},
         )
 
@@ -286,10 +320,15 @@ class _LossAccumulator:
             None。
 
         Side Effects:
-            更新末端、累计计数、事件类型计数和多作用域标记；不保存中间事件。
+            更新末端、累计计数、事件类型计数和多证券标记；不保存中间事件。
         """
         if point.scope_key != self.first.scope_key:
-            self.multiple_scopes = True
+            raise ValueError("loss point 不属于当前控制 scope")
+        if (point.security, point.raw_security_code) != (
+            self.first.security,
+            self.first.raw_security_code,
+        ):
+            self.multiple_securities = True
         self.last = point
         self.loss_count += 1
         event_type = point.event_type.value
@@ -298,8 +337,11 @@ class _LossAccumulator:
             return
         if self.first_gap is None:
             self.first_gap = point
-        elif point.scope_key != self.first_gap.scope_key:
-            self.multiple_gap_scopes = True
+        elif (point.security, point.raw_security_code) != (
+            self.first_gap.security,
+            self.first_gap.raw_security_code,
+        ):
+            self.multiple_gap_securities = True
         self.last_gap = point
         self.gap_loss_count += 1
 
@@ -325,40 +367,52 @@ class BoundedMarketEventQueue:
     """管理普通行情容量、快照合并和队外 gap/degraded 控制边界。
 
     上游 feed 或 native bridge 调用非阻塞入队，下游 EventBus、writer 与 health 消费 drain
-    批次和指标；关键状态包括受 ``RLock`` 保护的数据区、固定大小损失聚合器、累计指标及
+    批次和指标；关键状态包括受 ``RLock`` 保护的数据区、有界 per-scope 损失聚合器、累计指标及
     只会从正常转为降级的连续性标志。
     """
 
-    CONTROL_CAPACITY = 2
+    CONTROL_EVENTS_PER_SCOPE = 2
 
     def __init__(
         self,
         capacity: int,
         now_provider: Optional[Callable[[], datetime]] = None,
+        control_scope_capacity: Optional[int] = None,
     ) -> None:
         """创建空的线程安全有界行情队列。
 
         Args:
             capacity: 普通数据区最多保存的事件数量，必须为正整数。
             now_provider: 控制事件缺少来源时间时使用的时钟；默认 ``datetime.now``。
+            control_scope_capacity: 队外路径可同时保留的连续性 scope 数；
+                默认与普通数据容量相同。
 
         Returns:
             None。
 
         Raises:
-            ValueError: capacity 不是正整数时抛出。
+            ValueError: capacity 或 control_scope_capacity 不是正整数时抛出。
 
         Side Effects:
             创建进程内锁、空数据区和累计指标；不启动线程、不联网也不执行交易。
         """
         if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
             raise ValueError("capacity 必须是正整数")
+        if control_scope_capacity is None:
+            control_scope_capacity = capacity
+        if (
+            isinstance(control_scope_capacity, bool)
+            or not isinstance(control_scope_capacity, int)
+            or control_scope_capacity <= 0
+        ):
+            raise ValueError("control_scope_capacity 必须是正整数")
         self._capacity = capacity
+        self._control_scope_capacity = control_scope_capacity
         self._now = now_provider or datetime.now
         self._lock = RLock()
         self._data: "OrderedDict[Tuple[Any, ...], MarketEvent]" = OrderedDict()
         self._serial = 0
-        self._pending_loss: Optional[_LossAccumulator] = None
+        self._pending_losses: "OrderedDict[Tuple[Any, ...], _LossAccumulator]" = OrderedDict()
         self._high_watermark = 0
         self._enqueued_count = 0
         self._drained_count = 0
@@ -366,6 +420,7 @@ class BoundedMarketEventQueue:
         self._overflow_count = 0
         self._loss_boundary_count = 0
         self._control_emitted_count = 0
+        self._control_overflow_count = 0
         self._degraded = False
         self._overflow_by_event_type: Dict[str, int] = {}
 
@@ -386,18 +441,18 @@ class BoundedMarketEventQueue:
 
     @property
     def control_capacity(self) -> int:
-        """返回队外控制路径的固定逻辑槽数。
+        """返回队外控制路径的最大逻辑事件槽数。
 
         Args:
             无。
 
         Returns:
-            int: 最多一个 gap 和一个 degraded 状态事件，共两个槽。
+            int: 每个 scope 最多一个 gap 和一个 degraded 事件的总上限。
 
         Side Effects:
             无。
         """
-        return self.CONTROL_CAPACITY
+        return self._control_scope_capacity * self.CONTROL_EVENTS_PER_SCOPE
 
     def __len__(self) -> int:
         """返回当前普通数据事件数量。
@@ -521,7 +576,7 @@ class BoundedMarketEventQueue:
         with self._lock:
             return MarketEventQueueMetrics(
                 capacity=self._capacity,
-                control_capacity=self.CONTROL_CAPACITY,
+                control_capacity=self.control_capacity,
                 data_depth=len(self._data),
                 control_depth=self._control_depth_locked(),
                 high_watermark=self._high_watermark,
@@ -531,6 +586,9 @@ class BoundedMarketEventQueue:
                 overflow_count=self._overflow_count,
                 loss_boundary_count=self._loss_boundary_count,
                 control_emitted_count=self._control_emitted_count,
+                control_scope_capacity=self._control_scope_capacity,
+                control_scope_depth=len(self._pending_losses),
+                control_overflow_count=self._control_overflow_count,
                 degraded=self._degraded,
                 overflow_by_event_type=self._overflow_by_event_type,
             )
@@ -577,7 +635,8 @@ class BoundedMarketEventQueue:
             None。
 
         Side Effects:
-            增加 overflow、事件类型计数并永久标记 degraded；仅保留当前窗口首末损失点。
+            增加 overflow、事件类型计数并永久标记 degraded；仅保留每个 scope
+            当前窗口的首末损失点。新 scope 超过队外容量时立即抛出受控异常。
         """
         self._overflow_count += 1
         self._degraded = True
@@ -586,32 +645,37 @@ class BoundedMarketEventQueue:
             self._overflow_by_event_type.get(event_type, 0) + 1
         )
         point = _LossPoint.from_event(event, self._overflow_count)
-        if self._pending_loss is None:
-            self._pending_loss = _LossAccumulator.start(point)
+        accumulator = self._pending_losses.get(point.scope_key)
+        if accumulator is None:
+            if len(self._pending_losses) >= self._control_scope_capacity:
+                self._control_overflow_count += 1
+                raise MarketEventControlCapacityError(point.scope_key, self._control_scope_capacity)
+            self._pending_losses[point.scope_key] = _LossAccumulator.start(point)
             self._loss_boundary_count += 1
         else:
-            self._pending_loss.add(point)
+            accumulator.add(point)
 
     def _drain_control_locked(self) -> Tuple[MarketEvent, ...]:
-        """在锁内把当前聚合边界转换成至多两个控制事件并清空窗口。
+        """在锁内把各 scope 聚合边界转换为独立控制事件并清空窗口。
 
         Args:
             无。
 
         Returns:
-            Tuple[MarketEvent, ...]: gap 在前、degraded 状态在后的控制事件。
+            Tuple[MarketEvent, ...]: 按 scope 首次损失顺序输出，每个 scope 的 gap
+            在 degraded 状态之前。
 
         Side Effects:
             清除当前 pending loss 并增加 control_emitted_count；不恢复 degraded。
         """
-        accumulator = self._pending_loss
-        if accumulator is None:
+        if not self._pending_losses:
             return ()
-        controls = []
-        if accumulator.first_gap is not None and accumulator.last_gap is not None:
-            controls.append(self._build_gap_event_locked(accumulator))
-        controls.append(self._build_degraded_event_locked(accumulator))
-        self._pending_loss = None
+        controls: List[MarketEvent] = []
+        for accumulator in self._pending_losses.values():
+            if accumulator.first_gap is not None and accumulator.last_gap is not None:
+                controls.append(self._build_gap_event_locked(accumulator))
+            controls.append(self._build_degraded_event_locked(accumulator))
+        self._pending_losses.clear()
         self._control_emitted_count += len(controls)
         return tuple(controls)
 
@@ -631,13 +695,14 @@ class BoundedMarketEventQueue:
         last = accumulator.last_gap
         if first is None or last is None:
             raise RuntimeError("gap accumulator 缺少 L1/L2 loss point")
-        multiple = accumulator.multiple_gap_scopes
         sequence = last.source_sequence
-        if multiple or not sequence:
+        if not sequence:
             sequence = SourceSequence(
                 components={"queue_loss_index": last.queue_loss_index},
                 ordering_scope="queue_arrival",
             )
+        security = None if accumulator.multiple_gap_securities else first.security
+        raw_security = None if accumulator.multiple_gap_securities else first.raw_security_code
         payload = {
             "state": "degraded",
             "reason": "queue_overflow",
@@ -646,7 +711,8 @@ class BoundedMarketEventQueue:
             "total_overflow_count": self._overflow_count,
             "first_lost": first.as_payload(),
             "last_lost": last.as_payload(),
-            "multiple_scopes": multiple,
+            "multiple_scopes": False,
+            "multiple_securities": accumulator.multiple_gap_securities,
             "queue_capacity": self._capacity,
             "queue_high_watermark": self._high_watermark,
         }
@@ -655,14 +721,14 @@ class BoundedMarketEventQueue:
             capability_key=first.capability_key,
             event_type=MarketEventType.STREAM_GAP,
             level=first.level,
-            exchange=first.exchange if not multiple else "MULTI",
-            session_epoch=first.session_epoch if not multiple else "multiple-epochs",
+            exchange=first.exchange,
+            session_epoch=first.session_epoch,
             payload=payload,
-            security=first.security if not multiple else None,
-            raw_security_code=first.raw_security_code if not multiple else None,
+            security=security,
+            raw_security_code=raw_security,
             gateway_received_at=last.gateway_received_at or self._now(),
-            stream_id=(first.stream_id or "queue-overflow") if not multiple else "multiple-streams",
-            channel_id=(first.channel_id or "market-data") if not multiple else "multiple-channels",
+            stream_id=first.stream_id,
+            channel_id=first.channel_id,
             source_sequence=sequence,
             raw_type="queue_overflow",
             completeness=False,
@@ -682,7 +748,8 @@ class BoundedMarketEventQueue:
         """
         first = accumulator.first
         last = accumulator.last
-        multiple = accumulator.multiple_scopes
+        security = None if accumulator.multiple_securities else first.security
+        raw_security = None if accumulator.multiple_securities else first.raw_security_code
         payload = {
             "state": "degraded",
             "reason": "queue_overflow",
@@ -691,7 +758,8 @@ class BoundedMarketEventQueue:
             "total_overflow_count": self._overflow_count,
             "first_lost": first.as_payload(),
             "last_lost": last.as_payload(),
-            "multiple_scopes": multiple,
+            "multiple_scopes": False,
+            "multiple_securities": accumulator.multiple_securities,
             "event_type_counts": dict(sorted(accumulator.event_type_counts.items())),
             "queue_capacity": self._capacity,
             "queue_high_watermark": self._high_watermark,
@@ -701,12 +769,14 @@ class BoundedMarketEventQueue:
             capability_key=first.capability_key,
             event_type=MarketEventType.STREAM_STATUS,
             level=first.level,
-            exchange=first.exchange if not multiple else "MULTI",
-            session_epoch=first.session_epoch if not multiple else "multiple-epochs",
+            exchange=first.exchange,
+            session_epoch=first.session_epoch,
             payload=payload,
+            security=security,
+            raw_security_code=raw_security,
             gateway_received_at=last.gateway_received_at or self._now(),
-            stream_id=(first.stream_id or "queue-overflow") if not multiple else "multiple-streams",
-            channel_id=(first.channel_id or "market-data") if not multiple else "multiple-channels",
+            stream_id=first.stream_id,
+            channel_id=first.channel_id,
             raw_type="queue_overflow",
             completeness=False,
         )
@@ -732,20 +802,21 @@ class BoundedMarketEventQueue:
         return tuple(drained)
 
     def _control_depth_locked(self) -> int:
-        """返回当前聚合窗口实际会生成的控制事件数量。
+        """返回当前全部 scope 窗口实际会生成的控制事件数量。
 
         Args:
             无。
 
         Returns:
-            int: 无损失为零，仅非逐笔损失为一，含逐笔损失为二。
+            int: 各 scope 的状态事件与可选 gap 事件数之和。
 
         Side Effects:
             无。
         """
-        if self._pending_loss is None:
-            return 0
-        return 2 if self._pending_loss.first_gap is not None else 1
+        return sum(
+            2 if accumulator.first_gap is not None else 1
+            for accumulator in self._pending_losses.values()
+        )
 
     def _result_locked(self, outcome: QueuePutOutcome, accepted: bool) -> QueuePutResult:
         """在同一锁时点构造入队结果。
@@ -792,6 +863,7 @@ class BoundedMarketEventQueue:
 
 __all__ = [
     "BoundedMarketEventQueue",
+    "MarketEventControlCapacityError",
     "MarketEventDrainBatch",
     "MarketEventQueueMetrics",
     "QueuePutOutcome",

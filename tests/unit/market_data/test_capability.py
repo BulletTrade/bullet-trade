@@ -9,6 +9,7 @@
 关键配置约定: 全部测试离线执行，不加载 SDK、网络或真实账户。
 """
 
+from threading import Event, Thread
 from typing import Any, Mapping, Optional
 
 import pytest
@@ -379,6 +380,237 @@ def test_route_decision_records_provider_and_request_scope_provenance() -> None:
     assert decision.request_frequency == "tick"
     assert decision.request_fields == ("bid_prices", "last_price")
     assert decision.request_require_continuity is True
+
+
+def test_dynamic_manifest_supplier_rechecks_readiness_without_runtime_fallback() -> None:
+    """
+    验证每次 resolve 都读取显式 supplier，primary 运行时失效后绝不切备用来源。
+
+    Returns:
+        None: 首次 ready、随后 stale 且两个 owner 均未执行时返回。
+    """
+    capability_id = "realtime.snapshot.l1"
+    current = {"manifest": _manifest("primary", {capability_id: _declaration(capability_id)})}
+    primary = _Owner()
+    fallback = _Owner()
+    router = DataSourceRouter()
+    router.register_provider(
+        current["manifest"],
+        primary,
+        manifest_supplier=lambda: current["manifest"],
+    )
+    router.register_provider(
+        _manifest("fallback", {capability_id: _declaration(capability_id)}),
+        fallback,
+    )
+    router.set_route(RouteRule(capability_id, "primary", ("fallback",)))
+
+    assert router.resolve(CapabilityRequest(capability_id)).provider == "primary"
+    current["manifest"] = current["manifest"].with_readiness(
+        capability_id,
+        CapabilityReadiness.STALE,
+        "stale_threshold_exceeded",
+    )
+
+    with pytest.raises(DataCapabilityNotReadyError) as exc_info:
+        router.resolve(CapabilityRequest(capability_id))
+    assert exc_info.value.provider == "primary"
+    assert exc_info.value.readiness is CapabilityReadiness.STALE
+    assert primary.calls == 0
+    assert fallback.calls == 0
+
+
+@pytest.mark.parametrize("failure", ["exception", "provider_mismatch"])
+def test_dynamic_manifest_supplier_failure_is_fail_closed(failure: str) -> None:
+    """
+    验证 supplier 异常或 Provider 身份漂移都形成路由错误而不是静态 fail-open。
+
+    Args:
+        failure: 需要模拟的 supplier 失败类型。
+
+    Returns:
+        None: 两类失败均抛出 DataCapabilityRouteError 时返回。
+    """
+    capability_id = "realtime.snapshot.l1"
+    registered = _manifest("primary", {capability_id: _declaration(capability_id)})
+
+    def supplier() -> CapabilityManifest:
+        """
+        按参数返回错误身份 manifest 或抛出测试异常。
+
+        Returns:
+            CapabilityManifest: provider_mismatch 分支返回错误身份清单。
+
+        Raises:
+            RuntimeError: exception 分支模拟运行态 health 获取失败。
+        """
+        if failure == "exception":
+            raise RuntimeError("health unavailable")
+        return _manifest("other", {capability_id: _declaration(capability_id)})
+
+    router = DataSourceRouter()
+    router.register_provider(registered, _Owner(), manifest_supplier=supplier)
+    router.set_route(RouteRule(capability_id, "primary"))
+
+    with pytest.raises(DataCapabilityRouteError):
+        router.resolve(CapabilityRequest(capability_id))
+
+
+def test_unused_fallback_supplier_is_not_called_when_primary_is_ready() -> None:
+    """
+    验证 primary 已就绪时不会调用无关 fallback 的动态 health supplier。
+
+    Returns:
+        None: fallback supplier 即使会失败也不影响 primary 决策时返回。
+    """
+    capability_id = "realtime.snapshot.l1"
+    router = DataSourceRouter()
+    primary_manifest = _manifest("primary", {capability_id: _declaration(capability_id)})
+    fallback_manifest = _manifest("fallback", {capability_id: _declaration(capability_id)})
+
+    def failing_supplier() -> CapabilityManifest:
+        """
+        模拟不应在 primary ready 路径调用的 fallback health。
+
+        Returns:
+            CapabilityManifest: 本测试不会正常返回。
+
+        Raises:
+            RuntimeError: 一旦被错误调用就抛出。
+        """
+        raise RuntimeError("unused fallback unavailable")
+
+    router.register_provider(primary_manifest, _Owner())
+    router.register_provider(
+        fallback_manifest,
+        _Owner(),
+        manifest_supplier=failing_supplier,
+    )
+    router.set_route(RouteRule(capability_id, "primary", ("fallback",)))
+
+    assert router.resolve(CapabilityRequest(capability_id)).provider == "primary"
+
+
+def test_dynamic_supplier_cannot_turn_static_support_into_runtime_fallback() -> None:
+    """
+    验证 supplier 只能更新 readiness，不能把 supported 改成 unsupported 触发换源。
+
+    Returns:
+        None: 静态 support 漂移形成 RouteError 且 fallback 未执行时返回。
+    """
+    capability_id = "realtime.snapshot.l1"
+    primary_manifest = _manifest("primary", {capability_id: _declaration(capability_id)})
+    drifted_manifest = _manifest(
+        "primary",
+        {
+            capability_id: _declaration(
+                capability_id,
+                support=CapabilitySupport.UNSUPPORTED,
+                readiness=CapabilityReadiness.UNAVAILABLE,
+            )
+        },
+    )
+    fallback = _Owner()
+    router = DataSourceRouter()
+    router.register_provider(
+        primary_manifest,
+        _Owner(),
+        manifest_supplier=lambda: drifted_manifest,
+    )
+    router.register_provider(
+        _manifest("fallback", {capability_id: _declaration(capability_id)}),
+        fallback,
+    )
+    router.set_route(RouteRule(capability_id, "primary", ("fallback",)))
+
+    with pytest.raises(DataCapabilityRouteError, match="静态能力合同"):
+        router.resolve(CapabilityRequest(capability_id))
+    assert fallback.calls == 0
+
+
+def test_dynamic_supplier_cannot_promote_static_unsupported_capability() -> None:
+    """
+    验证 supplier 不能把静态 unsupported 反向提升为 supported/ready。
+
+    Returns:
+        None: 对称 support 漂移统一形成受控 RouteError 时返回。
+    """
+    capability_id = "realtime.snapshot.l1"
+    static_manifest = _manifest(
+        "primary",
+        {
+            capability_id: _declaration(
+                capability_id,
+                support=CapabilitySupport.UNSUPPORTED,
+                readiness=CapabilityReadiness.UNAVAILABLE,
+            )
+        },
+    )
+    dynamic_manifest = _manifest(
+        "primary",
+        {capability_id: _declaration(capability_id)},
+    )
+    router = DataSourceRouter()
+    router.register_provider(
+        static_manifest,
+        _Owner(),
+        manifest_supplier=lambda: dynamic_manifest,
+    )
+    router.set_route(RouteRule(capability_id, "primary"))
+
+    with pytest.raises(DataCapabilityRouteError, match="静态能力合同"):
+        router.resolve(CapabilityRequest(capability_id))
+
+
+def test_dynamic_manifest_supplier_runs_outside_router_global_lock() -> None:
+    """
+    验证慢 supplier 不持有 Router 全局锁，允许并行原子更新 manifest。
+
+    Returns:
+        None: updater 在 supplier 返回前完成且 resolve 正常固定来源时返回。
+    """
+    capability_id = "realtime.snapshot.l1"
+    manifest = _manifest("primary", {capability_id: _declaration(capability_id)})
+    supplier_entered = Event()
+    manifest_updated = Event()
+    router = DataSourceRouter()
+
+    def supplier() -> CapabilityManifest:
+        """
+        等待另一线程完成 Router 更新后返回动态快照。
+
+        Returns:
+            CapabilityManifest: 与注册静态合同一致的 manifest。
+
+        Raises:
+            RuntimeError: Router 锁错误覆盖 supplier 调用时超时抛出。
+        """
+        supplier_entered.set()
+        if not manifest_updated.wait(1):
+            raise RuntimeError("router lock held during supplier")
+        return manifest
+
+    def update_manifest() -> None:
+        """
+        在 supplier 已开始后尝试获取 Router 锁并更新 manifest。
+
+        Returns:
+            None: 更新完成并释放等待者后返回。
+        """
+        assert supplier_entered.wait(1)
+        router.update_manifest(manifest)
+        manifest_updated.set()
+
+    router.register_provider(manifest, _Owner(), manifest_supplier=supplier)
+    router.set_route(RouteRule(capability_id, "primary"))
+    updater = Thread(target=update_manifest)
+    updater.start()
+
+    decision = router.resolve(CapabilityRequest(capability_id))
+    updater.join(2)
+
+    assert updater.is_alive() is False
+    assert decision.provider == "primary"
 
 
 def test_market_and_asset_scope_selects_the_only_matching_owner() -> None:

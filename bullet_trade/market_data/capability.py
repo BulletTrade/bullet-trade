@@ -11,11 +11,11 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from enum import Enum
 from threading import RLock
 from types import MappingProxyType
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 _REQUEST_MODES = frozenset({"live", "backtest", "replay"})
 _REQUEST_TIME_DOMAINS = frozenset({"realtime", "historical", "as_of", "current"})
@@ -475,6 +475,9 @@ class CapabilityManifest:
         return replace(self, capabilities=capabilities)
 
 
+ManifestSupplier = Callable[[], CapabilityManifest]
+
+
 @dataclass(frozen=True)
 class RouteRule:
     """定义一个原子能力的唯一 primary 和显式有序 fallback。"""
@@ -671,11 +674,16 @@ class DataSourceRouter:
         Router 初始不含 Provider 或规则；调用方必须先注册 manifest/owner 并设置显式路由。
         """
         self._lock = RLock()
-        self._providers: Dict[str, Tuple[CapabilityManifest, Any]] = {}
+        self._providers: Dict[str, Tuple[CapabilityManifest, Any, Optional[ManifestSupplier]]] = {}
         self._routes: Dict[str, RouteRule] = {}
 
     def register_provider(
-        self, manifest: CapabilityManifest, owner: Any, replace_existing: bool = False
+        self,
+        manifest: CapabilityManifest,
+        owner: Any,
+        replace_existing: bool = False,
+        *,
+        manifest_supplier: Optional[ManifestSupplier] = None,
     ) -> None:
         """
         注册 Provider 能力清单和实际调用对象。
@@ -684,6 +692,7 @@ class DataSourceRouter:
             manifest: Provider 的版本化能力清单。
             owner: RouteDecision 固定后实际接收方法调用的对象。
             replace_existing: 是否允许替换同名 Provider。
+            manifest_supplier: 可选的显式动态 manifest 来源；每次 resolve 前调用，禁止从 owner 猜测。
 
         Raises:
             DataCapabilityRouteError: Provider 已存在且未允许替换时抛出。
@@ -691,7 +700,9 @@ class DataSourceRouter:
         with self._lock:
             if manifest.provider in self._providers and not replace_existing:
                 raise DataCapabilityRouteError(f"Provider 已注册: {manifest.provider}")
-            self._providers[manifest.provider] = (manifest, owner)
+            if manifest_supplier is not None and not callable(manifest_supplier):
+                raise TypeError("manifest_supplier 必须可调用")
+            self._providers[manifest.provider] = (manifest, owner, manifest_supplier)
 
     def update_manifest(self, manifest: CapabilityManifest) -> None:
         """
@@ -707,7 +718,75 @@ class DataSourceRouter:
             registration = self._providers.get(manifest.provider)
             if registration is None:
                 raise DataCapabilityRouteError(f"Provider 尚未注册: {manifest.provider}")
-            self._providers[manifest.provider] = (manifest, registration[1])
+            self._providers[manifest.provider] = (
+                manifest,
+                registration[1],
+                registration[2],
+            )
+
+    @staticmethod
+    def _current_manifest(
+        provider: str,
+        registration: Tuple[CapabilityManifest, Any, Optional[ManifestSupplier]],
+    ) -> CapabilityManifest:
+        """
+        读取显式 supplier 的最新 manifest，并验证 Provider 身份不漂移。
+
+        Args:
+            provider: 路由规则引用的已注册 Provider 名称。
+            registration: 静态 manifest、owner 与可选 supplier 的注册元组。
+
+        Returns:
+            CapabilityManifest: 当前 resolve 使用的不可变运行态快照。
+
+        Raises:
+            DataCapabilityRouteError: supplier 抛错、返回错误类型或 Provider 身份不匹配时抛出。
+
+        Side Effects:
+            只有显式提供 supplier 时调用它；绝不通过 ``hasattr`` 猜测 owner 能力。
+        """
+        static_manifest, _owner, supplier = registration
+        if supplier is None:
+            return static_manifest
+        try:
+            manifest = supplier()
+        except Exception as exc:
+            raise DataCapabilityRouteError(
+                "动态 manifest 获取失败: " f"provider={provider}, cause={type(exc).__name__}"
+            ) from exc
+        if not isinstance(manifest, CapabilityManifest):
+            raise DataCapabilityRouteError(f"动态 manifest 类型错误: provider={provider}")
+        if manifest.provider != provider:
+            raise DataCapabilityRouteError(
+                "动态 manifest Provider 身份不匹配: " f"expected={provider}, actual={manifest.provider}"
+            )
+        if (
+            manifest.manifest_version,
+            manifest.location,
+            manifest.provider_version,
+            manifest.build_id,
+        ) != (
+            static_manifest.manifest_version,
+            static_manifest.location,
+            static_manifest.provider_version,
+            static_manifest.build_id,
+        ):
+            raise DataCapabilityRouteError(f"动态 manifest 顶层来源证明漂移: provider={provider}")
+        if set(manifest.capabilities) != set(static_manifest.capabilities):
+            raise DataCapabilityRouteError(f"动态 manifest capability 集合漂移: provider={provider}")
+        dynamic_fields = {"readiness", "reason"}
+        for capability_id, static_declaration in static_manifest.capabilities.items():
+            dynamic_declaration = manifest.capabilities[capability_id]
+            static_contract_matches = all(
+                getattr(dynamic_declaration, item.name) == getattr(static_declaration, item.name)
+                for item in fields(CapabilityDeclaration)
+                if item.name not in dynamic_fields
+            )
+            if not static_contract_matches:
+                raise DataCapabilityRouteError(
+                    "动态 manifest 修改了静态能力合同: " f"provider={provider}, capability_id={capability_id}"
+                )
+        return manifest
 
     def set_route(self, rule: RouteRule) -> None:
         """
@@ -761,6 +840,9 @@ class DataSourceRouter:
             if rule is None:
                 raise DataCapabilityUnavailableError(request.capability_id, "route_not_configured")
             providers = (rule.primary,) + rule.fallbacks
+            registrations: Dict[
+                str, Tuple[CapabilityManifest, Any, Optional[ManifestSupplier]]
+            ] = {}
             primary_registration = self._providers.get(rule.primary)
             if primary_registration is None:
                 raise DataCapabilityRouteError(f"路由引用未注册 Provider: {rule.primary}")
@@ -772,81 +854,84 @@ class DataSourceRouter:
                 )
             route_semantic_class = primary_declaration.semantic_class
             for provider in providers:
-                validation_registration = self._providers.get(provider)
-                if validation_registration is None:
-                    raise DataCapabilityRouteError(f"路由引用未注册 Provider: {provider}")
-                validation_declaration = validation_registration[0].get(request.capability_id)
-                if validation_declaration is None:
-                    raise DataCapabilityRouteError(
-                        f"Provider 未显式声明 capability: provider={provider}, "
-                        f"capability_id={request.capability_id}"
-                    )
-                if validation_declaration.semantic_class != route_semantic_class:
-                    raise DataCapabilityRouteError(
-                        "运行时 manifest 与路由 semantic class 不一致: "
-                        f"provider={provider}, declared={validation_declaration.semantic_class}, "
-                        f"route={route_semantic_class}"
-                    )
-            unsupported: List[str] = []
-            for provider in providers:
                 registration = self._providers.get(provider)
                 if registration is None:
                     raise DataCapabilityRouteError(f"路由引用未注册 Provider: {provider}")
-                manifest, _owner = registration
-                declaration = manifest.get(request.capability_id)
-                if declaration is None:
+                static_declaration = registration[0].get(request.capability_id)
+                if static_declaration is None:
                     raise DataCapabilityRouteError(
                         f"Provider 未显式声明 capability: provider={provider}, "
                         f"capability_id={request.capability_id}"
                     )
-                if request.semantic_class and request.semantic_class != declaration.semantic_class:
+                if static_declaration.semantic_class != route_semantic_class:
                     raise DataCapabilityRouteError(
-                        f"请求 semantic class 不一致: requested={request.semantic_class}, "
-                        f"declared={declaration.semantic_class}"
+                        "注册 manifest 与路由 semantic class 不一致: "
+                        f"provider={provider}, declared={static_declaration.semantic_class}, "
+                        f"route={route_semantic_class}"
                     )
-                matches, match_reason = declaration.matches(request)
-                if declaration.support is CapabilitySupport.UNSUPPORTED or not matches:
-                    unsupported.append(provider)
-                    continue
-                if declaration.readiness is not CapabilityReadiness.READY:
-                    raise DataCapabilityNotReadyError(
-                        capability_id=request.capability_id,
-                        provider=provider,
-                        readiness=declaration.readiness,
-                        reason=declaration.reason or match_reason,
-                    )
-                is_fallback = provider != rule.primary
-                return RouteDecision(
+                registrations[provider] = registration
+
+        unsupported: List[str] = []
+        for provider in providers:
+            manifest = self._current_manifest(provider, registrations[provider])
+            declaration = manifest.get(request.capability_id)
+            if declaration is None:
+                raise DataCapabilityRouteError(
+                    f"Provider 未显式声明 capability: provider={provider}, "
+                    f"capability_id={request.capability_id}"
+                )
+            if declaration.semantic_class != route_semantic_class:
+                raise DataCapabilityRouteError(
+                    "运行时 manifest 与路由 semantic class 不一致: "
+                    f"provider={provider}, declared={declaration.semantic_class}, "
+                    f"route={route_semantic_class}"
+                )
+            if request.semantic_class and request.semantic_class != declaration.semantic_class:
+                raise DataCapabilityRouteError(
+                    f"请求 semantic class 不一致: requested={request.semantic_class}, "
+                    f"declared={declaration.semantic_class}"
+                )
+            matches, match_reason = declaration.matches(request)
+            if declaration.support is CapabilitySupport.UNSUPPORTED or not matches:
+                unsupported.append(provider)
+                continue
+            if declaration.readiness is not CapabilityReadiness.READY:
+                raise DataCapabilityNotReadyError(
                     capability_id=request.capability_id,
                     provider=provider,
-                    location=manifest.location,
-                    semantic_class=declaration.semantic_class,
-                    manifest_version=manifest.manifest_version,
-                    rule_id=rule.rule_id,
-                    support=declaration.support,
                     readiness=declaration.readiness,
-                    reason=(
-                        "fallback_after_explicit_unsupported" if is_fallback else "primary_ready"
-                    ),
-                    fallback_from=tuple(unsupported),
-                    provider_version=manifest.provider_version,
-                    build_id=manifest.build_id,
-                    time_domain=str(declaration.time_domain),
-                    runtime_modes=declaration.runtime_modes,
-                    request_mode=request.mode,
-                    request_time_domain=str(request.time_domain),
-                    request_as_of=request.as_of,
-                    request_market=request.market,
-                    request_asset_type=request.asset_type,
-                    request_frequency=request.frequency,
-                    request_adjustment=request.adjustment,
-                    request_fields=request.fields,
-                    request_require_continuity=request.require_continuity,
+                    reason=declaration.reason or match_reason,
                 )
-            raise DataCapabilityUnavailableError(
-                request.capability_id,
-                f"all_candidates_explicitly_unsupported:{','.join(unsupported)}",
+            is_fallback = provider != rule.primary
+            return RouteDecision(
+                capability_id=request.capability_id,
+                provider=provider,
+                location=manifest.location,
+                semantic_class=declaration.semantic_class,
+                manifest_version=manifest.manifest_version,
+                rule_id=rule.rule_id,
+                support=declaration.support,
+                readiness=declaration.readiness,
+                reason=("fallback_after_explicit_unsupported" if is_fallback else "primary_ready"),
+                fallback_from=tuple(unsupported),
+                provider_version=manifest.provider_version,
+                build_id=manifest.build_id,
+                time_domain=str(declaration.time_domain),
+                runtime_modes=declaration.runtime_modes,
+                request_mode=request.mode,
+                request_time_domain=str(request.time_domain),
+                request_as_of=request.as_of,
+                request_market=request.market,
+                request_asset_type=request.asset_type,
+                request_frequency=request.frequency,
+                request_adjustment=request.adjustment,
+                request_fields=request.fields,
+                request_require_continuity=request.require_continuity,
             )
+        raise DataCapabilityUnavailableError(
+            request.capability_id,
+            f"all_candidates_explicitly_unsupported:{','.join(unsupported)}",
+        )
 
     def execute(
         self,
@@ -928,6 +1013,7 @@ __all__ = [
     "DataCapabilityRouteError",
     "DataCapabilityUnavailableError",
     "DataSourceRouter",
+    "ManifestSupplier",
     "ProviderLocation",
     "RouteDecision",
     "RouteRule",
