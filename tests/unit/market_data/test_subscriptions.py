@@ -1233,3 +1233,47 @@ def test_uncertain_timeout_reconcile_converges_all_intent_quadrants(
     assert final.planned_subscribe == final.planned_unsubscribe == frozenset()
     assert final.pending_subscribe == final.pending_unsubscribe == frozenset()
     assert final.uncertain_subscribe == final.uncertain_unsubscribe == frozenset()
+
+
+def test_late_uncertain_rejection_latches_vendor_failure_until_explicit_retry() -> None:
+    """
+    验证 ACK 超时后的迟到拒绝保留厂商错误、精确幂等且绝不自动重试。
+
+    Returns:
+        None: failure 门闩、重复结果校验和显式 retry 后的新动作断言通过后返回。
+    """
+    manager = SubscriptionLeaseManager("epoch-1")
+    scope = _scope("600000.XSHG")
+    _add_lease(manager, "session-a", "lease-a", (scope,))
+    action = _take_single(manager, AdapterSubscriptionOperation.SUBSCRIBE)
+    manager.mark_action_uncertain(action, code="ACK_TIMEOUT", reason="callback delayed")
+
+    rejected = manager.reject_uncertain_action(
+        action,
+        code="VENDOR_SCOPE_DENIED",
+        reason="permission denied",
+    )
+
+    assert rejected.uncertain_subscribe == frozenset()
+    assert rejected.sent == rejected.confirmed == frozenset()
+    assert rejected.failures[0].code == "VENDOR_SCOPE_DENIED"
+    assert rejected.failures[0].reason == "permission denied"
+    assert manager.take_actions() == ()
+    assert (
+        manager.reject_uncertain_action(
+            action,
+            code="VENDOR_SCOPE_DENIED",
+            reason="permission denied",
+        )
+        == rejected
+    )
+    with pytest.raises(SubscriptionTransitionError, match="COMPLETED_RESULT_MISMATCH"):
+        manager.reject_uncertain_action(
+            action,
+            code="VENDOR_OTHER_DENIAL",
+            reason="permission denied",
+        )
+
+    manager.retry_failed(AdapterSubscriptionOperation.SUBSCRIBE, scope)
+    retry = _take_single(manager, AdapterSubscriptionOperation.SUBSCRIBE)
+    assert retry.action_id != action.action_id

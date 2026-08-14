@@ -1034,6 +1034,66 @@ class SubscriptionLeaseManager:
             )
             return self.snapshot()
 
+    def reject_uncertain_action(
+        self,
+        action: AdapterSubscriptionAction,
+        code: str,
+        reason: Optional[str] = None,
+    ) -> SubscriptionLeaseSnapshot:
+        """
+        将 uncertain 动作的迟到明确拒绝落为失败门闩，而不是按未生效自动重试。
+
+        Args:
+            action: 已进入 uncertain 且与迟到 callback 完全一致的动作。
+            code: 厂商 callback 返回的稳定拒绝错误码。
+            reason: 可选脱敏厂商原因；精确重复必须保持一致。
+
+        Returns:
+            SubscriptionLeaseSnapshot: 保留 vendor 拒绝和失败门闩的状态快照。
+
+        Raises:
+            StaleSubscriptionActionError: action 属于旧 epoch 时抛出。
+            SubscriptionTransitionError: action 不在 uncertain、被伪造或重复结果冲突时抛出。
+
+        Notes:
+            明确 rejected 与查询证明 ``applied=False`` 语义不同：前者必须等待
+            上层显式 ``retry_failed``，不得因 desired 仍存在而自动生成新动作。
+        """
+        normalized_code = _normalize_identifier(code, "code")
+        normalized_reason = str(reason).strip() or None if reason is not None else None
+        with self._lock:
+            self._require_action_epoch(action)
+            completed = self._completed.get(action.action_id)
+            if completed is not None:
+                self._require_completed_match(
+                    action,
+                    completed,
+                    "rejected",
+                    code=normalized_code,
+                    reason=normalized_reason,
+                )
+                return self.snapshot()
+            uncertain = self._uncertain.get(action.action_id)
+            if uncertain is None or uncertain.action != action:
+                raise SubscriptionTransitionError("SUBSCRIPTION_ACTION_NOT_UNCERTAIN")
+            failure = AdapterSubscriptionFailure(
+                action=action,
+                code=normalized_code,
+                reason=normalized_reason,
+            )
+            self._uncertain.pop(action.action_id, None)
+            if action.operation is AdapterSubscriptionOperation.SUBSCRIBE:
+                self._sent.discard(action.scope)
+            self._failures[(action.operation, action.scope)] = failure
+            self._remember_completed(
+                action,
+                outcome="rejected",
+                code=failure.code,
+                reason=failure.reason,
+            )
+            self._purge_obsolete_subscribe_state()
+            return self.snapshot()
+
     def reconcile_action(
         self,
         action: AdapterSubscriptionAction,

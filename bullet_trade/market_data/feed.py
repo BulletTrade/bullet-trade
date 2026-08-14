@@ -16,7 +16,7 @@ from abc import ABC, abstractmethod
 from collections import OrderedDict
 from dataclasses import dataclass, replace
 from datetime import datetime
-from threading import RLock
+from threading import Condition, RLock
 from types import MappingProxyType
 from typing import AbstractSet, Any, Callable, Dict, Mapping, Optional, Sequence, Set, Tuple, Type
 
@@ -54,11 +54,18 @@ from .models import (
     SecurityStatusEvent,
     SequenceGapEvent,
     SubscriptionItemResult,
-    SubscriptionItemState,
     SubscriptionSelector,
+    SubscriptionState,
     TransactionEvent,
 )
 from .queue import BoundedMarketEventQueue
+from .subscription_receipts import FeedSubscriptionItemPlan, SubscriptionReceiptProjector
+from .subscription_runtime import (
+    InMemorySubscriptionActionAdapter,
+    SubscriptionActionAdapter,
+    SubscriptionActionCoordinator,
+)
+from .subscriptions import SubscriptionLeaseManager, SubscriptionLeaseSnapshot
 
 TickCallback = Callable[[Mapping[str, Any]], None]
 MarketEventCallback = Callable[[MarketEvent], None]
@@ -218,6 +225,29 @@ class SubscriptionConflictError(MarketDataFeedError):
 
 class SubscriptionNotFoundError(MarketDataFeedError):
     """表示退订目标不是当前或已取消的明确 subscription ID。"""
+
+
+class SubscriptionCapacityError(MarketDataFeedError):
+    """表示 Feed 的本地订阅墓碑或单请求逐项数量达到硬上限。"""
+
+
+def _normalize_positive_limit(value: int, field_name: str) -> int:
+    """
+    校验 Feed 本地订阅容量参数为非布尔正整数。
+
+    Args:
+        value: 待校验的容量值。
+        field_name: 用于稳定错误消息的参数名。
+
+    Returns:
+        int: 已校验的原始容量值。
+
+    Raises:
+        ValueError: value 不是非布尔正整数时抛出。
+    """
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{field_name} 必须为正数整数")
+    return value
 
 
 _EVENT_CAPABILITY: Mapping[MarketEventType, str] = MappingProxyType(
@@ -443,7 +473,7 @@ class RealtimeMarketDataFeed(ABC):
 
 
 class MockRealtimeMarketDataFeed(RealtimeMarketDataFeed):
-    """提供无网络、无 SDK 且立即确认订阅的线程安全合同测试 Feed。"""
+    """提供无网络、无 SDK 且可控确认订阅的线程安全合同测试 Feed。"""
 
     def __init__(
         self,
@@ -455,6 +485,10 @@ class MockRealtimeMarketDataFeed(RealtimeMarketDataFeed):
         update_expectation_policy: Optional[MarketUpdateExpectationPolicy] = None,
         monotonic_clock: Optional[MonotonicClock] = None,
         module_capabilities: Optional[Mapping[str, Sequence[str]]] = None,
+        subscription_adapter: Optional[SubscriptionActionAdapter] = None,
+        subscription_ack_timeout_seconds: float = 5.0,
+        max_subscription_records: int = 1024,
+        max_subscription_items_per_request: int = 4096,
     ) -> None:
         """
         初始化断开状态的 Mock Feed。
@@ -468,8 +502,13 @@ class MockRealtimeMarketDataFeed(RealtimeMarketDataFeed):
             update_expectation_policy: 显式交易时段/停牌 policy；未配置时读取 fail-closed。
             monotonic_clock: 记录 gateway 到达 age 的可注入单调时钟。
             module_capabilities: 可选模块到原子 capability ID 的显式归属。
+            subscription_adapter: 可选离线 adapter；默认使用同步 callback 确认的内存实现。
+            subscription_ack_timeout_seconds: 本地 accepted 后等待实际 callback 的正数秒数。
+            max_subscription_records: 当前 Feed session 可保留的请求、回执和墓碑硬上限。
+            max_subscription_items_per_request: 单请求展开的公开逐项状态硬上限。
         """
         self._lock = RLock()
+        self._subscription_condition = Condition(self._lock)
         self._delivery_lock = RLock()
         self._callback_dispatch_active = False
         self._static_manifest = manifest.with_supported_readiness(
@@ -542,7 +581,33 @@ class MockRealtimeMarketDataFeed(RealtimeMarketDataFeed):
         self._request_index: Dict[str, Tuple[str, str]] = {}
         self._specs: Dict[str, MarketSubscriptionSpec] = {}
         self._receipts: Dict[str, MarketSubscriptionReceipt] = {}
+        self._subscription_item_plans: Dict[str, Tuple[FeedSubscriptionItemPlan, ...]] = {}
         self._active_subscription_ids: Dict[str, None] = {}
+        self._subscription_request_inflight: Dict[str, str] = {}
+        self._subscription_unsubscribe_inflight: Set[str] = set()
+        self._subscription_retry_inflight: Set[str] = set()
+        self._subscription_session_closing = False
+        self._subscription_lifecycle_revision = 0
+        self._max_subscription_records = _normalize_positive_limit(
+            max_subscription_records,
+            "max_subscription_records",
+        )
+        self._max_subscription_items_per_request = _normalize_positive_limit(
+            max_subscription_items_per_request,
+            "max_subscription_items_per_request",
+        )
+        self._subscription_receipts = SubscriptionReceiptProjector(
+            self._subscription_failure,
+            self._subscription_event_markets,
+        )
+        runtime_adapter = subscription_adapter or InMemorySubscriptionActionAdapter()
+        subscription_manager = SubscriptionLeaseManager("mock-session-0")
+        self._subscription_coordinator = SubscriptionActionCoordinator(
+            subscription_manager,
+            runtime_adapter,
+            ack_timeout_seconds=subscription_ack_timeout_seconds,
+            state_callback=self._on_subscription_state_change,
+        )
         self._tick_callback: Optional[TickCallback] = None
         self._market_event_callback: Optional[MarketEventCallback] = None
         self._tick_cache: Dict[str, Mapping[str, Any]] = {}
@@ -585,12 +650,22 @@ class MockRealtimeMarketDataFeed(RealtimeMarketDataFeed):
                 self._event_evidence.clear()
                 self._seen_gap_boundaries.clear()
                 self._freshness.reset()
-                for subscription_id in tuple(self._active_subscription_ids):
-                    receipt = self._receipts[subscription_id]
-                    self._receipts[subscription_id] = replace(
-                        receipt, session_epoch=self._session_epoch
-                    )
+                self._subscription_lifecycle_revision += 1
+                lifecycle_revision = self._subscription_lifecycle_revision
+                session_epoch = self._session_epoch
                 self._state_revision += 1
+            self._subscription_coordinator.begin_session_epoch(
+                session_epoch,
+                dispatch=False,
+            )
+            with self._lock:
+                dispatch_current = (
+                    self._connected
+                    and self._session_epoch == session_epoch
+                    and self._subscription_lifecycle_revision == lifecycle_revision
+                )
+            if dispatch_current:
+                self._subscription_coordinator.pump()
 
     def disconnect(self) -> None:
         """
@@ -606,10 +681,17 @@ class MockRealtimeMarketDataFeed(RealtimeMarketDataFeed):
                 if not self._connected:
                     return
                 self._connected = False
+                self._session_epoch = f"mock-disconnected-{self._epoch_counter}"
                 self._admission_manifest = self._static_manifest.with_supported_readiness(
                     CapabilityReadiness.UNAVAILABLE, "mock_disconnected"
                 )
+                self._subscription_lifecycle_revision += 1
+                session_epoch = self._session_epoch
                 self._state_revision += 1
+            self._subscription_coordinator.begin_session_epoch(
+                session_epoch,
+                dispatch=False,
+            )
 
     def health(self) -> FeedHealth:
         """
@@ -1052,7 +1134,7 @@ class MockRealtimeMarketDataFeed(RealtimeMarketDataFeed):
             bool: selector 覆盖该证券、市场或更宽控制 scope 时为 True。
         """
         if item.selector is SubscriptionSelector.ALL:
-            return True
+            return not exchange or item.scope in {"*", exchange}
         if item.selector is SubscriptionSelector.SYMBOLS:
             if security is not None:
                 return item.scope == security
@@ -1396,7 +1478,10 @@ class MockRealtimeMarketDataFeed(RealtimeMarketDataFeed):
             for item in receipt.confirmed:
                 if item.event_type is not event_type:
                     continue
-                if item.selector is SubscriptionSelector.ALL:
+                if item.selector is SubscriptionSelector.ALL and item.scope in {
+                    "*",
+                    exchange,
+                }:
                     return True
                 if item.selector is SubscriptionSelector.SYMBOLS and item.scope == security:
                     return True
@@ -1502,7 +1587,7 @@ class MockRealtimeMarketDataFeed(RealtimeMarketDataFeed):
 
     def subscribe(self, spec: MarketSubscriptionSpec) -> MarketSubscriptionReceipt:
         """
-        立即评估并确认或拒绝 Mock 订阅，保持 request_id + fingerprint 幂等。
+        评估 Mock 订阅并经通用 coordinator 等待实际 callback，保持请求幂等。
 
         Args:
             spec: 已规范化的部分、市场或全部范围订阅。
@@ -1515,7 +1600,20 @@ class MockRealtimeMarketDataFeed(RealtimeMarketDataFeed):
             SubscriptionConflictError: request_id 复用于不同 fingerprint 时抛出。
             RealtimeDataUnavailableError: 通配符没有任何获准实际事件时抛出。
         """
-        with self._lock:
+        if not isinstance(spec, MarketSubscriptionSpec):
+            raise ValueError("spec 必须为 MarketSubscriptionSpec")
+        with self._subscription_condition:
+            while self._subscription_session_closing:
+                self._subscription_condition.wait()
+            while spec.request_id in self._subscription_request_inflight:
+                inflight_fingerprint = self._subscription_request_inflight[spec.request_id]
+                if inflight_fingerprint != spec.fingerprint:
+                    raise SubscriptionConflictError(
+                        "SUBSCRIPTION_REQUEST_CONFLICT: "
+                        f"request_id={spec.request_id}, previous={inflight_fingerprint}, "
+                        f"current={spec.fingerprint}"
+                    )
+                self._subscription_condition.wait()
             self._require_connected()
             previous = self._request_index.get(spec.request_id)
             if previous is not None:
@@ -1527,41 +1625,28 @@ class MockRealtimeMarketDataFeed(RealtimeMarketDataFeed):
                         f"current={spec.fingerprint}"
                     )
                 return self._receipts[previous_subscription_id]
+            if len(self._request_index) >= self._max_subscription_records:
+                raise SubscriptionCapacityError("SUBSCRIPTION_RECORD_LIMIT")
             actual_event_types = self._expand_event_types(spec)
+            estimated_items = self._subscription_receipts.estimate_plan_count(
+                spec,
+                actual_event_types,
+            )
+            if estimated_items > self._max_subscription_items_per_request:
+                raise SubscriptionCapacityError("SUBSCRIPTION_ITEM_LIMIT")
             effective_symbols, effective_markets = self._effective_scope(spec, actual_event_types)
-            items = []
-            for scope in spec.scope_items():
-                for event_type in actual_event_types:
-                    failure = self._subscription_failure(spec, scope, event_type)
-                    if failure is None:
-                        item = SubscriptionItemResult(
-                            selector=spec.selector,
-                            scope=scope,
-                            level=spec.level,
-                            event_type=event_type,
-                            state=SubscriptionItemState.CONFIRMED,
-                        )
-                    else:
-                        code, reason = failure
-                        item = SubscriptionItemResult(
-                            selector=spec.selector,
-                            scope=scope,
-                            level=spec.level,
-                            event_type=event_type,
-                            state=SubscriptionItemState.REJECTED,
-                            code=code,
-                            reason=reason,
-                        )
-                    items.append(item)
+            plans = self._subscription_receipts.build_plans(spec, actual_event_types)
             token = hashlib.sha256(
                 f"{spec.request_id}:{spec.fingerprint}".encode("utf-8")
             ).hexdigest()[:20]
             subscription_id = f"mock-{token}"
+            initial_items = self._subscription_receipts.initial_items(plans)
+            session_epoch = self._require_session_epoch()
             receipt = MarketSubscriptionReceipt.from_items(
                 subscription_id=subscription_id,
                 spec=spec,
-                session_epoch=self._require_session_epoch(),
-                items=items,
+                session_epoch=session_epoch,
+                items=initial_items,
                 actual_event_types=actual_event_types,
                 effective_symbols=effective_symbols,
                 effective_markets=effective_markets,
@@ -1570,10 +1655,55 @@ class MockRealtimeMarketDataFeed(RealtimeMarketDataFeed):
             self._request_index[spec.request_id] = (spec.fingerprint, subscription_id)
             self._specs[subscription_id] = spec
             self._receipts[subscription_id] = receipt
+            self._subscription_item_plans[subscription_id] = plans
             if receipt.confirmed or receipt.pending:
                 self._active_subscription_ids[subscription_id] = None
+            adapter_scopes = self._subscription_receipts.unique_adapter_scopes(plans)
+            lifecycle_revision = self._subscription_lifecycle_revision
+            self._subscription_request_inflight[spec.request_id] = spec.fingerprint
             self._state_revision += 1
-            return receipt
+
+        registered = False
+        try:
+            if adapter_scopes:
+                with self._delivery_lock:
+                    self._subscription_coordinator.add_lease(
+                        session_id="mock-feed",
+                        subscription_id=subscription_id,
+                        request_id=spec.request_id,
+                        payload_fingerprint=spec.fingerprint,
+                        scopes=adapter_scopes,
+                        dispatch=False,
+                    )
+                    registered = True
+                    with self._lock:
+                        dispatch_current = (
+                            self._connected
+                            and self._session_epoch == session_epoch
+                            and self._subscription_lifecycle_revision == lifecycle_revision
+                        )
+                    if dispatch_current:
+                        self._subscription_coordinator.pump()
+                snapshot = self._subscription_coordinator.snapshot()
+                with self._lock:
+                    self._refresh_subscription_receipts_locked(snapshot)
+                    self._state_revision += 1
+            with self._lock:
+                return self._receipts[subscription_id]
+        except Exception:
+            if not registered:
+                with self._lock:
+                    self._request_index.pop(spec.request_id, None)
+                    self._specs.pop(subscription_id, None)
+                    self._receipts.pop(subscription_id, None)
+                    self._subscription_item_plans.pop(subscription_id, None)
+                    self._active_subscription_ids.pop(subscription_id, None)
+                    self._state_revision += 1
+            raise
+        finally:
+            with self._subscription_condition:
+                self._subscription_request_inflight.pop(spec.request_id, None)
+                self._subscription_condition.notify_all()
 
     def unsubscribe(self, subscription_id: str) -> MarketSubscriptionReceipt:
         """
@@ -1591,7 +1721,11 @@ class MockRealtimeMarketDataFeed(RealtimeMarketDataFeed):
         normalized_id = subscription_id.strip()
         if not normalized_id:
             raise ValueError("subscription_id 不能为空")
-        with self._lock:
+        with self._subscription_condition:
+            while self._subscription_session_closing:
+                self._subscription_condition.wait()
+            while normalized_id in self._subscription_unsubscribe_inflight:
+                self._subscription_condition.wait()
             receipt = self._receipts.get(normalized_id)
             if receipt is None:
                 raise SubscriptionNotFoundError(
@@ -1599,12 +1733,50 @@ class MockRealtimeMarketDataFeed(RealtimeMarketDataFeed):
                 )
             if normalized_id not in self._active_subscription_ids:
                 return receipt
-            canceled = receipt.as_canceled()
-            self._receipts[normalized_id] = canceled
+            self._subscription_unsubscribe_inflight.add(normalized_id)
             self._active_subscription_ids.pop(normalized_id, None)
-            self._purge_uncovered_snapshot_state_locked()
+            has_adapter_scopes = any(
+                plan.adapter_scopes for plan in self._subscription_item_plans[normalized_id]
+            )
+            session_epoch = self._session_epoch
+            lifecycle_revision = self._subscription_lifecycle_revision
             self._state_revision += 1
-            return canceled
+
+        removed = False
+        try:
+            if has_adapter_scopes:
+                with self._delivery_lock:
+                    self._subscription_coordinator.remove_lease(
+                        "mock-feed",
+                        normalized_id,
+                        dispatch=False,
+                    )
+                    removed = True
+                    with self._lock:
+                        dispatch_current = (
+                            self._connected
+                            and self._session_epoch == session_epoch
+                            and self._subscription_lifecycle_revision == lifecycle_revision
+                        )
+                    if dispatch_current:
+                        self._subscription_coordinator.pump()
+                snapshot = self._subscription_coordinator.snapshot()
+                with self._lock:
+                    self._refresh_subscription_receipts_locked(snapshot)
+            with self._lock:
+                self._purge_uncovered_snapshot_state_locked()
+                self._state_revision += 1
+                return self._receipts[normalized_id]
+        except Exception:
+            if has_adapter_scopes and not removed:
+                with self._lock:
+                    self._active_subscription_ids[normalized_id] = None
+                    self._state_revision += 1
+            raise
+        finally:
+            with self._subscription_condition:
+                self._subscription_unsubscribe_inflight.discard(normalized_id)
+                self._subscription_condition.notify_all()
 
     def unsubscribe_all(
         self,
@@ -1639,7 +1811,192 @@ class MockRealtimeMarketDataFeed(RealtimeMarketDataFeed):
                 ):
                     continue
                 selected.append(subscription_id)
-            return tuple(self.unsubscribe(subscription_id) for subscription_id in selected)
+        return tuple(self.unsubscribe(subscription_id) for subscription_id in selected)
+
+    def retry_failed(self, subscription_id: str) -> MarketSubscriptionReceipt:
+        """
+        显式重试一个订阅回执当前 epoch 内被 adapter 明确拒绝的动作。
+
+        Args:
+            subscription_id: 需要解除失败门闩并重试的明确订阅 ID。
+
+        Returns:
+            MarketSubscriptionReceipt: 重试调度和同步 fake callback 后的最新回执。
+
+        Raises:
+            FeedNotConnectedError: 当前 Feed 已断开或生命周期已改变时抛出。
+            SubscriptionNotFoundError: 订阅不存在或当前没有可重试失败时抛出。
+
+        Notes:
+            本入口只响应调用方显式动作；普通幂等 ``subscribe`` 不会清除失败门闩。
+            coordinator 与 adapter 调用均发生在 Feed ``_lock`` 外。
+        """
+        normalized_id = str(subscription_id).strip()
+        if not normalized_id:
+            raise ValueError("subscription_id 不能为空")
+        waited_for_retry = False
+        with self._subscription_condition:
+            while self._subscription_session_closing:
+                self._subscription_condition.wait()
+            while normalized_id in self._subscription_retry_inflight:
+                waited_for_retry = True
+                self._subscription_condition.wait()
+            receipt = self._receipts.get(normalized_id)
+            if receipt is None:
+                raise SubscriptionNotFoundError(
+                    f"SUBSCRIPTION_NOT_FOUND: subscription_id={normalized_id}"
+                )
+            if waited_for_retry and not receipt.rejected:
+                return receipt
+            self._require_connected()
+            plan_scopes = frozenset(
+                scope
+                for plan in self._subscription_item_plans[normalized_id]
+                for scope in plan.adapter_scopes
+            )
+            if not plan_scopes:
+                raise SubscriptionNotFoundError(
+                    f"SUBSCRIPTION_FAILURE_NOT_FOUND: subscription_id={normalized_id}"
+                )
+            session_epoch = self._require_session_epoch()
+            lifecycle_revision = self._subscription_lifecycle_revision
+            self._subscription_retry_inflight.add(normalized_id)
+
+        try:
+            with self._delivery_lock:
+                with self._lock:
+                    retry_current = (
+                        self._connected
+                        and self._session_epoch == session_epoch
+                        and self._subscription_lifecycle_revision == lifecycle_revision
+                    )
+                if not retry_current:
+                    raise FeedNotConnectedError("SUBSCRIPTION_RETRY_EPOCH_CHANGED")
+                snapshot = self._subscription_coordinator.snapshot()
+                failures = tuple(
+                    failure for failure in snapshot.failures if failure.action.scope in plan_scopes
+                )
+                if not failures:
+                    raise SubscriptionNotFoundError(
+                        f"SUBSCRIPTION_FAILURE_NOT_FOUND: subscription_id={normalized_id}"
+                    )
+                for failure in failures:
+                    self._subscription_coordinator.retry_failed(
+                        failure.action.operation,
+                        failure.action.scope,
+                        dispatch=False,
+                    )
+                self._subscription_coordinator.pump()
+            snapshot = self._subscription_coordinator.snapshot()
+            with self._lock:
+                self._refresh_subscription_receipts_locked(snapshot)
+                self._state_revision += 1
+                return self._receipts[normalized_id]
+        finally:
+            with self._subscription_condition:
+                self._subscription_retry_inflight.discard(normalized_id)
+                self._subscription_condition.notify_all()
+
+    def close_subscription_session(self) -> None:
+        """
+        永久关闭 Mock Feed 的逻辑订阅 session 并释放全部本地墓碑容量。
+
+        Returns:
+            None: request/spec/receipt/plan 墓碑和 active 索引均已清理后返回。
+
+        Notes:
+            该操作不同于 ``disconnect``：disconnect 保留 desired 供重连恢复；本方法
+            删除全部 desired，并在仍连接时通过同一 coordinator 安全退订当前 union。
+            已发送但结果未知的动作仍由状态机等待 callback/对账，不会被伪装为成功。
+        """
+        with self._subscription_condition:
+            while self._subscription_session_closing:
+                self._subscription_condition.wait()
+            self._subscription_session_closing = True
+            while (
+                self._subscription_request_inflight
+                or self._subscription_unsubscribe_inflight
+                or self._subscription_retry_inflight
+            ):
+                self._subscription_condition.wait()
+        try:
+            with self._delivery_lock:
+                with self._lock:
+                    session_epoch = self._session_epoch
+                    self._subscription_lifecycle_revision += 1
+                    lifecycle_revision = self._subscription_lifecycle_revision
+                    self._request_index.clear()
+                    self._specs.clear()
+                    self._receipts.clear()
+                    self._subscription_item_plans.clear()
+                    self._active_subscription_ids.clear()
+                    self._purge_uncovered_snapshot_state_locked()
+                    self._state_revision += 1
+                self._subscription_coordinator.close_session("mock-feed", dispatch=False)
+                with self._lock:
+                    dispatch_current = (
+                        self._connected
+                        and self._session_epoch == session_epoch
+                        and self._subscription_lifecycle_revision == lifecycle_revision
+                    )
+                if dispatch_current:
+                    self._subscription_coordinator.pump()
+        finally:
+            with self._subscription_condition:
+                self._subscription_session_closing = False
+                self._subscription_condition.notify_all()
+
+    def expire_subscription_ack_timeouts(
+        self,
+        now: Optional[float] = None,
+    ) -> Tuple[str, ...]:
+        """
+        将已超过 ACK 时限的订阅控制动作转为 uncertain 并刷新公开 receipt。
+
+        Args:
+            now: 可选单调时钟当前值；缺省时使用 coordinator 注入时钟。
+
+        Returns:
+            Tuple[str, ...]: 本次转为 uncertain 的稳定 action IDs。
+
+        Notes:
+            本方法只推进离线控制状态，不联网、不加载 SDK，也不自动猜测应用结果。
+        """
+        expired = self._subscription_coordinator.expire_ack_timeouts(now=now)
+        snapshot = self._subscription_coordinator.snapshot()
+        with self._lock:
+            self._refresh_subscription_receipts_locked(snapshot)
+            if expired:
+                self._state_revision += 1
+        return tuple(action.action_id for action in expired)
+
+    def reconcile_subscription_action(
+        self,
+        action_id: str,
+        applied: bool,
+        reason: Optional[str] = None,
+    ) -> None:
+        """
+        用离线查询证据对账 uncertain 控制动作并刷新全部受影响 lease 回执。
+
+        Args:
+            action_id: ACK 超时或 adapter 异常产生的 uncertain action ID。
+            applied: True 表示底层动作已生效，False 表示确定未生效。
+            reason: 可选脱敏对账证据。
+
+        Returns:
+            None: 对账及必要补偿完成后返回；调用方可按原 request 幂等读取回执。
+
+        Notes:
+            本方法只用于 fake/离线合同测试；真实 adapter 应由自身查询结果调用
+            coordinator，并不得根据超时自动猜测 applied。
+        """
+        with self._delivery_lock:
+            self._subscription_coordinator.reconcile_action(
+                action_id,
+                applied=applied,
+                reason=reason,
+            )
 
     def set_tick_callback(self, callback: Optional[TickCallback]) -> None:
         """
@@ -2024,6 +2381,74 @@ class MockRealtimeMarketDataFeed(RealtimeMarketDataFeed):
                 raise FeedNotConnectedError("MARKET_DATA_SESSION_EPOCH_MISSING")
             return self._session_epoch
 
+    def _on_subscription_state_change(
+        self,
+        snapshot: SubscriptionLeaseSnapshot,
+    ) -> None:
+        """
+        使用 coordinator 提供的同一个 manager 快照原子刷新 receipt 与 health 来源。
+
+        Args:
+            snapshot: 一次状态转换完成后的不可变租约快照。
+
+        Returns:
+            None: 全部非终态 receipt 与 Feed revision 更新后返回。
+        """
+        with self._lock:
+            self._refresh_subscription_receipts_locked(snapshot)
+            self._state_revision += 1
+
+    def _refresh_subscription_receipts_locked(
+        self,
+        snapshot: SubscriptionLeaseSnapshot,
+    ) -> None:
+        """
+        从单一 manager 快照重建全部 active 或退订过渡中的公开回执。
+
+        Args:
+            snapshot: receipt 与 health 必须共同消费的线性化状态快照。
+
+        Returns:
+            None: self._receipts 已与 snapshot 对齐后返回。
+
+        Notes:
+            调用方必须持有 Feed 锁。终态 canceled 和纯本地 rejected 墓碑保留原 epoch。
+        """
+        if self._session_epoch is not None and snapshot.session_epoch != self._session_epoch:
+            return
+        for subscription_id, previous in tuple(self._receipts.items()):
+            plans = self._subscription_item_plans[subscription_id]
+            active = subscription_id in self._active_subscription_ids
+            if not active and previous.state is SubscriptionState.CANCELED:
+                continue
+            if not active and all(not plan.adapter_scopes for plan in plans):
+                continue
+            spec = self._specs[subscription_id]
+            self._receipts[subscription_id] = self._subscription_receipts.project_receipt(
+                previous,
+                spec,
+                plans,
+                snapshot,
+                active=active,
+                limits=self._limits,
+            )
+
+    def _subscription_event_markets(
+        self,
+        event_type: MarketEventType,
+    ) -> Tuple[str, ...]:
+        """
+        从当前准入 manifest 返回一个实际事件的标准市场。
+
+        Args:
+            event_type: 需要展开 all selector 的实际事件类型。
+
+        Returns:
+            Tuple[str, ...]: 能力未声明时为空，否则为稳定市场元组。
+        """
+        declaration = self._event_declaration(event_type)
+        return tuple(declaration.markets) if declaration is not None else ()
+
     def _expand_event_types(self, spec: MarketSubscriptionSpec) -> Tuple[MarketEventType, ...]:
         """
         将 '*' 只展开为协商、授权且满足精确 scope/level 门禁的实际事件。
@@ -2130,6 +2555,12 @@ class MockRealtimeMarketDataFeed(RealtimeMarketDataFeed):
         if spec.selector is SubscriptionSelector.MARKETS:
             if declaration.markets and scope not in declaration.markets:
                 return "MARKET_UNSUPPORTED", scope
+        if spec.selector is SubscriptionSelector.SYMBOLS:
+            symbol_market = scope.rsplit(".", 1)[-1] if "." in scope else ""
+            if not symbol_market:
+                return "SYMBOL_MARKET_UNRESOLVED", scope
+            if declaration.markets and symbol_market not in declaration.markets:
+                return "MARKET_UNSUPPORTED", symbol_market
         if spec.selector in {SubscriptionSelector.MARKETS, SubscriptionSelector.ALL}:
             if not bool(declaration.metadata.get("full_market", False)):
                 return "FULL_MARKET_CAPABILITY_UNAVAILABLE", declaration.capability_id
@@ -2157,7 +2588,10 @@ class MockRealtimeMarketDataFeed(RealtimeMarketDataFeed):
             for item in receipt.confirmed:
                 if item.event_type is not event.event_type:
                     continue
-                if item.selector is SubscriptionSelector.ALL:
+                if item.selector is SubscriptionSelector.ALL and item.scope in {
+                    "*",
+                    event.exchange,
+                }:
                     return True
                 if item.selector is SubscriptionSelector.MARKETS and item.scope == event.exchange:
                     return True
@@ -2176,6 +2610,7 @@ __all__ = [
     "RealtimeDataUnavailableError",
     "RealtimeMarketDataFeed",
     "StaleMarketDataError",
+    "SubscriptionCapacityError",
     "SubscriptionConflictError",
     "SubscriptionNotFoundError",
     "TickCallback",
