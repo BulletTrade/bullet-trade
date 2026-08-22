@@ -12,28 +12,28 @@
 本模块不访问网络，实际交易写操作由 LiveEngine/Broker 完成。
 """
 
-from dataclasses import dataclass
-from typing import Any, Dict, Iterator, List, Optional, Union
-from datetime import datetime
-import uuid
 import asyncio
 import contextvars
 import inspect
 import threading
+import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime
+from functools import partial
+from typing import Any, Dict, Iterator, List, Optional, Union
 
-from .models import Order, OrderStatus, OrderStyle
 from .globals import log
+from .models import Order, OrderStatus, OrderStyle
+from .runtime import get_current_engine, process_orders_now
 from .settings import get_settings
-from .runtime import process_orders_now, get_current_engine
-
 
 # 全局订单队列
 _order_queue: List[Order] = []
 _order_queue_lock = threading.RLock()
-_current_order_batch: contextvars.ContextVar[Optional["_OrderBatchContext"]] = (
-    contextvars.ContextVar("bullet_trade_order_batch", default=None)
-)
+_current_order_batch: contextvars.ContextVar[
+    Optional["_OrderBatchContext"]
+] = contextvars.ContextVar("bullet_trade_order_batch", default=None)
 
 
 @dataclass
@@ -194,15 +194,22 @@ def _drain_order_queue() -> List[Order]:
 
 @dataclass
 class MarketOrderStyle:
-    """市价单参数，可指定保护价或买卖价差。"""
+    """描述策略公共市价意图及可选券商原生类型。
+
+    ``limit_price`` 和买卖价差保持既有位置参数顺序；``market_type`` 只承载
+    home_best 等公共 canonical 名称，由具体券商按交易所白名单解释并失败关闭。
+    """
+
     limit_price: Optional[float] = None
     buy_price_percent: Optional[float] = None
     sell_price_percent: Optional[float] = None
+    market_type: Optional[str] = None
 
 
 @dataclass
 class LimitOrderStyle:
     """限价单参数：显式给出委托价格。"""
+
     price: float
 
 
@@ -252,15 +259,19 @@ def _trigger_order_processing(wait_timeout: Optional[float] = None) -> None:
                             engine._process_orders(engine.context.current_dt),
                             loop,
                         )
-                        fut.result(timeout=wait_timeout if wait_timeout and wait_timeout > 0 else None)
+                        fut.result(
+                            timeout=wait_timeout if wait_timeout and wait_timeout > 0 else None
+                        )
                     else:
                         loop.call_soon_threadsafe(
-                            lambda: asyncio.create_task(engine._process_orders(engine.context.current_dt))
+                            lambda: asyncio.create_task(
+                                engine._process_orders(engine.context.current_dt)
+                            )
                         )
                 except Exception as exc:
                     log.debug(f"投递实盘订单处理任务失败: {exc}")
                 return
-        if settings.options.get('order_match_mode') == 'immediate':
+        if settings.options.get("order_match_mode") == "immediate":
             process_orders_now()
     except Exception as e:
         log.warning(f"触发订单处理失败，保留到队列: {e}")
@@ -321,8 +332,14 @@ def _describe_order_style(style: object) -> str:
     if isinstance(style, LimitOrderStyle):
         return f"LimitOrderStyle(price={_format_order_price(style.price)})"
     if isinstance(style, MarketOrderStyle):
+        market_type = str(style.market_type or "").strip().lower()
         if style.limit_price is not None:
-            return f"MarketOrderStyle(limit_price={_format_order_price(style.limit_price)})"
+            suffix = f", market_type={market_type}" if market_type else ""
+            return (
+                "MarketOrderStyle(" f"limit_price={_format_order_price(style.limit_price)}{suffix})"
+            )
+        if market_type:
+            return f"MarketOrderStyle(market_type={market_type})"
         return "MarketOrderStyle(market)"
     return style.__class__.__name__
 
@@ -377,6 +394,71 @@ def _record_requested_order_price(
         extra = order_obj.extra
     extra["order_price"] = float(requested_price)
     extra.setdefault("requested_order_price", float(requested_price))
+
+
+def _record_market_order_type(
+    order_obj: Order,
+    style: Optional[Union[OrderStyle, MarketOrderStyle, LimitOrderStyle]],
+) -> None:
+    """把显式原生市价类型记录到订单扩展字段。
+
+    Args:
+        order_obj: 待记录的订单对象。
+        style: 可选市价或限价风格。
+
+    Returns:
+        None。
+
+    Side Effects:
+        仅当 ``MarketOrderStyle.market_type`` 非空时更新 ``order_obj.extra``，
+        供 Live broker 和远程 adapter 透传而不改变其他券商的默认市价语义。
+    """
+
+    if not isinstance(style, MarketOrderStyle):
+        return
+    market_type = str(style.market_type or "").strip().lower()
+    if market_type:
+        order_obj.extra["market_type"] = market_type
+
+
+def _finish_scheduled_broker_cancel(
+    task: Any,
+    *,
+    order_obj: Optional[Order],
+    broker_id: str,
+) -> None:
+    """收口同一事件循环内非阻塞投递的券商撤单结果。
+
+    Args:
+        task: ``asyncio.Task`` 或等价 future。
+        order_obj: 可选策略订单对象。
+        broker_id: 已提交的精确券商订单号。
+
+    Returns:
+        None。
+
+    Side Effects:
+        异步撤单被券商确认接受时把订单标为 canceling；异常或 False 仅记录告警，
+        不在事件循环回调中再次发起撤单。
+    """
+
+    try:
+        accepted = bool(task.result())
+    except asyncio.CancelledError:
+        log.warning(f"券商撤单任务已取消: {broker_id}")
+        return
+    except Exception as exc:
+        log.warning(f"券商撤单失败 {broker_id}: {exc}")
+        return
+    if not accepted:
+        log.warning(f"券商未确认接受撤单: {broker_id}")
+        return
+    log.info(f"🗑️ 券商撤单已提交: {broker_id}")
+    if order_obj is not None:
+        try:
+            order_obj.status = OrderStatus.canceling
+        except Exception:
+            pass
 
 
 def _validate_live_order_request(requires_realtime_snapshot: bool) -> None:
@@ -440,7 +522,7 @@ def order(
     if amount == 0:
         log.warning(f"下单数量为0，忽略订单: {security}")
         return None
-    
+
     if style is not None:
         resolved_style: object = style
     elif price is not None:
@@ -465,7 +547,9 @@ def order(
     _record_requested_order_price(order_obj, price, resolved_style)
     if extra:
         order_obj.extra.update(dict(extra))
-    
+    # 显式 style 是权威语义，不能被旧 extra 中同名字段覆盖。
+    _record_market_order_type(order_obj, resolved_style)
+
     enqueued = _enqueue_order(order_obj)
     _register_order_snapshot(order_obj)
     log.debug(
@@ -474,17 +558,17 @@ def order(
     )
     if enqueued:
         _trigger_order_processing(wait_timeout)
-    
+
     return order_obj
 
 
 def cancel_order(order_or_id: Union[Order, str]) -> bool:
     """
     撤单：优先取消本地队列订单，若已下到券商且有券商订单号则调用券商撤单。
-    
+
     Args:
         order_or_id: Order 对象或订单 ID
-    
+
     Returns:
         是否成功接受撤单
 
@@ -506,9 +590,11 @@ def cancel_order(order_or_id: Union[Order, str]) -> bool:
                 removed = True
                 break
     engine = get_current_engine()
-    broker_id = None
-    if isinstance(order_or_id, Order):
-        broker_id = getattr(order_or_id, "_broker_order_id", None)
+    broker_id = (
+        getattr(order_or_id, "_broker_order_id", None)
+        if isinstance(order_or_id, Order)
+        else str(order_or_id)
+    )
     if engine and getattr(engine, "broker", None) and broker_id:
         write_validator = getattr(engine, "validate_broker_write_request", None)
         if callable(write_validator):
@@ -518,6 +604,21 @@ def cancel_order(order_or_id: Union[Order, str]) -> bool:
             if inspect.isawaitable(result):
                 loop = getattr(engine, "_loop", None)
                 if loop and loop.is_running():
+                    try:
+                        running_loop = asyncio.get_running_loop()
+                    except RuntimeError:
+                        running_loop = None
+                    if running_loop is loop:
+                        task = loop.create_task(result)
+                        task.add_done_callback(
+                            partial(
+                                _finish_scheduled_broker_cancel,
+                                order_obj=(order_or_id if isinstance(order_or_id, Order) else None),
+                                broker_id=str(broker_id),
+                            )
+                        )
+                        log.info(f"🗑️ 券商撤单已投递事件循环: {broker_id}")
+                        return True
                     fut = asyncio.run_coroutine_threadsafe(result, loop)
                     result = fut.result()
                 else:
@@ -593,7 +694,7 @@ def order_value(
     if value == 0:
         log.warning(f"下单价值为0，忽略订单: {security}")
         return None
-    
+
     # 临时订单，amount会在撮合时计算
     if style is not None:
         resolved_style: object = style
@@ -616,10 +717,11 @@ def order_value(
         wait_timeout=wait_timeout,
     )
     _record_requested_order_price(order_obj, price, resolved_style)
-    
+    _record_market_order_type(order_obj, resolved_style)
+
     # 存储目标价值，用于撮合时计算
     order_obj._target_value = abs(value)  # type: ignore
-    
+
     enqueued = _enqueue_order(order_obj)
     _register_order_snapshot(order_obj)
     log.debug(
@@ -628,7 +730,7 @@ def order_value(
     )
     if enqueued:
         _trigger_order_processing(wait_timeout)
-    
+
     return order_obj
 
 
@@ -683,6 +785,7 @@ def order_target(
         wait_timeout=wait_timeout,
     )
     _record_requested_order_price(order_obj, price, resolved_style)
+    _record_market_order_type(order_obj, resolved_style)
 
     order_obj._is_target_amount = True  # type: ignore
     order_obj._target_amount = amount  # type: ignore
@@ -750,6 +853,7 @@ def order_target_value(
         wait_timeout=wait_timeout,
     )
     _record_requested_order_price(order_obj, price, resolved_style)
+    _record_market_order_type(order_obj, resolved_style)
 
     order_obj._is_target_value = True  # type: ignore
     order_obj._target_value = value  # type: ignore
@@ -794,12 +898,12 @@ def clear_order_queue() -> None:
 
 
 __all__ = [
-    'order',
-    'order_value',
-    'order_target',
-    'order_target_value',
-    'get_order_queue',
-    'clear_order_queue',
-    'MarketOrderStyle',
-    'LimitOrderStyle',
+    "order",
+    "order_value",
+    "order_target",
+    "order_target_value",
+    "get_order_queue",
+    "clear_order_queue",
+    "MarketOrderStyle",
+    "LimitOrderStyle",
 ]

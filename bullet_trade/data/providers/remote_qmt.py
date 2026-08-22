@@ -113,7 +113,9 @@ class RemoteQmtProvider(DataProvider):
             raise RuntimeError("缺少 QMT_SERVER_TOKEN，用于鉴权远程 server")
         tls_cert = self.config.get("tls_cert") or _env("QMT_SERVER_TLS_CERT")
         tls_enabled = bool(tls_cert)
-        self._connection = RemoteQmtConnection(host, port, token, tls_cert=tls_cert, tls_enabled=tls_enabled)
+        self._connection = RemoteQmtConnection(
+            host, port, token, tls_cert=tls_cert, tls_enabled=tls_enabled
+        )
         self._connection.add_event_listener("tick", self._handle_tick_event)
         self._connection.start()
         self._subscription_key = "remote-provider"
@@ -136,7 +138,6 @@ class RemoteQmtProvider(DataProvider):
         prefer_engine: bool = False,
         force_no_engine: bool = False,
     ) -> pd.DataFrame:
-
         def _is_minute_frequency(value: str) -> bool:
             freq = str(value or "").strip().lower()
             if "minute" in freq or "min" in freq:
@@ -145,7 +146,9 @@ class RemoteQmtProvider(DataProvider):
 
         def _str_format(date_obj):
             if date_obj and isinstance(date_obj, datetime):
-                return date_obj.strftime("%Y-%m-%d %H:%M:%S" if _is_minute_frequency(frequency) else "%Y-%m-%d")
+                return date_obj.strftime(
+                    "%Y-%m-%d %H:%M:%S" if _is_minute_frequency(frequency) else "%Y-%m-%d"
+                )
             return date_obj
 
         payload = {
@@ -192,7 +195,9 @@ class RemoteQmtProvider(DataProvider):
             securities = [security]
         return {str(sec): last_day for sec in securities}
 
-    def get_all_securities(self, types: Union[str, List[str]] = "stock", date: Optional[str] = None) -> pd.DataFrame:
+    def get_all_securities(
+        self, types: Union[str, List[str]] = "stock", date: Optional[str] = None
+    ) -> pd.DataFrame:
         payload = {"types": types, "date": date}
         resp = self._connection.request("data.get_all_securities", payload)
         return _dataframe_from_payload(resp)
@@ -268,6 +273,10 @@ class RemoteQmtProvider(DataProvider):
         payload = {"security": security}
         resp = self._connection.request("data.snapshot", payload)
         return resp or {}
+
+    def get_live_current(self, security: str) -> Dict[str, Any]:
+        """获取目标证券的实时快照数据。"""
+        return self.get_current_tick(security)
 
     def _handle_tick_event(self, payload: Dict[str, Any]) -> None:
         """规范化远程 tick 事件并按新旧回调合同安全分发。

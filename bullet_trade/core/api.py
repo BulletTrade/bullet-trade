@@ -479,19 +479,54 @@ def get_orders(
     security: Optional[str] = None,
     status: Optional[object] = None,
     from_broker: bool = False,
+    strict: bool = False,
 ) -> Dict[str, Order]:
-    """
-    查询当日订单快照（聚宽风格）。
+    """查询当日订单快照（聚宽风格）。
+
+    Args:
+        order_id: 可选订单号。
+        security: 可选证券代码。
+        status: 可选订单状态。
+        from_broker: 是否要求柜台原始范围。
+        strict: 为 True 时传播查询异常，适合下单后的资金安全收口。
+
+    Returns:
+        Dict[str, Order]: 订单号到订单快照的映射。
+
+    Raises:
+        Exception: strict=True 时传播 Engine 或券商查询异常。
     """
     engine = get_current_engine()
     if not engine:
         return {}
     getter = getattr(engine, "get_orders", None)
     if not callable(getter):
+        if strict:
+            raise RuntimeError("BROKER_ORDER_QUERY_UNAVAILABLE")
         return {}
     try:
-        return getter(order_id=order_id, security=security, status=status, from_broker=from_broker) or {}
+        return (
+            getter(
+                order_id=order_id,
+                security=security,
+                status=status,
+                from_broker=from_broker,
+                strict=strict,
+            )
+            or {}
+        )
+    except TypeError:
+        if strict:
+            raise
+        return getter(
+            order_id=order_id,
+            security=security,
+            status=status,
+            from_broker=from_broker,
+        ) or {}
     except Exception:
+        if strict:
+            raise
         return {}
 
 
@@ -528,19 +563,38 @@ def get_open_orders() -> Dict[str, Order]:
 def get_trades(
     order_id: Optional[str] = None,
     security: Optional[str] = None,
+    strict: bool = False,
 ) -> Dict[str, Trade]:
-    """
-    查询当日成交快照（聚宽风格）。
+    """查询当日成交快照（聚宽风格）。
+
+    Args:
+        order_id: 可选订单号。
+        security: 可选证券代码。
+        strict: 为 True 时传播查询异常，适合已提交订单的终态收口。
+
+    Returns:
+        Dict[str, Trade]: 成交号到成交快照的映射。
+
+    Raises:
+        Exception: strict=True 时传播 Engine 或券商查询异常。
     """
     engine = get_current_engine()
     if not engine:
         return {}
     getter = getattr(engine, "get_trades", None)
     if not callable(getter):
+        if strict:
+            raise RuntimeError("BROKER_TRADE_QUERY_UNAVAILABLE")
         return {}
     try:
+        return getter(order_id=order_id, security=security, strict=strict) or {}
+    except TypeError:
+        if strict:
+            raise
         return getter(order_id=order_id, security=security) or {}
     except Exception:
+        if strict:
+            raise
         return {}
 
 # 导出所有API

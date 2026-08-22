@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import os
 from datetime import date as Date
 from datetime import datetime
@@ -71,6 +72,16 @@ class MiniQMTProvider(DataProvider):
         # MINIQMT_INDEX_WEIGHT_AUTO_DOWNLOAD=0 after a separate prewarm.
         self.index_weight_auto_download = bool(index_weight_auto_download)
         self.config["index_weight_auto_download"] = self.index_weight_auto_download
+        try:
+            self.max_live_age_seconds = float(
+                self.config.get("max_live_age_seconds")
+                or os.getenv("MINIQMT_LIVE_MAX_AGE_SECONDS")
+                or 5.0
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("MINIQMT_LIVE_MAX_AGE_SECONDS_INVALID") from exc
+        if not math.isfinite(self.max_live_age_seconds) or self.max_live_age_seconds <= 0:
+            raise ValueError("MINIQMT_LIVE_MAX_AGE_SECONDS_INVALID")
         self._cache = CacheManager(
             provider_name=self.name,
             cache_dir=cache_dir,
@@ -208,7 +219,9 @@ class MiniQMTProvider(DataProvider):
         except Exception:
             return start_str
         if start_dt.hour == 9 and start_dt.minute == 31 and start_dt.second == 0:
-            return start_dt.replace(hour=9, minute=30, second=0, microsecond=0).strftime("%Y%m%d%H%M%S")
+            return start_dt.replace(hour=9, minute=30, second=0, microsecond=0).strftime(
+                "%Y%m%d%H%M%S"
+            )
         return start_str
 
     def _download_history_data(
@@ -1398,16 +1411,16 @@ class MiniQMTProvider(DataProvider):
         )
 
     @staticmethod
-    def _parse_qmt_time_values(values: Any, *, source: str, security: str, period: str) -> pd.DatetimeIndex:
+    def _parse_qmt_time_values(
+        values: Any, *, source: str, security: str, period: str
+    ) -> pd.DatetimeIndex:
         raw = pd.Series(values)
         if raw.empty:
             return pd.DatetimeIndex([])
 
         non_null = raw.dropna()
         if non_null.empty:
-            raise KeyError(
-                f"QMT 数据时间字段为空 (source={source}, security={security}, period={period})"
-            )
+            raise KeyError(f"QMT 数据时间字段为空 (source={source}, security={security}, period={period})")
 
         if pd.api.types.is_datetime64_any_dtype(non_null):
             idx = pd.DatetimeIndex(pd.to_datetime(raw, errors="coerce"))
@@ -1424,16 +1437,22 @@ class MiniQMTProvider(DataProvider):
                 and digit_values.str[:2].isin(["19", "20"]).all()
             ):
                 max_len = digit_values.str.len().max()
-                fmt = "%Y%m%d" if max_len == 8 else "%Y%m%d%H%M" if max_len == 12 else "%Y%m%d%H%M%S"
+                fmt = (
+                    "%Y%m%d" if max_len == 8 else "%Y%m%d%H%M" if max_len == 12 else "%Y%m%d%H%M%S"
+                )
                 idx = pd.DatetimeIndex(pd.to_datetime(text, format=fmt, errors="coerce"))
             elif sample.max() >= 10**13:
                 fmt = "%Y%m%d%H%M%S" if text.str.len().max() >= 14 else "%Y%m%d%H%M"
                 idx = pd.DatetimeIndex(pd.to_datetime(text, format=fmt, errors="coerce"))
             elif sample.max() >= 10**11:
-                idx_utc = pd.to_datetime(numeric.astype("Int64"), unit="ms", utc=True, errors="coerce")
+                idx_utc = pd.to_datetime(
+                    numeric.astype("Int64"), unit="ms", utc=True, errors="coerce"
+                )
                 idx = pd.DatetimeIndex(idx_utc).tz_convert("Asia/Shanghai").tz_localize(None)
             elif sample.max() >= 10**9:
-                idx_utc = pd.to_datetime(numeric.astype("Int64"), unit="s", utc=True, errors="coerce")
+                idx_utc = pd.to_datetime(
+                    numeric.astype("Int64"), unit="s", utc=True, errors="coerce"
+                )
                 idx = pd.DatetimeIndex(idx_utc).tz_convert("Asia/Shanghai").tz_localize(None)
             elif sample.max() >= 10**7:
                 text = raw.astype("Int64").astype(str)
@@ -1446,7 +1465,9 @@ class MiniQMTProvider(DataProvider):
             digit_values = stripped[stripped.str.fullmatch(r"\d+")]
             if not digit_values.empty and digit_values.str.len().isin([8, 12, 14]).all():
                 max_len = digit_values.str.len().max()
-                fmt = "%Y%m%d" if max_len == 8 else "%Y%m%d%H%M" if max_len == 12 else "%Y%m%d%H%M%S"
+                fmt = (
+                    "%Y%m%d" if max_len == 8 else "%Y%m%d%H%M" if max_len == 12 else "%Y%m%d%H%M%S"
+                )
                 idx = pd.DatetimeIndex(pd.to_datetime(stripped, format=fmt, errors="coerce"))
             else:
                 idx = pd.DatetimeIndex(pd.to_datetime(raw, errors="coerce"))
@@ -1462,7 +1483,9 @@ class MiniQMTProvider(DataProvider):
         return idx
 
     @classmethod
-    def _extract_qmt_time_index(cls, df: pd.DataFrame, *, security: str, period: str) -> pd.DatetimeIndex:
+    def _extract_qmt_time_index(
+        cls, df: pd.DataFrame, *, security: str, period: str
+    ) -> pd.DatetimeIndex:
         if "time" in df.columns:
             return cls._parse_qmt_time_values(
                 df["time"],
@@ -1984,69 +2007,135 @@ class MiniQMTProvider(DataProvider):
         }
 
     # ------------------------ Live 快照 ------------------------
-    def get_live_current(self, security: str) -> Dict[str, Any]:
+    def _read_live_snapshot(self, security: str) -> Dict[str, Any]:
+        """读取并验证一份带权威源时间的 MiniQMT 实时快照。
+
+        Args:
+            security: 聚宽或 QMT 格式证券代码。
+
+        Returns:
+            Dict[str, Any]: 已通过价格、时间与新鲜度校验的原始快照摘要。
+
+        Raises:
+            RuntimeError: 行情缺失、价格非法、时间非法、未来或过期时抛出稳定错误码。
+
+        Side Effects:
+            通过本机 xtdata 读取一次实时行情，不写文件、不做历史数据回退。
         """
-        返回实盘当前快照（最小字段）：
-        - last_price, high_limit, low_limit, paused
-        若 xtdata 不可用或取值失败，返回空字典由上层回退处理。
-        """
+
         xt = self._ensure_xtdata()
         code = self._normalize_security_code(security)
-        try:
-            tick_map = xt.get_full_tick([code])
-            t = tick_map.get(code) if isinstance(tick_map, dict) else None
-            if not t or t.get("lastPrice") is None:
-                return {}
-            last_price = float(t.get("lastPrice"))
-            info = xt.get_instrument_detail(code)
-            high_limit = float(info.get("UpStopPrice") or 0.0) if isinstance(info, dict) else 0.0
-            low_limit = float(info.get("DownStopPrice") or 0.0) if isinstance(info, dict) else 0.0
-            paused = False
-            try:
-                open_int = t.get("openInt") if isinstance(t, dict) else None
-                if open_int is not None:
-                    # 0, 10 - 默认为未知
-                    # 1 - 停牌
-                    # 11 - 开盘前S
-                    # 12 - 集合竞价时段C
-                    # 13 - 连续交易T
-                    # 14 - 休市B
-                    # 15 - 闭市E
-                    # 16 - 波动性中断V
-                    # 17 - 临时停牌P
-                    # 18 - 收盘集合竞价U
-                    # 19 - 盘中集合竞价M
-                    # 20 - 暂停交易至闭市N
-                    # 21 - 获取字段异常
-                    # 22 - 盘后固定价格行情
-                    # 23 - 盘后固定价格行情完毕
+        tick_map = xt.get_full_tick([code])
+        tick = tick_map.get(code) if isinstance(tick_map, dict) else None
+        if not isinstance(tick, dict):
+            raise RuntimeError("MINIQMT_LIVE_NO_TICK")
 
-                    # 状态码	含义	是否真正"停牌"？
-                    # 1	停牌	✅ 是
-                    # 11	开盘前S	❌ 不是停牌，只是未开盘
-                    # 12	集合竞价时段C	❌ 不是停牌，可以挂单
-                    # 13	连续交易T	❌ 正常交易
-                    # 14	休市B	❌ 午休，不是停牌
-                    # 15	闭市E	❌ 已收盘，不是停牌
-                    # 16	波动性中断V	⚠️ 临时中断
-                    # 17	临时停牌P	✅ 是
-                    # 18	收盘集合竞价U	❌ 可以交易
-                    # 19	盘中集合竞价M	❌ 可以交易
-                    # 20	暂停交易至闭市N	✅ 是
-                    # 22	盘后固定价格行情	❌ 可以交易
-                    # paused = (int(open_int) != 13)
-                    # 更准确的写法应该是：
-                    paused = int(open_int) in (1, 17, 20)  # 或加上 16
-            except Exception:
-                pass
-            return {
-                "last_price": last_price,
-                "high_limit": high_limit,
-                "low_limit": low_limit,
-                "paused": paused,
-            }
+        raw_price = tick.get("lastPrice")
+        try:
+            last_price = float(raw_price)
+        except (TypeError, ValueError) as exc:
+            raise RuntimeError("MINIQMT_LIVE_PRICE_INVALID") from exc
+        if not math.isfinite(last_price) or last_price <= 0:
+            raise RuntimeError("MINIQMT_LIVE_PRICE_INVALID")
+
+        raw_time = tick.get("time")
+        if raw_time in (None, ""):
+            raise RuntimeError("MINIQMT_LIVE_TIMESTAMP_MISSING")
+        try:
+            source_time = (
+                pd.to_datetime(raw_time, unit="ms", utc=True)
+                .tz_convert("Asia/Shanghai")
+                .to_pydatetime()
+            )
+        except Exception as exc:
+            raise RuntimeError("MINIQMT_LIVE_TIMESTAMP_INVALID") from exc
+        received_time = datetime.now(source_time.tzinfo)
+        age_seconds = (received_time - source_time).total_seconds()
+        if age_seconds < -2.0:
+            raise RuntimeError("MINIQMT_LIVE_TIMESTAMP_FUTURE")
+        if age_seconds > self.max_live_age_seconds:
+            raise RuntimeError("MINIQMT_LIVE_STALE")
+
+        return {
+            "code": code,
+            "tick": tick,
+            "last_price": last_price,
+            "source_time": source_time,
+            "received_time": received_time,
+            "age_seconds": max(age_seconds, 0.0),
+            "source": "windows_miniqmt_xtdata",
+        }
+
+    def get_live_current(self, security: str) -> Dict[str, Any]:
+        """返回带源时间和新鲜度证明的实盘当前快照。
+
+        Args:
+            security: 聚宽或 QMT 格式证券代码。
+
+        Returns:
+            Dict[str, Any]: 最新价、涨跌停、停牌状态和源时间审计字段。
+
+        Raises:
+            RuntimeError: 实时快照缺失、非法或超过新鲜度阈值时抛出。
+
+        Side Effects:
+            读取一次本机 xtdata 快照及证券详情，不回退到分钟线或本机伪时间。
+        """
+        snapshot = self._read_live_snapshot(security)
+        xt = self._ensure_xtdata()
+        code = snapshot["code"]
+        tick = snapshot["tick"]
+        info = xt.get_instrument_detail(code)
+        high_limit = float(info.get("UpStopPrice") or 0.0) if isinstance(info, dict) else 0.0
+        low_limit = float(info.get("DownStopPrice") or 0.0) if isinstance(info, dict) else 0.0
+        paused = False
+        try:
+            open_int = tick.get("openInt")
+            if open_int is not None:
+                # 0, 10 - 默认为未知
+                # 1 - 停牌
+                # 11 - 开盘前S
+                # 12 - 集合竞价时段C
+                # 13 - 连续交易T
+                # 14 - 休市B
+                # 15 - 闭市E
+                # 16 - 波动性中断V
+                # 17 - 临时停牌P
+                # 18 - 收盘集合竞价U
+                # 19 - 盘中集合竞价M
+                # 20 - 暂停交易至闭市N
+                # 21 - 获取字段异常
+                # 22 - 盘后固定价格行情
+                # 23 - 盘后固定价格行情完毕
+
+                # 状态码	含义	是否真正"停牌"？
+                # 1	停牌	✅ 是
+                # 11	开盘前S	❌ 不是停牌，只是未开盘
+                # 12	集合竞价时段C	❌ 不是停牌，可以挂单
+                # 13	连续交易T	❌ 正常交易
+                # 14	休市B	❌ 午休，不是停牌
+                # 15	闭市E	❌ 已收盘，不是停牌
+                # 16	波动性中断V	⚠️ 临时中断
+                # 17	临时停牌P	✅ 是
+                # 18	收盘集合竞价U	❌ 可以交易
+                # 19	盘中集合竞价M	❌ 可以交易
+                # 20	暂停交易至闭市N	✅ 是
+                # 22	盘后固定价格行情	❌ 可以交易
+                # paused = (int(open_int) != 13)
+                # 更准确的写法应该是：
+                paused = int(open_int) in (1, 17, 20)  # 或加上 16
         except Exception:
-            return {}
+            pass
+        return {
+            "last_price": snapshot["last_price"],
+            "high_limit": high_limit,
+            "low_limit": low_limit,
+            "paused": paused,
+            "source_time": snapshot["source_time"],
+            "received_time": snapshot["received_time"],
+            "age_seconds": snapshot["age_seconds"],
+            "source": snapshot["source"],
+        }
 
     def _get_xt_split_dividend(
         self,

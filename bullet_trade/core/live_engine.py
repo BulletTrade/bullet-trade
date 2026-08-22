@@ -148,30 +148,30 @@ class LiveConfig:
         if overrides:
             raw.update(overrides)
         return cls(
-            order_max_volume=int(raw.get('order_max_volume', 1_000_000)),
-            trade_max_wait_time=int(raw.get('trade_max_wait_time', 16)),
-            event_time_out=int(raw.get('event_time_out', 60)),
-            strategy_name=raw.get('strategy_name'),
-            scheduler_market_periods=raw.get('scheduler_market_periods'),
-            account_sync_interval=int(raw.get('account_sync_interval', 60)),
-            account_sync_enabled=parse_bool(raw.get('account_sync_enabled'), default=True),
-            order_sync_interval=int(raw.get('order_sync_interval', 10)),
-            order_sync_enabled=parse_bool(raw.get('order_sync_enabled'), default=True),
-            g_autosave_interval=int(raw.get('g_autosave_interval', 60)),
-            g_autosave_enabled=parse_bool(raw.get('g_autosave_enabled'), default=True),
-            tick_subscription_limit=int(raw.get('tick_subscription_limit', 100)),
-            tick_sync_interval=int(raw.get('tick_sync_interval', 2)),
-            tick_sync_enabled=parse_bool(raw.get('tick_sync_enabled'), default=True),
-            risk_check_interval=int(raw.get('risk_check_interval', 300)),
-            risk_check_enabled=parse_bool(raw.get('risk_check_enabled'), default=False),
-            broker_heartbeat_interval=int(raw.get('broker_heartbeat_interval', 30)),
-            runtime_dir=str(raw.get('runtime_dir', './runtime')),
-            buy_price_percent=float(raw.get('market_buy_price_percent', 0.015)),
-            sell_price_percent=float(raw.get('market_sell_price_percent', -0.015)),
-            calendar_skip_weekend=parse_bool(raw.get('calendar_skip_weekend'), default=True),
-            calendar_retry_minutes=int(raw.get('calendar_retry_minutes', 1)),
-            portfolio_refresh_throttle_ms=int(raw.get('portfolio_refresh_throttle_ms', 200)),
-            fail_on_schedule_error=parse_bool(raw.get('fail_on_schedule_error'), default=False),
+            order_max_volume=int(raw.get("order_max_volume", 1_000_000)),
+            trade_max_wait_time=int(raw.get("trade_max_wait_time", 16)),
+            event_time_out=int(raw.get("event_time_out", 60)),
+            strategy_name=raw.get("strategy_name"),
+            scheduler_market_periods=raw.get("scheduler_market_periods"),
+            account_sync_interval=int(raw.get("account_sync_interval", 60)),
+            account_sync_enabled=parse_bool(raw.get("account_sync_enabled"), default=True),
+            order_sync_interval=int(raw.get("order_sync_interval", 10)),
+            order_sync_enabled=parse_bool(raw.get("order_sync_enabled"), default=True),
+            g_autosave_interval=int(raw.get("g_autosave_interval", 60)),
+            g_autosave_enabled=parse_bool(raw.get("g_autosave_enabled"), default=True),
+            tick_subscription_limit=int(raw.get("tick_subscription_limit", 100)),
+            tick_sync_interval=int(raw.get("tick_sync_interval", 2)),
+            tick_sync_enabled=parse_bool(raw.get("tick_sync_enabled"), default=True),
+            risk_check_interval=int(raw.get("risk_check_interval", 300)),
+            risk_check_enabled=parse_bool(raw.get("risk_check_enabled"), default=False),
+            broker_heartbeat_interval=int(raw.get("broker_heartbeat_interval", 30)),
+            runtime_dir=str(raw.get("runtime_dir", "./runtime")),
+            buy_price_percent=float(raw.get("market_buy_price_percent", 0.015)),
+            sell_price_percent=float(raw.get("market_sell_price_percent", -0.015)),
+            calendar_skip_weekend=parse_bool(raw.get("calendar_skip_weekend"), default=True),
+            calendar_retry_minutes=int(raw.get("calendar_retry_minutes", 1)),
+            portfolio_refresh_throttle_ms=int(raw.get("portfolio_refresh_throttle_ms", 200)),
+            fail_on_schedule_error=parse_bool(raw.get("fail_on_schedule_error"), default=False),
         )
 
 
@@ -363,10 +363,10 @@ class LiveEngine:
         self.after_trading_end_func = self._strategy_loader.after_trading_end_func
         module = sys.modules.get("strategy")
         if module:
-            self.handle_tick_func = getattr(module, 'handle_tick', None)
+            self.handle_tick_func = getattr(module, "handle_tick", None)
             if self.process_initialize_func is None:
-                self.process_initialize_func = getattr(module, 'process_initialize', None)
-            self.after_code_changed_func = getattr(module, 'after_code_changed', None)
+                self.process_initialize_func = getattr(module, "process_initialize", None)
+            self.after_code_changed_func = getattr(module, "after_code_changed", None)
             if self.strategy_capability_requirements is None:
                 self.strategy_capability_requirements = (
                     self._read_static_strategy_capability_requirements(module)
@@ -387,8 +387,8 @@ class LiveEngine:
         reset_settings()
         set_current_engine(self)
         set_current_context(self.context)
-        self.context.run_params['run_type'] = 'LIVE'
-        self.context.run_params['is_live'] = True
+        self.context.run_params["run_type"] = "LIVE"
+        self.context.run_params["is_live"] = True
         self.context.require_data_capabilities = self.require_data_capabilities
 
         current_hash = self._compute_strategy_hash()
@@ -421,11 +421,15 @@ class LiveEngine:
 
         self._apply_market_period_override()
 
-        hash_changed = bool(metadata) and metadata.get('strategy_hash') and metadata.get('strategy_hash') != current_hash
+        hash_changed = (
+            bool(metadata)
+            and metadata.get("strategy_hash")
+            and metadata.get("strategy_hash") != current_hash
+        )
         if metadata:
             log.debug(
                 "LiveEngine: metadata_hash=%s, current_hash=%s, restored=%s",
-                metadata.get('strategy_hash'),
+                metadata.get("strategy_hash"),
                 current_hash,
                 hash_changed,
             )
@@ -446,7 +450,9 @@ class LiveEngine:
         # 若策略已通过 run_daily/run_weekly 注册了相同函数，则避免 LiveEngine 再直接调用，防止重复触发
         try:
             tasks = get_tasks()
-            if self.before_trading_start_func and any(t.func is self.before_trading_start_func for t in tasks):
+            if self.before_trading_start_func and any(
+                t.func is self.before_trading_start_func for t in tasks
+            ):
                 log.debug("LiveEngine: before_market_open 已通过调度注册，跳过直接调用钩子")
                 self.before_trading_start_func = None
             if self.handle_data_func and any(t.func is self.handle_data_func for t in tasks):
@@ -461,8 +467,8 @@ class LiveEngine:
         symbols, markets = load_subscription_state()
         self._tick_symbols = set(symbols)
         self._tick_markets = set(markets)
-        should_sync_initial = (
-            not self._tick_subscription_updated and (self._tick_symbols or self._tick_markets)
+        should_sync_initial = not self._tick_subscription_updated and (
+            self._tick_symbols or self._tick_markets
         )
         if should_sync_initial:
             self._sync_provider_subscription(initial=True)
@@ -471,9 +477,7 @@ class LiveEngine:
         if self._last_schedule_dt:
             current_minute = self._now().replace(second=0, microsecond=0)
             if self._last_schedule_dt > current_minute:
-                log.warning(
-                    "检测到历史调度游标晚于当前系统时间，已忽略此前的游标值。"
-                )
+                log.warning("检测到历史调度游标晚于当前系统时间，已忽略此前的游标值。")
                 self._last_schedule_dt = None
 
         self._start_background_jobs()
@@ -586,9 +590,7 @@ class LiveEngine:
     async def _handle_minute_tick(self, wall_clock: datetime) -> None:
         current_minute = wall_clock.replace(second=0, microsecond=0)
         if self._last_schedule_dt and self._last_schedule_dt > current_minute:
-            log.warning(
-                "检测到历史调度游标超前当前时间，将重置为当前分钟之前。"
-            )
+            log.warning("检测到历史调度游标超前当前时间，将重置为当前分钟之前。")
             self._last_schedule_dt = current_minute - timedelta(minutes=1)
         scheduled = current_minute
         if self._last_schedule_dt and scheduled <= self._last_schedule_dt:
@@ -609,9 +611,7 @@ class LiveEngine:
         log.set_strategy_time(scheduled)
 
         if delay > timeout:
-            log.warning(
-                f"⏱️ 事件超时丢弃: scheduled={scheduled}, delay={delay:.1f}s (> {timeout}s)"
-            )
+            log.warning(f"⏱️ 事件超时丢弃: scheduled={scheduled}, delay={delay:.1f}s (> {timeout}s)")
             self._last_schedule_dt = scheduled
             persist_scheduler_cursor(scheduled)
             return
@@ -620,9 +620,7 @@ class LiveEngine:
         schedule_batch: Optional[_OrderBatchContext] = None
         schedule_failed = False
         schedule_scope = (
-            _order_batch_scope()
-            if self.config.fail_on_schedule_error
-            else nullcontext(None)
+            _order_batch_scope() if self.config.fail_on_schedule_error else nullcontext(None)
         )
         try:
             with schedule_scope as schedule_batch:
@@ -642,15 +640,13 @@ class LiveEngine:
                             schedule_batch,
                             "scheduler_trigger_failed",
                         )
-                        raise RuntimeError(
-                            "异步调度器触发失败，拒绝推进调度游标"
-                        ) from exc
+                        raise RuntimeError("异步调度器触发失败，拒绝推进调度游标") from exc
 
                 if self.config.fail_on_schedule_error:
                     schedule_errors = {
-                        task_id: str(result.get('error') or '未提供错误信息')
+                        task_id: str(result.get("error") or "未提供错误信息")
                         for task_id, result in schedule_results.items()
-                        if isinstance(result, dict) and 'error' in result
+                        if isinstance(result, dict) and "error" in result
                     }
                     if schedule_errors:
                         schedule_failed = True
@@ -658,10 +654,7 @@ class LiveEngine:
                             schedule_batch,
                             "scheduler_task_failed",
                         )
-                        raise RuntimeError(
-                            "调度任务执行失败，拒绝推进调度游标: "
-                            f"{schedule_errors}"
-                        )
+                        raise RuntimeError("调度任务执行失败，拒绝推进调度游标: " f"{schedule_errors}")
         finally:
             self._schedule_batch_active = False
             if schedule_batch is not None and not schedule_failed:
@@ -683,10 +676,7 @@ class LiveEngine:
         Side Effects:
             无；仅读取引擎的调度批次状态。
         """
-        return (
-            self._schedule_batch_active
-            or self._schedule_batch_failed_reason is not None
-        )
+        return self._schedule_batch_active or self._schedule_batch_failed_reason is not None
 
     def _reject_schedule_batch_orders(
         self,
@@ -736,8 +726,8 @@ class LiveEngine:
 
     async def _maybe_emit_market_events(self, dt: datetime) -> None:
         assert self.event_bus is not None
-        if self._pre_open_dt and 'pre_open' not in self._markers_fired and dt >= self._pre_open_dt:
-            self._markers_fired.add('pre_open')
+        if self._pre_open_dt and "pre_open" not in self._markers_fired and dt >= self._pre_open_dt:
+            self._markers_fired.add("pre_open")
             await self.event_bus.emit(BeforeTradingStartEvent(date=dt.date()))
             await self._call_hook(self.before_trading_start_func)
             if not self._open_dt or dt < self._open_dt:
@@ -745,25 +735,31 @@ class LiveEngine:
             else:
                 log.info("跳过 broker.before_open：当前时间已过开盘时间 %s", self._open_dt.strftime("%H:%M:%S"))
 
-        if self._open_dt and 'open' not in self._markers_fired and dt >= self._open_dt:
-            self._markers_fired.add('open')
+        if self._open_dt and "open" not in self._markers_fired and dt >= self._open_dt:
+            self._markers_fired.add("open")
             await self.event_bus.emit(MarketOpenEvent(time=dt.strftime("%H:%M:%S")))
 
         if self._is_trading_minute(dt):
             await self.event_bus.emit(EveryMinuteEvent(time=dt.strftime("%H:%M:%S")))
 
-        if self._close_dt and 'close' not in self._markers_fired and dt >= self._close_dt:
-            self._markers_fired.add('close')
+        if self._close_dt and "close" not in self._markers_fired and dt >= self._close_dt:
+            self._markers_fired.add("close")
             await self.event_bus.emit(MarketCloseEvent(time=dt.strftime("%H:%M:%S")))
             await self._call_hook(self.after_trading_end_func)
             await self.event_bus.emit(AfterTradingEndEvent(date=dt.date()))
-            await self.event_bus.emit(TradingDayEndEvent(
-                date=dt.date(),
-                portfolio_value=self.context.portfolio.total_value,
-            ))
+            await self.event_bus.emit(
+                TradingDayEndEvent(
+                    date=dt.date(),
+                    portfolio_value=self.context.portfolio.total_value,
+                )
+            )
 
-        if self._post_close_dt and 'post_close' not in self._markers_fired and dt >= self._post_close_dt:
-            self._markers_fired.add('post_close')
+        if (
+            self._post_close_dt
+            and "post_close" not in self._markers_fired
+            and dt >= self._post_close_dt
+        ):
+            self._markers_fired.add("post_close")
             await self._call_broker_lifecycle_hook("after_close")
 
     async def _maybe_handle_data(self, dt: datetime) -> None:
@@ -803,9 +799,7 @@ class LiveEngine:
             eligible_orders: List[Order] = []
             for order in orders:
                 try:
-                    self.validate_order_request(
-                        self._order_requires_realtime_snapshot(order)
-                    )
+                    self.validate_order_request(self._order_requires_realtime_snapshot(order))
                 except Exception as exc:
                     log.error(f"订单能力门禁拒绝 {order.security}: {exc}")
                     try:
@@ -850,11 +844,13 @@ class LiveEngine:
                         except Exception:
                             pass
                         continue
-                    action = 'buy' if plan.is_buy else 'sell'
+                    action = "buy" if plan.is_buy else "sell"
                     risk = self._risk
                     if risk:
                         positions_count = len(open_position_symbols | pending_new_positions)
-                        total_value = float(getattr(self.context.portfolio, "total_value", 0.0) or 0.0)
+                        total_value = float(
+                            getattr(self.context.portfolio, "total_value", 0.0) or 0.0
+                        )
                         try:
                             risk.check_order(
                                 order_value=order_value,
@@ -991,17 +987,25 @@ class LiveEngine:
                     self._apply_trade_snapshots(trade_snapshots)
             except Exception as exc:
                 log.debug(f"订单执行后同步成交快照失败: {exc}")
-            self._trace_submitted_buys("post_broker_sync", submitted_buys, order_snapshots, trade_snapshots)
+            self._trace_submitted_buys(
+                "post_broker_sync", submitted_buys, order_snapshots, trade_snapshots
+            )
             try:
                 self.refresh_account_snapshot(force=True)
             except Exception as exc:
                 log.debug(f"订单执行后刷新账户快照失败: {exc}")
-            self._trace_submitted_buys("post_account_refresh", submitted_buys, order_snapshots, trade_snapshots)
+            self._trace_submitted_buys(
+                "post_account_refresh", submitted_buys, order_snapshots, trade_snapshots
+            )
             try:
-                self._reconcile_submitted_buy_costs(submitted_buys, order_snapshots, trade_snapshots)
+                self._reconcile_submitted_buy_costs(
+                    submitted_buys, order_snapshots, trade_snapshots
+                )
             except Exception as exc:
                 log.debug(f"订单执行后修正持仓成本失败: {exc}")
-            self._trace_submitted_buys("post_cost_reconcile", submitted_buys, order_snapshots, trade_snapshots)
+            self._trace_submitted_buys(
+                "post_cost_reconcile", submitted_buys, order_snapshots, trade_snapshots
+            )
 
     def _register_order(self, order: Order) -> None:
         if not order:
@@ -1180,7 +1184,9 @@ class LiveEngine:
             "status": snapshot.get("status") or snapshot.get("state"),
             "raw_status": snapshot.get("raw_status"),
             "amount": snapshot.get("amount") or snapshot.get("order_volume"),
-            "filled": snapshot.get("filled") or snapshot.get("traded_volume") or snapshot.get("filled_amount"),
+            "filled": snapshot.get("filled")
+            or snapshot.get("traded_volume")
+            or snapshot.get("filled_amount"),
             "price": snapshot.get("price"),
             "order_price": snapshot.get("order_price"),
             "traded_price": snapshot.get("traded_price"),
@@ -1195,8 +1201,12 @@ class LiveEngine:
             "trade_id": snapshot.get("trade_id"),
             "order_id": snapshot.get("order_id") or snapshot.get("entrust_id"),
             "security": snapshot.get("security"),
-            "amount": snapshot.get("amount") or snapshot.get("volume") or snapshot.get("trade_volume"),
-            "price": snapshot.get("price") or snapshot.get("trade_price") or snapshot.get("traded_price"),
+            "amount": snapshot.get("amount")
+            or snapshot.get("volume")
+            or snapshot.get("trade_volume"),
+            "price": snapshot.get("price")
+            or snapshot.get("trade_price")
+            or snapshot.get("traded_price"),
             "time": snapshot.get("time") or snapshot.get("trade_time"),
         }
 
@@ -1222,17 +1232,21 @@ class LiveEngine:
             broker_order_id = snap.get("order_id") or snap.get("entrust_id")
             if broker_order_id is None:
                 continue
-            trades_by_order_id.setdefault(str(broker_order_id), []).append(self._compact_trade_snapshot(snap))
+            trades_by_order_id.setdefault(str(broker_order_id), []).append(
+                self._compact_trade_snapshot(snap)
+            )
 
         target = self._portfolio_target()
         for security, meta in submitted_buys.items():
             broker_order_ids = [str(item) for item in meta.get("broker_order_ids") or [] if item]
             position = target.positions.get(security)
-            order_rows = [order_by_id.get(order_id) for order_id in broker_order_ids if order_id in order_by_id]
-            trade_rows = [
-                row
+            order_rows = [
+                order_by_id.get(order_id)
                 for order_id in broker_order_ids
-                for row in trades_by_order_id.get(order_id, [])
+                if order_id in order_by_id
+            ]
+            trade_rows = [
+                row for order_id in broker_order_ids for row in trades_by_order_id.get(order_id, [])
             ]
             self._order_debug(
                 stage,
@@ -1248,9 +1262,26 @@ class LiveEngine:
                 trade_rows=trade_rows,
             )
 
-    def _sync_orders_from_broker(self, *, from_broker: bool = False) -> List[Dict[str, Any]]:
+    def _sync_orders_from_broker(
+        self, *, from_broker: bool = False, strict: bool = False
+    ) -> List[Dict[str, Any]]:
+        """从券商读取订单快照，可为资金操作启用严格异常语义。
+
+        Args:
+            from_broker: 是否要求券商返回柜台原始范围的当日订单。
+            strict: 为 True 时不把连接或查询异常降级为空列表。
+
+        Returns:
+            List[Dict[str, Any]]: 券商订单快照。
+
+        Raises:
+            RuntimeError: 严格模式下券商不存在或不支持订单查询。
+            Exception: 严格模式下原样传播券商查询异常。
+        """
         broker = self.broker
         if not broker:
+            if strict:
+                raise RuntimeError("BROKER_ORDER_QUERY_UNAVAILABLE")
             return []
         getter = getattr(broker, "get_orders", None)
         if callable(getter):
@@ -1260,14 +1291,22 @@ class LiveEngine:
                 try:
                     return getter() or []
                 except Exception:
+                    if strict:
+                        raise
                     return []
             except Exception:
+                if strict:
+                    raise
                 return []
         if broker.supports_orders_sync():
             try:
                 return broker.sync_orders() or []
             except Exception:
+                if strict:
+                    raise
                 return []
+        if strict:
+            raise RuntimeError("BROKER_ORDER_QUERY_UNAVAILABLE")
         return []
 
     def _snapshot_filled_amount(self, snapshot: Dict[str, Any]) -> int:
@@ -1556,6 +1595,7 @@ class LiveEngine:
     ) -> Optional[Order]:
         mapped = self._orders.get(mapped_order_id) if mapped_order_id else None
         order_remark = snapshot.get("order_remark") or snapshot.get("remark")
+        idempotency_key = snapshot.get("idempotency_key")
         strategy_name = snapshot.get("strategy_name")
         order_price = snapshot.get("order_price")
         order_sysid = snapshot.get("order_sysid")
@@ -1568,9 +1608,13 @@ class LiveEngine:
             extra["source"] = "broker"
             extra["is_external"] = False
             extra["engine_order_id"] = mapped_order_id
-            style_type = str(snapshot.get("style_type") or snapshot.get("style") or "").strip().lower()
+            style_type = (
+                str(snapshot.get("style_type") or snapshot.get("style") or "").strip().lower()
+            )
             if order_remark is not None:
                 extra["order_remark"] = order_remark
+            if idempotency_key is not None:
+                extra["idempotency_key"] = idempotency_key
             if strategy_name is not None:
                 extra["strategy_name"] = strategy_name
             if order_price is not None:
@@ -1626,6 +1670,8 @@ class LiveEngine:
         }
         if order_remark is not None:
             extra["order_remark"] = order_remark
+        if idempotency_key is not None:
+            extra["idempotency_key"] = idempotency_key
         if strategy_name is not None:
             extra["strategy_name"] = strategy_name
         if order_price is not None:
@@ -1698,7 +1744,9 @@ class LiveEngine:
         mapped_order_id = str(order_id) if order_id is not None else ""
         if order_id is not None:
             mapped_order_id = self._broker_order_index.get(str(order_id), str(order_id))
-        amount = snapshot.get("amount") or snapshot.get("volume") or snapshot.get("trade_volume") or 0
+        amount = (
+            snapshot.get("amount") or snapshot.get("volume") or snapshot.get("trade_volume") or 0
+        )
         price = snapshot.get("price") or snapshot.get("trade_price") or 0.0
         raw_time = snapshot.get("time") or snapshot.get("trade_time")
         trade_time = None
@@ -1723,16 +1771,34 @@ class LiveEngine:
             trade.trade_id = f"T{hashlib.md5(f'{trade.order_id}-{trade.time}-{trade.amount}-{trade.price}'.encode('utf-8')).hexdigest()[:12]}"
         return trade
 
-    def _sync_trades_from_broker(self) -> List[Dict[str, Any]]:
+    def _sync_trades_from_broker(self, *, strict: bool = False) -> List[Dict[str, Any]]:
+        """从券商读取成交快照，可选择不吞查询异常。
+
+        Args:
+            strict: 为 True 时不把连接或查询异常降级为空列表。
+
+        Returns:
+            List[Dict[str, Any]]: 券商成交快照。
+
+        Raises:
+            RuntimeError: 严格模式下券商不存在或不支持成交查询。
+            Exception: 严格模式下原样传播券商查询异常。
+        """
         broker = self.broker
         if not broker:
+            if strict:
+                raise RuntimeError("BROKER_TRADE_QUERY_UNAVAILABLE")
             return []
         getter = getattr(broker, "get_trades", None)
         if callable(getter):
             try:
                 return getter() or []
             except Exception:
+                if strict:
+                    raise
                 return []
+        if strict:
+            raise RuntimeError("BROKER_TRADE_QUERY_UNAVAILABLE")
         return []
 
     def _apply_trade_snapshots(self, snapshots: List[Dict[str, Any]]) -> None:
@@ -1752,10 +1818,14 @@ class LiveEngine:
         security: Optional[str] = None,
         status: Optional[object] = None,
         from_broker: bool = False,
+        strict: bool = False,
     ) -> Dict[str, Order]:
         for queued in list(get_order_queue() or []):
             self._register_order(queued)
-        snapshots = self._sync_orders_from_broker(from_broker=from_broker)
+        snapshots = self._sync_orders_from_broker(
+            from_broker=from_broker,
+            strict=strict,
+        )
         self._apply_order_snapshots(snapshots)
 
         status_val = self._normalize_status(status)
@@ -1793,14 +1863,19 @@ class LiveEngine:
         orders = self.get_orders()
         if not orders:
             return {}
-        return {oid: order for oid, order in orders.items() if self._status_value(order.status) in open_states}
+        return {
+            oid: order
+            for oid, order in orders.items()
+            if self._status_value(order.status) in open_states
+        }
 
     def get_trades(
         self,
         order_id: Optional[str] = None,
         security: Optional[str] = None,
+        strict: bool = False,
     ) -> Dict[str, Trade]:
-        snapshots = self._sync_trades_from_broker()
+        snapshots = self._sync_trades_from_broker(strict=strict)
         self._apply_trade_snapshots(snapshots)
         if not self._trades:
             return {}
@@ -1983,6 +2058,14 @@ class LiveEngine:
     def _get_closeable_amount(self, security: str) -> int:
         pos = self.context.portfolio.positions.get(security)
         if not pos:
+            if self.broker and hasattr(self.broker, "get_positions"):
+                try:
+                    positions = self.broker.get_positions()
+                    for p in positions:
+                        if p.get("security") == security or p.get("code") == security:
+                            return int(p.get("closeable_amount", p.get("amount", 0)) or 0)
+                except Exception:
+                    pass
             return 0
         return int(pos.closeable_amount or pos.total_amount or 0)
 
@@ -2008,7 +2091,7 @@ class LiveEngine:
             return self._broker_factory()
 
         cfg = get_broker_config()
-        name = (self.broker_name or cfg.get('default') or 'simulator').lower()
+        name = (self.broker_name or cfg.get("default") or "simulator").lower()
         return create_broker(name, cfg)
 
     # ------------------------------------------------------------------
@@ -2041,7 +2124,9 @@ class LiveEngine:
         for mk in markets:
             self._tick_markets.discard(mk)
         persist_subscription_state(self._tick_symbols, self._tick_markets)
-        self._sync_provider_subscription(unsubscribe=True, symbols=list(symbols), markets=list(markets))
+        self._sync_provider_subscription(
+            unsubscribe=True, symbols=list(symbols), markets=list(markets)
+        )
 
     def unsubscribe_all_ticks(self) -> None:
         self._tick_subscription_updated = True
@@ -2120,6 +2205,7 @@ class LiveEngine:
             asyncio.run_coroutine_threadsafe(self._call_hook(self.handle_tick_func, data), self._loop)  # type: ignore[arg-type]
         except Exception:
             pass
+
     async def _tick_loop(self) -> None:
         if not self.config.tick_sync_enabled:
             return
@@ -2137,7 +2223,9 @@ class LiveEngine:
             if self._tick_symbols:
                 for sym in list(self._tick_symbols):
                     try:
-                        tick = await self._loop.run_in_executor(None, self._fetch_tick_snapshot, sym)
+                        tick = await self._loop.run_in_executor(
+                            None, self._fetch_tick_snapshot, sym
+                        )
                     except Exception:
                         tick = None
                     if tick:
@@ -2155,41 +2243,51 @@ class LiveEngine:
     def _start_background_jobs(self) -> None:
         assert self._loop is not None
         if self.config.account_sync_enabled and self.broker and self.broker.supports_account_sync():
-            self._background_tasks.append(self._loop.create_task(
-                self._periodic_task(
-                    "account-sync",
-                    self.config.account_sync_interval,
-                    self._account_sync_step,
+            self._background_tasks.append(
+                self._loop.create_task(
+                    self._periodic_task(
+                        "account-sync",
+                        self.config.account_sync_interval,
+                        self._account_sync_step,
+                    )
                 )
-            ))
+            )
         if self.config.order_sync_enabled and self.broker and self.broker.supports_orders_sync():
-            self._background_tasks.append(self._loop.create_task(
-                self._periodic_task(
-                    "order-sync",
-                    self.config.order_sync_interval,
-                    self._order_sync_step,
+            self._background_tasks.append(
+                self._loop.create_task(
+                    self._periodic_task(
+                        "order-sync",
+                        self.config.order_sync_interval,
+                        self._order_sync_step,
+                    )
                 )
-            ))
+            )
         if self.config.risk_check_enabled:
-            self._background_tasks.append(self._loop.create_task(
-                self._periodic_task(
-                    "risk",
-                    self.config.risk_check_interval,
-                    self._risk_step,
+            self._background_tasks.append(
+                self._loop.create_task(
+                    self._periodic_task(
+                        "risk",
+                        self.config.risk_check_interval,
+                        self._risk_step,
+                    )
                 )
-            ))
+            )
         if self.config.broker_heartbeat_interval > 0 and self.broker:
-            self._background_tasks.append(self._loop.create_task(
-                self._periodic_task(
-                    "heartbeat",
-                    self.config.broker_heartbeat_interval,
-                    self._heartbeat_step,
+            self._background_tasks.append(
+                self._loop.create_task(
+                    self._periodic_task(
+                        "heartbeat",
+                        self.config.broker_heartbeat_interval,
+                        self._heartbeat_step,
+                    )
                 )
-            ))
+            )
         # Tick 轮询
         self._background_tasks.append(self._loop.create_task(self._tick_loop()))
 
-    async def _periodic_task(self, name: str, interval: int, coro_func: Callable[[], Awaitable[None]]) -> None:
+    async def _periodic_task(
+        self, name: str, interval: int, coro_func: Callable[[], Awaitable[None]]
+    ) -> None:
         if interval <= 0:
             return
         assert self._loop is not None and self._stop_event is not None
@@ -2256,14 +2354,14 @@ class LiveEngine:
         assert self.broker is not None
         self.broker.connect()
         summary = self._safe_account_info()
-        positions = summary.get('positions') or []
+        positions = summary.get("positions") or []
         log.info(
             "✅ 券商 %s 连接成功: account_id=%s, type=%s, 可用资金=%s, 总资产=%s, 持仓数=%s",
             self.broker.__class__.__name__,
-            summary.get('account_id') or getattr(self.broker, 'account_id', ''),
-            summary.get('account_type') or getattr(self.broker, 'account_type', ''),
-            summary.get('available_cash'),
-            summary.get('total_value'),
+            summary.get("account_id") or getattr(self.broker, "account_id", ""),
+            summary.get("account_type") or getattr(self.broker, "account_type", ""),
+            summary.get("available_cash"),
+            summary.get("total_value"),
             len(positions),
         )
         self._log_account_positions(summary)
@@ -2369,8 +2467,7 @@ class LiveEngine:
                 schema_version=schema_version,
             )
         raise TypeError(
-            "STRATEGY_CAPABILITY_REQUIREMENTS 必须是 "
-            "StrategyCapabilityRequirements、profile 字符串或映射"
+            "STRATEGY_CAPABILITY_REQUIREMENTS 必须是 " "StrategyCapabilityRequirements、profile 字符串或映射"
         )
 
     def require_data_capabilities(
@@ -2403,9 +2500,7 @@ class LiveEngine:
             raise RuntimeError("数据能力要求只能在策略 initialize 阶段追加")
         current = self.strategy_capability_requirements
         requested_profile = (
-            self._normalize_strategy_capability_profile(profile)
-            if profile is not None
-            else None
+            self._normalize_strategy_capability_profile(profile) if profile is not None else None
         )
         if current is None:
             current = StrategyCapabilityRequirements(
@@ -2416,13 +2511,11 @@ class LiveEngine:
             )
         elif requested_profile is not None and requested_profile is not current.profile:
             raise ValueError(
-                f"能力画像冲突: existing={current.profile.value}, "
-                f"requested={requested_profile.value}"
+                f"能力画像冲突: existing={current.profile.value}, " f"requested={requested_profile.value}"
             )
         if schema_version is not None and str(schema_version) != current.schema_version:
             raise ValueError(
-                f"能力声明版本冲突: existing={current.schema_version}, "
-                f"requested={schema_version}"
+                f"能力声明版本冲突: existing={current.schema_version}, " f"requested={schema_version}"
             )
         merged_required = set(current.required)
         merged_required.update(str(item) for item in required)
@@ -2458,9 +2551,7 @@ class LiveEngine:
             return None
         router = self.data_source_router
         if router is None and requirements.required:
-            raise DataCapabilityUnavailableError(
-                requirements.required[0], "router_not_configured"
-            )
+            raise DataCapabilityUnavailableError(requirements.required[0], "router_not_configured")
         return (router or DataSourceRouter()).preflight(requirements)
 
     def _finalize_strategy_capabilities(self) -> None:
@@ -2491,10 +2582,7 @@ class LiveEngine:
             RuntimeError: initialize、连接、关闭或预检阶段请求写操作时抛出。
         """
 
-        if (
-            operation == "order"
-            and self._schedule_batch_failed_reason is not None
-        ):
+        if operation == "order" and self._schedule_batch_failed_reason is not None:
             raise RuntimeError(
                 "实盘写请求被拒绝: "
                 f"operation={operation}, "
@@ -2503,13 +2591,10 @@ class LiveEngine:
             )
         if self._startup_phase not in {"created", "ready"}:
             raise RuntimeError(
-                f"实盘写请求被拒绝: operation={operation}, "
-                f"startup_phase={self._startup_phase}"
+                f"实盘写请求被拒绝: operation={operation}, " f"startup_phase={self._startup_phase}"
             )
 
-    def validate_order_request(
-        self, requires_realtime_snapshot: bool
-    ) -> Optional[RouteDecision]:
+    def validate_order_request(self, requires_realtime_snapshot: bool) -> Optional[RouteDecision]:
         """在订单入队前检查启动阶段和按需实时价能力。
 
         Args:
@@ -2529,8 +2614,7 @@ class LiveEngine:
 
         self.validate_broker_write_request("order")
         capability_contract_enabled = (
-            self.data_source_router is not None
-            or self.strategy_capability_requirements is not None
+            self.data_source_router is not None or self.strategy_capability_requirements is not None
         )
         if not requires_realtime_snapshot or not capability_contract_enabled:
             return None
@@ -2633,11 +2717,15 @@ class LiveEngine:
         }
         cfg = getattr(broker, "config", None)
         if cfg:
-            raw_parts["account_key"] = raw_parts["account_key"] or _text(getattr(cfg, "account_key", None))
+            raw_parts["account_key"] = raw_parts["account_key"] or _text(
+                getattr(cfg, "account_key", None)
+            )
             raw_parts["sub_account_id"] = raw_parts["sub_account_id"] or _text(
                 getattr(cfg, "sub_account_id", None)
             )
-            raw_parts["account_id"] = raw_parts["account_id"] or _text(getattr(cfg, "account_id", None))
+            raw_parts["account_id"] = raw_parts["account_id"] or _text(
+                getattr(cfg, "account_id", None)
+            )
 
         parts = {key: value for key, value in raw_parts.items() if value}
         ordered: List[str] = []
@@ -2673,10 +2761,10 @@ class LiveEngine:
         monthday: Any,
     ) -> Tuple[Any, ...]:
         return (
-            module or '',
-            func_name or '',
-            schedule_type or '',
-            str(time_expr) if time_expr is not None else '',
+            module or "",
+            func_name or "",
+            schedule_type or "",
+            str(time_expr) if time_expr is not None else "",
             None if weekday is None else int(weekday),
             None if monthday is None else int(monthday),
         )
@@ -2688,8 +2776,8 @@ class LiveEngine:
         seen = set()
         unique: List[Any] = []
         for task in tasks:
-            module = getattr(task.func, '__module__', None)
-            name = getattr(task.func, '__name__', None)
+            module = getattr(task.func, "__module__", None)
+            name = getattr(task.func, "__name__", None)
             key = self._task_meta_key(
                 module,
                 name,
@@ -2722,7 +2810,8 @@ class LiveEngine:
         positional = [
             p
             for p in params
-            if p.kind in (
+            if p.kind
+            in (
                 inspect.Parameter.POSITIONAL_ONLY,
                 inspect.Parameter.POSITIONAL_OR_KEYWORD,
             )
@@ -2767,9 +2856,9 @@ class LiveEngine:
             return
         for task in tasks:
             strategy = OverlapStrategy.SKIP
-            if task.schedule_type.value == 'daily':
+            if task.schedule_type.value == "daily":
                 self.async_scheduler.run_daily(task.func, task.time, strategy)
-            elif task.schedule_type.value == 'weekly':
+            elif task.schedule_type.value == "weekly":
                 self.async_scheduler.run_weekly(
                     task.func,
                     task.weekday,
@@ -2778,7 +2867,7 @@ class LiveEngine:
                     task.force,
                     strategy,
                 )
-            elif task.schedule_type.value == 'monthly':
+            elif task.schedule_type.value == "monthly":
                 self.async_scheduler.run_monthly(
                     task.func,
                     task.monthday,
@@ -2830,12 +2919,12 @@ class LiveEngine:
             return
         try:
             metadata = load_strategy_metadata()
-            if not metadata or metadata.get('version') != 1:
+            if not metadata or metadata.get("version") != 1:
                 return
-            if metadata.get('strategy_start_date') == self._strategy_start_date.isoformat():
+            if metadata.get("strategy_start_date") == self._strategy_start_date.isoformat():
                 return
             metadata = dict(metadata)
-            metadata['strategy_start_date'] = self._strategy_start_date.isoformat()
+            metadata["strategy_start_date"] = self._strategy_start_date.isoformat()
             persist_strategy_metadata(metadata)
         except Exception as exc:
             log.debug(f"策略起始日写入失败: {exc}")
@@ -2846,7 +2935,7 @@ class LiveEngine:
             return
         try:
             periods = parse_market_periods_string(expr)
-            set_option('market_period', [(start, end) for start, end in periods])
+            set_option("market_period", [(start, end) for start, end in periods])
             log.info("⚙️  已应用自定义交易时段: %s", expr)
         except Exception as exc:
             log.warning("环境变量 SCHEDULER_MARKET_PERIODS 解析失败(%s): %s", expr, exc)
@@ -2854,53 +2943,53 @@ class LiveEngine:
     def _collect_settings_snapshot(self) -> Dict[str, Any]:
         snapshot: Dict[str, Any] = {}
         settings = get_settings()
-        snapshot['benchmark'] = settings.benchmark
+        snapshot["benchmark"] = settings.benchmark
         options = self._serialize_options(settings.options or {})
-        if isinstance(options.get('market_period'), (list, tuple)):
-            options['market_period'] = self._serialize_market_periods(options['market_period'])
-        snapshot['options'] = options
+        if isinstance(options.get("market_period"), (list, tuple)):
+            options["market_period"] = self._serialize_market_periods(options["market_period"])
+        snapshot["options"] = options
         order_cost_snapshot: Dict[str, Dict[str, Any]] = {}
         order_cost_override_snapshot: Dict[str, Dict[str, Any]] = {}
         for asset, cost in (settings.order_cost or {}).items():
             order_cost_snapshot[str(asset)] = {
-                'open_tax': cost.open_tax,
-                'close_tax': cost.close_tax,
-                'open_commission': cost.open_commission,
-                'close_commission': cost.close_commission,
-                'min_commission': cost.min_commission,
-                'close_today_commission': cost.close_today_commission,
-                'commission_type': getattr(cost, 'commission_type', 'by_money'),
+                "open_tax": cost.open_tax,
+                "close_tax": cost.close_tax,
+                "open_commission": cost.open_commission,
+                "close_commission": cost.close_commission,
+                "min_commission": cost.min_commission,
+                "close_today_commission": cost.close_today_commission,
+                "commission_type": getattr(cost, "commission_type", "by_money"),
             }
-        snapshot['order_cost'] = order_cost_snapshot
-        for asset, cost in (getattr(settings, 'order_cost_overrides', {}) or {}).items():
+        snapshot["order_cost"] = order_cost_snapshot
+        for asset, cost in (getattr(settings, "order_cost_overrides", {}) or {}).items():
             order_cost_override_snapshot[str(asset)] = {
-                'open_tax': cost.open_tax,
-                'close_tax': cost.close_tax,
-                'open_commission': cost.open_commission,
-                'close_commission': cost.close_commission,
-                'min_commission': cost.min_commission,
-                'close_today_commission': cost.close_today_commission,
-                'commission_type': getattr(cost, 'commission_type', 'by_money'),
+                "open_tax": cost.open_tax,
+                "close_tax": cost.close_tax,
+                "open_commission": cost.open_commission,
+                "close_commission": cost.close_commission,
+                "min_commission": cost.min_commission,
+                "close_today_commission": cost.close_today_commission,
+                "commission_type": getattr(cost, "commission_type", "by_money"),
             }
         if order_cost_override_snapshot:
-            snapshot['order_cost_overrides'] = order_cost_override_snapshot
+            snapshot["order_cost_overrides"] = order_cost_override_snapshot
         if settings.slippage:
-            payload = {'class': settings.slippage.__class__.__name__}
-            if hasattr(settings.slippage, 'value'):
-                payload['value'] = getattr(settings.slippage, 'value', None)
-            if hasattr(settings.slippage, 'ratio'):
-                payload['ratio'] = getattr(settings.slippage, 'ratio', None)
-            if hasattr(settings.slippage, 'steps'):
-                payload['steps'] = getattr(settings.slippage, 'steps', None)
-            snapshot['slippage'] = payload
-        sl_map = getattr(settings, 'slippage_map', {}) or {}
+            payload = {"class": settings.slippage.__class__.__name__}
+            if hasattr(settings.slippage, "value"):
+                payload["value"] = getattr(settings.slippage, "value", None)
+            if hasattr(settings.slippage, "ratio"):
+                payload["ratio"] = getattr(settings.slippage, "ratio", None)
+            if hasattr(settings.slippage, "steps"):
+                payload["steps"] = getattr(settings.slippage, "steps", None)
+            snapshot["slippage"] = payload
+        sl_map = getattr(settings, "slippage_map", {}) or {}
         sl_map_snapshot: Dict[str, Any] = {}
         for key, cfg in sl_map.items():
             payload = self._serialize_slippage_config(cfg)
             if payload is not None:
                 sl_map_snapshot[key] = payload
         if sl_map_snapshot:
-            snapshot['slippage_map'] = sl_map_snapshot
+            snapshot["slippage_map"] = sl_map_snapshot
         return snapshot
 
     @staticmethod
@@ -2946,14 +3035,14 @@ class LiveEngine:
     @staticmethod
     def _serialize_slippage_config(config: Any) -> Optional[Dict[str, Any]]:
         if isinstance(config, PriceRelatedSlippage):
-            return {'class': 'PriceRelatedSlippage', 'ratio': float(config.ratio)}
+            return {"class": "PriceRelatedSlippage", "ratio": float(config.ratio)}
         if isinstance(config, StepRelatedSlippage):
-            return {'class': 'StepRelatedSlippage', 'steps': int(config.steps)}
+            return {"class": "StepRelatedSlippage", "steps": int(config.steps)}
         if isinstance(config, FixedSlippage):
-            return {'class': 'FixedSlippage', 'value': float(config.value)}
-        if hasattr(config, 'to_dict'):
+            return {"class": "FixedSlippage", "value": float(config.value)}
+        if hasattr(config, "to_dict"):
             try:
-                return {'class': config.__class__.__name__, **config.to_dict()}
+                return {"class": config.__class__.__name__, **config.to_dict()}
             except Exception:
                 return None
         return None
@@ -2962,14 +3051,14 @@ class LiveEngine:
     def _deserialize_slippage_config(payload: Dict[str, Any]) -> Optional[Any]:
         if not isinstance(payload, dict):
             return None
-        cls = payload.get('class')
+        cls = payload.get("class")
         try:
-            if cls == 'PriceRelatedSlippage':
-                return PriceRelatedSlippage(payload.get('ratio', 0.0))
-            if cls == 'StepRelatedSlippage':
-                return StepRelatedSlippage(payload.get('steps', 0))
-            if cls == 'FixedSlippage':
-                return FixedSlippage(payload.get('value', 0.0))
+            if cls == "PriceRelatedSlippage":
+                return PriceRelatedSlippage(payload.get("ratio", 0.0))
+            if cls == "StepRelatedSlippage":
+                return StepRelatedSlippage(payload.get("steps", 0))
+            if cls == "FixedSlippage":
+                return FixedSlippage(payload.get("value", 0.0))
         except Exception:
             return None
         return None
@@ -2979,8 +3068,8 @@ class LiveEngine:
         seen = set()
         for task in get_tasks():
             func = task.func
-            module = getattr(func, '__module__', None)
-            name = getattr(func, '__name__', None)
+            module = getattr(func, "__module__", None)
+            name = getattr(func, "__name__", None)
             if not module or not name:
                 continue
             key = self._task_meta_key(
@@ -2996,22 +3085,22 @@ class LiveEngine:
             seen.add(key)
             tasks_meta.append(
                 {
-                    'module': module,
-                    'func': name,
-                    'schedule_type': task.schedule_type.value,
-                    'time': task.time,
-                    'weekday': task.weekday,
-                    'monthday': task.monthday,
-                    'enabled': getattr(task, 'enabled', True),
+                    "module": module,
+                    "func": name,
+                    "schedule_type": task.schedule_type.value,
+                    "time": task.time,
+                    "weekday": task.weekday,
+                    "monthday": task.monthday,
+                    "enabled": getattr(task, "enabled", True),
                 }
             )
         return tasks_meta
 
     def _restore_strategy_metadata(self, meta: Dict[str, Any]) -> bool:
-        if not meta or meta.get('version') != 1:
+        if not meta or meta.get("version") != 1:
             return False
         try:
-            raw_start_date = meta.get('strategy_start_date')
+            raw_start_date = meta.get("strategy_start_date")
             if raw_start_date:
                 parsed_start_date = self._parse_date_value(raw_start_date)
                 if parsed_start_date:
@@ -3039,16 +3128,14 @@ class LiveEngine:
                         required = set(current.required).union(restored.required)
                         optional = set(current.optional).union(restored.optional)
                         optional.difference_update(required)
-                        self.strategy_capability_requirements = (
-                            StrategyCapabilityRequirements(
-                                profile=current.profile,
-                                required=tuple(required),
-                                optional=tuple(optional),
-                                schema_version=current.schema_version,
-                            )
+                        self.strategy_capability_requirements = StrategyCapabilityRequirements(
+                            profile=current.profile,
+                            required=tuple(required),
+                            optional=tuple(optional),
+                            schema_version=current.schema_version,
                         )
-            self._apply_settings_snapshot(meta.get('settings') or {})
-            self._apply_scheduler_tasks_snapshot(meta.get('tasks') or [])
+            self._apply_settings_snapshot(meta.get("settings") or {})
+            self._apply_scheduler_tasks_snapshot(meta.get("tasks") or [])
             return True
         except Exception as exc:
             log.warning(f"恢复策略元数据失败: {exc}")
@@ -3057,38 +3144,38 @@ class LiveEngine:
     def _apply_settings_snapshot(self, snapshot: Dict[str, Any]) -> None:
         if not snapshot:
             return
-        benchmark = snapshot.get('benchmark')
+        benchmark = snapshot.get("benchmark")
         if benchmark:
             try:
                 set_benchmark(benchmark)
             except Exception as exc:
                 log.warning(f"恢复 benchmark 失败: {exc}")
-        options = snapshot.get('options') or {}
+        options = snapshot.get("options") or {}
         for key, value in options.items():
             try:
-                if key == 'market_period' and value:
+                if key == "market_period" and value:
                     value = self._deserialize_market_periods(value)
                 set_option(key, value)
             except Exception as exc:
                 log.debug(f"恢复 option {key} 失败: {exc}")
-        order_costs = snapshot.get('order_cost') or {}
+        order_costs = snapshot.get("order_cost") or {}
         for asset, payload in order_costs.items():
             try:
                 cost = OrderCost(**payload)
                 set_order_cost(cost, type=asset)
             except Exception as exc:
                 log.debug(f"恢复 order_cost({asset}) 失败: {exc}")
-        order_cost_overrides = snapshot.get('order_cost_overrides') or {}
+        order_cost_overrides = snapshot.get("order_cost_overrides") or {}
         for asset, payload in order_cost_overrides.items():
             try:
                 cost = OrderCost(**payload)
                 # asset 形如 type_code
-                if '_' in asset:
-                    type_prefix, ref_code = asset.split('_', 1)
+                if "_" in asset:
+                    type_prefix, ref_code = asset.split("_", 1)
                     set_order_cost(cost, type=type_prefix, ref=ref_code)
             except Exception as exc:
                 log.debug(f"恢复 order_cost_overrides({asset}) 失败: {exc}")
-        sl_map = snapshot.get('slippage_map') or {}
+        sl_map = snapshot.get("slippage_map") or {}
         if sl_map:
             try:
                 settings = get_settings()
@@ -3097,20 +3184,20 @@ class LiveEngine:
                     cfg = self._deserialize_slippage_config(payload)
                     if cfg:
                         settings.slippage_map[key] = cfg
-                if settings.slippage is None and 'all' in settings.slippage_map:
-                    settings.slippage = settings.slippage_map.get('all')
+                if settings.slippage is None and "all" in settings.slippage_map:
+                    settings.slippage = settings.slippage_map.get("all")
             except Exception as exc:
                 log.debug(f"恢复 slippage_map 失败: {exc}")
-        slippage = snapshot.get('slippage')
+        slippage = snapshot.get("slippage")
         if slippage:
-            cls = slippage.get('class')
+            cls = slippage.get("class")
             try:
-                if cls == 'FixedSlippage':
-                    set_slippage(FixedSlippage(slippage.get('value', 0.0)))
-                elif cls == 'PriceRelatedSlippage':
-                    set_slippage(PriceRelatedSlippage(slippage.get('ratio', 0.0)))
-                elif cls == 'StepRelatedSlippage':
-                    set_slippage(StepRelatedSlippage(slippage.get('steps', 0)))
+                if cls == "FixedSlippage":
+                    set_slippage(FixedSlippage(slippage.get("value", 0.0)))
+                elif cls == "PriceRelatedSlippage":
+                    set_slippage(PriceRelatedSlippage(slippage.get("ratio", 0.0)))
+                elif cls == "StepRelatedSlippage":
+                    set_slippage(StepRelatedSlippage(slippage.get("steps", 0)))
             except Exception as exc:
                 log.debug(f"恢复 slippage 失败: {exc}")
 
@@ -3125,12 +3212,12 @@ class LiveEngine:
         seen = set()
         for task_meta in tasks:
             key = self._task_meta_key(
-                task_meta.get('module'),
-                task_meta.get('func'),
-                task_meta.get('schedule_type'),
-                task_meta.get('time'),
-                task_meta.get('weekday'),
-                task_meta.get('monthday'),
+                task_meta.get("module"),
+                task_meta.get("func"),
+                task_meta.get("schedule_type"),
+                task_meta.get("time"),
+                task_meta.get("weekday"),
+                task_meta.get("monthday"),
             )
             if key in seen:
                 continue
@@ -3138,20 +3225,20 @@ class LiveEngine:
             normalized_tasks.append(task_meta)
 
         for task_meta in normalized_tasks:
-            func = self._resolve_callable(task_meta.get('module'), task_meta.get('func'))
+            func = self._resolve_callable(task_meta.get("module"), task_meta.get("func"))
             if not func:
                 log.warning(f"无法恢复调度任务: {task_meta}")
                 continue
-            schedule_type = task_meta.get('schedule_type')
-            time_expr = task_meta.get('time', 'every_bar')
-            enabled = bool(task_meta.get('enabled', True))
+            schedule_type = task_meta.get("schedule_type")
+            time_expr = task_meta.get("time", "every_bar")
+            enabled = bool(task_meta.get("enabled", True))
             try:
-                if schedule_type == 'daily':
+                if schedule_type == "daily":
                     run_daily(func, time_expr)
-                elif schedule_type == 'weekly':
-                    run_weekly(func, task_meta.get('weekday'), time_expr)
-                elif schedule_type == 'monthly':
-                    run_monthly(func, task_meta.get('monthday'), time_expr)
+                elif schedule_type == "weekly":
+                    run_weekly(func, task_meta.get("weekday"), time_expr)
+                elif schedule_type == "monthly":
+                    run_monthly(func, task_meta.get("monthday"), time_expr)
                 current_tasks = get_tasks()
                 if current_tasks:
                     current_task = current_tasks[-1]
@@ -3159,7 +3246,9 @@ class LiveEngine:
             except Exception as exc:
                 log.warning(f"恢复调度任务失败 {task_meta}: {exc}")
 
-    def _resolve_callable(self, module_name: Optional[str], func_name: Optional[str]) -> Optional[Callable]:
+    def _resolve_callable(
+        self, module_name: Optional[str], func_name: Optional[str]
+    ) -> Optional[Callable]:
         if not module_name or not func_name:
             return None
         module = sys.modules.get(module_name)
@@ -3201,7 +3290,11 @@ class LiveEngine:
         if not self.broker or not self.broker.supports_account_sync():
             return
         now = datetime.now()
-        if not force and self._last_account_refresh and (now - self._last_account_refresh).total_seconds() < 1:
+        if (
+            not force
+            and self._last_account_refresh
+            and (now - self._last_account_refresh).total_seconds() < 1
+        ):
             return
         try:
             snapshot = self.broker.sync_account()
@@ -3214,13 +3307,17 @@ class LiveEngine:
 
     def _apply_account_snapshot(self, snapshot: Dict[str, Any]) -> None:
         try:
-            target = self.portfolio_proxy.backing if isinstance(self.context.portfolio, LivePortfolioProxy) else self.context.portfolio
-            cash = snapshot.get('available_cash')
-            transferable = snapshot.get('transferable_cash')
-            locked = snapshot.get('locked_cash')
+            target = (
+                self.portfolio_proxy.backing
+                if isinstance(self.context.portfolio, LivePortfolioProxy)
+                else self.context.portfolio
+            )
+            cash = snapshot.get("available_cash")
+            transferable = snapshot.get("transferable_cash")
+            locked = snapshot.get("locked_cash")
             if locked is None:
-                locked = snapshot.get('frozen_cash')
-            total = snapshot.get('total_value')
+                locked = snapshot.get("frozen_cash")
+            total = snapshot.get("total_value")
             if cash is not None:
                 target.available_cash = float(cash)
             if transferable is not None:
@@ -3229,33 +3326,42 @@ class LiveEngine:
                 target.locked_cash = float(locked)
             if total is not None:
                 target.total_value = float(total)
-            positions = snapshot.get('positions') or []
+            positions = snapshot.get("positions") or []
             target.positions.clear()
             stock_subportfolio = None
             try:
-                stock_subportfolio = target.subportfolios.get('stock')
+                stock_subportfolio = target.subportfolios.get("stock")
             except Exception:
                 stock_subportfolio = None
             if stock_subportfolio is not None:
-                stock_subportfolio.available_cash = float(getattr(target, 'available_cash', 0.0) or 0.0)
-                stock_subportfolio.transferable_cash = float(getattr(target, 'transferable_cash', 0.0) or 0.0)
+                stock_subportfolio.available_cash = float(
+                    getattr(target, "available_cash", 0.0) or 0.0
+                )
+                stock_subportfolio.transferable_cash = float(
+                    getattr(target, "transferable_cash", 0.0) or 0.0
+                )
                 stock_subportfolio.positions.clear()
             for item in positions:
-                security = item.get('security')
+                security = item.get("security")
                 if not security:
                     continue
-                amount = int(item.get('amount', item.get('total_amount', 0)) or 0)
-                price = float(item.get('current_price', item.get('price', 0.0)) or 0.0)
+                amount = int(item.get("amount", item.get("total_amount", 0)) or 0)
+                price = float(item.get("current_price", item.get("price", 0.0)) or 0.0)
                 position = Position(
                     security=security,
                     total_amount=amount,
-                    closeable_amount=int(item.get('closeable_amount', amount)),
-                    avg_cost=float(item.get('avg_cost', 0.0) or 0.0),
+                    closeable_amount=int(item.get("closeable_amount", amount)),
+                    avg_cost=float(item.get("avg_cost", 0.0) or 0.0),
                     price=price,
-                    value=float(item.get('market_value', amount * price)),
-                    buy_time=self._parse_datetime_value(item.get('buy_time', item.get('init_time'))),
+                    value=float(item.get("market_value", amount * price)),
+                    buy_time=self._parse_datetime_value(
+                        item.get("buy_time", item.get("init_time"))
+                    ),
                     last_buy_time=self._parse_datetime_value(
-                        item.get('last_buy_time', item.get('transact_time', item.get('buy_time', item.get('init_time'))))
+                        item.get(
+                            "last_buy_time",
+                            item.get("transact_time", item.get("buy_time", item.get("init_time"))),
+                        )
                     ),
                 )
                 target.positions[security] = position
@@ -3280,7 +3386,14 @@ class LiveEngine:
             info = self.broker.get_account_info() or {}
             # 如果券商返回的是自定义对象，尽量转成 dict
             if not isinstance(info, dict):
-                info = getattr(info, '__dict__', {}) or {}
+                info = getattr(info, "__dict__", {}) or {}
+            if "positions" not in info and hasattr(self.broker, "get_positions"):
+                try:
+                    positions = self.broker.get_positions()
+                    if isinstance(positions, list):
+                        info["positions"] = positions
+                except Exception as exc:
+                    log.debug(f"获取持仓列表失败: {exc}")
             return info
         except Exception as exc:
             log.debug(f"获取账户信息失败: {exc}")
@@ -3291,41 +3404,43 @@ class LiveEngine:
         以 print_portfolio_info 风格输出券商账户概览，避免原始 list 噪音。
         """
         try:
-            positions = list(summary.get('positions') or [])
-            total_value = self._to_float(summary.get('total_value'))
-            cash = self._to_float(summary.get('available_cash'))
+            positions = list(summary.get("positions") or [])
+            total_value = self._to_float(summary.get("total_value"))
+            cash = self._to_float(summary.get("available_cash"))
             invested = 0.0
             entries: List[Dict[str, Any]] = []
             for item in positions:
-                code = item.get('security') or item.get('code')
+                code = item.get("security") or item.get("code")
                 if not code:
                     continue
-                amount = int(item.get('amount', item.get('total_amount', 0)) or 0)
+                amount = int(item.get("amount", item.get("total_amount", 0)) or 0)
                 if amount <= 0:
                     continue
-                closeable = int(item.get('closeable_amount', amount) or amount)
-                avg_cost = self._to_float(item.get('avg_cost'))
-                price = self._to_float(item.get('current_price', item.get('price')))
-                value = self._to_float(item.get('market_value'), default=price * amount)
+                closeable = int(item.get("closeable_amount", amount) or amount)
+                avg_cost = self._to_float(item.get("avg_cost"))
+                price = self._to_float(item.get("current_price", item.get("price")))
+                value = self._to_float(item.get("market_value"), default=price * amount)
                 if value == 0.0:
                     value = price * amount
                 invested += value
                 pnl = value - avg_cost * amount
                 pnl_pct = ((price / avg_cost - 1.0) * 100.0) if avg_cost > 0 else 0.0
                 weight = ((value / total_value) * 100.0) if total_value > 0 else 0.0
-                name = item.get('display_name') or item.get('name') or self._lookup_security_name(code)
+                name = (
+                    item.get("display_name") or item.get("name") or self._lookup_security_name(code)
+                )
                 entries.append(
                     {
-                        'code': code,
-                        'name': name,
-                        'amount': amount,
-                        'closeable': closeable,
-                        'avg_cost': avg_cost,
-                        'price': price,
-                        'value': value,
-                        'pnl': pnl,
-                        'pnl_pct': pnl_pct,
-                        'weight': weight,
+                        "code": code,
+                        "name": name,
+                        "amount": amount,
+                        "closeable": closeable,
+                        "avg_cost": avg_cost,
+                        "price": price,
+                        "value": value,
+                        "pnl": pnl,
+                        "pnl_pct": pnl_pct,
+                        "weight": weight,
                     }
                 )
 
@@ -3340,15 +3455,15 @@ class LiveEngine:
                 log.info("当前持仓：无")
                 return
 
-            entries.sort(key=lambda x: x['value'], reverse=True)
+            entries.sort(key=lambda x: x["value"], reverse=True)
             entries = entries[:limit]
             headers = ["股票代码", "名称", "持仓", "可用", "成本价", "现价", "市值", "盈亏", "盈亏%", "占比%"]
             rows = [
                 [
-                    entry['code'],
-                    entry['name'],
-                    str(entry['amount']),
-                    str(entry['closeable']),
+                    entry["code"],
+                    entry["name"],
+                    str(entry["amount"]),
+                    str(entry["closeable"]),
                     f"{entry['avg_cost']:.3f}",
                     f"{entry['price']:.3f}",
                     f"{entry['value']:,.2f}",
@@ -3392,8 +3507,7 @@ class LiveEngine:
 
         def _format_row(values: Sequence[str]) -> str:
             segments = [
-                f" {cls._pad_cell(str(value), widths[idx])} "
-                for idx, value in enumerate(values)
+                f" {cls._pad_cell(str(value), widths[idx])} " for idx, value in enumerate(values)
             ]
             return "|" + "|".join(segments) + "|"
 
@@ -3436,6 +3550,8 @@ class LiveEngine:
         current = cls._display_width(text)
         padding = max(target_width - current, 0)
         return text + (" " * padding)
+
+
 class LivePortfolioProxy:
     """
     代理 Portfolio，确保访问现金/持仓时优先刷新券商快照。
@@ -3550,29 +3666,28 @@ class TradingCalendarGuard:
                     reason="days_none",
                     extra={"query": query},
                 )
-                return False
-            if isinstance(days, (list, tuple, set)):
+            elif isinstance(days, (list, tuple, set)):
                 if not days:
                     self._log_calendar_diag(
                         now=datetime.now(),
                         target=target,
-                        reason="days_empty",
+                        reason="days_empty_fallback_to_weekday",
                         extra={"query": query},
                     )
+                else:
+                    for day in days:
+                        try:
+                            if pd.to_datetime(day).date() == target:
+                                return True
+                        except Exception:
+                            continue
+                    self._log_calendar_diag(
+                        now=datetime.now(),
+                        target=target,
+                        reason="target_not_in_days",
+                        extra={"query": query, "sample_days": self._sample_days(days)},
+                    )
                     return False
-                for day in days:
-                    try:
-                        if pd.to_datetime(day).date() == target:
-                            return True
-                    except Exception:
-                        continue
-                self._log_calendar_diag(
-                    now=datetime.now(),
-                    target=target,
-                    reason="target_not_in_days",
-                    extra={"query": query, "sample_days": self._sample_days(days)},
-                )
-                return False
             try:
                 iterator = iter(days)
             except TypeError:
@@ -3618,7 +3733,14 @@ class TradingCalendarGuard:
                 extra={"weekday": target.weekday()},
             )
             return False
-        return True
+        # 非周末且无法从数据源确认交易日时，严格拒绝盲目执行策略，避免节假日误扣冷静期
+        self._log_calendar_diag(
+            now=datetime.now(),
+            target=target,
+            reason="unconfirmed_trading_day_fail_closed",
+            extra={"weekday": target.weekday()},
+        )
+        return False
 
     @staticmethod
     def _sample_days(days: Any, limit: int = 5) -> str:

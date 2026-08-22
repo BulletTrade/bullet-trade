@@ -178,6 +178,7 @@ def get_data_provider_config() -> dict:
             "data_dir": get_env("QMT_DATA_PATH"),
             "auto_download": get_env_optional_bool("MINIQMT_AUTO_DOWNLOAD"),
             "market": get_env("MINIQMT_MARKET"),
+            "max_live_age_seconds": get_env_float("MINIQMT_LIVE_MAX_AGE_SECONDS", 5.0),
             "cache_dir": cache_dir_for("miniqmt"),
             "tushare_token": get_env("TUSHARE_TOKEN"),
             "tushare_custom_url": get_env("TUSHARE_CUSTOM_URL"),

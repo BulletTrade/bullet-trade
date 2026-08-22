@@ -384,6 +384,8 @@ class BacktestEngine:
         module.get_open_orders = _get_open_orders
         module.get_orders = _get_orders
         module.get_trades = _get_trades
+        module.cancel_order = cancel_order
+        module.cancel_all_orders = cancel_all_orders
 
         # 注入调度函数
         module.run_daily = run_daily
