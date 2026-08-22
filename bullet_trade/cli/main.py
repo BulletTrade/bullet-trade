@@ -220,8 +220,8 @@ def create_parser():
         choices=list(list_brokers()),
         default=None,
         help=(
-            "券商类型：qmt、qmt-remote、simulator、huaxin（huaxin 仅预览骨架、"
-            "当前不可交易；默认读取 DEFAULT_BROKER）"
+            "券商类型：qmt、qmt-remote、simulator、huaxin（huaxin 需外部 Trader bundle "
+            "与私密配置；默认读取 DEFAULT_BROKER）"
         ),
     )
     live_parser.add_argument("--log-dir", type=str, default=None, help="覆盖 LOG_DIR，优先于 .env")
@@ -243,7 +243,10 @@ def create_parser():
     # server 命令
     server_parser = subparsers.add_parser("server", help="启动远程数据/券商服务")
     server_parser.add_argument(
-        "--server-type", dest="server_type", default="qmt", help="服务类型（默认 qmt；大 QMT 用 big_qmt 或 big-qmt）"
+        "--server-type",
+        dest="server_type",
+        default="qmt",
+        help="服务类型（qmt、big_qmt/big-qmt 或 huaxin）",
     )
     server_parser.add_argument(
         "--listen", dest="listen", default=None, help="监听地址（覆盖 QMT_SERVER_LISTEN）"

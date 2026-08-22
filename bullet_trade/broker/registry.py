@@ -11,6 +11,7 @@
 
 from __future__ import annotations
 
+import os
 from threading import RLock
 from typing import Any, Callable, Dict, Mapping, Tuple
 
@@ -244,8 +245,21 @@ def _build_huaxin(config: Mapping[str, Any]) -> BrokerBase:
     from ..integrations.huaxin.broker import HuaxinBroker
 
     huaxin_config = dict(config.get("huaxin") or {})
+    for k, v in os.environ.items():
+        if k.startswith("HUAXIN_"):
+            clean_key = k[7:].lower()
+            if clean_key not in huaxin_config:
+                huaxin_config[clean_key] = v
+
+    account_id = (
+        huaxin_config.get("account_id")
+        or huaxin_config.get("login_account")
+        or os.getenv("HUAXIN_LOGIN_ACCOUNT")
+        or os.getenv("HUAXIN_ACCOUNT_ID")
+        or "huaxin-unconfigured"
+    )
     return HuaxinBroker(
-        account_id=huaxin_config.get("account_id") or "huaxin-unconfigured",
+        account_id=account_id,
         account_type=huaxin_config.get("account_type", "stock"),
         config=huaxin_config,
     )

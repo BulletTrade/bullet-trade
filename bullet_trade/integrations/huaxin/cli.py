@@ -1,11 +1,11 @@
 """
 作者: BruceLee
-文件职责: 提供华鑫 native 基础切片的显式 doctor 与离线构建命令。
-主要输入: 命令行中的 bundle、构建 prefix、构建类型和受控超时。
+文件职责: 提供华鑫 native 基础切片的显式 doctor 与 fake/Trader 构建命令。
+主要输入: 命令行中的 bundle、构建 prefix、模式、外部 SDK include/lib 和受控超时。
 主要输出: 可机器读取的脱敏 JSON 诊断或内容寻址 bundle 信息。
 上游关系: ``bullet-trade huaxin`` 主命令或模块入口按需调用。
 下游关系: build.py 的 doctor/build_native_bridge；不直接调用 native 或厂商 API。
-关键环境或配置: 只接受 offline_fake 构建，不读取凭据、不联网、不连接柜台或交易。
+关键环境或配置: Trader 构建只读取显式 SDK 路径，不复制厂商资产、不读取凭据或连接柜台。
 """
 
 from __future__ import annotations
@@ -50,7 +50,7 @@ def configure_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
 
     build_parser = subparsers.add_parser(
         "build",
-        help="从包内自研源码显式构建离线 fake bridge",
+        help="从包内自研源码显式构建离线 fake 或 Trader-only bridge",
     )
     build_parser.add_argument(
         "--prefix",
@@ -58,11 +58,36 @@ def configure_parser(parser: argparse.ArgumentParser) -> argparse.ArgumentParser
         required=True,
         help="站点包和源码包之外的构建输出根目录",
     )
-    build_parser.add_argument(
+    mode_group = build_parser.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument(
         "--offline-fake",
         action="store_true",
-        required=True,
         help="确认仅构建不连接厂商 SDK 的离线 fake bridge",
+    )
+    mode_group.add_argument(
+        "--trader",
+        action="store_true",
+        help="构建显式链接外部官方 Trader SDK 的 Linux bridge",
+    )
+    build_parser.add_argument(
+        "--sdk-dir",
+        type=Path,
+        help="Trader SDK 根目录，其下必须含 include/ 与 lib/",
+    )
+    build_parser.add_argument(
+        "--sdk-include-dir",
+        type=Path,
+        help="显式覆盖 Trader SDK include 目录",
+    )
+    build_parser.add_argument(
+        "--sdk-library-dir",
+        type=Path,
+        help="显式覆盖 Trader SDK lib 目录",
+    )
+    build_parser.add_argument(
+        "--trader-library",
+        default="libtraderapi.so",
+        help="Trader 动态库文件名，默认 libtraderapi.so",
     )
     build_parser.add_argument(
         "--build-type",
@@ -127,12 +152,12 @@ def _run_doctor(arguments: argparse.Namespace) -> int:
 
     report = doctor(bundle_path=arguments.bundle, load=arguments.load)
     _print_json(report.to_dict())
-    return 0 if report.offline_bridge_ready else 2
+    return 0 if report.offline_bridge_ready or report.native_ready else 2
 
 
 def _run_build(arguments: argparse.Namespace) -> int:
     """
-    执行显式 offline_fake 构建并输出内容寻址结果。
+    执行显式 fake 或 Trader 构建并输出内容寻址结果。
 
     参数:
         arguments: 已解析的 prefix、build_type 与 timeout 参数。
@@ -144,9 +169,13 @@ def _run_build(arguments: argparse.Namespace) -> int:
 
     result = build_native_bridge(
         prefix=arguments.prefix,
-        mode="offline_fake",
+        mode="trader" if arguments.trader else "offline_fake",
         build_type=arguments.build_type,
         timeout_seconds=arguments.timeout,
+        sdk_dir=arguments.sdk_dir,
+        sdk_include_dir=arguments.sdk_include_dir,
+        sdk_library_dir=arguments.sdk_library_dir,
+        trader_library=arguments.trader_library,
     )
     _print_json(result.to_dict())
     return 0

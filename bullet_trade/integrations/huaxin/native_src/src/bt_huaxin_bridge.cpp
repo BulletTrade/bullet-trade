@@ -57,6 +57,11 @@ static_assert(std::is_standard_layout<bt_huaxin_event>::value);
 static_assert(std::is_trivially_copyable<bt_huaxin_event>::value);
 static_assert(std::is_standard_layout<bt_huaxin_event_batch>::value);
 static_assert(std::is_trivially_copyable<bt_huaxin_event_batch>::value);
+static_assert(sizeof(bt_huaxin_query_request) <= BT_HUAXIN_REQUEST_PAYLOAD_CAPACITY);
+static_assert(sizeof(bt_huaxin_limit_order_request) <= BT_HUAXIN_REQUEST_PAYLOAD_CAPACITY);
+static_assert(sizeof(bt_huaxin_cancel_order_request) <= BT_HUAXIN_REQUEST_PAYLOAD_CAPACITY);
+static_assert(sizeof(bt_huaxin_order_event) <= BT_HUAXIN_OWNED_EVENT_PAYLOAD_CAPACITY);
+static_assert(sizeof(bt_huaxin_trade_event) <= BT_HUAXIN_OWNED_EVENT_PAYLOAD_CAPACITY);
 
 int64_t monotonic_nanoseconds() noexcept {
     const auto now = std::chrono::steady_clock::now().time_since_epoch();
@@ -328,6 +333,20 @@ const char *bt_huaxin_error_message(int32_t result) {
             return "unsupported request";
         case BT_HUAXIN_QUEUE_FULL:
             return "queue full";
+        case BT_HUAXIN_SESSION_NOT_STARTED:
+            return "session not started";
+        case BT_HUAXIN_NOT_LOGGED_IN:
+            return "not logged in";
+        case BT_HUAXIN_TRADING_DISABLED:
+            return "trading disabled";
+        case BT_HUAXIN_CANCEL_DISABLED:
+            return "cancel disabled";
+        case BT_HUAXIN_NOT_READY:
+            return "runtime not ready";
+        case BT_HUAXIN_VENDOR_ERROR:
+            return "vendor API returned an error";
+        case BT_HUAXIN_INVALID_STATE:
+            return "invalid runtime state";
         default:
             return "unknown result";
     }
@@ -414,6 +433,72 @@ int32_t bt_huaxin_get_health(
         out_health->queue_size = static_cast<uint32_t>(handle->events.size());
         out_health->reserved = 0u;
         out_health->dropped_events = handle->dropped_events;
+        set_schema_identity(&out_health->schema);
+        return BT_HUAXIN_OK;
+    } catch (...) {
+        return BT_HUAXIN_INTERNAL_ERROR;
+    }
+}
+
+int32_t bt_huaxin_start_session(
+    bt_huaxin_handle *handle,
+    const bt_huaxin_session_config *config
+) {
+    if (handle == nullptr || config == nullptr) {
+        return BT_HUAXIN_INVALID_ARGUMENT;
+    }
+    const int32_t header_result = validate_header(
+        config->abi_version,
+        config->struct_size,
+        sizeof(bt_huaxin_session_config)
+    );
+    if (header_result != BT_HUAXIN_OK) {
+        return header_result;
+    }
+    if (!schema_identity_matches(config->schema)) {
+        return BT_HUAXIN_SCHEMA_INCOMPATIBLE;
+    }
+    return BT_HUAXIN_UNSUPPORTED_REQUEST;
+}
+
+int32_t bt_huaxin_stop_session(bt_huaxin_handle *handle) {
+    return handle == nullptr ? BT_HUAXIN_INVALID_ARGUMENT : BT_HUAXIN_OK;
+}
+
+int32_t bt_huaxin_get_trader_health(
+    bt_huaxin_handle *handle,
+    bt_huaxin_trader_health *out_health
+) {
+    try {
+        if (handle == nullptr || out_health == nullptr) {
+            return BT_HUAXIN_INVALID_ARGUMENT;
+        }
+        const int32_t header_result = validate_header(
+            out_health->abi_version,
+            out_health->struct_size,
+            sizeof(bt_huaxin_trader_health)
+        );
+        if (header_result != BT_HUAXIN_OK) {
+            return header_result;
+        }
+        if (!schema_identity_matches(out_health->schema)) {
+            return BT_HUAXIN_SCHEMA_INCOMPATIBLE;
+        }
+        std::lock_guard<std::mutex> lock(handle->mutex);
+        out_health->state = BT_HUAXIN_STATE_OFFLINE_READY;
+        out_health->queue_capacity = handle->queue_capacity;
+        out_health->queue_size = static_cast<uint32_t>(handle->events.size());
+        out_health->reserved = 0u;
+        out_health->dropped_events = handle->dropped_events;
+        out_health->transport_connected = 0u;
+        out_health->logged_in = 0u;
+        out_health->ready_for_queries = 0u;
+        out_health->ready_for_new_orders = 0u;
+        out_health->ready_for_cancel = 0u;
+        std::memset(out_health->reserved_flags, 0, sizeof(out_health->reserved_flags));
+        out_health->session_epoch = 0u;
+        out_health->last_error_id = 0;
+        out_health->reserved_tail = 0u;
         set_schema_identity(&out_health->schema);
         return BT_HUAXIN_OK;
     } catch (...) {
@@ -560,6 +645,50 @@ int32_t bt_huaxin_free_event_batch(bt_huaxin_event_batch *batch) {
     } catch (...) {
         return BT_HUAXIN_INTERNAL_ERROR;
     }
+}
+
+int32_t bt_huaxin_drain_owned_event_batch(
+    bt_huaxin_handle *handle,
+    uint32_t max_events,
+    bt_huaxin_owned_event_batch *out_batch
+) {
+    if (handle == nullptr || max_events == 0u || out_batch == nullptr) {
+        return BT_HUAXIN_INVALID_ARGUMENT;
+    }
+    const int32_t header_result = validate_header(
+        out_batch->abi_version,
+        out_batch->struct_size,
+        sizeof(bt_huaxin_owned_event_batch)
+    );
+    if (header_result != BT_HUAXIN_OK) {
+        return header_result;
+    }
+    if (!schema_identity_matches(out_batch->schema)) {
+        return BT_HUAXIN_SCHEMA_INCOMPATIBLE;
+    }
+    return BT_HUAXIN_UNSUPPORTED_REQUEST;
+}
+
+int32_t bt_huaxin_free_owned_event_batch(bt_huaxin_owned_event_batch *batch) {
+    if (batch == nullptr) {
+        return BT_HUAXIN_INVALID_ARGUMENT;
+    }
+    const int32_t header_result = validate_header(
+        batch->abi_version,
+        batch->struct_size,
+        sizeof(bt_huaxin_owned_event_batch)
+    );
+    if (header_result != BT_HUAXIN_OK) {
+        return header_result;
+    }
+    if (!schema_identity_matches(batch->schema)) {
+        return BT_HUAXIN_SCHEMA_INCOMPATIBLE;
+    }
+    if (batch->events != nullptr || batch->event_count != 0u ||
+        batch->event_stride != 0u || batch->ownership_token != 0u) {
+        return BT_HUAXIN_BUFFER_OWNERSHIP_ERROR;
+    }
+    return BT_HUAXIN_OK;
 }
 
 }  // extern "C"

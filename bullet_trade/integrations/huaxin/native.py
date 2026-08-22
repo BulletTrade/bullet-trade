@@ -11,10 +11,11 @@
 from __future__ import annotations
 
 import ctypes
+import math
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Type
+from typing import Any, Dict, List, Mapping, Optional, Type
 
 from .errors import (
     HUAXIN_NATIVE_UNAVAILABLE,
@@ -29,12 +30,124 @@ from .errors import (
 ABI_VERSION = 2
 VENDOR_SCHEMA_ID = "bullet_trade.huaxin.offline_fake.v1"
 FIELD_SET_VERSION = "1"
+TRADER_VENDOR_SCHEMA_ID = "bullet_trade.huaxin.tora_trader.v1"
+TRADER_FIELD_SET_VERSION = "tora-stock-v4.1.8-order-v2"
+MODE_OFFLINE_FAKE = "offline_fake"
+MODE_TRADER = "trader"
 VENDOR_SCHEMA_ID_CAPACITY = 64
 FIELD_SET_VERSION_CAPACITY = 32
 EVENT_PAYLOAD_CAPACITY = 192
 REQUEST_PAYLOAD_CAPACITY = 192
+OWNED_EVENT_PAYLOAD_CAPACITY = 1024
 MAX_DRAIN_EVENTS = 4096
 REQUEST_TYPE_PING = 1
+REQUEST_QUERY_SECURITY = 100
+REQUEST_QUERY_SHAREHOLDER_ACCOUNT = 101
+REQUEST_QUERY_TRADING_ACCOUNT = 102
+REQUEST_QUERY_POSITION = 103
+REQUEST_QUERY_ORDER = 104
+REQUEST_QUERY_TRADE = 105
+REQUEST_PLACE_LIMIT = 120
+REQUEST_CANCEL_ORDER = 121
+REQUEST_PLACE_ORDER = 122
+
+EVENT_BRIDGE_CREATED = 1
+EVENT_OFFLINE_READY = 2
+EVENT_REQUEST_COMPLETED = 3
+EVENT_STATE = 100
+EVENT_ERROR = 101
+EVENT_LOGIN = 102
+EVENT_SECURITY = 110
+EVENT_SHAREHOLDER_ACCOUNT = 111
+EVENT_TRADING_ACCOUNT = 112
+EVENT_POSITION = 113
+EVENT_ORDER = 114
+EVENT_TRADE = 115
+EVENT_QUERY_END = 116
+EVENT_ORDER_INSERT_RESPONSE = 120
+EVENT_ORDER_ACTION_RESPONSE = 121
+
+EVENT_NAMES = {
+    EVENT_BRIDGE_CREATED: "bridge_created",
+    EVENT_OFFLINE_READY: "offline_ready",
+    EVENT_REQUEST_COMPLETED: "request_completed",
+    EVENT_STATE: "state",
+    EVENT_ERROR: "error",
+    EVENT_LOGIN: "login",
+    EVENT_SECURITY: "security",
+    EVENT_SHAREHOLDER_ACCOUNT: "shareholder_account",
+    EVENT_TRADING_ACCOUNT: "trading_account",
+    EVENT_POSITION: "position",
+    EVENT_ORDER: "order",
+    EVENT_TRADE: "trade",
+    EVENT_QUERY_END: "query_end",
+    EVENT_ORDER_INSERT_RESPONSE: "order_insert_response",
+    EVENT_ORDER_ACTION_RESPONSE: "order_action_response",
+}
+
+FLOW_PATH_CAPACITY = 256
+FRONT_CAPACITY = 256
+LOGIN_ACCOUNT_CAPACITY = 32
+DEPARTMENT_CAPACITY = 16
+PASSWORD_CAPACITY = 64
+USER_PRODUCT_INFO_CAPACITY = 10
+INTERFACE_PRODUCT_INFO_CAPACITY = 32
+TERMINAL_INFO_CAPACITY = 255
+MAC_ADDRESS_CAPACITY = 20
+INTERFACE_ADDRESS_CAPACITY = 128
+EXCHANGE_CAPACITY = 8
+INVESTOR_CAPACITY = 32
+BUSINESS_UNIT_CAPACITY = 32
+SHAREHOLDER_CAPACITY = 16
+SECURITY_CAPACITY = 32
+SECURITY_NAME_CAPACITY = 96
+ORDER_LOCAL_ID_CAPACITY = 16
+ORDER_SYS_ID_CAPACITY = 32
+TRADE_ID_CAPACITY = 32
+DATE_CAPACITY = 16
+TIME_CAPACITY = 16
+ERROR_MESSAGE_CAPACITY = 256
+
+_LOGIN_ACCOUNT_TYPES = {
+    "user_id": 0,
+    "account_id": 1,
+    "sha_stock": 2,
+    "sz_stock": 3,
+    "sh_b_stock": 4,
+    "sz_b_stock": 5,
+    "three_new_board_a": 6,
+    "three_new_board_b": 7,
+    "hk_stock": 8,
+    "unified_user_id": 9,
+    "bj_stock": 10,
+}
+_TRADE_COMM_MODES = {"tcp": 0, "tcp_direct": 3}
+_TOPIC_MODES = {"restart": 0, "resume": 1, "quick": 2}
+_ORDER_PRICE_TYPES = {
+    "limit": 1,
+    "home_best": 2,
+    "opponent_best": 3,
+    "five_level": 4,
+    "any_price": 5,
+}
+_TIME_CONDITIONS = {"gfd": 1, "ioc": 2}
+_VOLUME_CONDITIONS = {"any": 1, "all": 2}
+
+_SSE_ORDER_COMBINATIONS = {
+    ("limit", "gfd", "any"),
+    ("home_best", "gfd", "any"),
+    ("opponent_best", "gfd", "any"),
+    ("five_level", "ioc", "any"),
+    ("five_level", "gfd", "any"),
+}
+_SZSE_ORDER_COMBINATIONS = {
+    ("limit", "gfd", "any"),
+    ("home_best", "gfd", "any"),
+    ("opponent_best", "gfd", "any"),
+    ("five_level", "ioc", "any"),
+    ("any_price", "ioc", "any"),
+    ("any_price", "ioc", "all"),
+}
 
 NATIVE_RESULT_ABI_INCOMPATIBLE = -2
 NATIVE_RESULT_STRUCT_SIZE_INCOMPATIBLE = -3
@@ -88,6 +201,70 @@ class _Health(ctypes.Structure):
         ("queue_size", ctypes.c_uint32),
         ("reserved", ctypes.c_uint32),
         ("dropped_events", ctypes.c_uint64),
+        ("schema", _SchemaIdentity),
+    ]
+
+
+class _SessionConfig(ctypes.Structure):
+    """映射 caller-owned Trader 会话配置，所有文本使用显式长度。"""
+
+    _fields_ = [
+        ("abi_version", ctypes.c_uint32),
+        ("struct_size", ctypes.c_uint32),
+        ("encrypt", ctypes.c_uint8),
+        ("enable_trading", ctypes.c_uint8),
+        ("enable_cancel", ctypes.c_uint8),
+        ("reserved_flags", ctypes.c_uint8),
+        ("login_account_type", ctypes.c_int32),
+        ("trade_comm_mode", ctypes.c_int32),
+        ("private_topic", ctypes.c_int32),
+        ("public_topic", ctypes.c_int32),
+        ("flow_path_size", ctypes.c_uint32),
+        ("flow_path", ctypes.c_uint8 * FLOW_PATH_CAPACITY),
+        ("trade_front_size", ctypes.c_uint32),
+        ("trade_front", ctypes.c_uint8 * FRONT_CAPACITY),
+        ("login_account_size", ctypes.c_uint32),
+        ("login_account", ctypes.c_uint8 * LOGIN_ACCOUNT_CAPACITY),
+        ("department_id_size", ctypes.c_uint32),
+        ("department_id", ctypes.c_uint8 * DEPARTMENT_CAPACITY),
+        ("password_size", ctypes.c_uint32),
+        ("password", ctypes.c_uint8 * PASSWORD_CAPACITY),
+        ("dynamic_password_size", ctypes.c_uint32),
+        ("dynamic_password", ctypes.c_uint8 * PASSWORD_CAPACITY),
+        ("user_product_info_size", ctypes.c_uint32),
+        ("user_product_info", ctypes.c_uint8 * USER_PRODUCT_INFO_CAPACITY),
+        ("interface_product_info_size", ctypes.c_uint32),
+        ("interface_product_info", ctypes.c_uint8 * INTERFACE_PRODUCT_INFO_CAPACITY),
+        ("terminal_info_size", ctypes.c_uint32),
+        ("terminal_info", ctypes.c_uint8 * TERMINAL_INFO_CAPACITY),
+        ("mac_address_size", ctypes.c_uint32),
+        ("mac_address", ctypes.c_uint8 * MAC_ADDRESS_CAPACITY),
+        ("interface_address_size", ctypes.c_uint32),
+        ("interface_address", ctypes.c_uint8 * INTERFACE_ADDRESS_CAPACITY),
+        ("schema", _SchemaIdentity),
+    ]
+
+
+class _TraderHealth(ctypes.Structure):
+    """映射不改变旧 health 布局的 Trader readiness 输出结构。"""
+
+    _fields_ = [
+        ("abi_version", ctypes.c_uint32),
+        ("struct_size", ctypes.c_uint32),
+        ("state", ctypes.c_int32),
+        ("queue_capacity", ctypes.c_uint32),
+        ("queue_size", ctypes.c_uint32),
+        ("reserved", ctypes.c_uint32),
+        ("dropped_events", ctypes.c_uint64),
+        ("transport_connected", ctypes.c_uint8),
+        ("logged_in", ctypes.c_uint8),
+        ("ready_for_queries", ctypes.c_uint8),
+        ("ready_for_new_orders", ctypes.c_uint8),
+        ("ready_for_cancel", ctypes.c_uint8),
+        ("reserved_flags", ctypes.c_uint8 * 3),
+        ("session_epoch", ctypes.c_uint64),
+        ("last_error_id", ctypes.c_int32),
+        ("reserved_tail", ctypes.c_uint32),
         ("schema", _SchemaIdentity),
     ]
 
@@ -148,9 +325,363 @@ class _EventBatch(ctypes.Structure):
     ]
 
 
+class _QueryRequest(ctypes.Structure):
+    """映射证券查询的可选交易所和证券过滤条件。"""
+
+    _fields_ = [
+        ("exchange_size", ctypes.c_uint32),
+        ("security_size", ctypes.c_uint32),
+        ("exchange", ctypes.c_uint8 * EXCHANGE_CAPACITY),
+        ("security", ctypes.c_uint8 * SECURITY_CAPACITY),
+    ]
+
+
+class _LimitOrderRequest(ctypes.Structure):
+    """映射固定限价/GFD/AV 现货委托请求。"""
+
+    _fields_ = [
+        ("exchange_size", ctypes.c_uint32),
+        ("investor_id_size", ctypes.c_uint32),
+        ("business_unit_id_size", ctypes.c_uint32),
+        ("shareholder_id_size", ctypes.c_uint32),
+        ("security_size", ctypes.c_uint32),
+        ("direction", ctypes.c_uint8),
+        ("reserved", ctypes.c_uint8 * 3),
+        ("limit_price", ctypes.c_double),
+        ("amount", ctypes.c_uint32),
+        ("order_ref", ctypes.c_int32),
+        ("exchange", ctypes.c_uint8 * EXCHANGE_CAPACITY),
+        ("investor_id", ctypes.c_uint8 * INVESTOR_CAPACITY),
+        ("business_unit_id", ctypes.c_uint8 * BUSINESS_UNIT_CAPACITY),
+        ("shareholder_id", ctypes.c_uint8 * SHAREHOLDER_CAPACITY),
+        ("security", ctypes.c_uint8 * SECURITY_CAPACITY),
+    ]
+
+
+class _OrderRequest(ctypes.Structure):
+    """映射使用 BulletTrade 稳定枚举的沪深现货委托请求。"""
+
+    _fields_ = [
+        ("exchange_size", ctypes.c_uint32),
+        ("investor_id_size", ctypes.c_uint32),
+        ("business_unit_id_size", ctypes.c_uint32),
+        ("shareholder_id_size", ctypes.c_uint32),
+        ("security_size", ctypes.c_uint32),
+        ("direction", ctypes.c_uint8),
+        ("order_price_type", ctypes.c_uint8),
+        ("time_condition", ctypes.c_uint8),
+        ("volume_condition", ctypes.c_uint8),
+        ("limit_price", ctypes.c_double),
+        ("amount", ctypes.c_uint32),
+        ("order_ref", ctypes.c_int32),
+        ("exchange", ctypes.c_uint8 * EXCHANGE_CAPACITY),
+        ("investor_id", ctypes.c_uint8 * INVESTOR_CAPACITY),
+        ("business_unit_id", ctypes.c_uint8 * BUSINESS_UNIT_CAPACITY),
+        ("shareholder_id", ctypes.c_uint8 * SHAREHOLDER_CAPACITY),
+        ("security", ctypes.c_uint8 * SECURITY_CAPACITY),
+    ]
+
+
+class _CancelOrderRequest(ctypes.Structure):
+    """映射 OrderSysID 或完整会话三元组的明确身份撤单。"""
+
+    _fields_ = [
+        ("exchange_size", ctypes.c_uint32),
+        ("order_sys_id_size", ctypes.c_uint32),
+        ("front_id", ctypes.c_int32),
+        ("session_id", ctypes.c_int32),
+        ("order_ref", ctypes.c_int32),
+        ("exchange", ctypes.c_uint8 * EXCHANGE_CAPACITY),
+        ("order_sys_id", ctypes.c_uint8 * ORDER_SYS_ID_CAPACITY),
+    ]
+
+
+class _OwnedEvent(ctypes.Structure):
+    """映射真实 Trader bridge-owned 大 payload 事件。"""
+
+    pass
+
+
+class _OwnedEventBatch(ctypes.Structure):
+    """映射真实 Trader bridge-owned 大事件批次。"""
+
+    pass
+
+
+_OwnedEvent._fields_ = [
+    ("abi_version", ctypes.c_uint32),
+    ("struct_size", ctypes.c_uint32),
+    ("event_type", ctypes.c_uint32),
+    ("payload_size", ctypes.c_uint32),
+    ("sequence", ctypes.c_uint64),
+    ("received_ns", ctypes.c_int64),
+    ("request_id", ctypes.c_uint64),
+    ("schema", _SchemaIdentity),
+    ("payload", ctypes.c_uint8 * OWNED_EVENT_PAYLOAD_CAPACITY),
+]
+_OwnedEventBatch._fields_ = [
+    ("abi_version", ctypes.c_uint32),
+    ("struct_size", ctypes.c_uint32),
+    ("event_count", ctypes.c_uint32),
+    ("event_stride", ctypes.c_uint32),
+    ("schema", _SchemaIdentity),
+    ("events", ctypes.POINTER(_OwnedEvent)),
+    ("ownership_token", ctypes.c_uint64),
+]
+
+
+class _StateEvent(ctypes.Structure):
+    """映射 Trader 状态与 readiness 变化。"""
+
+    _fields_ = [
+        ("state", ctypes.c_int32),
+        ("reason", ctypes.c_int32),
+        ("transport_connected", ctypes.c_uint8),
+        ("logged_in", ctypes.c_uint8),
+        ("ready_for_queries", ctypes.c_uint8),
+        ("ready_for_new_orders", ctypes.c_uint8),
+        ("ready_for_cancel", ctypes.c_uint8),
+        ("reserved", ctypes.c_uint8 * 3),
+        ("session_epoch", ctypes.c_uint64),
+    ]
+
+
+class _ErrorEvent(ctypes.Structure):
+    """映射脱离厂商指针的错误事件。"""
+
+    _fields_ = [
+        ("error_id", ctypes.c_int32),
+        ("vendor_request_id", ctypes.c_int32),
+        ("message_size", ctypes.c_uint32),
+        ("message", ctypes.c_uint8 * ERROR_MESSAGE_CAPACITY),
+    ]
+
+
+class _LoginEvent(ctypes.Structure):
+    """映射登录成功后的会话身份。"""
+
+    _fields_ = [
+        ("front_id", ctypes.c_int32),
+        ("session_id", ctypes.c_int32),
+        ("max_order_ref", ctypes.c_int32),
+        ("trading_day_size", ctypes.c_uint32),
+        ("login_time_size", ctypes.c_uint32),
+        ("trading_day", ctypes.c_uint8 * DATE_CAPACITY),
+        ("login_time", ctypes.c_uint8 * TIME_CAPACITY),
+    ]
+
+
+class _SecurityEvent(ctypes.Structure):
+    """映射证券基础信息查询记录。"""
+
+    _fields_ = [
+        ("exchange_size", ctypes.c_uint32),
+        ("security_size", ctypes.c_uint32),
+        ("security_name_size", ctypes.c_uint32),
+        ("short_name_size", ctypes.c_uint32),
+        ("exchange", ctypes.c_uint8 * EXCHANGE_CAPACITY),
+        ("security", ctypes.c_uint8 * SECURITY_CAPACITY),
+        ("security_name", ctypes.c_uint8 * SECURITY_NAME_CAPACITY),
+        ("short_name", ctypes.c_uint8 * SECURITY_NAME_CAPACITY),
+        ("market_id", ctypes.c_int32),
+        ("security_type", ctypes.c_int32),
+        ("order_unit", ctypes.c_int32),
+        ("limit_buy_unit", ctypes.c_int32),
+        ("limit_sell_unit", ctypes.c_int32),
+        ("min_limit_buy", ctypes.c_int32),
+        ("max_limit_buy", ctypes.c_int32),
+        ("min_limit_sell", ctypes.c_int32),
+        ("max_limit_sell", ctypes.c_int32),
+        ("market_buy_unit", ctypes.c_int32),
+        ("market_sell_unit", ctypes.c_int32),
+        ("min_market_buy", ctypes.c_int32),
+        ("max_market_buy", ctypes.c_int32),
+        ("min_market_sell", ctypes.c_int32),
+        ("max_market_sell", ctypes.c_int32),
+        ("volume_multiple", ctypes.c_int32),
+        ("has_price_limit", ctypes.c_uint8),
+        ("day_trading", ctypes.c_uint8),
+        ("reserved_flags", ctypes.c_uint8 * 2),
+        ("security_status", ctypes.c_int64),
+        ("price_tick", ctypes.c_double),
+        ("pre_close_price", ctypes.c_double),
+        ("upper_limit_price", ctypes.c_double),
+        ("lower_limit_price", ctypes.c_double),
+    ]
+
+
+class _ShareholderEvent(ctypes.Structure):
+    """映射股东账户查询记录。"""
+
+    _fields_ = [
+        ("investor_id_size", ctypes.c_uint32),
+        ("exchange_size", ctypes.c_uint32),
+        ("shareholder_id_size", ctypes.c_uint32),
+        ("investor_id", ctypes.c_uint8 * INVESTOR_CAPACITY),
+        ("exchange", ctypes.c_uint8 * EXCHANGE_CAPACITY),
+        ("shareholder_id", ctypes.c_uint8 * SHAREHOLDER_CAPACITY),
+        ("market_id", ctypes.c_int32),
+        ("shareholder_id_type", ctypes.c_int32),
+        ("main_flag", ctypes.c_uint8),
+        ("reserved", ctypes.c_uint8 * 3),
+    ]
+
+
+class _AccountEvent(ctypes.Structure):
+    """映射资金账户查询记录。"""
+
+    _fields_ = [
+        ("department_id_size", ctypes.c_uint32),
+        ("account_id_size", ctypes.c_uint32),
+        ("department_id", ctypes.c_uint8 * DEPARTMENT_CAPACITY),
+        ("account_id", ctypes.c_uint8 * LOGIN_ACCOUNT_CAPACITY),
+        ("currency", ctypes.c_int32),
+        ("reserved", ctypes.c_int32),
+        ("available_cash", ctypes.c_double),
+        ("transferable_cash", ctypes.c_double),
+        ("frozen_cash", ctypes.c_double),
+    ]
+
+
+class _PositionEvent(ctypes.Structure):
+    """映射持仓查询的权威余额、可用量、冻结量和未成交在途字段。"""
+
+    _fields_ = [
+        ("exchange_size", ctypes.c_uint32),
+        ("investor_id_size", ctypes.c_uint32),
+        ("shareholder_id_size", ctypes.c_uint32),
+        ("security_size", ctypes.c_uint32),
+        ("trading_day_size", ctypes.c_uint32),
+        ("exchange", ctypes.c_uint8 * EXCHANGE_CAPACITY),
+        ("investor_id", ctypes.c_uint8 * INVESTOR_CAPACITY),
+        ("shareholder_id", ctypes.c_uint8 * SHAREHOLDER_CAPACITY),
+        ("security", ctypes.c_uint8 * SECURITY_CAPACITY),
+        ("trading_day", ctypes.c_uint8 * DATE_CAPACITY),
+        ("current_position", ctypes.c_int32),
+        ("available_position", ctypes.c_int32),
+        ("history_position", ctypes.c_int32),
+        ("history_frozen", ctypes.c_int32),
+        ("today_bs", ctypes.c_int32),
+        ("today_bs_frozen", ctypes.c_int32),
+        ("today_pr", ctypes.c_int32),
+        ("today_pr_frozen", ctypes.c_int32),
+        ("total_cost", ctypes.c_double),
+        ("today_sm", ctypes.c_int32),
+        ("today_sm_frozen", ctypes.c_int32),
+        ("pre_position", ctypes.c_int32),
+        ("pre_frozen", ctypes.c_int32),
+        ("repay_untrade_volume", ctypes.c_int32),
+        ("repay_transfer_untrade_volume", ctypes.c_int32),
+        ("collateral_buy_untrade_volume", ctypes.c_int32),
+        ("credit_buy_untrade_volume", ctypes.c_int32),
+        ("credit_sell_untrade_volume", ctypes.c_int32),
+        ("history_position_price", ctypes.c_double),
+        ("open_position_cost", ctypes.c_double),
+        ("collateral_buy_untrade_amount", ctypes.c_double),
+        ("credit_buy_untrade_amount", ctypes.c_double),
+        ("credit_sell_untrade_amount", ctypes.c_double),
+    ]
+
+
+class _OrderEvent(ctypes.Structure):
+    """映射委托查询和私有流回报记录。"""
+
+    _fields_ = [
+        ("exchange_size", ctypes.c_uint32),
+        ("investor_id_size", ctypes.c_uint32),
+        ("shareholder_id_size", ctypes.c_uint32),
+        ("security_size", ctypes.c_uint32),
+        ("order_local_id_size", ctypes.c_uint32),
+        ("order_sys_id_size", ctypes.c_uint32),
+        ("trading_day_size", ctypes.c_uint32),
+        ("insert_time_size", ctypes.c_uint32),
+        ("status_message_size", ctypes.c_uint32),
+        ("exchange", ctypes.c_uint8 * EXCHANGE_CAPACITY),
+        ("investor_id", ctypes.c_uint8 * INVESTOR_CAPACITY),
+        ("shareholder_id", ctypes.c_uint8 * SHAREHOLDER_CAPACITY),
+        ("security", ctypes.c_uint8 * SECURITY_CAPACITY),
+        ("direction", ctypes.c_uint8),
+        ("order_price_type", ctypes.c_uint8),
+        ("time_condition", ctypes.c_uint8),
+        ("volume_condition", ctypes.c_uint8),
+        ("order_status", ctypes.c_uint8),
+        ("submit_status", ctypes.c_uint8),
+        ("reserved", ctypes.c_uint8 * 2),
+        ("limit_price", ctypes.c_double),
+        ("amount", ctypes.c_int32),
+        ("filled", ctypes.c_int32),
+        ("canceled", ctypes.c_int32),
+        ("front_id", ctypes.c_int32),
+        ("session_id", ctypes.c_int32),
+        ("order_ref", ctypes.c_int32),
+        ("order_local_id", ctypes.c_uint8 * ORDER_LOCAL_ID_CAPACITY),
+        ("order_sys_id", ctypes.c_uint8 * ORDER_SYS_ID_CAPACITY),
+        ("trading_day", ctypes.c_uint8 * DATE_CAPACITY),
+        ("insert_time", ctypes.c_uint8 * TIME_CAPACITY),
+        ("status_message", ctypes.c_uint8 * ERROR_MESSAGE_CAPACITY),
+    ]
+
+
+class _TradeEvent(ctypes.Structure):
+    """映射成交查询和私有流回报记录。"""
+
+    _fields_ = [
+        ("exchange_size", ctypes.c_uint32),
+        ("investor_id_size", ctypes.c_uint32),
+        ("shareholder_id_size", ctypes.c_uint32),
+        ("security_size", ctypes.c_uint32),
+        ("trade_id_size", ctypes.c_uint32),
+        ("order_sys_id_size", ctypes.c_uint32),
+        ("order_local_id_size", ctypes.c_uint32),
+        ("trade_date_size", ctypes.c_uint32),
+        ("trade_time_size", ctypes.c_uint32),
+        ("trading_day_size", ctypes.c_uint32),
+        ("exchange", ctypes.c_uint8 * EXCHANGE_CAPACITY),
+        ("investor_id", ctypes.c_uint8 * INVESTOR_CAPACITY),
+        ("shareholder_id", ctypes.c_uint8 * SHAREHOLDER_CAPACITY),
+        ("security", ctypes.c_uint8 * SECURITY_CAPACITY),
+        ("direction", ctypes.c_uint8),
+        ("reserved", ctypes.c_uint8 * 3),
+        ("trade_id", ctypes.c_uint8 * TRADE_ID_CAPACITY),
+        ("order_sys_id", ctypes.c_uint8 * ORDER_SYS_ID_CAPACITY),
+        ("order_local_id", ctypes.c_uint8 * ORDER_LOCAL_ID_CAPACITY),
+        ("order_ref", ctypes.c_int32),
+        ("price", ctypes.c_double),
+        ("amount", ctypes.c_int32),
+        ("trade_date", ctypes.c_uint8 * DATE_CAPACITY),
+        ("trade_time", ctypes.c_uint8 * TIME_CAPACITY),
+        ("trading_day", ctypes.c_uint8 * DATE_CAPACITY),
+    ]
+
+
+class _QueryEndEvent(ctypes.Structure):
+    """映射每个查询唯一、明确的完成边界。"""
+
+    _fields_ = [
+        ("request_type", ctypes.c_uint32),
+        ("error_id", ctypes.c_int32),
+        ("record_count", ctypes.c_uint32),
+        ("message_size", ctypes.c_uint32),
+        ("message", ctypes.c_uint8 * ERROR_MESSAGE_CAPACITY),
+    ]
+
+
+class _OrderResponseEvent(ctypes.Structure):
+    """映射报单或撤单同步响应/错误回报。"""
+
+    _fields_ = [
+        ("error_id", ctypes.c_int32),
+        ("order_ref", ctypes.c_int32),
+        ("order_sys_id_size", ctypes.c_uint32),
+        ("message_size", ctypes.c_uint32),
+        ("order_sys_id", ctypes.c_uint8 * ORDER_SYS_ID_CAPACITY),
+        ("message", ctypes.c_uint8 * ERROR_MESSAGE_CAPACITY),
+    ]
+
+
 @dataclass(frozen=True)
 class NativeHealth:
-    """表示 fake/offline runtime 的不可变 health 快照。
+    """表示 fake/offline 或真实 Trader runtime 的不可变 health 快照。
 
     由 ``NativeRuntime.health`` 从严格校验后的 C POD 创建；关键状态包含有界队列水位、
     丢弃计数和显式 vendor schema/field-set，不持有 native 内存。
@@ -162,6 +693,13 @@ class NativeHealth:
     dropped_events: int
     vendor_schema_id: str
     field_set_version: str
+    transport_connected: bool = False
+    logged_in: bool = False
+    ready_for_queries: bool = False
+    ready_for_new_orders: bool = False
+    ready_for_cancel: bool = False
+    session_epoch: int = 0
+    last_error_id: int = 0
 
 
 @dataclass(frozen=True)
@@ -179,9 +717,153 @@ class NativeEvent:
     vendor_schema_id: str
     field_set_version: str
     payload: bytes
+    data: Mapping[str, object] = field(default_factory=dict)
+
+    @property
+    def event_name(self) -> str:
+        """返回稳定事件名，未知整数使用 ``unknown_<id>``。
+
+        Returns:
+            str: 供 adapter 匹配且不依赖厂商类型的事件名。
+        """
+
+        return EVENT_NAMES.get(self.event_type, f"unknown_{self.event_type}")
 
 
-def _schema_identity() -> _SchemaIdentity:
+@dataclass(frozen=True)
+class NativeSessionConfig:
+    """表示启动真实 Trader 会话所需的显式配置。
+
+    密码、动态口令、TerminalInfo 和 MacAddress 不参与 repr；调用方应从受控配置
+    注入，不得写入 manifest、日志或普通协议事件。
+    """
+
+    flow_path: str
+    trade_front: str
+    login_account: str
+    password: str = field(repr=False)
+    terminal_info: str = field(repr=False)
+    user_product_info: str
+    mac_address: str = field(default="", repr=False)
+    department_id: str = ""
+    dynamic_password: str = field(default="", repr=False)
+    interface_product_info: str = ""
+    interface_address: str = ""
+    login_account_type: str = "account_id"
+    trade_comm_mode: str = "tcp"
+    encrypt: bool = False
+    private_topic: str = "resume"
+    public_topic: Optional[str] = None
+    enable_trading: bool = False
+    enable_cancel: bool = False
+
+    @classmethod
+    def from_mapping(
+        cls: Type["NativeSessionConfig"], config: Mapping[str, Any]
+    ) -> "NativeSessionConfig":
+        """从华鑫 broker 配置映射构造会话配置。
+
+        Args:
+            config: 使用公开同名键的配置；``login_account`` 缺省回退 ``account_id``。
+
+        Returns:
+            NativeSessionConfig: 已完成必填键存在性检查的不可变配置。
+
+        Raises:
+            ValueError: flow/front/account/password/UserProductInfo/TerminalInfo
+                任一缺失。
+        """
+
+        values = {
+            "flow_path": config.get("flow_path"),
+            "trade_front": config.get("trade_front"),
+            "login_account": config.get("login_account") or config.get("account_id"),
+            "password": config.get("password"),
+            "user_product_info": config.get("user_product_info"),
+            "terminal_info": config.get("terminal_info"),
+        }
+        missing = [
+            name for name, value in values.items() if not isinstance(value, str) or not value
+        ]
+        if missing:
+            raise ValueError(f"NativeSessionConfig 缺少必填字段: {', '.join(sorted(missing))}")
+        return cls(
+            flow_path=str(values["flow_path"]),
+            trade_front=str(values["trade_front"]),
+            login_account=str(values["login_account"]),
+            password=str(values["password"]),
+            user_product_info=str(values["user_product_info"]),
+            terminal_info=str(values["terminal_info"]),
+            mac_address=str(config.get("mac_address") or ""),
+            department_id=str(config.get("department_id") or ""),
+            dynamic_password=str(config.get("dynamic_password") or ""),
+            interface_product_info=str(config.get("interface_product_info") or ""),
+            interface_address=str(config.get("interface_address") or ""),
+            login_account_type=str(config.get("login_account_type") or "account_id"),
+            trade_comm_mode=str(config.get("trade_comm_mode") or "tcp"),
+            encrypt=bool(config.get("encrypt", False)),
+            private_topic=str(config.get("private_topic") or "resume"),
+            public_topic=(
+                str(config["public_topic"]) if config.get("public_topic") is not None else None
+            ),
+            enable_trading=bool(config.get("enable_trading", False)),
+            enable_cancel=bool(config.get("enable_cancel", False)),
+        )
+
+
+@dataclass(frozen=True)
+class NativeLimitOrderRequest:
+    """表示固定限价、当日有效、任意数量成交的 A 股现货委托。"""
+
+    exchange: str
+    investor_id: str
+    shareholder_id: str
+    security: str
+    direction: str
+    limit_price: float
+    amount: int
+    order_ref: int
+    business_unit_id: str = ""
+
+
+@dataclass(frozen=True)
+class NativeOrderRequest:
+    """表示使用受控价格、时效和成交量条件的沪深 A 股现货委托。
+
+    所有类型字段均使用 BulletTrade canonical 名称；调用方不能传入 TORA 原始字符。
+    ``limit_price`` 对上交所市价单是强制保护限价，深交所市价单可按官方合同传 0，
+    也可由上层安全策略传入正保护价。
+    """
+
+    exchange: str
+    investor_id: str
+    shareholder_id: str
+    security: str
+    direction: str
+    order_price_type: str
+    time_condition: str
+    volume_condition: str
+    limit_price: float
+    amount: int
+    order_ref: int
+    business_unit_id: str = ""
+
+
+@dataclass(frozen=True)
+class NativeCancelOrderRequest:
+    """表示使用 OrderSysID 或完整 FrontID/SessionID/OrderRef 的撤单身份。"""
+
+    exchange: str
+    order_sys_id: str = ""
+    front_id: int = 0
+    session_id: int = 0
+    order_ref: int = 0
+
+
+def _schema_identity(
+    vendor_schema_id: str = VENDOR_SCHEMA_ID,
+    field_set_version: str = FIELD_SET_VERSION,
+) -> _SchemaIdentity:
     """构造当前 wrapper 明确要求的 schema 身份 POD。
 
     Args:
@@ -194,8 +876,8 @@ def _schema_identity() -> _SchemaIdentity:
         仅分配 Python 管理的 ctypes 内存，不调用 native。
     """
 
-    vendor_schema = VENDOR_SCHEMA_ID.encode("utf-8")
-    field_set = FIELD_SET_VERSION.encode("utf-8")
+    vendor_schema = vendor_schema_id.encode("utf-8")
+    field_set = field_set_version.encode("utf-8")
     if len(vendor_schema) > VENDOR_SCHEMA_ID_CAPACITY:
         raise RuntimeError("VENDOR_SCHEMA_ID 超过 C ABI 固定容量")
     if len(field_set) > FIELD_SET_VERSION_CAPACITY:
@@ -209,7 +891,12 @@ def _schema_identity() -> _SchemaIdentity:
     return identity
 
 
-def _decode_schema_identity(identity: _SchemaIdentity, operation: str) -> tuple:
+def _decode_schema_identity(
+    identity: _SchemaIdentity,
+    operation: str,
+    expected_vendor_schema_id: str = VENDOR_SCHEMA_ID,
+    expected_field_set_version: str = FIELD_SET_VERSION,
+) -> tuple:
     """严格解码 native 返回的 schema 身份并拒绝越界长度。
 
     Args:
@@ -247,15 +934,18 @@ def _decode_schema_identity(identity: _SchemaIdentity, operation: str) -> tuple:
             "native schema 身份不是合法 UTF-8",
             {"operation": operation},
         ) from exc
-    if vendor_schema_id != VENDOR_SCHEMA_ID or field_set_version != FIELD_SET_VERSION:
+    if (
+        vendor_schema_id != expected_vendor_schema_id
+        or field_set_version != expected_field_set_version
+    ):
         raise HuaxinAbiError(
             VENDOR_SCHEMA_INCOMPATIBLE,
             "native vendor schema 或 field-set 与 wrapper 不一致",
             {
                 "operation": operation,
-                "expected_vendor_schema_id": VENDOR_SCHEMA_ID,
+                "expected_vendor_schema_id": expected_vendor_schema_id,
                 "actual_vendor_schema_id": vendor_schema_id,
-                "expected_field_set_version": FIELD_SET_VERSION,
+                "expected_field_set_version": expected_field_set_version,
                 "actual_field_set_version": field_set_version,
             },
         )
@@ -266,6 +956,8 @@ def _validate_native_struct(
     value: ctypes.Structure,
     structure_type: Type[ctypes.Structure],
     operation: str,
+    expected_vendor_schema_id: str = VENDOR_SCHEMA_ID,
+    expected_field_set_version: str = FIELD_SET_VERSION,
 ) -> None:
     """验证 native 返回 POD 的 ABI major、精确结构大小和 schema。
 
@@ -299,7 +991,838 @@ def _validate_native_struct(
                 "actual_size": actual_size,
             },
         )
-    _decode_schema_identity(getattr(value, "schema"), operation)
+    _decode_schema_identity(
+        getattr(value, "schema"),
+        operation,
+        expected_vendor_schema_id,
+        expected_field_set_version,
+    )
+
+
+def _encode_text(value: str, capacity: int, field_name: str, required: bool = False) -> bytes:
+    """把 Python 文本编码为不含 NUL 的定长 ABI bytes。
+
+    Args:
+        value: 待编码文本。
+        capacity: C ABI 固定容量。
+        field_name: 受控错误中的字段名。
+        required: 是否拒绝空文本。
+
+    Returns:
+        bytes: UTF-8 编码结果。
+
+    Raises:
+        TypeError: value 不是字符串。
+        ValueError: 文本为空、含 NUL 或超过固定容量。
+    """
+
+    if not isinstance(value, str):
+        raise TypeError(f"{field_name} 必须为 str")
+    encoded = value.encode("utf-8")
+    if required and not encoded:
+        raise ValueError(f"{field_name} 不能为空")
+    if b"\0" in encoded:
+        raise ValueError(f"{field_name} 不得包含 NUL")
+    if len(encoded) > capacity:
+        raise ValueError(f"{field_name} UTF-8 长度不能超过 {capacity} 字节")
+    return encoded
+
+
+def _assign_text(
+    value: ctypes.Structure,
+    field_name: str,
+    text: str,
+    capacity: int,
+    required: bool = False,
+) -> None:
+    """把显式长度文本写入含 ``<name>_size`` 和 bytes 数组的 ctypes 结构。
+
+    Args:
+        value: 目标 ctypes 结构。
+        field_name: 目标数组字段名。
+        text: 待编码文本。
+        capacity: 目标固定容量。
+        required: 是否拒绝空文本。
+
+    Returns:
+        None。
+
+    Side Effects:
+        修改 caller-owned ctypes 结构，不调用 native。
+    """
+
+    encoded = _encode_text(text, capacity, field_name, required)
+    setattr(value, f"{field_name}_size", len(encoded))
+    getattr(value, field_name)[: len(encoded)] = encoded
+
+
+def _session_config_to_raw(
+    config: NativeSessionConfig,
+    vendor_schema_id: str,
+    field_set_version: str,
+) -> _SessionConfig:
+    """把公开会话配置转换为严格版本化的 C ABI POD。
+
+    Args:
+        config: 不可变公开配置。
+        vendor_schema_id: 当前真实 bundle 声明的 schema。
+        field_set_version: 当前真实 bundle 声明的字段集。
+
+    Returns:
+        _SessionConfig: 调用期间由 Python 持有的配置结构。
+
+    Raises:
+        ValueError: 枚举或文本字段不满足合同。
+    """
+
+    if config.login_account_type not in _LOGIN_ACCOUNT_TYPES:
+        raise ValueError("login_account_type 不在允许枚举中")
+    if config.trade_comm_mode not in _TRADE_COMM_MODES:
+        raise ValueError("trade_comm_mode 仅允许 tcp 或 tcp_direct")
+    if config.private_topic not in _TOPIC_MODES:
+        raise ValueError("private_topic 仅允许 restart、resume 或 quick")
+    if config.public_topic is not None and config.public_topic not in _TOPIC_MODES:
+        raise ValueError("public_topic 仅允许 None、restart、resume 或 quick")
+    raw = _SessionConfig(
+        abi_version=ABI_VERSION,
+        struct_size=ctypes.sizeof(_SessionConfig),
+        encrypt=int(config.encrypt),
+        enable_trading=int(config.enable_trading),
+        enable_cancel=int(config.enable_cancel),
+        reserved_flags=0,
+        login_account_type=_LOGIN_ACCOUNT_TYPES[config.login_account_type],
+        trade_comm_mode=_TRADE_COMM_MODES[config.trade_comm_mode],
+        private_topic=_TOPIC_MODES[config.private_topic],
+        public_topic=(-1 if config.public_topic is None else _TOPIC_MODES[config.public_topic]),
+        schema=_schema_identity(vendor_schema_id, field_set_version),
+    )
+    _assign_text(raw, "flow_path", config.flow_path, FLOW_PATH_CAPACITY, True)
+    _assign_text(raw, "trade_front", config.trade_front, FRONT_CAPACITY, True)
+    _assign_text(raw, "login_account", config.login_account, LOGIN_ACCOUNT_CAPACITY, True)
+    _assign_text(raw, "department_id", config.department_id, DEPARTMENT_CAPACITY)
+    _assign_text(raw, "password", config.password, PASSWORD_CAPACITY, True)
+    _assign_text(raw, "dynamic_password", config.dynamic_password, PASSWORD_CAPACITY)
+    _assign_text(
+        raw,
+        "user_product_info",
+        config.user_product_info,
+        USER_PRODUCT_INFO_CAPACITY,
+        True,
+    )
+    _assign_text(
+        raw,
+        "interface_product_info",
+        config.interface_product_info,
+        INTERFACE_PRODUCT_INFO_CAPACITY,
+    )
+    _assign_text(raw, "terminal_info", config.terminal_info, TERMINAL_INFO_CAPACITY, True)
+    _assign_text(raw, "mac_address", config.mac_address, MAC_ADDRESS_CAPACITY, True)
+    _assign_text(
+        raw,
+        "interface_address",
+        config.interface_address,
+        INTERFACE_ADDRESS_CAPACITY,
+    )
+    return raw
+
+
+def _structure_bytes(value: ctypes.Structure) -> bytes:
+    """复制一个无指针 ctypes POD 的完整二进制布局。
+
+    Args:
+        value: 待复制的 POD。
+
+    Returns:
+        bytes: 精确 ``ctypes.sizeof(value)`` 字节。
+    """
+
+    return ctypes.string_at(ctypes.byref(value), ctypes.sizeof(value))
+
+
+def _clear_structure(value: ctypes.Structure) -> None:
+    """覆盖并清空包含会话身份或凭据的 caller-owned POD。
+
+    Args:
+        value: 调用完成后不再使用的 ctypes 结构。
+
+    Returns:
+        None。
+
+    Side Effects:
+        原地把结构的全部字节覆盖为零；调用方不得继续读取原字段。
+    """
+
+    ctypes.memset(ctypes.byref(value), 0, ctypes.sizeof(value))
+
+
+def _query_payload(exchange: str = "", security: str = "") -> bytes:
+    """构造证券查询过滤 payload。
+
+    Args:
+        exchange: 可选 SSE/SZSE/BSE 等交易所文本。
+        security: 可选证券代码。
+
+    Returns:
+        bytes: `_QueryRequest` 的完整二进制布局。
+    """
+
+    raw = _QueryRequest()
+    _assign_text(raw, "exchange", exchange, EXCHANGE_CAPACITY)
+    _assign_text(raw, "security", security, SECURITY_CAPACITY)
+    return _structure_bytes(raw)
+
+
+def _limit_order_payload(order: NativeLimitOrderRequest) -> bytes:
+    """校验并构造限价委托 payload。
+
+    Args:
+        order: 公开限价委托请求。
+
+    Returns:
+        bytes: `_LimitOrderRequest` 的完整二进制布局。
+
+    Raises:
+        ValueError: 方向、价格、数量或订单引用不合法。
+    """
+
+    direction = order.direction.lower()
+    if direction not in {"buy", "sell"}:
+        raise ValueError("direction 仅允许 buy 或 sell")
+    try:
+        limit_price = float(order.limit_price)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("limit_price 必须为有限且大于 0 的数值") from None
+    if not math.isfinite(limit_price) or limit_price <= 0.0:
+        raise ValueError("limit_price 必须为有限且大于 0 的数值")
+    if (
+        isinstance(order.amount, bool)
+        or not isinstance(order.amount, int)
+        or order.amount < 1
+        or order.amount > (1 << 31) - 1
+    ):
+        raise ValueError("amount 必须为 1..INT32_MAX 的非 bool 整数")
+    if order.order_ref < 1 or order.order_ref > (1 << 31) - 1:
+        raise ValueError("order_ref 必须为正 int32")
+    raw = _LimitOrderRequest(
+        direction=0 if direction == "buy" else 1,
+        limit_price=limit_price,
+        amount=order.amount,
+        order_ref=order.order_ref,
+    )
+    _assign_text(raw, "exchange", order.exchange, EXCHANGE_CAPACITY, True)
+    _assign_text(raw, "investor_id", order.investor_id, INVESTOR_CAPACITY, True)
+    _assign_text(raw, "business_unit_id", order.business_unit_id, BUSINESS_UNIT_CAPACITY)
+    _assign_text(raw, "shareholder_id", order.shareholder_id, SHAREHOLDER_CAPACITY, True)
+    _assign_text(raw, "security", order.security, SECURITY_CAPACITY, True)
+    return _structure_bytes(raw)
+
+
+def _normalize_order_exchange(exchange: str) -> str:
+    """把公开交易所别名归一为 native 写请求唯一名称。
+
+    Args:
+        exchange: SSE/SZSE/BSE 或兼容的 SH/SZ/XSHG/XSHE/BJ/XBEI/数字别名。
+
+    Returns:
+        str: SSE、SZSE 或 BSE。
+
+    Raises:
+        TypeError: exchange 不是字符串。
+        ValueError: exchange 不在受支持的现货交易所别名中。
+    """
+
+    if not isinstance(exchange, str):
+        raise TypeError("exchange 必须为 str")
+    value = exchange.upper()
+    if value in {"SSE", "SH", "XSHG", "1"}:
+        return "SSE"
+    if value in {"SZSE", "SZ", "XSHE", "2"}:
+        return "SZSE"
+    if value in {"BSE", "BJ", "XBEI", "4"}:
+        return "BSE"
+    raise ValueError("exchange 仅允许 SSE、SZSE、BSE 及其公开别名")
+
+
+def _order_payload(order: NativeOrderRequest) -> bytes:
+    """校验交易所矩阵并构造不含厂商原始枚举的通用委托 payload。
+
+    Args:
+        order: 使用 canonical 类型值的限价或市价委托请求。
+
+    Returns:
+        bytes: `_OrderRequest` 的完整二进制布局。
+
+    Raises:
+        TypeError: 订单类型不正确。
+        ValueError: 枚举、交易所组合、保护价、数量或订单引用不合法。
+    """
+
+    if not isinstance(order, NativeOrderRequest):
+        raise TypeError("order 必须为 NativeOrderRequest")
+    if not isinstance(order.direction, str):
+        raise ValueError("direction 必须使用 buy 或 sell 字符串")
+    direction = order.direction.lower()
+    if direction not in {"buy", "sell"}:
+        raise ValueError("direction 仅允许 buy 或 sell")
+    if not isinstance(order.order_price_type, str):
+        raise ValueError("order_price_type 必须使用 canonical 字符串")
+    if not isinstance(order.time_condition, str):
+        raise ValueError("time_condition 必须使用 canonical 字符串")
+    if not isinstance(order.volume_condition, str):
+        raise ValueError("volume_condition 必须使用 canonical 字符串")
+    order_price_type = order.order_price_type.lower()
+    time_condition = order.time_condition.lower()
+    volume_condition = order.volume_condition.lower()
+    if order_price_type not in _ORDER_PRICE_TYPES:
+        raise ValueError("order_price_type 不在受控枚举中")
+    if time_condition not in _TIME_CONDITIONS:
+        raise ValueError("time_condition 不在受控枚举中")
+    if volume_condition not in _VOLUME_CONDITIONS:
+        raise ValueError("volume_condition 不在受控枚举中")
+
+    exchange = _normalize_order_exchange(order.exchange)
+    combination = (order_price_type, time_condition, volume_condition)
+    if exchange == "SSE":
+        supported = combination in _SSE_ORDER_COMBINATIONS
+    elif exchange == "SZSE":
+        supported = combination in _SZSE_ORDER_COMBINATIONS
+    else:
+        supported = combination == ("limit", "gfd", "any")
+    if not supported:
+        raise ValueError("当前交易所不支持该 order_price_type/time_condition/volume_condition 组合")
+
+    try:
+        limit_price = float(order.limit_price)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("limit_price 必须为有限数值") from None
+    if not math.isfinite(limit_price) or limit_price < 0.0:
+        raise ValueError("limit_price 必须为有限且不小于 0 的数值")
+    if (order_price_type == "limit" or exchange == "SSE") and limit_price <= 0.0:
+        raise ValueError("限价单和上交所市价单的 limit_price 必须大于 0")
+    if (
+        isinstance(order.amount, bool)
+        or not isinstance(order.amount, int)
+        or order.amount < 1
+        or order.amount > (1 << 31) - 1
+    ):
+        raise ValueError("amount 必须为 1..INT32_MAX 的非 bool 整数")
+    if (
+        isinstance(order.order_ref, bool)
+        or not isinstance(order.order_ref, int)
+        or order.order_ref < 1
+        or order.order_ref > (1 << 31) - 1
+    ):
+        raise ValueError("order_ref 必须为正 int32")
+
+    raw = _OrderRequest(
+        direction=0 if direction == "buy" else 1,
+        order_price_type=_ORDER_PRICE_TYPES[order_price_type],
+        time_condition=_TIME_CONDITIONS[time_condition],
+        volume_condition=_VOLUME_CONDITIONS[volume_condition],
+        limit_price=limit_price,
+        amount=order.amount,
+        order_ref=order.order_ref,
+    )
+    _assign_text(raw, "exchange", exchange, EXCHANGE_CAPACITY, True)
+    _assign_text(raw, "investor_id", order.investor_id, INVESTOR_CAPACITY, True)
+    _assign_text(raw, "business_unit_id", order.business_unit_id, BUSINESS_UNIT_CAPACITY)
+    _assign_text(raw, "shareholder_id", order.shareholder_id, SHAREHOLDER_CAPACITY, True)
+    _assign_text(raw, "security", order.security, SECURITY_CAPACITY, True)
+    return _structure_bytes(raw)
+
+
+def _cancel_order_payload(cancel: NativeCancelOrderRequest) -> bytes:
+    """校验并构造明确身份撤单 payload。
+
+    Args:
+        cancel: OrderSysID 或完整会话三元组撤单请求。
+
+    Returns:
+        bytes: `_CancelOrderRequest` 的完整二进制布局。
+
+    Raises:
+        ValueError: 身份为空或会话三元组只提供一部分。
+    """
+
+    identity_values = (cancel.front_id, cancel.session_id, cancel.order_ref)
+    has_any_session_identity = any(value != 0 for value in identity_values)
+    has_complete_session_identity = (
+        cancel.front_id > 0 and cancel.session_id != 0 and cancel.order_ref > 0
+    )
+    if has_any_session_identity and not has_complete_session_identity:
+        raise ValueError("FrontID/SessionID/OrderRef 必须同时完整提供")
+    if not cancel.order_sys_id and not has_complete_session_identity:
+        raise ValueError("撤单必须提供 OrderSysID 或完整会话三元组")
+    for name, value in (("front_id", cancel.front_id), ("order_ref", cancel.order_ref)):
+        if value < 0 or value > (1 << 31) - 1:
+            raise ValueError(f"{name} 必须位于非负 int32 范围")
+    if cancel.session_id < -(1 << 31) or cancel.session_id > (1 << 31) - 1:
+        raise ValueError("session_id 必须位于有符号 int32 范围")
+    raw = _CancelOrderRequest(
+        front_id=cancel.front_id,
+        session_id=cancel.session_id,
+        order_ref=cancel.order_ref,
+    )
+    _assign_text(raw, "exchange", cancel.exchange, EXCHANGE_CAPACITY, True)
+    _assign_text(raw, "order_sys_id", cancel.order_sys_id, ORDER_SYS_ID_CAPACITY)
+    return _structure_bytes(raw)
+
+
+def _decode_event_text(raw: Any, size: int, capacity: int, field_name: str) -> str:
+    """按显式长度解码可能为 UTF-8 或 GB18030 的厂商文本。
+
+    Args:
+        raw: ctypes uint8 数组。
+        size: native 声明的有效字节数。
+        capacity: 当前字段固定容量。
+        field_name: ABI 错误中的字段名。
+
+    Returns:
+        str: 解码后的文本。
+
+    Raises:
+        HuaxinAbiError: 长度越界或文本无法按允许编码解码。
+    """
+
+    if size < 0 or size > capacity:
+        raise HuaxinAbiError(
+            NATIVE_ABI_INCOMPATIBLE,
+            "Trader 事件文本长度超过固定容量",
+            {"field": field_name},
+        )
+    value = bytes(raw[:size])
+    for encoding in ("utf-8", "gb18030"):
+        try:
+            return value.decode(encoding, errors="strict")
+        except UnicodeDecodeError:
+            continue
+    raise HuaxinAbiError(
+        NATIVE_ABI_INCOMPATIBLE,
+        "Trader 事件文本编码无法识别",
+        {"field": field_name},
+    )
+
+
+def _payload_as(payload: bytes, structure_type: Type[ctypes.Structure]) -> ctypes.Structure:
+    """把事件 payload 严格解析为指定 ctypes POD。
+
+    Args:
+        payload: native 深拷贝出的 bytes。
+        structure_type: 与 event_type 对应的固定结构。
+
+    Returns:
+        ctypes.Structure: Python 自有内存中的结构副本。
+
+    Raises:
+        HuaxinAbiError: payload 大小与合同不一致。
+    """
+
+    expected = ctypes.sizeof(structure_type)
+    if len(payload) != expected:
+        raise HuaxinAbiError(
+            NATIVE_ABI_INCOMPATIBLE,
+            "Trader 事件 payload 大小不兼容",
+            {"expected_size": expected, "actual_size": len(payload)},
+        )
+    return structure_type.from_buffer_copy(payload)
+
+
+def _char_value(value: int) -> str:
+    """把厂商单字节枚举转为可序列化字符。
+
+    Args:
+        value: 0-255 整数。
+
+    Returns:
+        str: ASCII 字符；零值返回空字符串。
+    """
+
+    return "" if value == 0 else bytes((value,)).decode("latin-1")
+
+
+def _direction_value(value: int) -> str:
+    """把 bridge 归一化方向码转为 buy/sell 或原始字符。
+
+    Args:
+        value: bridge 方向整数。
+
+    Returns:
+        str: buy、sell 或未知原始字符。
+    """
+
+    if value == 0:
+        return "buy"
+    if value == 1:
+        return "sell"
+    return _char_value(value)
+
+
+def _order_price_type_value(value: int) -> str:
+    """把 bridge 稳定价格类型码还原为 canonical 名称。
+
+    Args:
+        value: bridge 稳定整数；未知值可能是保留的厂商原始字符。
+
+    Returns:
+        str: canonical 名称或未识别的原始单字节字符。
+    """
+
+    names = {code: name for name, code in _ORDER_PRICE_TYPES.items()}
+    return names.get(value, _char_value(value))
+
+
+def _time_condition_value(value: int) -> str:
+    """把 bridge 稳定有效期条件码还原为 canonical 名称。
+
+    Args:
+        value: bridge 稳定整数；未知值可能是保留的厂商原始字符。
+
+    Returns:
+        str: gfd、ioc 或未识别的原始单字节字符。
+    """
+
+    names = {code: name for name, code in _TIME_CONDITIONS.items()}
+    return names.get(value, _char_value(value))
+
+
+def _volume_condition_value(value: int) -> str:
+    """把 bridge 稳定成交量条件码还原为 canonical 名称。
+
+    Args:
+        value: bridge 稳定整数；未知值可能是保留的厂商原始字符。
+
+    Returns:
+        str: any、all 或未识别的原始单字节字符。
+    """
+
+    names = {code: name for name, code in _VOLUME_CONDITIONS.items()}
+    return names.get(value, _char_value(value))
+
+
+def _decode_event_data(event_type: int, payload: bytes) -> Mapping[str, object]:
+    """把真实 Trader typed payload 解码为 adapter 可消费的结构化字典。
+
+    Args:
+        event_type: 稳定 flat ABI 事件整数。
+        payload: 已复制到 Python 的 payload。
+
+    Returns:
+        Mapping[str, object]: 不含厂商指针或凭据的事件数据；未知事件返回空映射。
+    """
+
+    if event_type == EVENT_STATE:
+        value = _payload_as(payload, _StateEvent)
+        return {
+            "state": int(value.state),
+            "reason": int(value.reason),
+            "transport_connected": bool(value.transport_connected),
+            "logged_in": bool(value.logged_in),
+            "ready_for_queries": bool(value.ready_for_queries),
+            "ready_for_new_orders": bool(value.ready_for_new_orders),
+            "ready_for_cancel": bool(value.ready_for_cancel),
+            "session_epoch": int(value.session_epoch),
+        }
+    if event_type == EVENT_ERROR:
+        value = _payload_as(payload, _ErrorEvent)
+        return {
+            "error_id": int(value.error_id),
+            "vendor_request_id": int(value.vendor_request_id),
+            "error_message": _decode_event_text(
+                value.message,
+                int(value.message_size),
+                ERROR_MESSAGE_CAPACITY,
+                "error_message",
+            ),
+        }
+    if event_type == EVENT_LOGIN:
+        value = _payload_as(payload, _LoginEvent)
+        return {
+            "front_id": int(value.front_id),
+            "session_id": int(value.session_id),
+            "max_order_ref": int(value.max_order_ref),
+            "trading_day": _decode_event_text(
+                value.trading_day, int(value.trading_day_size), DATE_CAPACITY, "trading_day"
+            ),
+            "login_time": _decode_event_text(
+                value.login_time, int(value.login_time_size), TIME_CAPACITY, "login_time"
+            ),
+        }
+    if event_type == EVENT_SECURITY:
+        value = _payload_as(payload, _SecurityEvent)
+        return {
+            "exchange": _decode_event_text(
+                value.exchange, int(value.exchange_size), EXCHANGE_CAPACITY, "exchange"
+            ),
+            "security": _decode_event_text(
+                value.security, int(value.security_size), SECURITY_CAPACITY, "security"
+            ),
+            "security_name": _decode_event_text(
+                value.security_name,
+                int(value.security_name_size),
+                SECURITY_NAME_CAPACITY,
+                "security_name",
+            ),
+            "short_name": _decode_event_text(
+                value.short_name,
+                int(value.short_name_size),
+                SECURITY_NAME_CAPACITY,
+                "short_name",
+            ),
+            "market_id": int(value.market_id),
+            "security_type": int(value.security_type),
+            "order_unit": int(value.order_unit),
+            "limit_buy_unit": int(value.limit_buy_unit),
+            "limit_sell_unit": int(value.limit_sell_unit),
+            "min_limit_buy": int(value.min_limit_buy),
+            "max_limit_buy": int(value.max_limit_buy),
+            "min_limit_sell": int(value.min_limit_sell),
+            "max_limit_sell": int(value.max_limit_sell),
+            "market_buy_unit": int(value.market_buy_unit),
+            "market_sell_unit": int(value.market_sell_unit),
+            "min_market_buy": int(value.min_market_buy),
+            "max_market_buy": int(value.max_market_buy),
+            "min_market_sell": int(value.min_market_sell),
+            "max_market_sell": int(value.max_market_sell),
+            "volume_multiple": int(value.volume_multiple),
+            "has_price_limit": bool(value.has_price_limit),
+            "day_trading": bool(value.day_trading),
+            "security_status": int(value.security_status),
+            "price_tick": float(value.price_tick),
+            "pre_close_price": float(value.pre_close_price),
+            "upper_limit_price": float(value.upper_limit_price),
+            "lower_limit_price": float(value.lower_limit_price),
+        }
+    if event_type == EVENT_SHAREHOLDER_ACCOUNT:
+        value = _payload_as(payload, _ShareholderEvent)
+        return {
+            "investor_id": _decode_event_text(
+                value.investor_id,
+                int(value.investor_id_size),
+                INVESTOR_CAPACITY,
+                "investor_id",
+            ),
+            "exchange": _decode_event_text(
+                value.exchange, int(value.exchange_size), EXCHANGE_CAPACITY, "exchange"
+            ),
+            "shareholder_id": _decode_event_text(
+                value.shareholder_id,
+                int(value.shareholder_id_size),
+                SHAREHOLDER_CAPACITY,
+                "shareholder_id",
+            ),
+            "market_id": int(value.market_id),
+            "shareholder_id_type": int(value.shareholder_id_type),
+            "main_flag": bool(value.main_flag),
+        }
+    if event_type == EVENT_TRADING_ACCOUNT:
+        value = _payload_as(payload, _AccountEvent)
+        return {
+            "department_id": _decode_event_text(
+                value.department_id,
+                int(value.department_id_size),
+                DEPARTMENT_CAPACITY,
+                "department_id",
+            ),
+            "account_id": _decode_event_text(
+                value.account_id,
+                int(value.account_id_size),
+                LOGIN_ACCOUNT_CAPACITY,
+                "account_id",
+            ),
+            "currency": _char_value(int(value.currency)),
+            "available_cash": float(value.available_cash),
+            "transferable_cash": float(value.transferable_cash),
+            "frozen_cash": float(value.frozen_cash),
+        }
+    if event_type == EVENT_POSITION:
+        value = _payload_as(payload, _PositionEvent)
+        return {
+            "exchange": _decode_event_text(
+                value.exchange, int(value.exchange_size), EXCHANGE_CAPACITY, "exchange"
+            ),
+            "investor_id": _decode_event_text(
+                value.investor_id,
+                int(value.investor_id_size),
+                INVESTOR_CAPACITY,
+                "investor_id",
+            ),
+            "shareholder_id": _decode_event_text(
+                value.shareholder_id,
+                int(value.shareholder_id_size),
+                SHAREHOLDER_CAPACITY,
+                "shareholder_id",
+            ),
+            "security": _decode_event_text(
+                value.security, int(value.security_size), SECURITY_CAPACITY, "security"
+            ),
+            "trading_day": _decode_event_text(
+                value.trading_day, int(value.trading_day_size), DATE_CAPACITY, "trading_day"
+            ),
+            "current_position": int(value.current_position),
+            "available_position": int(value.available_position),
+            "history_position": int(value.history_position),
+            "history_frozen": int(value.history_frozen),
+            "today_bs": int(value.today_bs),
+            "today_bs_frozen": int(value.today_bs_frozen),
+            "today_pr": int(value.today_pr),
+            "today_pr_frozen": int(value.today_pr_frozen),
+            "total_cost": float(value.total_cost),
+            "today_sm": int(value.today_sm),
+            "today_sm_frozen": int(value.today_sm_frozen),
+            "pre_position": int(value.pre_position),
+            "pre_frozen": int(value.pre_frozen),
+            "repay_untrade_volume": int(value.repay_untrade_volume),
+            "repay_transfer_untrade_volume": int(value.repay_transfer_untrade_volume),
+            "collateral_buy_untrade_volume": int(value.collateral_buy_untrade_volume),
+            "credit_buy_untrade_volume": int(value.credit_buy_untrade_volume),
+            "credit_sell_untrade_volume": int(value.credit_sell_untrade_volume),
+            "history_position_price": float(value.history_position_price),
+            "open_position_cost": float(value.open_position_cost),
+            "collateral_buy_untrade_amount": float(value.collateral_buy_untrade_amount),
+            "credit_buy_untrade_amount": float(value.credit_buy_untrade_amount),
+            "credit_sell_untrade_amount": float(value.credit_sell_untrade_amount),
+        }
+    if event_type == EVENT_ORDER:
+        value = _payload_as(payload, _OrderEvent)
+        return {
+            "exchange": _decode_event_text(
+                value.exchange, int(value.exchange_size), EXCHANGE_CAPACITY, "exchange"
+            ),
+            "investor_id": _decode_event_text(
+                value.investor_id,
+                int(value.investor_id_size),
+                INVESTOR_CAPACITY,
+                "investor_id",
+            ),
+            "shareholder_id": _decode_event_text(
+                value.shareholder_id,
+                int(value.shareholder_id_size),
+                SHAREHOLDER_CAPACITY,
+                "shareholder_id",
+            ),
+            "security": _decode_event_text(
+                value.security, int(value.security_size), SECURITY_CAPACITY, "security"
+            ),
+            "direction": _direction_value(int(value.direction)),
+            "order_price_type": _order_price_type_value(int(value.order_price_type)),
+            "time_condition": _time_condition_value(int(value.time_condition)),
+            "volume_condition": _volume_condition_value(int(value.volume_condition)),
+            "limit_price": float(value.limit_price),
+            "amount": int(value.amount),
+            "filled": int(value.filled),
+            "canceled": int(value.canceled),
+            "front_id": int(value.front_id),
+            "session_id": int(value.session_id),
+            "order_ref": int(value.order_ref),
+            "order_local_id": _decode_event_text(
+                value.order_local_id,
+                int(value.order_local_id_size),
+                ORDER_LOCAL_ID_CAPACITY,
+                "order_local_id",
+            ),
+            "order_sys_id": _decode_event_text(
+                value.order_sys_id,
+                int(value.order_sys_id_size),
+                ORDER_SYS_ID_CAPACITY,
+                "order_sys_id",
+            ),
+            "order_status": _char_value(int(value.order_status)),
+            "submit_status": _char_value(int(value.submit_status)),
+            "trading_day": _decode_event_text(
+                value.trading_day, int(value.trading_day_size), DATE_CAPACITY, "trading_day"
+            ),
+            "insert_time": _decode_event_text(
+                value.insert_time, int(value.insert_time_size), TIME_CAPACITY, "insert_time"
+            ),
+            "status_msg": _decode_event_text(
+                value.status_message,
+                int(value.status_message_size),
+                ERROR_MESSAGE_CAPACITY,
+                "status_message",
+            ),
+        }
+    if event_type == EVENT_TRADE:
+        value = _payload_as(payload, _TradeEvent)
+        return {
+            "exchange": _decode_event_text(
+                value.exchange, int(value.exchange_size), EXCHANGE_CAPACITY, "exchange"
+            ),
+            "investor_id": _decode_event_text(
+                value.investor_id,
+                int(value.investor_id_size),
+                INVESTOR_CAPACITY,
+                "investor_id",
+            ),
+            "shareholder_id": _decode_event_text(
+                value.shareholder_id,
+                int(value.shareholder_id_size),
+                SHAREHOLDER_CAPACITY,
+                "shareholder_id",
+            ),
+            "security": _decode_event_text(
+                value.security, int(value.security_size), SECURITY_CAPACITY, "security"
+            ),
+            "direction": _direction_value(int(value.direction)),
+            "trade_id": _decode_event_text(
+                value.trade_id, int(value.trade_id_size), TRADE_ID_CAPACITY, "trade_id"
+            ),
+            "order_sys_id": _decode_event_text(
+                value.order_sys_id,
+                int(value.order_sys_id_size),
+                ORDER_SYS_ID_CAPACITY,
+                "order_sys_id",
+            ),
+            "order_local_id": _decode_event_text(
+                value.order_local_id,
+                int(value.order_local_id_size),
+                ORDER_LOCAL_ID_CAPACITY,
+                "order_local_id",
+            ),
+            "order_ref": int(value.order_ref),
+            "price": float(value.price),
+            "amount": int(value.amount),
+            "trade_date": _decode_event_text(
+                value.trade_date, int(value.trade_date_size), DATE_CAPACITY, "trade_date"
+            ),
+            "trade_time": _decode_event_text(
+                value.trade_time, int(value.trade_time_size), TIME_CAPACITY, "trade_time"
+            ),
+            "trading_day": _decode_event_text(
+                value.trading_day, int(value.trading_day_size), DATE_CAPACITY, "trading_day"
+            ),
+        }
+    if event_type == EVENT_QUERY_END:
+        value = _payload_as(payload, _QueryEndEvent)
+        return {
+            "request_type": int(value.request_type),
+            "error_id": int(value.error_id),
+            "record_count": int(value.record_count),
+            "error_message": _decode_event_text(
+                value.message,
+                int(value.message_size),
+                ERROR_MESSAGE_CAPACITY,
+                "error_message",
+            ),
+        }
+    if event_type in {EVENT_ORDER_INSERT_RESPONSE, EVENT_ORDER_ACTION_RESPONSE}:
+        value = _payload_as(payload, _OrderResponseEvent)
+        return {
+            "error_id": int(value.error_id),
+            "order_ref": int(value.order_ref),
+            "order_sys_id": _decode_event_text(
+                value.order_sys_id,
+                int(value.order_sys_id_size),
+                ORDER_SYS_ID_CAPACITY,
+                "order_sys_id",
+            ),
+            "error_message": _decode_event_text(
+                value.message,
+                int(value.message_size),
+                ERROR_MESSAGE_CAPACITY,
+                "error_message",
+            ),
+        }
+    return {}
 
 
 def _configure_signatures(library: ctypes.CDLL) -> None:
@@ -335,6 +1858,18 @@ def _configure_signatures(library: ctypes.CDLL) -> None:
     library.bt_huaxin_destroy.restype = ctypes.c_int32
     library.bt_huaxin_get_health.argtypes = [ctypes.c_void_p, ctypes.POINTER(_Health)]
     library.bt_huaxin_get_health.restype = ctypes.c_int32
+    library.bt_huaxin_start_session.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_SessionConfig),
+    ]
+    library.bt_huaxin_start_session.restype = ctypes.c_int32
+    library.bt_huaxin_stop_session.argtypes = [ctypes.c_void_p]
+    library.bt_huaxin_stop_session.restype = ctypes.c_int32
+    library.bt_huaxin_get_trader_health.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(_TraderHealth),
+    ]
+    library.bt_huaxin_get_trader_health.restype = ctypes.c_int32
     library.bt_huaxin_submit_request.argtypes = [
         ctypes.c_void_p,
         ctypes.POINTER(_Request),
@@ -348,6 +1883,14 @@ def _configure_signatures(library: ctypes.CDLL) -> None:
     library.bt_huaxin_drain_event_batch.restype = ctypes.c_int32
     library.bt_huaxin_free_event_batch.argtypes = [ctypes.POINTER(_EventBatch)]
     library.bt_huaxin_free_event_batch.restype = ctypes.c_int32
+    library.bt_huaxin_drain_owned_event_batch.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.POINTER(_OwnedEventBatch),
+    ]
+    library.bt_huaxin_drain_owned_event_batch.restype = ctypes.c_int32
+    library.bt_huaxin_free_owned_event_batch.argtypes = [ctypes.POINTER(_OwnedEventBatch)]
+    library.bt_huaxin_free_owned_event_batch.restype = ctypes.c_int32
 
 
 class NativeBridge:
@@ -377,6 +1920,14 @@ class NativeBridge:
         self.library_path = library_path
         self._library = library
         self.manifest = dict(manifest)
+        bridge_manifest = manifest.get("bridge", {})
+        self.mode = str(manifest.get("mode", MODE_OFFLINE_FAKE))
+        self.expected_vendor_schema_id = str(
+            bridge_manifest.get("vendor_schema_id", VENDOR_SCHEMA_ID)
+        )
+        self.expected_field_set_version = str(
+            bridge_manifest.get("field_set_version", FIELD_SET_VERSION)
+        )
 
     @classmethod
     def load(cls: Type["NativeBridge"], bundle_path: Path) -> "NativeBridge":
@@ -388,16 +1939,27 @@ class NativeBridge:
         返回:
             可创建 opaque runtime 的 NativeBridge。
         副作用:
-            校验成功后调用 ctypes.CDLL；不会编译、联网或加载厂商 SDK。
+            校验成功后调用 ctypes.CDLL；真实 bundle 会由系统装载器解析其已校验的
+            ``$ORIGIN/vendor`` 依赖，但不会创建 TORA runtime 或连接柜台。
         异常:
             HuaxinBundleError: manifest、指纹或 artifact 校验失败。
             HuaxinNativeUnavailableError: 动态库无法由当前平台加载。
             HuaxinAbiError: 动态库 ABI major 与 wrapper 不一致。
         """
 
-        from .build import verify_bundle
+        from .build import _runtime_vendor_status, verify_bundle
 
         manifest, artifact_path = verify_bundle(bundle_path)
+        if manifest.get("mode") == MODE_TRADER:
+            runtime_ready, _runtime_path, runtime_status = _runtime_vendor_status(
+                bundle_path, manifest
+            )
+            if not runtime_ready:
+                raise HuaxinNativeUnavailableError(
+                    HUAXIN_NATIVE_UNAVAILABLE,
+                    "真实华鑫 bundle 的外部 Trader 运行时库未通过校验",
+                    {"runtime_status": runtime_status},
+                )
         try:
             library = ctypes.CDLL(str(artifact_path))
             _configure_signatures(library)
@@ -421,14 +1983,25 @@ class NativeBridge:
         actual_field_set = cls._decode_static_text(
             library.bt_huaxin_field_set_version(), "field_set_version"
         )
-        if actual_vendor_schema != VENDOR_SCHEMA_ID or actual_field_set != FIELD_SET_VERSION:
+        bridge_manifest = manifest.get("bridge")
+        expected_vendor_schema = (
+            str(bridge_manifest.get("vendor_schema_id"))
+            if isinstance(bridge_manifest, dict)
+            else VENDOR_SCHEMA_ID
+        )
+        expected_field_set = (
+            str(bridge_manifest.get("field_set_version"))
+            if isinstance(bridge_manifest, dict)
+            else FIELD_SET_VERSION
+        )
+        if actual_vendor_schema != expected_vendor_schema or actual_field_set != expected_field_set:
             raise HuaxinAbiError(
                 VENDOR_SCHEMA_INCOMPATIBLE,
                 "Python wrapper 与 native bridge schema 身份不一致",
                 {
-                    "expected_vendor_schema_id": VENDOR_SCHEMA_ID,
+                    "expected_vendor_schema_id": expected_vendor_schema,
                     "actual_vendor_schema_id": actual_vendor_schema,
-                    "expected_field_set_version": FIELD_SET_VERSION,
+                    "expected_field_set_version": expected_field_set,
                     "actual_field_set_version": actual_field_set,
                 },
             )
@@ -548,7 +2121,10 @@ class NativeBridge:
             struct_size=ctypes.sizeof(_CreateOptions),
             queue_capacity=queue_capacity,
             reserved=0,
-            schema=_schema_identity(),
+            schema=_schema_identity(
+                self.expected_vendor_schema_id,
+                self.expected_field_set_version,
+            ),
         )
         handle = ctypes.c_void_p()
         result = int(self._library.bt_huaxin_create(ctypes.byref(options), ctypes.byref(handle)))
@@ -654,6 +2230,50 @@ class NativeRuntime:
 
         with self._lock:
             handle = self._require_handle()
+            schema = _schema_identity(
+                self._bridge.expected_vendor_schema_id,
+                self._bridge.expected_field_set_version,
+            )
+            if self._bridge.mode == MODE_TRADER:
+                trader_raw = _TraderHealth(
+                    abi_version=ABI_VERSION,
+                    struct_size=ctypes.sizeof(_TraderHealth),
+                    schema=schema,
+                )
+                result = int(
+                    self._bridge._library.bt_huaxin_get_trader_health(
+                        handle, ctypes.byref(trader_raw)
+                    )
+                )
+                self._bridge._raise_for_result(result, "trader_health")
+                _validate_native_struct(
+                    trader_raw,
+                    _TraderHealth,
+                    "trader_health",
+                    self._bridge.expected_vendor_schema_id,
+                    self._bridge.expected_field_set_version,
+                )
+                vendor_schema_id, field_set_version = _decode_schema_identity(
+                    trader_raw.schema,
+                    "trader_health",
+                    self._bridge.expected_vendor_schema_id,
+                    self._bridge.expected_field_set_version,
+                )
+                return NativeHealth(
+                    state=int(trader_raw.state),
+                    queue_capacity=int(trader_raw.queue_capacity),
+                    queue_size=int(trader_raw.queue_size),
+                    dropped_events=int(trader_raw.dropped_events),
+                    vendor_schema_id=vendor_schema_id,
+                    field_set_version=field_set_version,
+                    transport_connected=bool(trader_raw.transport_connected),
+                    logged_in=bool(trader_raw.logged_in),
+                    ready_for_queries=bool(trader_raw.ready_for_queries),
+                    ready_for_new_orders=bool(trader_raw.ready_for_new_orders),
+                    ready_for_cancel=bool(trader_raw.ready_for_cancel),
+                    session_epoch=int(trader_raw.session_epoch),
+                    last_error_id=int(trader_raw.last_error_id),
+                )
             raw = _Health(
                 abi_version=ABI_VERSION,
                 struct_size=ctypes.sizeof(_Health),
@@ -662,12 +2282,23 @@ class NativeRuntime:
                 queue_size=0,
                 reserved=0,
                 dropped_events=0,
-                schema=_schema_identity(),
+                schema=schema,
             )
             result = int(self._bridge._library.bt_huaxin_get_health(handle, ctypes.byref(raw)))
             self._bridge._raise_for_result(result, "health")
-            _validate_native_struct(raw, _Health, "health")
-            vendor_schema_id, field_set_version = _decode_schema_identity(raw.schema, "health")
+            _validate_native_struct(
+                raw,
+                _Health,
+                "health",
+                self._bridge.expected_vendor_schema_id,
+                self._bridge.expected_field_set_version,
+            )
+            vendor_schema_id, field_set_version = _decode_schema_identity(
+                raw.schema,
+                "health",
+                self._bridge.expected_vendor_schema_id,
+                self._bridge.expected_field_set_version,
+            )
             return NativeHealth(
                 state=int(raw.state),
                 queue_capacity=int(raw.queue_capacity),
@@ -702,10 +2333,37 @@ class NativeRuntime:
             获取生命周期锁并让 native fake runtime 入队一个请求完成事件；不联网、不交易。
         """
 
+        self._submit_payload(request_id, payload, request_type, "submit_request")
+
+    def _submit_payload(
+        self,
+        request_id: int,
+        payload: bytes,
+        request_type: int,
+        operation: str,
+    ) -> None:
+        """构造通用请求头并同步调用 native dispatcher。
+
+        Args:
+            request_id: 调用方稳定请求标识。
+            payload: 与 request_type 对应的 typed bytes。
+            request_type: flat ABI 请求整数。
+            operation: 受控异常中的操作名。
+
+        Returns:
+            None。
+
+        Raises:
+            TypeError: payload 不是 bytes。
+            ValueError: 标识或 payload 超出当前模式合同。
+            HuaxinNativeCallError: native 或厂商同步拒绝请求。
+        """
+
         if not isinstance(payload, bytes):
             raise TypeError("payload 必须为 bytes")
-        if request_id < 1 or request_id > (1 << 64) - 1:
-            raise ValueError("request_id 必须为非零 uint64")
+        max_request_id = (1 << 31) - 1 if self._bridge.mode == MODE_TRADER else (1 << 64) - 1
+        if request_id < 1 or request_id > max_request_id:
+            raise ValueError(f"request_id 必须位于 1 到 {max_request_id}")
         if len(payload) > REQUEST_PAYLOAD_CAPACITY:
             raise ValueError(f"payload 不能超过 {REQUEST_PAYLOAD_CAPACITY} 字节")
         raw = _Request(
@@ -714,13 +2372,214 @@ class NativeRuntime:
             request_type=request_type,
             payload_size=len(payload),
             request_id=request_id,
-            schema=_schema_identity(),
+            schema=_schema_identity(
+                self._bridge.expected_vendor_schema_id,
+                self._bridge.expected_field_set_version,
+            ),
         )
         raw.payload[: len(payload)] = payload
         with self._lock:
             handle = self._require_handle()
             result = int(self._bridge._library.bt_huaxin_submit_request(handle, ctypes.byref(raw)))
-            self._bridge._raise_for_result(result, "submit_request")
+            if result != 0:
+                print(f"[DEBUG NATIVE] bt_huaxin_submit_request operation={operation} result={result} request_type={raw.request_type} payload_len={len(payload)}")
+            self._bridge._raise_for_result(result, operation)
+
+    def start_session(self, config: NativeSessionConfig) -> None:
+        """启动真实 TORA Trader 生命周期、连接和自动登录。
+
+        Args:
+            config: 明确包含 flow/front/身份和独立写门禁的会话配置。
+
+        Returns:
+            None；登录结果通过 health 与 owned events 异步观察。
+
+        Raises:
+            TypeError: config 类型不正确。
+            HuaxinNativeCallError: fake 模式或 native 同步拒绝启动。
+
+        Side Effects:
+            真实模式创建 TORA API 线程并连接配置的交易前置。
+        """
+
+        if not isinstance(config, NativeSessionConfig):
+            raise TypeError("config 必须为 NativeSessionConfig")
+        raw = _session_config_to_raw(
+            config,
+            self._bridge.expected_vendor_schema_id,
+            self._bridge.expected_field_set_version,
+        )
+        try:
+            with self._lock:
+                handle = self._require_handle()
+                result = int(
+                    self._bridge._library.bt_huaxin_start_session(handle, ctypes.byref(raw))
+                )
+                self._bridge._raise_for_result(result, "start_session")
+        finally:
+            _clear_structure(raw)
+
+    def stop_session(self) -> None:
+        """幂等停止 Trader 会话但保留 runtime 供最后 drain/health。
+
+        Returns:
+            None。
+
+        Side Effects:
+            真实模式注销 SPI 并调用厂商 Release；fake 模式为空操作。
+        """
+
+        with self._lock:
+            handle = self._require_handle()
+            result = int(self._bridge._library.bt_huaxin_stop_session(handle))
+            self._bridge._raise_for_result(result, "stop_session")
+
+    def query_security(self, request_id: int, exchange: str = "", security: str = "") -> None:
+        """提交证券基础信息查询。
+
+        Args:
+            request_id: 正 int32 请求标识。
+            exchange: 可选交易所过滤。
+            security: 可选证券代码过滤。
+
+        Returns:
+            None；记录与 query_end 通过 drain 返回。
+        """
+
+        self._submit_payload(
+            request_id,
+            _query_payload(exchange, security),
+            REQUEST_QUERY_SECURITY,
+            "query_security",
+        )
+
+    def query_shareholder_accounts(self, request_id: int) -> None:
+        """提交股东账户查询并通过 query_end 标记完成。
+
+        Args:
+            request_id: 正 int32 请求标识。
+
+        Returns:
+            None。
+        """
+
+        self._submit_payload(
+            request_id, b"", REQUEST_QUERY_SHAREHOLDER_ACCOUNT, "query_shareholder_accounts"
+        )
+
+    def query_trading_accounts(self, request_id: int) -> None:
+        """提交资金账户查询。
+
+        Args:
+            request_id: 正 int32 请求标识。
+
+        Returns:
+            None。
+        """
+
+        self._submit_payload(
+            request_id, b"", REQUEST_QUERY_TRADING_ACCOUNT, "query_trading_accounts"
+        )
+
+    def query_positions(self, request_id: int) -> None:
+        """提交持仓查询。
+
+        Args:
+            request_id: 正 int32 请求标识。
+
+        Returns:
+            None。
+        """
+
+        self._submit_payload(request_id, b"", REQUEST_QUERY_POSITION, "query_positions")
+
+    def query_orders(self, request_id: int) -> None:
+        """提交当日委托查询。
+
+        Args:
+            request_id: 正 int32 请求标识。
+
+        Returns:
+            None。
+        """
+
+        self._submit_payload(request_id, b"", REQUEST_QUERY_ORDER, "query_orders")
+
+    def query_trades(self, request_id: int) -> None:
+        """提交当日成交查询。
+
+        Args:
+            request_id: 正 int32 请求标识。
+
+        Returns:
+            None。
+        """
+
+        self._submit_payload(request_id, b"", REQUEST_QUERY_TRADE, "query_trades")
+
+    def place_limit(self, request_id: int, order: NativeLimitOrderRequest) -> None:
+        """提交受 native 交易门禁保护的限价委托。
+
+        Args:
+            request_id: 正 int32 请求标识。
+            order: 限价/GFD/AV 委托身份和价格数量。
+
+        Returns:
+            None；响应和最终状态通过 owned events 返回。
+        """
+
+        if not isinstance(order, NativeLimitOrderRequest):
+            raise TypeError("order 必须为 NativeLimitOrderRequest")
+        self._submit_payload(
+            request_id,
+            _limit_order_payload(order),
+            REQUEST_PLACE_LIMIT,
+            "place_limit",
+        )
+
+    def place_order(self, request_id: int, order: NativeOrderRequest) -> None:
+        """提交经 Python/native 双层交易所矩阵门禁的现货委托。
+
+        Args:
+            request_id: 正 int32 请求标识。
+            order: 使用 canonical 三元组和显式保护价的委托请求。
+
+        Returns:
+            None；响应和最终状态通过 owned events 返回。
+
+        Raises:
+            TypeError: order 不是 NativeOrderRequest。
+            ValueError: 类型、交易所组合、价格或数量不满足安全合同。
+        """
+
+        if not isinstance(order, NativeOrderRequest):
+            raise TypeError("order 必须为 NativeOrderRequest")
+        self._submit_payload(
+            request_id,
+            _order_payload(order),
+            REQUEST_PLACE_ORDER,
+            "place_order",
+        )
+
+    def cancel_order(self, request_id: int, cancel: NativeCancelOrderRequest) -> None:
+        """提交受独立撤单门禁保护的明确身份撤单。
+
+        Args:
+            request_id: 正 int32 请求标识，同时用作 OrderActionRef。
+            cancel: OrderSysID 或完整会话三元组身份。
+
+        Returns:
+            None；响应和最终状态通过 owned events 返回。
+        """
+
+        if not isinstance(cancel, NativeCancelOrderRequest):
+            raise TypeError("cancel 必须为 NativeCancelOrderRequest")
+        self._submit_payload(
+            request_id,
+            _cancel_order_payload(cancel),
+            REQUEST_CANCEL_ORDER,
+            "cancel_order",
+        )
 
     def drain(self, max_events: int) -> List[NativeEvent]:
         """
@@ -739,14 +2598,20 @@ class NativeRuntime:
 
         if max_events < 1 or max_events > MAX_DRAIN_EVENTS:
             raise ValueError(f"max_events 必须位于 1 到 {MAX_DRAIN_EVENTS}")
+        if self._bridge.mode == MODE_TRADER:
+            return self._drain_owned(max_events)
         with self._lock:
             handle = self._require_handle()
+            schema = _schema_identity(
+                self._bridge.expected_vendor_schema_id,
+                self._bridge.expected_field_set_version,
+            )
             batch = _EventBatch(
                 abi_version=ABI_VERSION,
                 struct_size=ctypes.sizeof(_EventBatch),
                 event_count=0,
                 event_stride=0,
-                schema=_schema_identity(),
+                schema=schema,
                 events=None,
                 ownership_token=0,
             )
@@ -759,7 +2624,13 @@ class NativeRuntime:
                     )
                 )
                 self._bridge._raise_for_result(result, "drain_event_batch")
-                _validate_native_struct(batch, _EventBatch, "drain_event_batch")
+                _validate_native_struct(
+                    batch,
+                    _EventBatch,
+                    "drain_event_batch",
+                    self._bridge.expected_vendor_schema_id,
+                    self._bridge.expected_field_set_version,
+                )
                 count = int(batch.event_count)
                 if count > max_events:
                     raise HuaxinAbiError(
@@ -791,7 +2662,13 @@ class NativeRuntime:
                 events: List[NativeEvent] = []
                 for index in range(count):
                     raw = batch.events[index]
-                    _validate_native_struct(raw, _Event, "drain_event")
+                    _validate_native_struct(
+                        raw,
+                        _Event,
+                        "drain_event",
+                        self._bridge.expected_vendor_schema_id,
+                        self._bridge.expected_field_set_version,
+                    )
                     payload_size = int(raw.payload_size)
                     if payload_size > EVENT_PAYLOAD_CAPACITY:
                         raise HuaxinAbiError(
@@ -800,7 +2677,10 @@ class NativeRuntime:
                             {"operation": "drain_event"},
                         )
                     vendor_schema_id, field_set_version = _decode_schema_identity(
-                        raw.schema, "drain_event"
+                        raw.schema,
+                        "drain_event",
+                        self._bridge.expected_vendor_schema_id,
+                        self._bridge.expected_field_set_version,
                     )
                     events.append(
                         NativeEvent(
@@ -820,7 +2700,7 @@ class NativeRuntime:
                     struct_size=ctypes.sizeof(_EventBatch),
                     event_count=int(batch.event_count),
                     event_stride=int(batch.event_stride),
-                    schema=_schema_identity(),
+                    schema=schema,
                     events=batch.events,
                     ownership_token=int(batch.ownership_token),
                 )
@@ -829,6 +2709,136 @@ class NativeRuntime:
                 )
                 if free_result != 0:
                     self._bridge._raise_for_result(free_result, "free_event_batch")
+
+    def _drain_owned(self, max_events: int) -> List[NativeEvent]:
+        """复制并释放真实 Trader 的 bridge-owned 大事件批次。
+
+        Args:
+            max_events: 本次最多复制的事件数，已由公开 drain 校验。
+
+        Returns:
+            List[NativeEvent]: payload 和结构化 data 均由 Python 自有的事件列表。
+
+        Raises:
+            HuaxinAbiError: batch、event 或 typed payload 不兼容。
+            HuaxinNativeCallError: native drain/free 返回非零错误。
+
+        Side Effects:
+            从 native 有界队列移除事件，并在 finally 中恰好释放一次 batch。
+        """
+
+        with self._lock:
+            handle = self._require_handle()
+            schema = _schema_identity(
+                self._bridge.expected_vendor_schema_id,
+                self._bridge.expected_field_set_version,
+            )
+            batch = _OwnedEventBatch(
+                abi_version=ABI_VERSION,
+                struct_size=ctypes.sizeof(_OwnedEventBatch),
+                event_count=0,
+                event_stride=0,
+                schema=schema,
+                events=None,
+                ownership_token=0,
+            )
+            try:
+                result = int(
+                    self._bridge._library.bt_huaxin_drain_owned_event_batch(
+                        handle,
+                        ctypes.c_uint32(max_events),
+                        ctypes.byref(batch),
+                    )
+                )
+                self._bridge._raise_for_result(result, "drain_owned_event_batch")
+                _validate_native_struct(
+                    batch,
+                    _OwnedEventBatch,
+                    "drain_owned_event_batch",
+                    self._bridge.expected_vendor_schema_id,
+                    self._bridge.expected_field_set_version,
+                )
+                count = int(batch.event_count)
+                if count > max_events:
+                    raise HuaxinAbiError(
+                        NATIVE_ABI_INCOMPATIBLE,
+                        "native owned batch 数量超过调用方上限",
+                        {"operation": "drain_owned_event_batch"},
+                    )
+                event_address = ctypes.cast(batch.events, ctypes.c_void_p).value
+                ownership_token = int(batch.ownership_token)
+                if count == 0:
+                    if event_address or ownership_token:
+                        raise HuaxinAbiError(
+                            NATIVE_ABI_INCOMPATIBLE,
+                            "native owned 空 batch 携带了所有权指针",
+                            {"operation": "drain_owned_event_batch"},
+                        )
+                    return []
+                if (
+                    int(batch.event_stride) != ctypes.sizeof(_OwnedEvent)
+                    or not event_address
+                    or not ownership_token
+                ):
+                    raise HuaxinAbiError(
+                        NATIVE_ABI_INCOMPATIBLE,
+                        "native owned batch stride 或所有权描述符不兼容",
+                        {"operation": "drain_owned_event_batch"},
+                    )
+                events: List[NativeEvent] = []
+                for index in range(count):
+                    raw = batch.events[index]
+                    _validate_native_struct(
+                        raw,
+                        _OwnedEvent,
+                        "drain_owned_event",
+                        self._bridge.expected_vendor_schema_id,
+                        self._bridge.expected_field_set_version,
+                    )
+                    payload_size = int(raw.payload_size)
+                    if payload_size > OWNED_EVENT_PAYLOAD_CAPACITY:
+                        raise HuaxinAbiError(
+                            NATIVE_ABI_INCOMPATIBLE,
+                            "native owned event payload 长度超过固定容量",
+                            {"operation": "drain_owned_event"},
+                        )
+                    vendor_schema_id, field_set_version = _decode_schema_identity(
+                        raw.schema,
+                        "drain_owned_event",
+                        self._bridge.expected_vendor_schema_id,
+                        self._bridge.expected_field_set_version,
+                    )
+                    payload = bytes(raw.payload[:payload_size])
+                    events.append(
+                        NativeEvent(
+                            event_type=int(raw.event_type),
+                            sequence=int(raw.sequence),
+                            received_ns=int(raw.received_ns),
+                            request_id=int(raw.request_id),
+                            vendor_schema_id=vendor_schema_id,
+                            field_set_version=field_set_version,
+                            payload=payload,
+                            data=_decode_event_data(int(raw.event_type), payload),
+                        )
+                    )
+                return events
+            finally:
+                cleanup_batch = _OwnedEventBatch(
+                    abi_version=ABI_VERSION,
+                    struct_size=ctypes.sizeof(_OwnedEventBatch),
+                    event_count=int(batch.event_count),
+                    event_stride=int(batch.event_stride),
+                    schema=schema,
+                    events=batch.events,
+                    ownership_token=int(batch.ownership_token),
+                )
+                free_result = int(
+                    self._bridge._library.bt_huaxin_free_owned_event_batch(
+                        ctypes.byref(cleanup_batch)
+                    )
+                )
+                if free_result != 0:
+                    self._bridge._raise_for_result(free_result, "free_owned_event_batch")
 
     def close(self) -> None:
         """

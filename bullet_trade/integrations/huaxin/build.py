@@ -5,7 +5,7 @@
 主要输出: 内容寻址 bundle、脱敏 manifest、doctor 报告和稳定失败原因。
 上游关系: 华鑫 CLI、离线测试和未来本地 Huaxin preflight 显式调用。
 下游关系: 包内 native_src/CMakeLists.txt 与 native.py 的显式 loader。
-关键环境或配置: 当前仅支持 offline_fake；不读取、复制或加载任何厂商 SDK。
+关键环境或配置: 默认 offline_fake；trader 必须显式提供外部 SDK include/lib，且不会复制厂商资产。
 """
 
 from __future__ import annotations
@@ -31,16 +31,31 @@ from .errors import (
     BUILD_FINGERPRINT_MISMATCH,
     BUILD_PREFIX_UNSAFE,
     BUILD_TOOL_MISSING,
+    HUAXIN_NATIVE_UNAVAILABLE,
     OFFLINE_FAKE_ONLY,
-    SDK_BUILD_NOT_IMPLEMENTED,
     HuaxinBuildError,
     HuaxinBundleError,
     HuaxinError,
 )
-from .native import ABI_VERSION, FIELD_SET_VERSION, VENDOR_SCHEMA_ID
+from .native import (
+    ABI_VERSION,
+    FIELD_SET_VERSION,
+    MODE_OFFLINE_FAKE,
+    MODE_TRADER,
+    TRADER_FIELD_SET_VERSION,
+    TRADER_VENDOR_SCHEMA_ID,
+    VENDOR_SCHEMA_ID,
+)
 
 MANIFEST_SCHEMA_VERSION = 1
-SUPPORTED_BUILD_MODE = "offline_fake"
+SUPPORTED_BUILD_MODE = MODE_OFFLINE_FAKE
+SUPPORTED_BUILD_MODES = {MODE_OFFLINE_FAKE, MODE_TRADER}
+DEFAULT_TRADER_LIBRARY = "libtraderapi.so"
+REQUIRED_TRADER_HEADERS = (
+    "TORATstpTraderApi.h",
+    "TORATstpUserApiDataType.h",
+    "TORATstpUserApiStruct.h",
+)
 MAX_MANIFEST_BYTES = 1024 * 1024
 
 
@@ -297,6 +312,113 @@ def _validate_prefix(prefix: Path) -> Path:
     return resolved
 
 
+def _validate_regular_external_file(path: Path, role: str) -> Path:
+    """校验外部 SDK 输入为非符号链接普通文件。
+
+    Args:
+        path: 操作员显式提供的头文件或动态库路径。
+        role: 脱敏诊断中的文件角色。
+
+    Returns:
+        Path: 规范化绝对路径。
+
+    Raises:
+        HuaxinBuildError: 文件缺失、为符号链接或不是普通文件。
+    """
+
+    candidate = path.expanduser()
+    if candidate.is_symlink() or not candidate.is_file():
+        raise HuaxinBuildError(
+            BUILD_FAILED,
+            "外部华鑫 Trader SDK 文件缺失或类型不安全",
+            {"component": role},
+        )
+    return candidate.resolve()
+
+
+def _resolve_trader_sdk(
+    sdk_dir: Optional[Path],
+    sdk_include_dir: Optional[Path],
+    sdk_library_dir: Optional[Path],
+    trader_library: str,
+) -> Dict[str, Any]:
+    """解析并指纹化显式 Trader SDK include/lib 布局。
+
+    Args:
+        sdk_dir: 可选 SDK 根目录，默认从其 ``include``/``lib`` 子目录解析。
+        sdk_include_dir: 可覆盖根目录的头文件目录。
+        sdk_library_dir: 可覆盖根目录的动态库目录。
+        trader_library: 动态库文件名，默认 ``libtraderapi.so``。
+
+    Returns:
+        Dict[str, Any]: 含构建期绝对路径与可写入 manifest 的脱敏哈希元数据。
+
+    Raises:
+        HuaxinBuildError: 目录、文件名、必需头或动态库不满足合同。
+    """
+
+    if Path(trader_library).name != trader_library or trader_library in {"", ".", ".."}:
+        raise HuaxinBuildError(
+            BUILD_FAILED,
+            "Trader 动态库参数必须是单一文件名",
+            {"component": "trader_library"},
+        )
+    root_candidate = Path(sdk_dir).expanduser() if sdk_dir is not None else None
+    if root_candidate is not None and root_candidate.is_symlink():
+        raise HuaxinBuildError(
+            BUILD_FAILED,
+            "Trader SDK 根目录不得是符号链接",
+            {"component": "sdk_root"},
+        )
+    root = root_candidate.resolve() if root_candidate is not None else None
+    include_candidate = (
+        Path(sdk_include_dir).expanduser()
+        if sdk_include_dir is not None
+        else (root / "include" if root is not None else None)
+    )
+    library_candidate = (
+        Path(sdk_library_dir).expanduser()
+        if sdk_library_dir is not None
+        else (root / "lib" if root is not None else None)
+    )
+    if include_candidate is None or library_candidate is None:
+        raise HuaxinBuildError(
+            BUILD_FAILED,
+            "trader 模式必须显式提供 --sdk-dir 或 include/lib 目录",
+            {"component": "sdk_layout"},
+        )
+    if not include_candidate.is_dir() or include_candidate.is_symlink():
+        raise HuaxinBuildError(
+            BUILD_FAILED,
+            "Trader SDK include 目录缺失或类型不安全",
+            {"component": "sdk_include"},
+        )
+    if not library_candidate.is_dir() or library_candidate.is_symlink():
+        raise HuaxinBuildError(
+            BUILD_FAILED,
+            "Trader SDK lib 目录缺失或类型不安全",
+            {"component": "sdk_lib"},
+        )
+    include_dir = include_candidate.resolve()
+    library_dir = library_candidate.resolve()
+    headers = []
+    for name in REQUIRED_TRADER_HEADERS:
+        header = _validate_regular_external_file(include_dir / name, f"sdk_header:{name}")
+        headers.append({"name": name, "sha256": _sha256_file(header)})
+    library = _validate_regular_external_file(library_dir / trader_library, "sdk_library")
+    return {
+        "include_dir": include_dir,
+        "library_dir": library_dir,
+        "library": library,
+        "manifest": {
+            "included": False,
+            "status": "external_build_input",
+            "headers": headers,
+            "library": {"name": trader_library, "sha256": _sha256_file(library)},
+        },
+    }
+
+
 def _find_installed_artifact(stage_root: Path) -> Path:
     """
     在 CMake 安装树中寻找唯一自研动态库。
@@ -362,15 +484,23 @@ def build_native_bridge(
     mode: str = SUPPORTED_BUILD_MODE,
     build_type: str = "Release",
     timeout_seconds: int = 300,
+    sdk_dir: Optional[Path] = None,
+    sdk_include_dir: Optional[Path] = None,
+    sdk_library_dir: Optional[Path] = None,
+    trader_library: str = DEFAULT_TRADER_LIBRARY,
 ) -> BuildResult:
     """
-    显式构建并原子发布自研 fake/offline native bridge。
+    显式构建并原子发布 fake/offline 或 Trader-only native bridge。
 
     参数:
         prefix: 站点包外的显式构建根目录。
-        mode: 当前必须为 offline_fake；真实 SDK 模式尚未实现。
+        mode: ``offline_fake`` 或 ``trader``。
         build_type: CMake 构建类型，允许 Release、RelWithDebInfo 或 Debug。
         timeout_seconds: 每个 CMake 步骤的正整数超时秒数。
+        sdk_dir: trader 模式 SDK 根目录，默认读取 include/lib 子目录。
+        sdk_include_dir: 可覆盖根目录的显式头文件目录。
+        sdk_library_dir: 可覆盖根目录的显式动态库目录。
+        trader_library: trader 模式链接库文件名，默认 ``libtraderapi.so``。
     返回:
         内容寻址 bundle 的 BuildResult。
     副作用:
@@ -379,16 +509,31 @@ def build_native_bridge(
         HuaxinBuildError: 模式、工具链、prefix、构建或制品校验失败。
     """
 
-    if mode != SUPPORTED_BUILD_MODE:
+    if mode not in SUPPORTED_BUILD_MODES:
         raise HuaxinBuildError(
-            SDK_BUILD_NOT_IMPLEMENTED,
-            "当前基础切片只实现 offline_fake，不会编译或链接厂商 SDK",
+            BUILD_FAILED,
+            "华鑫 native 构建模式仅允许 offline_fake 或 trader",
             {"requested_mode": mode},
         )
     if build_type not in {"Release", "RelWithDebInfo", "Debug"}:
         raise ValueError("build_type 仅允许 Release、RelWithDebInfo 或 Debug")
     if timeout_seconds <= 0:
         raise ValueError("timeout_seconds 必须为正整数")
+
+    sdk: Optional[Dict[str, Any]] = None
+    if mode == MODE_TRADER:
+        sdk = _resolve_trader_sdk(
+            sdk_dir,
+            sdk_include_dir,
+            sdk_library_dir,
+            trader_library,
+        )
+    elif any(value is not None for value in (sdk_dir, sdk_include_dir, sdk_library_dir)):
+        raise HuaxinBuildError(
+            BUILD_FAILED,
+            "offline_fake 模式不得接收厂商 SDK 路径",
+            {"component": "sdk_layout"},
+        )
 
     resolved_prefix = _validate_prefix(Path(prefix))
     cmake = _find_tool("cmake", ("cmake",))
@@ -421,7 +566,16 @@ def build_native_bridge(
         str(build_root),
         f"-DCMAKE_BUILD_TYPE={build_type}",
         f"-DCMAKE_CXX_COMPILER={compiler}",
+        f"-DBT_HUAXIN_MODE={mode}",
     ]
+    if sdk is not None:
+        configure_command.extend(
+            [
+                f"-DBT_HUAXIN_SDK_INCLUDE_DIR={sdk['include_dir']}",
+                f"-DBT_HUAXIN_SDK_LIBRARY_DIR={sdk['library_dir']}",
+                f"-DBT_HUAXIN_TRADER_LIBRARY={trader_library}",
+            ]
+        )
     build_command = [cmake, "--build", str(build_root), "--config", build_type]
     install_command = [
         cmake,
@@ -449,18 +603,20 @@ def build_native_bridge(
         shutil.copy2(built_artifact, staged_artifact)
         artifact_hash = _sha256_file(staged_artifact)
 
+        vendor_schema_id = TRADER_VENDOR_SCHEMA_ID if mode == MODE_TRADER else VENDOR_SCHEMA_ID
+        field_set_version = TRADER_FIELD_SET_VERSION if mode == MODE_TRADER else FIELD_SET_VERSION
         manifest: Dict[str, Any] = {
             "schema_version": MANIFEST_SCHEMA_VERSION,
-            "mode": SUPPORTED_BUILD_MODE,
+            "mode": mode,
             "distribution": {"name": "bullet-trade", "version": __version__},
             "source": source_snapshot,
             "bridge": {
                 "abi_version": ABI_VERSION,
-                "vendor_schema_id": VENDOR_SCHEMA_ID,
-                "field_set_version": FIELD_SET_VERSION,
+                "vendor_schema_id": vendor_schema_id,
+                "field_set_version": field_set_version,
                 "artifact": staged_artifact.relative_to(stage_bundle).as_posix(),
                 "sha256": artifact_hash,
-                "vendor_sdk_linked": False,
+                "vendor_sdk_linked": mode == MODE_TRADER,
             },
             "target": {
                 "system": platform.system().lower(),
@@ -472,13 +628,24 @@ def build_native_bridge(
                 "compiler": _command_version((compiler, "--version")),
                 "build_type": build_type,
             },
-            "runtime": {
-                "inspection_status": "not_inspected",
-                "dynamic_dependencies": None,
-                "rpath": None,
-            },
+            "runtime": (
+                {
+                    "inspection_status": "not_inspected",
+                    "dynamic_dependencies": None,
+                    "rpath": None,
+                }
+                if mode == MODE_OFFLINE_FAKE
+                else {
+                    "inspection_status": "build_contract",
+                    "dynamic_dependencies": [trader_library],
+                    "rpath": "$ORIGIN/vendor",
+                    "vendor_artifact": f"lib/vendor/{trader_library}",
+                }
+            ),
             "integrity_scope": "self_consistency_not_provenance",
-            "vendor_sdk": {"included": False, "status": "not_used"},
+            "vendor_sdk": (
+                {"included": False, "status": "not_used"} if sdk is None else sdk["manifest"]
+            ),
         }
         fingerprint = _manifest_fingerprint(manifest)
         manifest["fingerprint"] = {"algorithm": "sha256", "value": fingerprint}
@@ -570,20 +737,32 @@ def verify_bundle(bundle_path: Path) -> Tuple[Dict[str, Any], Path]:
             {"component": "manifest"},
         )
 
+    mode = manifest.get("mode")
+    if mode not in SUPPORTED_BUILD_MODES:
+        raise HuaxinBundleError(
+            BRIDGE_BUNDLE_INVALID,
+            "华鑫 native manifest 构建模式不兼容",
+            {"component": "mode"},
+        )
+    expected_vendor_schema_id = TRADER_VENDOR_SCHEMA_ID if mode == MODE_TRADER else VENDOR_SCHEMA_ID
+    expected_field_set_version = (
+        TRADER_FIELD_SET_VERSION if mode == MODE_TRADER else FIELD_SET_VERSION
+    )
     bridge = manifest.get("bridge")
     if (
         not isinstance(bridge, dict)
         or bridge.get("abi_version") != ABI_VERSION
-        or bridge.get("vendor_schema_id") != VENDOR_SCHEMA_ID
-        or bridge.get("field_set_version") != FIELD_SET_VERSION
+        or bridge.get("vendor_schema_id") != expected_vendor_schema_id
+        or bridge.get("field_set_version") != expected_field_set_version
+        or bridge.get("vendor_sdk_linked") is not (mode == MODE_TRADER)
     ):
         raise HuaxinBundleError(
             BRIDGE_BUNDLE_INVALID,
             "华鑫 native manifest ABI 或 schema 身份不兼容",
             {
                 "expected_abi": ABI_VERSION,
-                "expected_vendor_schema_id": VENDOR_SCHEMA_ID,
-                "expected_field_set_version": FIELD_SET_VERSION,
+                "expected_vendor_schema_id": expected_vendor_schema_id,
+                "expected_field_set_version": expected_field_set_version,
             },
         )
     artifact_relative = bridge.get("artifact")
@@ -622,6 +801,63 @@ def verify_bundle(bundle_path: Path) -> Tuple[Dict[str, Any], Path]:
             {"component": "bridge.artifact"},
         )
 
+    vendor_sdk = manifest.get("vendor_sdk")
+    runtime = manifest.get("runtime")
+    if mode == MODE_OFFLINE_FAKE:
+        if vendor_sdk != {"included": False, "status": "not_used"}:
+            raise HuaxinBundleError(
+                BRIDGE_BUNDLE_INVALID,
+                "offline_fake manifest 不得声明厂商 SDK",
+                {"component": "vendor_sdk"},
+            )
+    else:
+        if not isinstance(vendor_sdk, dict) or vendor_sdk.get("included") is not False:
+            raise HuaxinBundleError(
+                BRIDGE_BUNDLE_INVALID,
+                "Trader manifest 缺少外部 SDK 指纹",
+                {"component": "vendor_sdk"},
+            )
+        headers = vendor_sdk.get("headers")
+        library = vendor_sdk.get("library")
+        header_names = (
+            {
+                item.get("name")
+                for item in headers
+                if isinstance(item, dict) and isinstance(item.get("sha256"), str)
+            }
+            if isinstance(headers, list)
+            else set()
+        )
+        if header_names != set(REQUIRED_TRADER_HEADERS) or not isinstance(library, dict):
+            raise HuaxinBundleError(
+                BRIDGE_BUNDLE_INVALID,
+                "Trader manifest 的 SDK 头文件或动态库清单不完整",
+                {"component": "vendor_sdk"},
+            )
+        library_name = library.get("name")
+        library_hash = library.get("sha256")
+        if (
+            not isinstance(library_name, str)
+            or Path(library_name).name != library_name
+            or not isinstance(library_hash, str)
+            or len(library_hash) != 64
+        ):
+            raise HuaxinBundleError(
+                BRIDGE_BUNDLE_INVALID,
+                "Trader manifest 的动态库身份不合法",
+                {"component": "vendor_sdk.library"},
+            )
+        if (
+            not isinstance(runtime, dict)
+            or runtime.get("rpath") != "$ORIGIN/vendor"
+            or runtime.get("vendor_artifact") != f"lib/vendor/{library_name}"
+        ):
+            raise HuaxinBundleError(
+                BRIDGE_BUNDLE_INVALID,
+                "Trader manifest 的运行时依赖位置不兼容",
+                {"component": "runtime"},
+            )
+
     current_source = _source_snapshot(_native_source_root())
     manifest_source = manifest.get("source")
     if (
@@ -641,6 +877,48 @@ def verify_bundle(bundle_path: Path) -> Tuple[Dict[str, Any], Path]:
             {"component": "distribution"},
         )
     return manifest, artifact_path
+
+
+def _runtime_vendor_status(
+    bundle_path: Path,
+    manifest: Mapping[str, Any],
+) -> Tuple[bool, Optional[Path], Optional[str]]:
+    """校验操作员单独放置的 Trader 运行时动态库。
+
+    Args:
+        bundle_path: 已通过 ``verify_bundle`` 的 bundle 根目录。
+        manifest: 已验证 manifest。
+
+    Returns:
+        Tuple[bool, Optional[Path], Optional[str]]: 是否就绪、候选路径和稳定状态。
+
+    Side Effects:
+        只读运行时库并计算 SHA-256，不执行或复制厂商代码。
+    """
+
+    if manifest.get("mode") != MODE_TRADER:
+        return False, None, "not_required"
+    runtime = manifest.get("runtime")
+    vendor_sdk = manifest.get("vendor_sdk")
+    if not isinstance(runtime, dict) or not isinstance(vendor_sdk, dict):
+        return False, None, "manifest_invalid"
+    relative = runtime.get("vendor_artifact")
+    library = vendor_sdk.get("library")
+    if not isinstance(relative, str) or not isinstance(library, dict):
+        return False, None, "manifest_invalid"
+    relative_path = Path(relative)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        return False, None, "manifest_invalid"
+    root = Path(bundle_path).expanduser().resolve()
+    candidate = root / relative_path
+    if candidate.is_symlink() or not candidate.is_file():
+        return False, candidate, "missing"
+    resolved = candidate.resolve()
+    if root not in resolved.parents:
+        return False, candidate, "path_escape"
+    if _sha256_file(resolved) != library.get("sha256"):
+        return False, resolved, "hash_mismatch"
+    return True, resolved, "verified"
 
 
 def _production_platform_supported() -> bool:
@@ -680,7 +958,7 @@ def doctor(bundle_path: Optional[Path] = None, load: bool = False) -> DoctorRepo
         {"name": "cmake_available", "ok": bool(cmake)},
         {"name": "compiler_available", "ok": bool(compiler)},
         {"name": "production_platform", "ok": platform_supported},
-        {"name": "vendor_sdk", "ok": False, "status": "not_checked_by_offline_slice"},
+        {"name": "vendor_sdk", "ok": False, "status": "not_checked_without_bundle"},
     ]
     if bundle_path is None:
         checks.append({"name": "bundle_present", "ok": False})
@@ -698,7 +976,18 @@ def doctor(bundle_path: Optional[Path] = None, load: bool = False) -> DoctorRepo
 
     try:
         manifest, _artifact_path = verify_bundle(Path(bundle_path))
+        mode = str(manifest.get("mode", MODE_OFFLINE_FAKE))
         checks.append({"name": "bundle_integrity", "ok": True})
+        vendor_ready, _vendor_path, vendor_status = _runtime_vendor_status(
+            Path(bundle_path), manifest
+        )
+        checks.append(
+            {
+                "name": "vendor_runtime",
+                "ok": vendor_ready if mode == MODE_TRADER else True,
+                "status": vendor_status,
+            }
+        )
         bridge_loadable: Optional[bool] = None
         if load:
             from .native import NativeBridge
@@ -712,15 +1001,23 @@ def doctor(bundle_path: Optional[Path] = None, load: bool = False) -> DoctorRepo
                 }
             )
             bridge_loadable = True
+        offline_ready = mode == MODE_OFFLINE_FAKE
+        native_ready = bool(
+            mode == MODE_TRADER and platform_supported and vendor_ready and bridge_loadable is True
+        )
         return DoctorReport(
-            native_ready=False,
-            offline_bridge_ready=True,
+            native_ready=native_ready,
+            offline_bridge_ready=offline_ready,
             bridge_loadable=bridge_loadable,
             platform_supported=platform_supported,
             source_present=source_present,
             toolchain_ready=toolchain_ready,
-            mode=str(manifest.get("mode", SUPPORTED_BUILD_MODE)),
-            reason_code=OFFLINE_FAKE_ONLY,
+            mode=mode,
+            reason_code=(
+                OFFLINE_FAKE_ONLY
+                if mode == MODE_OFFLINE_FAKE
+                else ("OK" if native_ready else HUAXIN_NATIVE_UNAVAILABLE)
+            ),
             checks=tuple(checks),
             bundle_fingerprint=str(manifest["fingerprint"]["value"]),
         )

@@ -111,6 +111,7 @@ version = {attr = "bullet_trade.__version__.__version__"}
     "native_src/CMakeLists.txt",
     "native_src/include/bt_huaxin_bridge.h",
     "native_src/src/bt_huaxin_bridge.cpp",
+    "native_src/src/bt_huaxin_trader_bridge.cpp",
 ]
 
 [tool.pytest.ini_options]
