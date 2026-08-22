@@ -1,7 +1,6 @@
 """验证 HuaxinBroker 对公开 NativeRuntime 的 Trader-only 合同。"""
 
 import asyncio
-import os
 from types import SimpleNamespace
 
 import pytest
@@ -19,7 +18,6 @@ from bullet_trade.integrations.huaxin.errors import (
     HuaxinNativeUnavailableError,
     HuaxinTradingDisabledError,
 )
-from bullet_trade.integrations.huaxin.order_journal import ToraOrderIdentityJournal
 
 
 class _FakeRuntime:
@@ -458,24 +456,6 @@ def _connected_broker(runtime, **flags):
     return broker
 
 
-@pytest.fixture
-def order_identity_journal_path(tmp_path):
-    """创建权限满足生产 journal 门禁的临时 SQLite 路径。
-
-    Args:
-        tmp_path: pytest 私有临时目录。
-
-    Returns:
-        str: 尚未创建的订单身份 SQLite 绝对路径。
-
-    Side Effects:
-        把测试目录权限收紧为 0700。
-    """
-
-    os.chmod(tmp_path, 0o700)
-    return str(tmp_path / "huaxin-order-identities.sqlite3")
-
-
 @pytest.mark.parametrize(
     ("config", "required_field"),
     [
@@ -878,11 +858,8 @@ def test_query_bucket_over_512_fails_instead_of_truncating(drain_max_events) -> 
 
 
 @pytest.mark.asyncio
-async def test_limit_place_and_exact_cancel_contract(order_identity_journal_path) -> None:
+async def test_limit_place_and_exact_cancel_contract() -> None:
     """验证未显式市价类型拒绝、限价字段和精确撤单身份完整透传。
-
-    Args:
-        order_identity_journal_path: 私有订单身份 journal 路径。
 
     Returns:
         None。
@@ -1052,7 +1029,7 @@ async def test_strategy_cancel_inside_engine_loop_is_non_blocking(monkeypatch) -
 )
 @pytest.mark.asyncio
 async def test_market_order_matrix_maps_exchange_specific_conditions(
-    security, market_type, price, expected, order_identity_journal_path
+    security, market_type, price, expected
 ) -> None:
     """验证沪深市价白名单映射，公共相同组合复用同一 canonical 三元组。
 
@@ -1061,7 +1038,6 @@ async def test_market_order_matrix_maps_exchange_specific_conditions(
         market_type: 公共原生市价类型。
         price: 上交所保护价或深市可选保护价。
         expected: 预期 native 价格/时间/数量三元组。
-        order_identity_journal_path: 私有订单身份 journal 路径。
 
     Returns:
         None。
@@ -1071,7 +1047,6 @@ async def test_market_order_matrix_maps_exchange_specific_conditions(
     broker = _connected_broker(
         runtime,
         enable_trading=True,
-        order_identity_journal_path=order_identity_journal_path,
     )
     order_id = await broker.buy(
         security,
@@ -1106,14 +1081,13 @@ async def test_market_order_matrix_maps_exchange_specific_conditions(
 )
 @pytest.mark.asyncio
 async def test_market_order_matrix_rejects_cross_exchange_and_unknown_types(
-    security, market_type, order_identity_journal_path
+    security, market_type
 ) -> None:
     """验证跨交易所或未知市价类型不会降级并且零 native 写调用。
 
     Args:
         security: 带交易所后缀的证券代码。
         market_type: 不适用或未知类型。
-        order_identity_journal_path: 私有订单身份 journal 路径。
 
     Returns:
         None。
@@ -1123,7 +1097,6 @@ async def test_market_order_matrix_rejects_cross_exchange_and_unknown_types(
     broker = _connected_broker(
         runtime,
         enable_trading=True,
-        order_identity_journal_path=order_identity_journal_path,
     )
 
     with pytest.raises(HuaxinTradingDisabledError) as exc_info:
@@ -1140,13 +1113,8 @@ async def test_market_order_matrix_rejects_cross_exchange_and_unknown_types(
 
 
 @pytest.mark.asyncio
-async def test_sse_market_order_requires_positive_protection_price_before_native_query(
-    order_identity_journal_path,
-) -> None:
+async def test_sse_market_order_requires_positive_protection_price_before_native_query() -> None:
     """验证上交所市价缺少保护价时在证券查询和写调用前同步拒绝。
-
-    Args:
-        order_identity_journal_path: 私有订单身份 journal 路径。
 
     Returns:
         None。
@@ -1156,7 +1124,6 @@ async def test_sse_market_order_requires_positive_protection_price_before_native
     broker = _connected_broker(
         runtime,
         enable_trading=True,
-        order_identity_journal_path=order_identity_journal_path,
     )
 
     with pytest.raises(ValueError, match="保护限价"):
@@ -1181,16 +1148,13 @@ async def test_sse_market_order_requires_positive_protection_price_before_native
     ],
 )
 @pytest.mark.asyncio
-async def test_security_constraints_fail_closed_before_order_write(
-    field, value, message, order_identity_journal_path
-) -> None:
+async def test_security_constraints_fail_closed_before_order_write(field, value, message) -> None:
     """验证证券单位、数量、状态、tick 和涨跌停异常均零 native 写。
 
     Args:
         field: 要破坏的 query_security 字段。
         value: 注入的非法值。
         message: 预期错误文本片段。
-        order_identity_journal_path: 私有订单身份 journal 路径。
 
     Returns:
         None。
@@ -1242,7 +1206,6 @@ async def test_security_constraints_fail_closed_before_order_write(
     broker = _connected_broker(
         runtime,
         enable_trading=True,
-        order_identity_journal_path=order_identity_journal_path,
     )
 
     with pytest.raises((ValueError, HuaxinTradingDisabledError), match=message):

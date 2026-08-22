@@ -64,12 +64,11 @@ class ServerConfig:
     idempotency_ttl_seconds: int = 300
     idempotency_journal_path: Optional[str] = None
     idempotency_journal_max_entries: int = 100000
-    huaxin_order_identity_journal_path: Optional[str] = None
     huaxin_xmd_backend: Optional[str] = None
     huaxin_xmd_python: Optional[str] = None
     huaxin_xmd_sdk_dir: Optional[str] = None
     huaxin_xmd_front: Optional[str] = None
-    huaxin_xmd_max_age_seconds: float = 5.0
+    huaxin_xmd_max_age_seconds: float = 30.0
     huaxin_xmd_connect_timeout: float = 15.0
     huaxin_xmd_command_timeout: float = 5.0
     huaxin_xmd_snapshot_timeout: float = 5.0
@@ -106,7 +105,7 @@ def _parse_accounts(raw: Optional[str]) -> Dict[str, AccountConfig]:
 
 
 def _parse_sub_accounts(raw: Optional[str]) -> List[SubAccountConfig]:
-    items = []
+    items: List[SubAccountConfig] = []
     if not raw:
         return items
     for token in _split_items(raw):
@@ -258,15 +257,12 @@ def build_server_config(args) -> ServerConfig:
     idempotency_journal_max_entries = get_env_int(
         "QMT_SERVER_IDEMPOTENCY_JOURNAL_MAX_ENTRIES", 100000
     )
-    huaxin_order_identity_journal_path = (
-        get_env("HUAXIN_ORDER_IDENTITY_JOURNAL_PATH") if huaxin_server else None
-    )
     huaxin_xmd_backend = get_env("HUAXIN_XMD_BACKEND") if huaxin_server else None
     huaxin_xmd_python = get_env("HUAXIN_XMD_PYTHON") if huaxin_server else None
     huaxin_xmd_sdk_dir = get_env("HUAXIN_XMD_SDK_DIR") if huaxin_server else None
     huaxin_xmd_front = get_env("HUAXIN_XMD_FRONT") if huaxin_server else None
     huaxin_xmd_max_age_seconds = (
-        get_env_float("HUAXIN_XMD_MAX_AGE_SECONDS", 5.0) if huaxin_server else 5.0
+        get_env_float("HUAXIN_XMD_MAX_AGE_SECONDS", 30.0) if huaxin_server else 30.0
     )
     huaxin_xmd_connect_timeout = (
         get_env_float("HUAXIN_XMD_CONNECT_TIMEOUT", 15.0) if huaxin_server else 15.0
@@ -318,7 +314,7 @@ def build_server_config(args) -> ServerConfig:
         getattr(args, "sub_accounts", None) or get_env("QMT_SERVER_SUB_ACCOUNTS")
     )
 
-    cfg = ServerConfig(
+    server_config = ServerConfig(
         server_type=server_type,
         listen=listen,
         port=port,
@@ -341,7 +337,6 @@ def build_server_config(args) -> ServerConfig:
         idempotency_ttl_seconds=max(0, int(idempotency_ttl_seconds)),
         idempotency_journal_path=idempotency_journal_path,
         idempotency_journal_max_entries=max(1, int(idempotency_journal_max_entries)),
-        huaxin_order_identity_journal_path=huaxin_order_identity_journal_path,
         huaxin_xmd_backend=huaxin_xmd_backend,
         huaxin_xmd_python=huaxin_xmd_python,
         huaxin_xmd_sdk_dir=huaxin_xmd_sdk_dir,
@@ -351,4 +346,4 @@ def build_server_config(args) -> ServerConfig:
         huaxin_xmd_command_timeout=float(huaxin_xmd_command_timeout),
         huaxin_xmd_snapshot_timeout=float(huaxin_xmd_snapshot_timeout),
     )
-    return cfg
+    return server_config

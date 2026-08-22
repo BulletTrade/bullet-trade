@@ -12,10 +12,14 @@ from __future__ import annotations
 import logging
 import os
 from datetime import datetime
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Set
+from typing import Any, Dict, List, Mapping, Optional, Set
 
 from ...core.models import SecurityUnitData
-from ...integrations.huaxin.xmd_backend import Python37XmdBackend, XmdBackend
+from ...integrations.huaxin.xmd_backend import (
+    DEFAULT_MAX_AGE_SECONDS,
+    Python37XmdBackend,
+    XmdBackend,
+)
 from .base import DataProvider
 
 log = logging.getLogger(__name__)
@@ -56,10 +60,11 @@ class HuaxinDataProvider(DataProvider):
             or os.getenv("HUAXIN_XMD_FRONT")
             or ""
         )
+        configured_max_age = self._cfg.get("huaxin_xmd_max_age_seconds")
+        if configured_max_age in (None, ""):
+            configured_max_age = os.getenv("HUAXIN_XMD_MAX_AGE_SECONDS")
         self._max_age_seconds = float(
-            self._cfg.get("huaxin_xmd_max_age_seconds")
-            or os.getenv("HUAXIN_XMD_MAX_AGE_SECONDS")
-            or 30.0
+            DEFAULT_MAX_AGE_SECONDS if configured_max_age in (None, "") else configured_max_age
         )
         self._connect_timeout = float(
             self._cfg.get("huaxin_xmd_connect_timeout")
@@ -195,6 +200,7 @@ class HuaxinDataProvider(DataProvider):
             # 尝试从活动的 HuaxinBroker 静态主数据中补充中文名与跳价
             try:
                 from bullet_trade.broker.registry import get_broker_instance
+
                 broker = get_broker_instance("huaxin") if callable(get_broker_instance) else None
                 if broker and hasattr(broker, "get_security_master"):
                     master = broker.get_security_master(security)
@@ -202,7 +208,9 @@ class HuaxinDataProvider(DataProvider):
                         if not res["name"]:
                             res["name"] = str(master.get("security_name") or "")
                         if not res["display_name"]:
-                            res["display_name"] = str(master.get("short_name") or master.get("security_name") or "")
+                            res["display_name"] = str(
+                                master.get("short_name") or master.get("security_name") or ""
+                            )
                         if "price_tick" in master:
                             res["price_tick"] = float(master["price_tick"])
                         if "day_trading" in master:
@@ -297,6 +305,7 @@ class HuaxinDataProvider(DataProvider):
         cur_trading_day = None
         try:
             from bullet_trade.broker.registry import get_broker_instance
+
             broker = get_broker_instance("huaxin") if callable(get_broker_instance) else None
             if broker and hasattr(broker, "get_trading_day"):
                 t_str = broker.get_trading_day()

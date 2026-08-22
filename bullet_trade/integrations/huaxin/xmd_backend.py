@@ -2,7 +2,7 @@
 作者: BruceLee
 
 文件职责: 在 BulletTrade 主进程中管理华鑫 Python 3.7 XMD JSONL sidecar。
-主要输入: 显式 Python 3.7 解释器、XMD SDK 目录、固定 L1 前置和订阅证券。
+主要输入: 显式 Python 3.7 解释器、XMD SDK 目录、环境配置的 L1 前置和订阅证券。
 主要输出: 仅来自 ``huaxin_xmd_l1`` 的新鲜 L1 快照与脱敏模块健康状态。
 上游关系: Huaxin server 数据 adapter；普通 import 不创建进程、不加载厂商 SDK。
 下游关系: ``xmd_sidecar.py`` 的 stdin/stdout JSONL 白名单协议，不触碰 Trader 写接口。
@@ -22,9 +22,10 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Protocol, Set, TextIO, Tuple
+from urllib.parse import urlsplit
 
 HUAXIN_XMD_SOURCE = "huaxin_xmd_l1"
-HUAXIN_DG14_L1_TCP_FRONT = "tcp://192.168.140.5:7780"
+DEFAULT_MAX_AGE_SECONDS = 30.0
 _SHANGHAI_TZ = timezone(timedelta(hours=8))
 _ALLOWED_ENVIRONMENT = ("PATH", "LD_LIBRARY_PATH", "LANG", "LC_ALL", "TZ")
 
@@ -68,6 +69,39 @@ class XmdBackend(Protocol):
 
     def health(self) -> Dict[str, Any]:
         """返回不含路径或凭据的模块健康状态。"""
+
+
+def _validate_tcp_front(value: str) -> str:
+    """校验并返回显式 TCP 行情前置地址。
+
+    Args:
+        value: 生产或仿真 env 提供的 ``tcp://host:port``。
+
+    Returns:
+        str: 去除首尾空白后的原始前置地址。
+
+    Raises:
+        XmdBackendError: 地址缺少 TCP scheme、主机或合法端口时抛出。
+    """
+
+    text = str(value or "").strip()
+    try:
+        parsed = urlsplit(text)
+        port = parsed.port
+    except ValueError as exc:
+        raise XmdBackendError("front_invalid", "华鑫 XMD 前置必须为 tcp://host:port") from exc
+    if (
+        parsed.scheme.lower() != "tcp"
+        or not parsed.hostname
+        or port is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in {"", "/"}
+    ):
+        raise XmdBackendError("front_invalid", "华鑫 XMD 前置必须为 tcp://host:port")
+    return text
 
 
 def _normalise_security(security: str) -> Tuple[str, str, str]:
@@ -258,7 +292,7 @@ class Python37XmdBackend:
         python_path: str,
         sdk_dir: str,
         front: str,
-        max_age_seconds: float = 5.0,
+        max_age_seconds: float = DEFAULT_MAX_AGE_SECONDS,
         connect_timeout: float = 15.0,
         command_timeout: float = 5.0,
         sidecar_path: Optional[str] = None,
@@ -268,7 +302,7 @@ class Python37XmdBackend:
         Args:
             python_path: Python 3.7 可执行文件绝对路径。
             sdk_dir: XMD SDK 绝对目录。
-            front: 明确的东莞 14 L1 TCP 前置。
+            front: 当前生产或仿真环境的 L1 TCP 前置。
             max_age_seconds: 快照最大允许年龄。
             connect_timeout: 等待 sidecar 登录 ready 的秒数。
             command_timeout: 等待订阅/退订回执的秒数。
@@ -287,9 +321,7 @@ class Python37XmdBackend:
             sidecar_path or str(Path(__file__).with_name("xmd_sidecar.py")),
             "sidecar_path",
         )
-        if str(front or "").strip() != HUAXIN_DG14_L1_TCP_FRONT:
-            raise XmdBackendError("front_invalid", "华鑫 XMD 前置与东莞 14 当前 L1 地址不一致")
-        self.front = HUAXIN_DG14_L1_TCP_FRONT
+        self.front = _validate_tcp_front(front)
         self.max_age_seconds = self._positive_float(max_age_seconds, "max_age_seconds")
         self.connect_timeout = self._positive_float(connect_timeout, "connect_timeout")
         self.command_timeout = self._positive_float(command_timeout, "command_timeout")
@@ -402,7 +434,14 @@ class Python37XmdBackend:
         environment = {key: os.environ[key] for key in _ALLOWED_ENVIRONMENT if key in os.environ}
         environment["PYTHONDONTWRITEBYTECODE"] = "1"
         environment["PYTHONUNBUFFERED"] = "1"
-        argv = [self.python_path, self.sidecar_path, "--sdk-dir", self.sdk_dir]
+        argv = [
+            self.python_path,
+            self.sidecar_path,
+            "--sdk-dir",
+            self.sdk_dir,
+            "--front",
+            self.front,
+        ]
         try:
             process = subprocess.Popen(
                 argv,
@@ -796,7 +835,7 @@ class Python37XmdBackend:
 
 
 __all__ = [
-    "HUAXIN_DG14_L1_TCP_FRONT",
+    "DEFAULT_MAX_AGE_SECONDS",
     "HUAXIN_XMD_SOURCE",
     "Python37XmdBackend",
     "XmdBackend",

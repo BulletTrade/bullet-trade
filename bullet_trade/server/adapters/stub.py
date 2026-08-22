@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import time
 from typing import Any, Dict, List, Optional
 
@@ -778,6 +777,7 @@ def build_stub_bundle(config: ServerConfig, router: AccountRouter) -> AdapterBun
         data_adapter=StubDataAdapter(),
         broker_adapter=StubBrokerAdapter(router),
         broker_writes_require_persistent_idempotency=False,
+        broker_writes_require_idempotency_key=False,
     )
 
 

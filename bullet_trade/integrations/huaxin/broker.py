@@ -273,7 +273,6 @@ class HuaxinBroker(BrokerBase):
             "investor_id": "HUAXIN_INVESTOR_ID",
             "shareholder_id": "HUAXIN_SHAREHOLDER_ID",
             "business_unit_id": "HUAXIN_BUSINESS_UNIT_ID",
-            "order_identity_journal_path": "HUAXIN_ORDER_IDENTITY_JOURNAL_PATH",
             "bundle_path": "HUAXIN_NATIVE_BUNDLE",
             "tradable_security_statuses": "HUAXIN_TRADABLE_SECURITY_STATUSES",
         }
@@ -310,9 +309,6 @@ class HuaxinBroker(BrokerBase):
         self._login_session_id = 0
         self._login_trading_day: Optional[str] = None
         self._security_master: Dict[str, Dict[str, Any]] = {}
-        self._order_identity_journal = None
-        self._order_identity_scope = ""
-        self._order_identity_journal_reason = ""
 
     @property
     def doctor_report(self) -> Optional[DoctorReport]:
@@ -382,7 +378,9 @@ class HuaxinBroker(BrokerBase):
             self._security_constraints.clear()
             term_info = str(self._config.get("terminal_info") or "")
             prod_info = str(self._config.get("user_product_info") or "")
-            acct_val = str(self._config.get("login_account") or self._config.get("account_id") or "")
+            acct_val = str(
+                self._config.get("login_account") or self._config.get("account_id") or ""
+            )
             log.info("【华鑫合规信息上报】账号=%s, UserProductInfo=%s", acct_val, prod_info)
             log.info("【华鑫合规信息上报】自动组装 TerminalInfo=%s", term_info)
             runtime = self._create_runtime()
@@ -489,9 +487,7 @@ class HuaxinBroker(BrokerBase):
 
                 # 每 5 分钟打印一次温和的守望心跳日志
                 if time.time() - last_heartbeat >= 300:
-                    log.info(
-                        "⏳ 正在持续守望华鑫柜台开机 (主事件循环与策略定时任务健康运行中，后台正以 15s 周期主动探测就绪)..."
-                    )
+                    log.info("⏳ 正在持续守望华鑫柜台开机 (主事件循环与策略定时任务健康运行中，后台正以 15s 周期主动探测就绪)...")
                     last_heartbeat = time.time()
 
                 time.sleep(5.0)
@@ -523,10 +519,29 @@ class HuaxinBroker(BrokerBase):
             if len(explicit) > 10 or ";" in explicit:
                 return explicit
 
-        lip = str(self._config.get("local_ip") or self._config.get("lip") or os.getenv("HUAXIN_LOCAL_IP") or os.getenv("HUAXIN_LIP") or "").strip()
-        mac = str(self._config.get("mac_address") or self._config.get("mac") or os.getenv("HUAXIN_MAC_ADDRESS") or "").strip()
-        hd = str(self._config.get("hard_disk_id") or self._config.get("hd") or os.getenv("HUAXIN_HARD_DISK_ID") or os.getenv("HUAXIN_HD") or "").strip()
-        prod = str(self._config.get("user_product_info") or os.getenv("HUAXIN_USER_PRODUCT_INFO") or "").strip()
+        lip = str(
+            self._config.get("local_ip")
+            or self._config.get("lip")
+            or os.getenv("HUAXIN_LOCAL_IP")
+            or os.getenv("HUAXIN_LIP")
+            or ""
+        ).strip()
+        mac = str(
+            self._config.get("mac_address")
+            or self._config.get("mac")
+            or os.getenv("HUAXIN_MAC_ADDRESS")
+            or ""
+        ).strip()
+        hd = str(
+            self._config.get("hard_disk_id")
+            or self._config.get("hd")
+            or os.getenv("HUAXIN_HARD_DISK_ID")
+            or os.getenv("HUAXIN_HD")
+            or ""
+        ).strip()
+        prod = str(
+            self._config.get("user_product_info") or os.getenv("HUAXIN_USER_PRODUCT_INFO") or ""
+        ).strip()
 
         if not hd:
             for cand in ("/home/terminalinfo", "/home/userlgy/terminalinfo"):
@@ -589,10 +604,6 @@ class HuaxinBroker(BrokerBase):
                     },
                 )
 
-    def _initialize_order_identity_journal(self) -> None:
-        """纯内存模式下无需初始化持久账本。"""
-        self._order_ref_allocator_ready = True
-
     def disconnect(self) -> bool:
         """幂等停止 Trader 会话并释放 native runtime。
 
@@ -611,9 +622,6 @@ class HuaxinBroker(BrokerBase):
             self._order_ref_allocator_ready = False
             self._security_order_constraints_ready = False
             self._login_max_order_ref = None
-            self._order_identity_journal = None
-            self._order_identity_scope = ""
-            self._order_identity_journal_reason = "session_not_connected"
             self._security_constraints.clear()
             if runtime is None:
                 return True
@@ -776,7 +784,9 @@ class HuaxinBroker(BrokerBase):
             Optional[Dict[str, Any]]: 柜台主数据字典。
         """
         sec = security.split(".")[0].strip()
-        exchange = "SZSE" if security.endswith(".XSHE") or sec.startswith(("00", "30", "15")) else "SSE"
+        exchange = (
+            "SZSE" if security.endswith(".XSHE") or sec.startswith(("00", "30", "15")) else "SSE"
+        )
         canonical_key = f"{exchange}:{sec}"
         if canonical_key in self._security_master:
             return dict(self._security_master[canonical_key])
@@ -980,16 +990,6 @@ class HuaxinBroker(BrokerBase):
         )
         investor_id, shareholder_id = self._resolve_trading_identity(exchange, payload)
         local_id = _stable_local_order_id(idempotency_key)
-        fingerprint = self._order_identity_fingerprint(
-            exchange=exchange,
-            security=security_code,
-            direction=side,
-            amount=quantity,
-            limit_price=limit_price,
-            market_type=market_type,
-            native_conditions=native_conditions,
-        )
-
         with self._runtime_lock:
             runtime = self._require_runtime_ready("ready_for_new_orders")
             request_id = self._next_request_id()
@@ -1199,8 +1199,8 @@ class HuaxinBroker(BrokerBase):
                 "trading_enabled": self._enable_trading,
                 "cancel_order_enabled": self._enable_cancel,
                 "order_ref_allocator_ready": self._connected,
-                "order_identity_journal_ready": self._connected,
-                "order_identity_journal_reason": None,
+                "order_identity_ready": self._connected,
+                "order_identity_mode": "memory",
                 "security_order_constraints_ready": self._security_order_constraints_ready,
                 "validated_security_constraint_count": len(self._security_constraints),
                 "baseline_query_ready": _REQUIRED_BASELINE_QUERIES.issubset(
@@ -1542,15 +1542,11 @@ class HuaxinBroker(BrokerBase):
         minimum = self._required_int_field(row, f"min_{prefix}_{suffix}", minimum=1)
         maximum = self._required_int_field(row, f"max_{prefix}_{suffix}", minimum=minimum)
         if quantity < minimum or quantity > maximum:
-            raise ValueError(
-                f"华鑫证券 {security} {prefix} {suffix} 数量必须位于 {minimum}..{maximum}"
-            )
+            raise ValueError(f"华鑫证券 {security} {prefix} {suffix} 数量必须位于 {minimum}..{maximum}")
         if quantity % unit != 0:
             raise ValueError(f"华鑫证券 {security} 委托数量必须为交易单位 {unit} 的整数倍")
         if quantity % volume_multiple != 0:
-            raise ValueError(
-                f"华鑫证券 {security} 委托数量必须为数量乘数 {volume_multiple} 的整数倍"
-            )
+            raise ValueError(f"华鑫证券 {security} 委托数量必须为数量乘数 {volume_multiple} 的整数倍")
 
         tick = self._required_float_field(row, "price_tick", positive=True)
         if price > 0:
@@ -1575,64 +1571,6 @@ class HuaxinBroker(BrokerBase):
         canonical = _canonical_security(exchange, security)
         self._security_constraints[canonical] = dict(row)
         self._security_order_constraints_ready = bool(self._security_constraints)
-
-    @staticmethod
-    def _order_identity_fingerprint(
-        *,
-        exchange: str,
-        security: str,
-        direction: str,
-        amount: int,
-        limit_price: float,
-        market_type: Optional[str],
-        native_conditions: Tuple[str, str, str],
-    ) -> str:
-        """计算最靠近 native 写调用的稳定委托语义指纹。
-
-        Args:
-            exchange: 当前交易所。
-            security: 不带后缀证券代码。
-            direction: buy/sell。
-            amount: 精确整数数量。
-            limit_price: 限价或保护价。
-            market_type: 公共市价类型；限价为空。
-            native_conditions: 实际下发的 canonical 三元组。
-
-        Returns:
-            str: 可由持久 journal 校验的 SHA256 指纹。
-        """
-
-        order_price_type, time_condition, volume_condition = native_conditions
-        body = f"{exchange}:{security}:{direction}:{amount}:{limit_price}:{market_type}:{order_price_type}:{time_condition}:{volume_condition}"
-        return hashlib.sha256(body.encode("utf-8")).hexdigest()
-
-    @staticmethod
-    def _format_existing_order_claim(
-        claim: OrderIdentityClaim, idempotency_key: str
-    ) -> Dict[str, Any]:
-        """把 journal 中已存在的占位转换为零重发响应。
-
-        Args:
-            claim: 已存在的持久订单身份快照。
-            idempotency_key: 当前请求携带的同一原始幂等键。
-
-        Returns:
-            Dict[str, Any]: 已持久结果，或 prepared 对应的 submit_unknown 响应。
-        """
-
-        result = dict(claim.result)
-        state = str(claim.state or "submit_unknown").lower()
-        if state == "prepared":
-            state = "submit_unknown"
-            result.setdefault("reason", "persistent_prepared_identity")
-        result.setdefault("order_id", claim.stable_local_order_id)
-        result.setdefault("stable_local_order_id", claim.stable_local_order_id)
-        result.setdefault("order_ref", claim.order_ref)
-        result.setdefault("status", state)
-        result.setdefault("submission_state", state)
-        result["idempotency_key"] = idempotency_key
-        result["deduplicated"] = True
-        return result
 
     @staticmethod
     def _submit_unknown_result(
@@ -1666,47 +1604,6 @@ class HuaxinBroker(BrokerBase):
             "submission_state": "submit_unknown",
             "reason": reason,
         }
-
-    def _persist_order_result(
-        self,
-        *,
-        idempotency_key: str,
-        fingerprint: str,
-        result: Mapping[str, Any],
-    ) -> Dict[str, Any]:
-        """把一次 native 写结果单调收口到订单身份 journal。
-
-        Args:
-            idempotency_key: 原始幂等键，只参与哈希定位。
-            fingerprint: claim 时使用的委托语义指纹。
-            result: 当前 accepted/rejected/submit_unknown 或订单事实。
-
-        Returns:
-            Dict[str, Any]: 原结果；持久化失败时降级为同订单的 submit_unknown。
-
-        Side Effects:
-            更新私有 SQLite 结果；不会重发 native 请求。
-        """
-
-        normalized = dict(result)
-        status = str(normalized.get("status") or "").strip().lower()
-        submission_state = str(normalized.get("submission_state") or "").strip().lower()
-        if status in {"new", "accepted"}:
-            state = "accepted"
-        elif status in {
-            "open",
-            "filling",
-            "filled",
-            "partly_canceled",
-            "canceled",
-            "rejected",
-        }:
-            state = status
-        elif submission_state == "rejected":
-            state = "rejected"
-        else:
-            state = "submit_unknown"
-        return dict(normalized)
 
     @staticmethod
     def _build_native_order_request(
@@ -2035,7 +1932,12 @@ class HuaxinBroker(BrokerBase):
         if not order_sys_id and not has_complete_session_identity:
             raise ValueError("华鑫撤单必须提供 OrderSysID 或完整 FrontID+SessionID+OrderRef")
         return {
-            "exchange": exchange or ("SSE" if "XSHG" in str(order_id) or "60" in str(order_id) or "51" in str(order_id) else "SZSE"),
+            "exchange": exchange
+            or (
+                "SSE"
+                if "XSHG" in str(order_id) or "60" in str(order_id) or "51" in str(order_id)
+                else "SZSE"
+            ),
             "order_sys_id": order_sys_id,
             "front_id": front_id,
             "session_id": session_id,

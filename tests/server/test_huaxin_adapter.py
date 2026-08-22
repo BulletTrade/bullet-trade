@@ -1,20 +1,28 @@
 """验证 Huaxin server adapter 的 Trader/XMD 分离、安全门禁和透传合同。"""
 
+import asyncio
 import sys
 import textwrap
+import threading
 from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
 
-from bullet_trade.integrations.huaxin.errors import HuaxinTradingDisabledError
+from bullet_trade.data.providers.huaxin import HuaxinDataProvider
+from bullet_trade.integrations.huaxin.errors import (
+    HuaxinNativeUnavailableError,
+    HuaxinTradingDisabledError,
+)
 from bullet_trade.integrations.huaxin.xmd_backend import (
-    HUAXIN_DG14_L1_TCP_FRONT,
+    DEFAULT_MAX_AGE_SECONDS,
     HUAXIN_XMD_SOURCE,
     Python37XmdBackend,
     XmdBackendError,
     _normalise_tick,
 )
+
+_TEST_XMD_FRONT = "tcp://127.0.0.1:9402"
 from bullet_trade.server import config as server_config_module
 from bullet_trade.server.adapters.base import AccountRouter, AdapterBundle
 from bullet_trade.server.adapters.huaxin import (
@@ -57,6 +65,29 @@ def _server_config(**overrides):
     }
     values.update(overrides)
     return ServerConfig(**values)
+
+
+async def _wait_for_condition(predicate, timeout=1.0):
+    """等待异步 watchdog 使给定条件成立。
+
+    Args:
+        predicate: 无参数布尔函数。
+        timeout: 最长等待秒数。
+
+    Returns:
+        None。
+
+    Raises:
+        AssertionError: 超时仍未满足条件时抛出。
+    """
+
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + float(timeout)
+    while loop.time() < deadline:
+        if predicate():
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("等待 watchdog 状态变化超时")
 
 
 def test_non_loopback_requires_tls_fixed_token_and_allowlist() -> None:
@@ -113,10 +144,10 @@ def test_allowlist_rejects_invalid_entries_and_preserves_ipv6_host_prefix() -> N
         )
 
 
-def test_huaxin_bundle_is_broker_only_and_missing_journal_keeps_readonly_start(
+def test_huaxin_bundle_requires_key_but_not_sqlite_journal(
     monkeypatch,
 ) -> None:
-    """验证缺写 journal 时仍可构造只读服务，但写 action 明确 unavailable。
+    """验证华鑫写保留幂等键要求，但不会创建或要求 SQLite。
 
     Args:
         monkeypatch: pytest monkeypatch fixture。
@@ -139,14 +170,17 @@ def test_huaxin_bundle_is_broker_only_and_missing_journal_keeps_readonly_start(
 
     assert bundle.data_adapter is None
     assert isinstance(bundle.broker_adapter, HuaxinBrokerAdapter)
-    assert bundle.broker_writes_require_persistent_idempotency is True
+    assert bundle.broker_writes_require_persistent_idempotency is False
+    assert bundle.broker_writes_require_idempotency_key is True
 
     _validate_huaxin_server_config(
         config,
         {**login_metadata, "enable_trading": True},
     )
     health = ServerApplication(config, router, bundle)._health_snapshot()["value"]
-    assert health["idempotency_journal"]["state"] == "unavailable"
+    assert health["idempotency_journal"]["required"] is False
+    assert health["idempotency_journal"]["ready"] is False
+    assert health["idempotency_journal"]["state"] == "ready"
     assert health["huaxin"]["actions"]["broker.place_order"]["status"] == "unavailable"
 
 
@@ -156,7 +190,6 @@ def test_huaxin_server_uses_huaxin_account_environment(monkeypatch) -> None:
     values = {
         "HUAXIN_ACCOUNT_ID": "huaxin-account",
         "HUAXIN_ACCOUNT_TYPE": "stock",
-        "HUAXIN_ORDER_IDENTITY_JOURNAL_PATH": "/private/huaxin-orders.sqlite3",
     }
     monkeypatch.setattr(
         server_config_module,
@@ -182,11 +215,11 @@ def test_huaxin_server_uses_huaxin_account_environment(monkeypatch) -> None:
     assert len(config.accounts) == 1
     assert config.accounts[0].account_id == "huaxin-account"
     assert config.accounts[0].data_path is None
-    assert config.huaxin_order_identity_journal_path == "/private/huaxin-orders.sqlite3"
+    assert not hasattr(config, "huaxin_order_identity_journal_path")
 
 
-def test_huaxin_xmd_config_is_explicit_and_rejects_wrong_front() -> None:
-    """验证启用 data 时必须显式选择 sidecar、路径和当前东莞 14 前置。"""
+def test_huaxin_xmd_config_accepts_any_explicit_tcp_front() -> None:
+    """验证启用 data 时要求显式 sidecar、路径和通用 TCP 前置。"""
 
     missing = _server_config(enable_data=True, enable_broker=False, accounts=[])
     with pytest.raises(ValueError, match="HUAXIN_XMD_BACKEND"):
@@ -199,21 +232,35 @@ def test_huaxin_xmd_config_is_explicit_and_rejects_wrong_front() -> None:
         huaxin_xmd_backend="python37_sidecar",
         huaxin_xmd_python="/private/python",
         huaxin_xmd_sdk_dir="/private/sdk",
-        huaxin_xmd_front="tcp://127.0.0.1:7780",
+        huaxin_xmd_front="http://127.0.0.1:7780",
     )
-    with pytest.raises(ValueError, match="东莞 14"):
+    with pytest.raises(ValueError, match="tcp://host:port"):
         _validate_huaxin_server_config(wrong_front, {})
 
-    valid = _server_config(
+    for front in (_TEST_XMD_FRONT, "tcp://127.0.0.2:9502"):
+        valid = _server_config(
+            enable_data=True,
+            enable_broker=False,
+            accounts=[],
+            huaxin_xmd_backend="python37_sidecar",
+            huaxin_xmd_python="/private/python",
+            huaxin_xmd_sdk_dir="/private/sdk",
+            huaxin_xmd_front=front,
+        )
+        _validate_huaxin_server_config(valid, {})
+
+    too_relaxed = _server_config(
         enable_data=True,
         enable_broker=False,
         accounts=[],
         huaxin_xmd_backend="python37_sidecar",
         huaxin_xmd_python="/private/python",
         huaxin_xmd_sdk_dir="/private/sdk",
-        huaxin_xmd_front=HUAXIN_DG14_L1_TCP_FRONT,
+        huaxin_xmd_front=_TEST_XMD_FRONT,
+        huaxin_xmd_max_age_seconds=30.1,
     )
-    _validate_huaxin_server_config(valid, {})
+    with pytest.raises(ValueError, match="不能超过"):
+        _validate_huaxin_server_config(too_relaxed, {})
 
 
 def test_huaxin_server_config_reads_namespaced_xmd_environment(monkeypatch) -> None:
@@ -223,7 +270,7 @@ def test_huaxin_server_config_reads_namespaced_xmd_environment(monkeypatch) -> N
         "HUAXIN_XMD_BACKEND": "python37_sidecar",
         "HUAXIN_XMD_PYTHON": "/private/huaxin37/bin/python",
         "HUAXIN_XMD_SDK_DIR": "/private/xmd-sdk",
-        "HUAXIN_XMD_FRONT": HUAXIN_DG14_L1_TCP_FRONT,
+        "HUAXIN_XMD_FRONT": _TEST_XMD_FRONT,
     }
     monkeypatch.setattr(
         server_config_module,
@@ -249,8 +296,25 @@ def test_huaxin_server_config_reads_namespaced_xmd_environment(monkeypatch) -> N
     assert config.huaxin_xmd_backend == "python37_sidecar"
     assert config.huaxin_xmd_python == "/private/huaxin37/bin/python"
     assert config.huaxin_xmd_sdk_dir == "/private/xmd-sdk"
-    assert config.huaxin_xmd_front == HUAXIN_DG14_L1_TCP_FRONT
+    assert config.huaxin_xmd_front == _TEST_XMD_FRONT
+    assert config.huaxin_xmd_max_age_seconds == DEFAULT_MAX_AGE_SECONDS
     assert config.accounts == []
+
+
+def test_huaxin_provider_uses_same_thirty_second_default(monkeypatch) -> None:
+    """验证直接 provider 未配置时与 Server/backend 同为 30 秒。"""
+
+    monkeypatch.delenv("HUAXIN_XMD_MAX_AGE_SECONDS", raising=False)
+
+    provider = HuaxinDataProvider(
+        {
+            "huaxin_xmd_python": "/private/python",
+            "huaxin_xmd_sdk_dir": "/private/sdk",
+            "huaxin_xmd_front": _TEST_XMD_FRONT,
+        }
+    )
+
+    assert provider._max_age_seconds == DEFAULT_MAX_AGE_SECONDS
 
 
 def test_huaxin_broker_config_maps_required_mac_address(monkeypatch) -> None:
@@ -265,7 +329,6 @@ def test_huaxin_broker_config_maps_required_mac_address(monkeypatch) -> None:
         lambda name, default=None: {
             "HUAXIN_MAC_ADDRESS": "00-11-22-33-44-55",
             "HUAXIN_USER_PRODUCT_INFO": "BT",
-            "HUAXIN_ORDER_IDENTITY_JOURNAL_PATH": "/private/huaxin-orders.sqlite3",
         }.get(name, default),
     )
 
@@ -273,7 +336,7 @@ def test_huaxin_broker_config_maps_required_mac_address(monkeypatch) -> None:
 
     assert config["mac_address"] == "00-11-22-33-44-55"
     assert config["user_product_info"] == "BT"
-    assert config["order_identity_journal_path"] == "/private/huaxin-orders.sqlite3"
+    assert "order_identity_journal_path" not in config
 
 
 @pytest.mark.parametrize(
@@ -472,8 +535,8 @@ def _xmd_server_config(**overrides):
         "huaxin_xmd_backend": "python37_sidecar",
         "huaxin_xmd_python": "/private/huaxin37/bin/python",
         "huaxin_xmd_sdk_dir": "/private/xmd-sdk",
-        "huaxin_xmd_front": HUAXIN_DG14_L1_TCP_FRONT,
-        "huaxin_xmd_max_age_seconds": 5.0,
+        "huaxin_xmd_front": _TEST_XMD_FRONT,
+        "huaxin_xmd_max_age_seconds": DEFAULT_MAX_AGE_SECONDS,
         "huaxin_xmd_snapshot_timeout": 1.0,
     }
     values.update(overrides)
@@ -530,6 +593,144 @@ async def test_huaxin_data_adapter_rejects_wrong_source_and_stale_cache() -> Non
     await adapter.stop()
 
 
+@pytest.mark.asyncio
+async def test_xmd_adapter_keeps_server_alive_when_initial_front_is_closed() -> None:
+    """验证初次 XMD 登录超时不会阻止 Server adapter 常驻并在前置恢复后 ready。"""
+
+    created = []
+
+    class _FirstUnavailableBackend(_FakeXmdBackend):
+        """仅第一套 backend 模拟前置关闭的替身。"""
+
+        def __init__(self, *args, fail_start=False, **kwargs):
+            """保存本实例是否模拟首次启动失败。
+
+            Args:
+                *args: Fake backend 位置参数。
+                fail_start: 是否抛出登录就绪超时。
+                **kwargs: Fake backend 关键字参数。
+
+            Returns:
+                None。
+            """
+
+            super().__init__(*args, **kwargs)
+            self.fail_start = bool(fail_start)
+
+        def start(self):
+            """第一套返回可恢复超时，后续实例正常启动。
+
+            Returns:
+                None。
+
+            Raises:
+                XmdBackendError: fail_start=True 时模拟前置未开放。
+            """
+
+            if self.fail_start:
+                raise XmdBackendError("sidecar_ready_timeout", "仿真前置暂未开放")
+            super().start()
+
+    def _factory(**kwargs):
+        """首个 backend 注入可恢复失败，重建实例恢复正常。
+
+        Args:
+            **kwargs: adapter 传入的 backend 配置。
+
+        Returns:
+            _FirstUnavailableBackend: 新 backend。
+        """
+
+        backend = _FirstUnavailableBackend(fail_start=not created, **kwargs)
+        created.append(backend)
+        return backend
+
+    adapter = HuaxinDataAdapter(_xmd_server_config(), backend_factory=_factory)
+    adapter._watchdog_interval_seconds = 0.01
+
+    await adapter.start()
+    assert adapter._state == "degraded"
+    await _wait_for_condition(lambda: len(created) == 2 and adapter._state == "ready")
+
+    assert adapter.backend_status()["ready"] is True
+    assert adapter.backend_status()["reconnect_count"] == 1
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_xmd_adapter_rebuilds_after_ready_disconnect_and_restores_subscription() -> None:
+    """验证 XMD ready 后 sidecar 失活时快速失败，并重建订阅与新鲜快照。"""
+
+    reconnect_gate = threading.Event()
+    created = []
+
+    class _BlockingReconnectBackend(_FakeXmdBackend):
+        """让第二套 backend 在 start 中等待测试释放的替身。"""
+
+        def __init__(self, *args, block_start=False, **kwargs):
+            """保存是否阻塞本次启动。
+
+            Args:
+                *args: Fake backend 位置参数。
+                block_start: 是否等待 reconnect_gate。
+                **kwargs: Fake backend 关键字参数。
+
+            Returns:
+                None。
+            """
+
+            super().__init__(*args, **kwargs)
+            self.block_start = bool(block_start)
+
+        def start(self):
+            """第二次启动等待主测试检查快速失败语义。
+
+            Returns:
+                None。
+            """
+
+            if self.block_start:
+                reconnect_gate.wait(1.0)
+            super().start()
+
+    def _factory(**kwargs):
+        """依次创建首个和阻塞中的重连 backend。
+
+        Args:
+            **kwargs: adapter 传入的 backend 配置。
+
+        Returns:
+            _BlockingReconnectBackend: 新 backend。
+        """
+
+        backend = _BlockingReconnectBackend(block_start=bool(created), **kwargs)
+        created.append(backend)
+        return backend
+
+    adapter = HuaxinDataAdapter(_xmd_server_config(), backend_factory=_factory)
+    adapter._watchdog_interval_seconds = 0.01
+    await adapter.start()
+    await adapter.get_snapshot({"security": "511880.XSHG"})
+    assert "511880.XSHG" in adapter._subscriptions
+
+    created[0].started = False
+    await _wait_for_condition(lambda: adapter._state == "reconnecting")
+    with pytest.raises(XmdBackendError, match="正在恢复"):
+        await adapter.get_snapshot({"security": "511880.XSHG"})
+
+    reconnect_gate.set()
+    await _wait_for_condition(lambda: len(created) == 2 and adapter._state == "ready")
+
+    assert created[0].stopped is True
+    assert created[1].subscriptions == {"511880.XSHG"}
+    assert adapter.backend_status()["reconnect_count"] == 1
+    restored = await adapter.get_snapshot({"security": "511880.XSHG"})
+    assert restored["source"] == HUAXIN_XMD_SOURCE
+    await adapter.stop()
+    assert adapter._state == "stopped"
+    assert adapter._watchdog_task is None
+
+
 def test_xmd_tick_normalization_preserves_exchange_time_and_order_book() -> None:
     """验证 sidecar tick 归一后保留北京时间、盘口和唯一华鑫来源。"""
 
@@ -583,6 +784,9 @@ def test_python37_xmd_backend_consumes_frozen_jsonl_protocol(tmp_path) -> None:
             import json
             import sys
             import time
+
+            if sys.argv[-2:] != ["--front", "tcp://127.0.0.1:9402"]:
+                raise SystemExit(3)
 
             def emit(value):
                 print(json.dumps(value, separators=(",", ":")), flush=True)
@@ -651,8 +855,8 @@ def test_python37_xmd_backend_consumes_frozen_jsonl_protocol(tmp_path) -> None:
     backend = Python37XmdBackend(
         python_path=sys.executable,
         sdk_dir=str(sdk_dir),
-        front=HUAXIN_DG14_L1_TCP_FRONT,
-        max_age_seconds=5.0,
+        front=_TEST_XMD_FRONT,
+        max_age_seconds=DEFAULT_MAX_AGE_SECONDS,
         connect_timeout=2.0,
         command_timeout=2.0,
         sidecar_path=str(sidecar),
@@ -927,6 +1131,7 @@ class _FakeBroker:
         self.account_type = account_type
         self.config = config
         self.place_payload = None
+        self.place_call_count = 0
         self.cancel_payload = None
         self.connected = False
         self.baseline_queries = set()
@@ -939,6 +1144,7 @@ class _FakeBroker:
         """
 
         self.connected = True
+        self.baseline_queries.update({"account", "positions", "orders", "trades"})
         return True
 
     def disconnect(self):
@@ -1012,6 +1218,7 @@ class _FakeBroker:
         """
 
         self.place_payload = (direction, security, amount, price, kwargs)
+        self.place_call_count += 1
         return {"order_id": "O1", "status": "submit_unknown"}
 
     def submit_cancel_order(self, order_id, payload, **kwargs):
@@ -1037,13 +1244,13 @@ class _FakeBroker:
         """
 
         return {
-            "ready_for_queries": True,
-            "ready_for_new_orders": True,
-            "ready_for_cancel": True,
+            "ready_for_queries": self.connected,
+            "ready_for_new_orders": self.connected,
+            "ready_for_cancel": self.connected,
             "trading_enabled": True,
             "cancel_order_enabled": True,
             "order_ref_allocator_ready": True,
-            "order_identity_journal_ready": True,
+            "order_identity_ready": True,
             "security_order_constraints_ready": True,
             "baseline_query_ready": self.baseline_queries
             == {
@@ -1059,10 +1266,7 @@ class _FakeBroker:
 async def test_adapter_delegates_queries_and_preserves_cancel_payload() -> None:
     """验证 adapter 对查询、限价/显式市价和撤单幂等载荷的精确透传。"""
 
-    config = _server_config(
-        idempotency_journal_path="/tmp/test-journal.sqlite",
-        huaxin_order_identity_journal_path="/private/huaxin-orders.sqlite3",
-    )
+    config = _server_config()
     router = AccountRouter(config.accounts)
     adapter = HuaxinBrokerAdapter(
         config,
@@ -1073,8 +1277,8 @@ async def test_adapter_delegates_queries_and_preserves_cancel_payload() -> None:
     await adapter.start()
     ctx = router.get("default")
 
-    assert adapter.backend_status()["state"] == "degraded"
-    assert adapter.backend_status()["actions"]["broker.place_order"]["status"] == "unavailable"
+    assert adapter.backend_status()["state"] == "ready"
+    assert adapter.backend_status()["actions"]["broker.place_order"]["status"] == "ready"
     assert (await adapter.get_account_info(ctx))["value"]["available_cash"] == 1000
     assert (await adapter.get_positions(ctx))[0]["amount"] == 100
     assert (await adapter.list_orders(ctx))[0]["order_id"] == "O1"
@@ -1091,7 +1295,7 @@ async def test_adapter_delegates_queries_and_preserves_cancel_payload() -> None:
     )
     assert place["order_id"] == "O1"
     broker = adapter._brokers["default"]
-    assert broker.config["order_identity_journal_path"] == "/private/huaxin-orders.sqlite3"
+    assert "order_identity_journal_path" not in broker.config
     assert broker.place_payload[4]["market"] is False
     assert broker.place_payload[4]["extra"]["idempotency_key"] == "place-1"
 
@@ -1126,10 +1330,136 @@ async def test_adapter_delegates_queries_and_preserves_cancel_payload() -> None:
 
 
 @pytest.mark.asyncio
+async def test_huaxin_server_memory_idempotency_requires_key_without_sqlite() -> None:
+    """验证华鑫写只使用进程内幂等，未知态同键不会再次调用 native adapter。"""
+
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    adapter = HuaxinBrokerAdapter(
+        config,
+        router,
+        broker_config={"enable_trading": True, "enable_cancel": True},
+        broker_factory=_FakeBroker,
+    )
+    await adapter.start()
+    app = ServerApplication(
+        config,
+        router,
+        AdapterBundle(
+            data_adapter=None,
+            broker_adapter=adapter,
+            broker_writes_require_persistent_idempotency=False,
+            broker_writes_require_idempotency_key=True,
+        ),
+    )
+    session = SimpleNamespace(account_key="default", sub_account_id=None)
+    payload = {
+        "security": "511880.XSHG",
+        "side": "BUY",
+        "amount": 100,
+        "style": {"type": "limit", "price": 100.2},
+        "idempotency_key": "memory-only-unknown",
+    }
+
+    first = await app._dispatch_broker(session, "place_order", dict(payload))
+    repeated = await app._dispatch_broker(session, "place_order", dict(payload))
+
+    assert first["status"] == repeated["status"] == "submit_unknown"
+    assert adapter._brokers["default"].place_call_count == 1
+    assert app._idempotency_journal is None
+    missing_key = dict(payload)
+    missing_key.pop("idempotency_key")
+    with pytest.raises(ValueError, match="idempotency_key"):
+        await app._dispatch_broker(session, "place_order", missing_key)
+    assert adapter._brokers["default"].place_call_count == 1
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_broker_adapter_rebuilds_after_ready_disconnect_without_replaying_writes() -> None:
+    """验证 Trader ready 后断线会快速失败并在同一 executor 重建，不重放写请求。"""
+
+    reconnect_gate = threading.Event()
+    created = []
+
+    class _BlockingReconnectBroker(_FakeBroker):
+        """让第二套 Broker 在 connect 中等待测试释放的替身。"""
+
+        def __init__(self, *args, block_connect=False, **kwargs):
+            """保存是否阻塞本次连接。
+
+            Args:
+                *args: FakeBroker 位置参数。
+                block_connect: 是否等待 reconnect_gate。
+                **kwargs: FakeBroker 关键字参数。
+
+            Returns:
+                None。
+            """
+
+            super().__init__(*args, **kwargs)
+            self.block_connect = bool(block_connect)
+
+        def connect(self):
+            """第二次连接等待主测试确认重连期间已快速失败。
+
+            Returns:
+                bool: 最终复用父类成功结果。
+            """
+
+            if self.block_connect:
+                reconnect_gate.wait(1.0)
+            return super().connect()
+
+    def _factory(**kwargs):
+        """依次创建首个和阻塞中的重连 Broker。
+
+        Args:
+            **kwargs: adapter 传入的 Broker 构造参数。
+
+        Returns:
+            _BlockingReconnectBroker: 新 Broker。
+        """
+
+        broker = _BlockingReconnectBroker(block_connect=bool(created), **kwargs)
+        created.append(broker)
+        return broker
+
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    adapter = HuaxinBrokerAdapter(
+        config,
+        router,
+        broker_config={"enable_trading": True, "enable_cancel": True},
+        broker_factory=_factory,
+    )
+    adapter._watchdog_interval_seconds = 0.01
+    await adapter.start()
+    assert adapter.backend_status()["state"] == "ready"
+
+    created[0].connected = False
+    await _wait_for_condition(lambda: adapter._state == "reconnecting")
+    with pytest.raises(HuaxinNativeUnavailableError, match="正在恢复"):
+        await adapter.get_account_info(router.get("default"))
+
+    reconnect_gate.set()
+    await _wait_for_condition(lambda: len(created) == 2 and adapter._state == "ready")
+
+    assert created[0].connected is False
+    assert created[1].connected is True
+    assert created[0].place_payload is None and created[1].place_payload is None
+    assert created[0].cancel_payload is None and created[1].cancel_payload is None
+    assert adapter.backend_status()["reconnect_count"] == 1
+    await adapter.stop()
+    assert adapter._state == "stopped"
+    assert adapter._watchdog_task is None
+
+
+@pytest.mark.asyncio
 async def test_adapter_rejects_market_without_explicit_type_before_broker_call() -> None:
     """验证远程市价缺少 market_type 时不会调用 HuaxinBroker。"""
 
-    config = _server_config(idempotency_journal_path="/tmp/test-journal.sqlite")
+    config = _server_config()
     router = AccountRouter(config.accounts)
     adapter = HuaxinBrokerAdapter(
         config,

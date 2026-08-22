@@ -124,7 +124,10 @@ class ServerApplication:
             adapters.broker_adapter
             and adapters.broker_writes_require_persistent_idempotency is not False
         )
-        if self.config.idempotency_journal_path:
+        self._idempotency_key_required = bool(
+            adapters.broker_adapter and adapters.broker_writes_require_idempotency_key is not False
+        )
+        if self._idempotency_journal_required and self.config.idempotency_journal_path:
             try:
                 self._idempotency_journal = PersistentIdempotencyJournal(
                     self.config.idempotency_journal_path,
@@ -441,7 +444,7 @@ class ServerApplication:
         if method == "resolve_submission":
             return await self._resolve_submission(resolved_key, sub_cfg, ctx, payload)
         write_action = f"broker.{method}" if method in {"place_order", "cancel_order"} else None
-        if write_action is not None and self._idempotency_journal_required:
+        if write_action is not None and self._idempotency_key_required:
             _validate_required_idempotency_key(payload)
         write_fingerprint = (
             _build_write_fingerprint(write_action, payload) if write_action is not None else None

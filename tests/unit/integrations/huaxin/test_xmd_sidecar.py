@@ -18,12 +18,13 @@ from typing import Any, Dict, List, Optional, Tuple
 import pytest
 
 from bullet_trade.integrations.huaxin.xmd_sidecar import (
-    HUAXIN_DG14_L1_TCP_FRONT,
     XmdJsonlSidecar,
     XmdSidecarError,
     _normalise_security,
     load_xmdapi,
 )
+
+_TEST_XMD_FRONT = "tcp://127.0.0.1:9402"
 
 
 class _FakeSpiBase:
@@ -288,6 +289,7 @@ def _started_sidecar(
     output = io.StringIO()
     sidecar = XmdJsonlSidecar(
         sdk_dir="/explicit/fake-sdk",
+        front=_TEST_XMD_FRONT,
         output_stream=output,
         xmdapi_module=module,
         queue_capacity=queue_capacity,
@@ -297,8 +299,8 @@ def _started_sidecar(
 
 
 @pytest.mark.unit
-def test_start_uses_fixed_front_empty_login_and_main_thread_release() -> None:
-    """验证固定前置、空域登录以及主线程唯一 Release。
+def test_start_uses_explicit_front_empty_login_and_main_thread_release() -> None:
+    """验证显式前置、空域登录以及主线程唯一 Release。
 
     返回:
         无；调用与 JSONL 状态符合合同即通过。
@@ -307,7 +309,7 @@ def test_start_uses_fixed_front_empty_login_and_main_thread_release() -> None:
     owner_thread = threading.get_ident()
     sidecar, module, output = _started_sidecar()
 
-    assert module.api.front == HUAXIN_DG14_L1_TCP_FRONT
+    assert module.api.front == _TEST_XMD_FRONT
     assert len(module.api.login_requests) == 1
     assert vars(module.api.login_requests[0]) == {}
     events = _json_lines(output)

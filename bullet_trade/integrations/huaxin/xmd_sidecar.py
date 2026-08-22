@@ -5,7 +5,7 @@
 主要输出: stdout 中的 ready/response/tick/error JSON 事件。
 上游关系: BulletTrade 行情网关以子进程方式启动本模块并消费 JSONL；普通 import 不启动 SDK。
 下游关系: 仅显式导入 SDK 目录中的 xmdapi，不导入 Trader，也不包含任何交易调用。
-关键环境或配置: 固定东莞 14 L1 TCP 前置；空域登录；不配置 flow、不写文件；launcher
+关键环境或配置: 由父进程通过固定 argv 显式传入 L1 TCP 前置；空域登录；不配置 flow、不写文件；launcher
 负责设置 PYTHONDONTWRITEBYTECODE=1。SDK 回调只复制标量到有界队列，输出和 Release
 必须由主线程完成。
 """
@@ -22,8 +22,8 @@ import sys
 import threading
 import time
 from typing import IO, Any, Dict, List, Mapping, Optional, Tuple
+from urllib.parse import urlsplit
 
-HUAXIN_DG14_L1_TCP_FRONT = "tcp://192.168.140.5:7780"
 DEFAULT_QUEUE_CAPACITY = 1024
 STDIN_POLL_SECONDS = 0.10
 
@@ -47,6 +47,37 @@ class XmdSidecarError(RuntimeError):
         super().__init__(message)
         self.code = str(code)
         self.message = str(message)
+
+
+def _validate_tcp_front(value: str) -> str:
+    """校验父进程显式传入的 TCP 行情前置。
+
+    参数:
+        value: 生产或仿真配置中的 ``tcp://host:port``。
+    返回:
+        去除首尾空白后的原始地址。
+    异常:
+        XmdSidecarError: 地址结构不完整或包含凭据时抛出。
+    """
+
+    text = str(value or "").strip()
+    try:
+        parsed = urlsplit(text)
+        port = parsed.port
+    except ValueError as exc:
+        raise XmdSidecarError("front_invalid", "华鑫 XMD 前置必须为 tcp://host:port") from exc
+    if (
+        parsed.scheme.lower() != "tcp"
+        or not parsed.hostname
+        or port is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.query
+        or parsed.fragment
+        or parsed.path not in ("", "/")
+    ):
+        raise XmdSidecarError("front_invalid", "华鑫 XMD 前置必须为 tcp://host:port")
+    return text
 
 
 def _text(value: Any) -> str:
@@ -380,11 +411,12 @@ def _make_spi_class(xmdapi: Any) -> Any:
 
 
 class XmdJsonlSidecar:
-    """管理一个固定前置、空域登录的华鑫 XMD JSONL 生命周期。"""
+    """管理一个显式前置、空域登录的华鑫 XMD JSONL 生命周期。"""
 
     def __init__(
         self,
         sdk_dir: str,
+        front: str,
         output_stream: IO[str],
         xmdapi_module: Optional[Any] = None,
         queue_capacity: int = DEFAULT_QUEUE_CAPACITY,
@@ -393,6 +425,7 @@ class XmdJsonlSidecar:
 
         参数:
             sdk_dir: 显式 XMD SDK 目录；测试注入模块时仍保留来源说明。
+            front: 父进程显式传入的生产或仿真 TCP 前置。
             output_stream: JSONL 文本输出流。
             xmdapi_module: 纯测试使用的 fake SDK；生产必须留空。
             queue_capacity: native 回调事件队列容量。
@@ -403,6 +436,7 @@ class XmdJsonlSidecar:
         if int(queue_capacity) <= 0:
             raise ValueError("queue_capacity 必须大于零")
         self._sdk_dir = str(sdk_dir)
+        self._front = _validate_tcp_front(front)
         self._xmdapi = xmdapi_module
         self._writer = _JsonlWriter(output_stream)
         self._events = queue.Queue(maxsize=int(queue_capacity))
@@ -516,7 +550,7 @@ class XmdJsonlSidecar:
             spi_class = _make_spi_class(self._xmdapi)
             self._spi = spi_class(self._enqueue_callback)
             self._api.RegisterSpi(self._spi)
-            self._api.RegisterFront(HUAXIN_DG14_L1_TCP_FRONT)
+            self._api.RegisterFront(self._front)
             self._running = True
             self._api.Init()
             self.drain_events()
@@ -1009,6 +1043,7 @@ class XmdJsonlSidecar:
 
 def run_sidecar(
     sdk_dir: str,
+    front: str,
     input_stream: IO[str],
     output_stream: IO[str],
     xmdapi_module: Optional[Any] = None,
@@ -1017,6 +1052,7 @@ def run_sidecar(
 
     参数:
         sdk_dir: 显式 XMD SDK 目录。
+        front: 父进程显式传入的生产或仿真 TCP 前置。
         input_stream: JSONL 命令输入流。
         output_stream: JSONL 事件输出流。
         xmdapi_module: 仅供纯 fake 单测注入。
@@ -1026,6 +1062,7 @@ def run_sidecar(
 
     sidecar = XmdJsonlSidecar(
         sdk_dir=sdk_dir,
+        front=front,
         output_stream=output_stream,
         xmdapi_module=xmdapi_module,
     )
@@ -1076,12 +1113,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         进程退出码。
     """
 
-    parser = argparse.ArgumentParser(description="华鑫东莞14 XMD L1 JSONL sidecar")
+    parser = argparse.ArgumentParser(description="华鑫 XMD L1 JSONL sidecar")
     parser.add_argument("--sdk-dir", required=True, help="包含 xmdapi.py 与 _xmdapi 的绝对目录")
+    parser.add_argument("--front", required=True, help="当前环境的 tcp://host:port 行情前置")
     args = parser.parse_args(argv)
     output_stream = _protected_cli_stream()
     try:
-        return run_sidecar(args.sdk_dir, sys.stdin, output_stream)
+        return run_sidecar(args.sdk_dir, args.front, sys.stdin, output_stream)
     finally:
         output_stream.close()
 
