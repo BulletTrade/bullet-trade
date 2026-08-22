@@ -141,7 +141,7 @@ QMT_SERVER_SUB_ACCOUNT=demo@main
 | --- | --- | --- |
 | `BT_ENV_FILE` / `BULLET_TRADE_ENV_FILE` / `ENV_FILE` | `./.env.live` | 显式指定要加载的 `.env` 文件；优先于自动向上查找 `.env`。 |
 | `DEFAULT_DATA_PROVIDER` | `jqdata` | 默认行情源：`jqdata`、`tushare`、`qmt`、`qmt-remote`、`rqdata`、`easy_tdx`。RQData/easy_tdx 仍为 Beta，需要显式启用。 |
-| `DEFAULT_BROKER` | `simulator` | 默认券商/交易通道：`simulator`、`qmt`、`qmt-remote`。 |
+| `DEFAULT_BROKER` | `simulator` | 默认券商/交易通道：`simulator`、`qmt`、`qmt-remote`、`huaxin`；远程华鑫策略通常仍选择 `qmt-remote`，由 server 使用 `huaxin` adapter。 |
 | `LOG_DIR` | `./logs` | 日志目录。 |
 | `LOG_LEVEL` | `INFO` | 控制台日志级别。 |
 | `LOG_FILE_LEVEL` | 跟随 `LOG_LEVEL` | 文件日志级别。 |
@@ -258,8 +258,8 @@ QMT_SERVER_SUB_ACCOUNT=demo@main
 | `QMT_SERVER_LOG_ACCOUNT` | `false` | 是否打印账户快照。 |
 | `QMT_SERVER_ACCESS_LOG` | `true` | 是否启用访问日志。 |
 | `QMT_SERVER_ORDER_RISK_ENABLED` | `false` | 是否启用 server 端订单/撤单风控。 |
-| `QMT_SERVER_IDEMPOTENCY_TTL_SECONDS` | `300` | 进程内幂等快速缓存窗口秒数；真实 broker 的 SQLite 账本不会随该 TTL 自动删除。 |
-| `QMT_SERVER_IDEMPOTENCY_JOURNAL_PATH` | 无 | 真实 broker adapter 必填的 SQLite 持久幂等账本路径；未配置时下单/撤单 readiness 为 unavailable 且所有写请求 fail-closed。目录必须位于本机磁盘并由运行账户独占写入，不能放入临时目录、NFS/SMB/同步盘或使用符号链接。 |
+| `QMT_SERVER_IDEMPOTENCY_TTL_SECONDS` | `300` | 进程内幂等快速缓存窗口秒数；使用 SQLite 的 adapter 不会随该 TTL 自动删除持久记录。 |
+| `QMT_SERVER_IDEMPOTENCY_JOURNAL_PATH` | 无 | 要求持久幂等账本的 adapter 必填；未配置时其写请求 fail-closed。目录必须位于本机磁盘并由运行账户独占写入，不能放入临时目录、NFS/SMB/同步盘或使用符号链接。华鑫 adapter 明确不创建该 SQLite，但下单/撤单仍要求 `idempotency_key`。 |
 | `QMT_SERVER_IDEMPOTENCY_JOURNAL_MAX_ENTRIES` | `100000` | SQLite 账本最大记录数；达到上限拒绝新写请求，不能自动淘汰历史幂等键。 |
 | `QMT_SERVER_ACCOUNTS` | 空 | 多账户映射，例如 `main=123456,hedge=654321:future`。 |
 | `QMT_SERVER_SUB_ACCOUNTS` | 空 | 子账户映射，例如 `demo@main:limit=50000`。 |
