@@ -1203,6 +1203,32 @@ class _FakeBroker:
         self.baseline_queries.add("trades")
         return [{"trade_id": "T1", "order_id": kwargs.get("order_id") or "O1"}]
 
+    def get_trading_day(self):
+        """返回固定的柜台权威交易日。
+
+        Returns:
+            str: ``20260824``。
+        """
+
+        return "20260824"
+
+    def get_security_master(self, security):
+        """返回固定的证券主数据。
+
+        Args:
+            security: 标准证券代码。
+
+        Returns:
+            dict: 含证券代码、跳价和涨跌停价的测试主数据。
+        """
+
+        return {
+            "security": security,
+            "price_tick": 0.001,
+            "upper_limit_price": 101.0,
+            "lower_limit_price": 99.0,
+        }
+
     def submit_order(self, direction, security, amount, price, **kwargs):
         """记录 adapter 透传的限价或显式市价字段。
 
@@ -1283,6 +1309,8 @@ async def test_adapter_delegates_queries_and_preserves_cancel_payload() -> None:
     assert (await adapter.get_positions(ctx))[0]["amount"] == 100
     assert (await adapter.list_orders(ctx))[0]["order_id"] == "O1"
     assert (await adapter.list_trades(ctx))[0]["trade_id"] == "T1"
+    assert await adapter.get_trading_day() == "20260824"
+    assert (await adapter.get_security_info("511880.XSHG"))["price_tick"] == 0.001
     place = await adapter.place_order(
         ctx,
         {
@@ -1327,6 +1355,46 @@ async def test_adapter_delegates_queries_and_preserves_cancel_payload() -> None:
     assert broker.cancel_payload[1] == cancel_payload
     assert adapter.backend_status()["actions"]["broker.place_order"]["status"] == "ready"
     await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_huaxin_data_calendar_and_security_info_delegate_to_trader() -> None:
+    """验证统一数据协议把交易日与证券信息委托给同一 Trader 会话。"""
+
+    config = _xmd_server_config(
+        enable_broker=True,
+        accounts=[AccountConfig(key="default", account_id="acct")],
+    )
+    router = AccountRouter(config.accounts)
+    broker_adapter = HuaxinBrokerAdapter(
+        config,
+        router,
+        broker_config={"enable_trading": True, "enable_cancel": True},
+        broker_factory=_FakeBroker,
+    )
+    data_adapter = HuaxinDataAdapter(
+        config,
+        backend_factory=_FakeXmdBackend,
+        broker_adapter=broker_adapter,
+    )
+    await broker_adapter.start()
+    await data_adapter.start()
+
+    trade_days = await data_adapter.get_trade_days(
+        {"start_date": "2026-08-24", "end_date": "2026-08-24"}
+    )
+    outside = await data_adapter.get_trade_days(
+        {"start_date": "2026-08-22", "end_date": "2026-08-22"}
+    )
+    security_info = await data_adapter.get_security_info({"security": "511880.XSHG"})
+
+    assert trade_days == {"dtype": "list", "values": ["2026-08-24"]}
+    assert outside == {"dtype": "list", "values": []}
+    assert security_info["value"]["security"] == "511880.XSHG"
+    assert security_info["value"]["price_tick"] == 0.001
+    assert data_adapter.backend_status()["actions"]["data.trade_days"]["status"] == "ready"
+    await data_adapter.stop()
+    await broker_adapter.stop()
 
 
 @pytest.mark.asyncio

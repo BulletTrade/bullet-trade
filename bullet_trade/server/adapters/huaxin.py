@@ -19,7 +19,7 @@ import logging
 import math
 import time
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import date, datetime
 from typing import Any, Callable, Dict, List, Mapping, Optional, Set
 
 from bullet_trade.integrations.huaxin.broker import HuaxinBroker
@@ -335,6 +335,35 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
 
         return list(await self._run_ready(self._broker_for(account).get_positions) or [])
 
+    async def get_trading_day(self) -> Optional[str]:
+        """返回默认华鑫父账户登录回报中的权威交易日。
+
+        Returns:
+            Optional[str]: ``YYYYMMDD`` 交易日；柜台未返回时为 None。
+
+        Raises:
+            HuaxinNativeUnavailableError: Trader 正在恢复或尚未 ready 时抛出。
+        """
+
+        broker = self._default_broker()
+        return await self._run_ready(broker.get_trading_day)
+
+    async def get_security_info(self, security: str) -> Dict[str, Any]:
+        """查询默认华鑫父账户可见的单证券柜台主数据。
+
+        Args:
+            security: ``.XSHG/.XSHE`` 标准证券代码。
+
+        Returns:
+            Dict[str, Any]: 柜台证券约束与静态字段；未找到时返回空字典。
+
+        Raises:
+            HuaxinNativeUnavailableError: Trader 正在恢复或尚未 ready 时抛出。
+        """
+
+        broker = self._default_broker()
+        return dict(await self._run_ready(broker.get_security_master, security) or {})
+
     async def list_orders(
         self, account: AccountContext, filters: Optional[Dict[str, Any]] = None
     ) -> List[Dict[str, Any]]:
@@ -593,6 +622,20 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
             raise RuntimeError(f"Huaxin broker 账户尚未连接: {key}")
         return broker
 
+    def _default_broker(self) -> HuaxinBroker:
+        """取得单父账户 Server 的默认 HuaxinBroker。
+
+        Returns:
+            HuaxinBroker: 按账户键稳定排序后的首个已连接 broker。
+
+        Raises:
+            RuntimeError: adapter 尚未创建任何 Trader 账户时抛出。
+        """
+
+        if not self._brokers:
+            raise RuntimeError("Huaxin broker 尚未连接")
+        return self._brokers[sorted(self._brokers)[0]]
+
     async def _connect_all(self) -> None:
         """按账户配置创建并连接一套新的 Broker 映射。
 
@@ -840,8 +883,8 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
 class HuaxinDataAdapter:
     """把只读 XMD L1 backend 暴露为 server 当前时点数据接口。
 
-    该 adapter 不实现 history/trade_days/security_info，也不会持有 Trader。所有返回值
-    必须同时通过 backend 与 adapter 两层 source、证券身份、时间和盘口校验。
+    历史行情继续明确不支持；交易日和证券信息仅委托同一 Server 的 Trader adapter，
+    实时快照必须同时通过 backend 与 adapter 两层 source、证券身份、时间和盘口校验。
     """
 
     authoritative_realtime_only = True
@@ -852,12 +895,14 @@ class HuaxinDataAdapter:
         config: ServerConfig,
         *,
         backend_factory: Callable[..., XmdBackend] = Python37XmdBackend,
+        broker_adapter: Optional[HuaxinBrokerAdapter] = None,
     ) -> None:
         """创建尚未启动的 XMD backend 与专用单线程 executor。
 
         Args:
             config: 已通过华鑫 data 配置门禁的服务配置。
             backend_factory: 测试可注入的 XmdBackend 工厂。
+            broker_adapter: 同一 Server 的 Trader adapter，用于权威交易日和证券主数据。
 
         Returns:
             None。
@@ -870,6 +915,7 @@ class HuaxinDataAdapter:
         self._max_age_seconds = float(config.huaxin_xmd_max_age_seconds)
         self._snapshot_timeout = float(config.huaxin_xmd_snapshot_timeout)
         self._backend_factory = backend_factory
+        self._broker_adapter = broker_adapter
         self._backend = self._build_backend()
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="huaxin-xmd")
         self._started = False
@@ -975,6 +1021,72 @@ class HuaxinDataAdapter:
 
         return await self.get_snapshot(payload)
 
+    async def get_trade_days(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """按 Trader 登录回报中的权威交易日响应远程日历请求。
+
+        Args:
+            payload: 可含 start/start_date、end/end_date 和 count 的远程请求。
+
+        Returns:
+            Dict[str, Any]: ``dtype=list`` 与零或一个 ISO 交易日。
+
+        Raises:
+            HuaxinNativeUnavailableError: 未启用 Trader 或 Trader 尚未 ready 时抛出。
+            ValueError: 日期边界、count 或柜台交易日格式非法时抛出。
+        """
+
+        if self._broker_adapter is None:
+            raise HuaxinNativeUnavailableError(
+                HUAXIN_NATIVE_UNAVAILABLE,
+                "华鑫交易日查询需要同一 Server 启用 Trader",
+            )
+        raw_day = str(await self._broker_adapter.get_trading_day() or "").strip()
+        if not raw_day:
+            raise HuaxinNativeUnavailableError(
+                HUAXIN_NATIVE_UNAVAILABLE,
+                "华鑫 Trader 尚未返回权威交易日",
+            )
+        try:
+            trading_day = datetime.strptime(raw_day, "%Y%m%d").date()
+        except ValueError as exc:
+            raise ValueError("华鑫 Trader 返回的交易日格式非法") from exc
+        start = self._parse_date_bound(payload.get("start") or payload.get("start_date"), "start")
+        end = self._parse_date_bound(payload.get("end") or payload.get("end_date"), "end")
+        count = payload.get("count")
+        if count is not None:
+            try:
+                count_value = int(count)
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("count 必须为整数") from exc
+        else:
+            count_value = 1
+        in_range = (start is None or trading_day >= start) and (end is None or trading_day <= end)
+        values = [trading_day.isoformat()] if count_value > 0 and in_range else []
+        return {"dtype": "list", "values": values}
+
+    async def get_security_info(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """从同一 Trader 会话查询单证券静态主数据和交易约束。
+
+        Args:
+            payload: 含 security/stock/stockcode 的远程请求。
+
+        Returns:
+            Dict[str, Any]: ``dtype=dict`` 与柜台证券主数据。
+
+        Raises:
+            HuaxinNativeUnavailableError: 未启用 Trader 或 Trader 尚未 ready 时抛出。
+            ValueError: 请求缺少证券代码时抛出。
+        """
+
+        if self._broker_adapter is None:
+            raise HuaxinNativeUnavailableError(
+                HUAXIN_NATIVE_UNAVAILABLE,
+                "华鑫证券信息查询需要同一 Server 启用 Trader",
+            )
+        security = self._security_from_payload(payload)
+        info = await self._broker_adapter.get_security_info(security)
+        return {"dtype": "dict", "value": info}
+
     async def get_current_tick(self, security: str) -> Dict[str, Any]:
         """兼容 server tick manager 读取一个标准证券快照。
 
@@ -1013,6 +1125,11 @@ class HuaxinDataAdapter:
             state = str(health.get("state") or "unavailable")
         action_state = "ready" if ready else state
         reason = self._last_error_reason or health.get("last_error_code")
+        trader_status = (
+            self._broker_adapter.backend_status() if self._broker_adapter is not None else {}
+        )
+        metadata_ready = bool(trader_status.get("ready"))
+        metadata_state = "ready" if metadata_ready else "unavailable"
         return {
             "backend_type": "huaxin",
             "component": "xmd_l1",
@@ -1026,6 +1143,8 @@ class HuaxinDataAdapter:
                 "data.snapshot": {"status": action_state, "reason": reason},
                 "data.live_current": {"status": action_state, "reason": reason},
                 "data.current_tick": {"status": action_state, "reason": reason},
+                "data.trade_days": {"status": metadata_state},
+                "data.security_info": {"status": metadata_state},
                 "data.history": {
                     "status": "unsupported",
                     "reason": "Huaxin XMD 不提供历史行情",
@@ -1138,6 +1257,32 @@ class HuaxinDataAdapter:
         if not text:
             raise ValueError("缺少 security")
         return text
+
+    @staticmethod
+    def _parse_date_bound(value: Any, field_name: str) -> Optional[date]:
+        """解析远程日历请求的可选日期边界。
+
+        Args:
+            value: ISO 日期、datetime 或 date 等可转换值。
+            field_name: 用于错误消息的字段名。
+
+        Returns:
+            Optional[date]: 解析后的 date；缺省时为 None。
+
+        Raises:
+            ValueError: 无法解析为 ISO 日期时抛出。
+        """
+
+        if value in (None, ""):
+            return None
+        if isinstance(value, datetime):
+            return value.date()
+        if isinstance(value, date):
+            return value
+        try:
+            return datetime.fromisoformat(str(value).strip()).date()
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{field_name} 必须为 ISO 日期") from exc
 
     def _build_backend(self) -> XmdBackend:
         """按当前 ServerConfig 创建一个尚未启动的 XMD backend。
@@ -1311,11 +1456,13 @@ def build_huaxin_bundle(config: ServerConfig, router: AccountRouter) -> AdapterB
 
     broker_config = _load_huaxin_broker_config() if config.enable_broker else {}
     _validate_huaxin_server_config(config, broker_config)
-    data_adapter = HuaxinDataAdapter(config) if config.enable_data else None
     broker_adapter = (
         HuaxinBrokerAdapter(config, router, broker_config=broker_config)
         if config.enable_broker
         else None
+    )
+    data_adapter = (
+        HuaxinDataAdapter(config, broker_adapter=broker_adapter) if config.enable_data else None
     )
     return AdapterBundle(
         data_adapter=data_adapter,
