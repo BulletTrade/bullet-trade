@@ -1301,6 +1301,7 @@ class HuaxinDataAdapter:
             max_age_seconds=self._max_age_seconds,
             connect_timeout=float(self.config.huaxin_xmd_connect_timeout),
             command_timeout=float(self.config.huaxin_xmd_command_timeout),
+            simulation_replay=bool(self.config.huaxin_xmd_simulation_replay),
         )
 
     def _require_ready(self) -> None:

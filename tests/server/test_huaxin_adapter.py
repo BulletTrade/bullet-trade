@@ -278,7 +278,11 @@ def test_huaxin_server_config_reads_namespaced_xmd_environment(monkeypatch) -> N
         lambda name, default=None: values.get(name, default),
     )
     monkeypatch.setattr(server_config_module, "get_env_int", lambda name, default=0: default)
-    monkeypatch.setattr(server_config_module, "get_env_bool", lambda name, default=False: default)
+    monkeypatch.setattr(
+        server_config_module,
+        "get_env_bool",
+        lambda name, default=False: name == "HUAXIN_XMD_SIMULATION_REPLAY" or default,
+    )
     monkeypatch.setattr(server_config_module, "get_env_float", lambda name, default=0.0: default)
     monkeypatch.setattr(server_config_module, "get_env_optional_bool", lambda name: None)
     args = SimpleNamespace(
@@ -298,6 +302,7 @@ def test_huaxin_server_config_reads_namespaced_xmd_environment(monkeypatch) -> N
     assert config.huaxin_xmd_sdk_dir == "/private/xmd-sdk"
     assert config.huaxin_xmd_front == _TEST_XMD_FRONT
     assert config.huaxin_xmd_max_age_seconds == DEFAULT_MAX_AGE_SECONDS
+    assert config.huaxin_xmd_simulation_replay is True
     assert config.accounts == []
 
 
@@ -315,6 +320,14 @@ def test_huaxin_provider_uses_same_thirty_second_default(monkeypatch) -> None:
     )
 
     assert provider._max_age_seconds == DEFAULT_MAX_AGE_SECONDS
+
+
+def test_huaxin_provider_reads_explicit_simulation_replay_flag() -> None:
+    """验证直接 provider 只在显式配置时启用仿真回放时钟。"""
+
+    provider = HuaxinDataProvider({"huaxin_xmd_simulation_replay": "true"})
+
+    assert provider._simulation_replay is True
 
 
 def test_huaxin_broker_config_maps_required_mac_address(monkeypatch) -> None:
@@ -759,8 +772,48 @@ def test_xmd_tick_normalization_preserves_exchange_time_and_order_book() -> None
     assert snapshot["security"] == "511880.XSHG"
     assert snapshot["source"] == HUAXIN_XMD_SOURCE
     assert snapshot["source_time"].endswith("+08:00")
+    assert snapshot["time_basis"] == "exchange_time"
     assert snapshot["bid_price1"] == 100.704
     assert snapshot["ask_price1"] == 100.705
+    assert snapshot["age_seconds"] == pytest.approx(0.0)
+
+
+def test_xmd_tick_simulation_replay_uses_receive_time_for_artificial_trading_day() -> None:
+    """验证 7×24 仿真人工交易日仅在显式开关下改用接收时间。"""
+
+    now_dt = datetime(2026, 8, 22, 14, 3, 0, tzinfo=timezone(timedelta(hours=8)))
+    payload = {
+        "type": "tick",
+        "security": "511880",
+        "exchange": "SSE",
+        "TradingDay": "20450424",
+        "UpdateTime": "09:53:00",
+        "Millisec": 0,
+        "Last": 100.705,
+        "Bid1": 100.704,
+        "Ask1": 100.705,
+        "BidVolume1": 100,
+        "AskVolume1": 200,
+        "UpperLimit": 110.0,
+        "LowerLimit": 90.0,
+        "Volume": 300,
+        "Turnover": 400.5,
+        "receive_ns": int(now_dt.timestamp() * 1_000_000_000),
+    }
+
+    with pytest.raises(XmdBackendError, match="明显晚于本机时间"):
+        _normalise_tick(payload, now=now_dt.timestamp())
+
+    snapshot = _normalise_tick(
+        payload,
+        now=now_dt.timestamp(),
+        simulation_replay=True,
+    )
+
+    assert snapshot["trading_day"] == "20450424"
+    assert snapshot["update_time"] == "09:53:00"
+    assert snapshot["time_basis"] == "receive_time_simulation_replay"
+    assert snapshot["source_time"] == snapshot["received_time"]
     assert snapshot["age_seconds"] == pytest.approx(0.0)
 
 

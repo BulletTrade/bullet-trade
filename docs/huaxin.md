@@ -93,7 +93,12 @@ HUAXIN_XMD_PYTHON=<PRIVATE_PYTHON37_EXECUTABLE>
 HUAXIN_XMD_SDK_DIR=<PRIVATE_XMD_SDK_DIR>
 HUAXIN_XMD_FRONT=<PRIVATE_XMD_TCP_FRONT>
 HUAXIN_XMD_MAX_AGE_SECONDS=30
+HUAXIN_XMD_SIMULATION_REPLAY=false
 ```
+
+生产环境必须保持 ``HUAXIN_XMD_SIMULATION_REPLAY=false``，继续按交易所时间严格校验。
+只有厂商 7×24 仿真环境使用人工交易日回放行情时才设置为 ``true``；此时快照保留原始
+``TradingDay``/``UpdateTime``，但以本机接收时间执行 30 秒新鲜度门禁。
 
 启动命令：
 

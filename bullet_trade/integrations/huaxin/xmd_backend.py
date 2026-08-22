@@ -206,12 +206,17 @@ def _non_negative_integer(payload: Mapping[str, Any], field: str) -> int:
     return value
 
 
-def _normalise_tick(payload: Mapping[str, Any], now: Optional[float] = None) -> Dict[str, Any]:
+def _normalise_tick(
+    payload: Mapping[str, Any],
+    now: Optional[float] = None,
+    simulation_replay: bool = False,
+) -> Dict[str, Any]:
     """把 sidecar tick 严格归一为 BulletTrade 新鲜度快照。
 
     Args:
         payload: ``type=tick`` 的 JSON 对象。
         now: 测试可注入的当前 epoch；默认读取系统时间。
+        simulation_replay: 是否按接收时间兼容 7×24 仿真柜台的回放交易日。
 
     Returns:
         Dict[str, Any]: 带 source/source_time/received_time/盘口的 canonical 快照。
@@ -230,7 +235,7 @@ def _normalise_tick(payload: Mapping[str, Any], now: Optional[float] = None) -> 
     if code != expected_code or exchange != expected_exchange:
         raise XmdBackendError("tick_identity_invalid", "华鑫 XMD 行情证券或交易所身份不一致")
 
-    source_timestamp = _parse_source_timestamp(payload)
+    exchange_timestamp = _parse_source_timestamp(payload)
     try:
         receive_ns = int(payload.get("receive_ns"))
     except (TypeError, ValueError, OverflowError) as exc:
@@ -239,8 +244,12 @@ def _normalise_tick(payload: Mapping[str, Any], now: Optional[float] = None) -> 
         raise XmdBackendError("received_time_invalid", "华鑫 XMD 接收时间必须大于零")
     received_timestamp = receive_ns / 1_000_000_000.0
     current = time.time() if now is None else float(now)
-    if source_timestamp - current > 1.0 or received_timestamp - current > 1.0:
+    if received_timestamp - current > 1.0:
         raise XmdBackendError("tick_time_in_future", "华鑫 XMD 行情时间明显晚于本机时间")
+    if not simulation_replay and exchange_timestamp - current > 1.0:
+        raise XmdBackendError("tick_time_in_future", "华鑫 XMD 行情时间明显晚于本机时间")
+    source_timestamp = received_timestamp if simulation_replay else exchange_timestamp
+    time_basis = "receive_time_simulation_replay" if simulation_replay else "exchange_time"
 
     last_price = _finite_number(payload, "Last")
     bid_price1 = _finite_number(payload, "Bid1")
@@ -277,6 +286,7 @@ def _normalise_tick(payload: Mapping[str, Any], now: Optional[float] = None) -> 
         "update_millisec": int(payload.get("Millisec")),
         "source_time": datetime.fromtimestamp(source_timestamp, _SHANGHAI_TZ).isoformat(),
         "received_time": datetime.fromtimestamp(received_timestamp, _SHANGHAI_TZ).isoformat(),
+        "time_basis": time_basis,
         "age_seconds": age_seconds,
         "source": HUAXIN_XMD_SOURCE,
         "provider": HUAXIN_XMD_SOURCE,
@@ -296,6 +306,7 @@ class Python37XmdBackend:
         connect_timeout: float = 15.0,
         command_timeout: float = 5.0,
         sidecar_path: Optional[str] = None,
+        simulation_replay: bool = False,
     ) -> None:
         """保存显式路径和时效门禁，但不启动任何进程。
 
@@ -307,6 +318,7 @@ class Python37XmdBackend:
             connect_timeout: 等待 sidecar 登录 ready 的秒数。
             command_timeout: 等待订阅/退订回执的秒数。
             sidecar_path: 测试可注入的 sidecar 绝对路径。
+            simulation_replay: 是否按接收时间兼容 7×24 仿真柜台回放行情。
 
         Returns:
             None。
@@ -325,6 +337,7 @@ class Python37XmdBackend:
         self.max_age_seconds = self._positive_float(max_age_seconds, "max_age_seconds")
         self.connect_timeout = self._positive_float(connect_timeout, "connect_timeout")
         self.command_timeout = self._positive_float(command_timeout, "command_timeout")
+        self.simulation_replay = bool(simulation_replay)
         self._process: Optional[subprocess.Popen] = None
         self._stdin: Optional[TextIO] = None
         self._reader_thread: Optional[threading.Thread] = None
@@ -660,6 +673,7 @@ class Python37XmdBackend:
             return {
                 "backend": "python37_sidecar",
                 "source": HUAXIN_XMD_SOURCE,
+                "simulation_replay": self.simulation_replay,
                 "process_alive": process_alive,
                 "connected": bool(self._ready and process_alive),
                 "logged_in": bool(self._ready and process_alive),
@@ -812,7 +826,7 @@ class Python37XmdBackend:
                 self._condition.notify_all()
             return
         if event_type == "tick":
-            snapshot = _normalise_tick(payload)
+            snapshot = _normalise_tick(payload, simulation_replay=self.simulation_replay)
             with self._condition:
                 self._latest[snapshot["security"]] = snapshot
                 self._last_event_time = snapshot["received_time"]

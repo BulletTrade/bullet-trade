@@ -69,6 +69,7 @@ class ServerConfig:
     huaxin_xmd_sdk_dir: Optional[str] = None
     huaxin_xmd_front: Optional[str] = None
     huaxin_xmd_max_age_seconds: float = 30.0
+    huaxin_xmd_simulation_replay: bool = False
     huaxin_xmd_connect_timeout: float = 15.0
     huaxin_xmd_command_timeout: float = 5.0
     huaxin_xmd_snapshot_timeout: float = 5.0
@@ -264,6 +265,9 @@ def build_server_config(args) -> ServerConfig:
     huaxin_xmd_max_age_seconds = (
         get_env_float("HUAXIN_XMD_MAX_AGE_SECONDS", 30.0) if huaxin_server else 30.0
     )
+    huaxin_xmd_simulation_replay = (
+        get_env_bool("HUAXIN_XMD_SIMULATION_REPLAY", False) if huaxin_server else False
+    )
     huaxin_xmd_connect_timeout = (
         get_env_float("HUAXIN_XMD_CONNECT_TIMEOUT", 15.0) if huaxin_server else 15.0
     )
@@ -342,6 +346,7 @@ def build_server_config(args) -> ServerConfig:
         huaxin_xmd_sdk_dir=huaxin_xmd_sdk_dir,
         huaxin_xmd_front=huaxin_xmd_front,
         huaxin_xmd_max_age_seconds=float(huaxin_xmd_max_age_seconds),
+        huaxin_xmd_simulation_replay=bool(huaxin_xmd_simulation_replay),
         huaxin_xmd_connect_timeout=float(huaxin_xmd_connect_timeout),
         huaxin_xmd_command_timeout=float(huaxin_xmd_command_timeout),
         huaxin_xmd_snapshot_timeout=float(huaxin_xmd_snapshot_timeout),

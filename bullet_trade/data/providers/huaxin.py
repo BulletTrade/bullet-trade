@@ -66,6 +66,15 @@ class HuaxinDataProvider(DataProvider):
         self._max_age_seconds = float(
             DEFAULT_MAX_AGE_SECONDS if configured_max_age in (None, "") else configured_max_age
         )
+        configured_simulation_replay = self._cfg.get("huaxin_xmd_simulation_replay")
+        if configured_simulation_replay in (None, ""):
+            configured_simulation_replay = os.getenv("HUAXIN_XMD_SIMULATION_REPLAY", "false")
+        self._simulation_replay = str(configured_simulation_replay).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         self._connect_timeout = float(
             self._cfg.get("huaxin_xmd_connect_timeout")
             or os.getenv("HUAXIN_XMD_CONNECT_TIMEOUT")
@@ -119,6 +128,7 @@ class HuaxinDataProvider(DataProvider):
             max_age_seconds=self._max_age_seconds,
             connect_timeout=self._connect_timeout,
             command_timeout=self._command_timeout,
+            simulation_replay=self._simulation_replay,
         )
         try:
             backend.start()
