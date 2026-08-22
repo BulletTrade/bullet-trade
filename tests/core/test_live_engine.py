@@ -1257,6 +1257,8 @@ async def test_strategy_start_date_persisted_and_restored(tmp_path):
 
 @pytest.mark.asyncio
 async def test_calendar_guard_skips_weekend(monkeypatch):
+    """验证交易日查询失败时，周末与工作日都保持失败关闭。"""
+
     guard = TradingCalendarGuard({"calendar_skip_weekend": True, "calendar_retry_minutes": 15})
 
     def _raise(*args, **kwargs):
@@ -1270,12 +1272,15 @@ async def test_calendar_guard_skips_weekend(monkeypatch):
 
     monday = datetime(2025, 1, 6, 9, 0)
     result = await guard.ensure_trade_day(monday)
-    assert result is True
-    assert guard._confirmed_date == monday.date()
+    assert result is False
+    assert guard._confirmed_date is None
+    assert guard._next_check == monday + timedelta(minutes=15)
 
 
 @pytest.mark.asyncio
 async def test_calendar_guard_weekend_allowed(monkeypatch):
+    """验证关闭周末快速跳过后，交易日查询异常仍不会放行。"""
+
     guard = TradingCalendarGuard({"calendar_skip_weekend": False})
 
     def _raise(*args, **kwargs):
@@ -1284,8 +1289,8 @@ async def test_calendar_guard_weekend_allowed(monkeypatch):
     monkeypatch.setattr("bullet_trade.data.api.get_trade_days", _raise, raising=False)
     sunday = datetime(2025, 1, 5, 9, 0)
     result = await guard.ensure_trade_day(sunday)
-    assert result is True
-    assert guard._confirmed_date == sunday.date()
+    assert result is False
+    assert guard._confirmed_date is None
 
 
 @pytest.mark.asyncio
