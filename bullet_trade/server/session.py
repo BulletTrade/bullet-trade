@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import errno
+import hmac
 import os
 import secrets
 import time
@@ -80,8 +81,9 @@ class ClientSession:
         message = await read_message(self.reader)
         if message.get("type") != "handshake":
             raise ProtocolError("首包必须为 handshake")
-        token = message.get("token")
-        if token != self.app.config.token:
+        token = str(message.get("token") or "").encode("utf-8")
+        expected_token = str(self.app.config.token or "").encode("utf-8")
+        if not hmac.compare_digest(token, expected_token):
             await self._send_error(message.get("id"), "AUTH_FAILED", "token 不匹配")
             raise ProtocolError("token 不匹配")
         client_features = message.get("features") or []

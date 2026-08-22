@@ -7,10 +7,15 @@ import pandas as pd
 import pytest
 
 from bullet_trade.broker import RemoteQmtBroker
-from bullet_trade.remote import RemoteQmtConnection
+from bullet_trade.remote import (
+    RemoteQmtConnection,
+    RemoteServerError,
+    RemoteSubmissionUnknownError,
+    classify_remote_action,
+)
 from bullet_trade.server.adapters.base import AccountRouter
 from bullet_trade.server.adapters.stub import build_stub_bundle  # noqa: F401
-from bullet_trade.server.app import ServerApplication
+from bullet_trade.server.app import IdempotencyConflictError, ServerApplication
 from bullet_trade.server.config import AccountConfig, ServerConfig
 from bullet_trade.server.session import ClientSession
 
@@ -154,6 +159,267 @@ def test_remote_connection_explicit_none_timeout_keeps_legacy_wait(monkeypatch):
     assert conn.request("broker.account", {}, timeout=None) == {"ok": True}
 
     assert recorded_future.timeouts == [60, None]
+
+
+def test_remote_connection_classifies_concrete_write_actions():
+    """远程 action 必须按具体名称分类，不得用模糊前缀猜测。"""
+
+    assert classify_remote_action("broker.place_order") == "ambiguous_write"
+    assert classify_remote_action("broker.cancel_order") == "ambiguous_write"
+    assert classify_remote_action("broker.resolve_submission") == "none"
+    assert classify_remote_action("broker.orders") == "none"
+    assert classify_remote_action("data.subscribe") == "idempotent_transition"
+
+
+@pytest.mark.parametrize(
+    ("action", "payload"),
+    [
+        (
+            "broker.place_order",
+            {
+                "security": "000001.XSHE",
+                "side": "BUY",
+                "amount": 100,
+                "style": {"type": "limit", "price": 10.0},
+            },
+        ),
+        ("broker.cancel_order", {"order_id": "order-to-cancel"}),
+    ],
+)
+def test_remote_connection_does_not_retry_ambiguous_write_after_response_loss(action, payload):
+    """写帧发出后响应丢失必须只发送一次，并保留原幂等键。"""
+
+    conn = RemoteQmtConnection("127.0.0.1", 0, "token")
+    conn._connected.set()
+    sent = []
+
+    async def _send_and_drop(message):
+        """记录写帧后模拟服务端响应丢失。"""
+
+        sent.append(message)
+        conn._pending[message["id"]].set_exception(RuntimeError("连接已断开"))
+
+    conn._send = _send_and_drop  # type: ignore[method-assign]
+
+    async def _run():
+        """执行一次模糊写并返回未知异常。"""
+
+        with pytest.raises(RemoteSubmissionUnknownError) as exc_info:
+            request_payload = dict(payload)
+            request_payload["idempotency_key"] = "disconnect-write-once"
+            await conn._request_async(action, request_payload)
+        return exc_info.value
+
+    error = asyncio.run(_run())
+
+    assert len(sent) == 1
+    assert sent[0]["action"] == action
+    assert sent[0]["payload"]["idempotency_key"] == "disconnect-write-once"
+    assert error.idempotency_key == "disconnect-write-once"
+
+
+def test_remote_broker_resolves_response_loss_without_resending_order(monkeypatch):
+    """标准远程 Broker 应用原 key 只读解析丢失响应，不重发下单。"""
+
+    class _ResolveAfterDropConnection:
+        """模拟下单已送达、响应丢失，但只读解析成功的连接。"""
+
+        def __init__(self):
+            """初始化写帧和解析请求记录。"""
+
+            self.write_requests = []
+            self.resolve_requests = []
+
+        def start(self):
+            """模拟连接启动。"""
+
+            return None
+
+        def close(self):
+            """模拟连接关闭。"""
+
+            return None
+
+        def request(self, action, payload, timeout=30.0):
+            """记录唯一下单帧并模拟响应丢失。"""
+
+            self.write_requests.append((action, dict(payload), timeout))
+            raise RemoteSubmissionUnknownError(
+                action,
+                str(payload["idempotency_key"]),
+                payload,
+                message="deterministic response loss",
+            )
+
+        def resolve_submission(
+            self,
+            idempotency_key,
+            *,
+            write_action,
+            request_payload=None,
+            order_id=None,
+            context=None,
+            timeout=30.0,
+        ):
+            """记录原 key 只读解析并返回已接受事实。"""
+
+            self.resolve_requests.append(
+                {
+                    "idempotency_key": idempotency_key,
+                    "write_action": write_action,
+                    "request_payload": dict(request_payload or {}),
+                    "order_id": order_id,
+                    "context": dict(context or {}),
+                    "timeout": timeout,
+                }
+            )
+            return {
+                "status": "accepted",
+                "submission_state": "accepted",
+                "write_action": "broker.place_order",
+                "idempotency_key": idempotency_key,
+                "order_id": "resolved-order-1",
+                "resolved_result": {
+                    "order_id": "resolved-order-1",
+                    "status": "open",
+                    "security": request_payload["security"],
+                    "side": request_payload["side"],
+                    "amount": request_payload["amount"],
+                    "idempotency_key": idempotency_key,
+                },
+            }
+
+    monkeypatch.setenv("QMT_SERVER_TOKEN", "dummy-token")
+    broker = RemoteQmtBroker(account_id="acc")
+    connection = _ResolveAfterDropConnection()
+    broker._connection = connection  # type: ignore[assignment]
+    broker.connect()
+
+    order_id = broker._place_order_sync(
+        "BUY",
+        "000001.XSHE",
+        100,
+        10.0,
+        0,
+        extra={"idempotency_key": "signal-execution-stable-key"},
+    )
+
+    assert order_id == "resolved-order-1"
+    assert len(connection.write_requests) == 1
+    assert connection.write_requests[0][0] == "broker.place_order"
+    assert len(connection.resolve_requests) == 1
+    assert connection.resolve_requests[0]["idempotency_key"] == "signal-execution-stable-key"
+    assert (
+        connection.resolve_requests[0]["request_payload"]["idempotency_key"]
+        == "signal-execution-stable-key"
+    )
+
+
+def test_remote_connection_retries_read_once_after_disconnect():
+    """普通只读请求断连后可受控重连重试，并只返回一份结果。"""
+
+    conn = RemoteQmtConnection("127.0.0.1", 0, "token")
+    conn._connected.set()
+    sent = []
+
+    async def _send_disconnect_then_respond(message):
+        """首帧模拟断连，第二帧返回确定的只读结果。"""
+
+        sent.append(message)
+        pending = conn._pending[message["id"]]
+        if len(sent) == 1:
+            pending.set_exception(RuntimeError("连接已断开"))
+        else:
+            pending.set_result({"value": {"available_cash": 1000.0}})
+
+    conn._send = _send_disconnect_then_respond  # type: ignore[method-assign]
+
+    result = asyncio.run(conn._request_async("broker.account", {"account_key": "default"}))
+
+    assert result == {"value": {"available_cash": 1000.0}}
+    assert [message["action"] for message in sent] == ["broker.account", "broker.account"]
+
+
+def test_remote_server_direct_idempotency_and_resolution_contract():
+    """服务端应防止同 key 异载荷，并以缓存/强订单键只读解析。"""
+
+    _ensure_current_event_loop()
+    config = ServerConfig(
+        server_type="stub",
+        listen="127.0.0.1",
+        port=0,
+        token="stub-token",
+        enable_data=True,
+        enable_broker=True,
+        accounts=[AccountConfig(key="default", account_id="demo")],
+    )
+    router = AccountRouter(config.accounts)
+    bundle = build_stub_bundle(config, router)
+    app = ServerApplication(config, router, bundle)
+    session = SimpleNamespace(account_key="default", sub_account_id=None)
+    payload = {
+        "security": "000001.XSHE",
+        "side": "BUY",
+        "amount": 100,
+        "style": {"type": "limit", "price": 10.0},
+        "idempotency_key": "direct-server-idem-1",
+    }
+
+    async def _run():
+        """在单一事件循环中验证幂等占位、冲突和结果解析。"""
+
+        first = await app._dispatch_broker(session, "place_order", dict(payload))
+        second = await app._dispatch_broker(session, "place_order", dict(payload))
+        cached_resolution = await app._dispatch_broker(
+            session,
+            "resolve_submission",
+            {
+                "idempotency_key": payload["idempotency_key"],
+                "write_action": "broker.place_order",
+                "request_payload": dict(payload),
+            },
+        )
+        conflicting = dict(payload)
+        conflicting["amount"] = 200
+        with pytest.raises(IdempotencyConflictError):
+            await app._dispatch_broker(session, "place_order", conflicting)
+        app._idempotency_cache.clear()
+        query_resolution = await app._dispatch_broker(
+            session,
+            "resolve_submission",
+            {
+                "idempotency_key": payload["idempotency_key"],
+                "write_action": "broker.place_order",
+                "request_payload": dict(payload),
+            },
+        )
+        unknown_resolution = await app._dispatch_broker(
+            session,
+            "resolve_submission",
+            {
+                "idempotency_key": "missing-idem-key",
+                "write_action": "broker.place_order",
+                "request_payload": {
+                    "security": "600000.XSHG",
+                    "side": "BUY",
+                    "amount": 100,
+                    "style": {"type": "limit", "price": 9.0},
+                },
+            },
+        )
+        orders = await bundle.broker_adapter.list_orders(router.get("default"))
+        return first, second, cached_resolution, query_resolution, unknown_resolution, orders
+
+    first, second, cached, queried, unknown, orders = asyncio.run(_run())
+
+    assert first["order_id"] == second["order_id"]
+    assert len(orders) == 1
+    assert cached["status"] == "accepted"
+    assert cached["evidence"]["source"] == "idempotency_cache"
+    assert queried["status"] == "accepted"
+    assert queried["evidence"]["source"] == "broker_order_query"
+    assert unknown["status"] == "submit_unknown"
+    assert unknown["order_id"].startswith("submit_unknown:")
 
 
 def test_server_session_extends_place_order_timeout_for_long_wait():
@@ -581,6 +847,33 @@ def test_stub_server_place_order_idempotency(stub_server):
         conn.close()
 
 
+def test_stub_server_returns_stable_idempotency_conflict_code(stub_server):
+    """同 key 异载荷必须返回稳定冲突码，且不得创建第二笔委托。"""
+
+    conn = _make_connection(stub_server)
+    try:
+        before = conn.request("broker.orders", {})
+        payload = {
+            "security": "600000.XSHG",
+            "side": "BUY",
+            "amount": 100,
+            "style": {"type": "limit", "price": 9.0},
+            "idempotency_key": "idem-conflict-code-1",
+        }
+        conn.request("broker.place_order", payload)
+        conflicting = dict(payload)
+        conflicting["amount"] = 200
+
+        with pytest.raises(RemoteServerError) as exc_info:
+            conn.request("broker.place_order", conflicting)
+
+        assert exc_info.value.code == "IDEMPOTENCY_CONFLICT"
+        after = conn.request("broker.orders", {})
+        assert len(after) == len(before) + 1
+    finally:
+        conn.close()
+
+
 def test_remote_data_provider_dataframe_conversion():
     from bullet_trade.data.providers.remote_qmt import _dataframe_from_payload
 
@@ -656,13 +949,9 @@ def test_remote_data_provider_dispatches_standard_tick_callback():
     received = []
     provider.set_tick_callback(lambda tick: received.append(tick))
 
-    provider._handle_tick_event(
-        {"symbol": "000001.SZ", "lastPrice": 12.34, "time": "09:30:00"}
-    )
+    provider._handle_tick_event({"symbol": "000001.SZ", "lastPrice": 12.34, "time": "09:30:00"})
 
-    assert received == [
-        {"sid": "000001.XSHE", "last_price": 12.34, "dt": "09:30:00"}
-    ]
+    assert received == [{"sid": "000001.XSHE", "last_price": 12.34, "dt": "09:30:00"}]
 
 
 def test_remote_data_provider_preserves_legacy_context_callback():
@@ -682,9 +971,7 @@ def test_remote_data_provider_preserves_legacy_context_callback():
 
     provider._handle_tick_event({"sid": "600000.SH", "last_price": 8.76})
 
-    assert received == [
-        (context, {"sid": "600000.XSHG", "last_price": 8.76, "dt": None})
-    ]
+    assert received == [(context, {"sid": "600000.XSHG", "last_price": 8.76, "dt": None})]
 
 
 @pytest.mark.asyncio

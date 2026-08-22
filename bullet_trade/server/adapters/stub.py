@@ -4,9 +4,15 @@ import asyncio
 import time
 from typing import Any, Dict, List, Optional
 
-from .base import AccountRouter, AdapterBundle, RemoteBrokerAdapter, RemoteDataAdapter, AccountContext
-from ..config import ServerConfig, AccountConfig
+from ..config import AccountConfig, ServerConfig
 from . import register_adapter
+from .base import (
+    AccountContext,
+    AccountRouter,
+    AdapterBundle,
+    RemoteBrokerAdapter,
+    RemoteDataAdapter,
+)
 
 
 def _first_present(*values: Any) -> Any:
@@ -45,18 +51,88 @@ _DEFAULT_TRADE_DAYS = [
 _DEFAULT_HISTORY_FIELDS = ["open", "close", "high", "low", "volume", "money"]
 _DEFAULT_HISTORY_ROWS = {
     "1m": [
-        {"open": 11.18, "close": 11.19, "high": 11.19, "low": 11.18, "volume": 1814.0, "money": 2029316.0},
-        {"open": 11.19, "close": 11.20, "high": 11.20, "low": 11.19, "volume": 4008.0, "money": 4486960.0},
-        {"open": 11.20, "close": 11.20, "high": 11.20, "low": 11.19, "volume": 1025.0, "money": 1147150.0},
-        {"open": 11.19, "close": 11.19, "high": 11.20, "low": 11.19, "volume": 586.0, "money": 655831.0},
-        {"open": 11.19, "close": 11.20, "high": 11.20, "low": 11.19, "volume": 1893.0, "money": 2118342.0},
+        {
+            "open": 11.18,
+            "close": 11.19,
+            "high": 11.19,
+            "low": 11.18,
+            "volume": 1814.0,
+            "money": 2029316.0,
+        },
+        {
+            "open": 11.19,
+            "close": 11.20,
+            "high": 11.20,
+            "low": 11.19,
+            "volume": 4008.0,
+            "money": 4486960.0,
+        },
+        {
+            "open": 11.20,
+            "close": 11.20,
+            "high": 11.20,
+            "low": 11.19,
+            "volume": 1025.0,
+            "money": 1147150.0,
+        },
+        {
+            "open": 11.19,
+            "close": 11.19,
+            "high": 11.20,
+            "low": 11.19,
+            "volume": 586.0,
+            "money": 655831.0,
+        },
+        {
+            "open": 11.19,
+            "close": 11.20,
+            "high": 11.20,
+            "low": 11.19,
+            "volume": 1893.0,
+            "money": 2118342.0,
+        },
     ],
     "1d": [
-        {"open": 10.91, "close": 10.94, "high": 11.05, "low": 10.90, "volume": 827664.0, "money": 909199430.0},
-        {"open": 10.91, "close": 11.02, "high": 11.05, "low": 10.83, "volume": 884129.0, "money": 972821270.0},
-        {"open": 10.98, "close": 10.99, "high": 11.05, "low": 10.94, "volume": 632522.0, "money": 696208267.0},
-        {"open": 11.00, "close": 11.08, "high": 11.18, "low": 10.99, "volume": 1164565.0, "money": 1294675716.0},
-        {"open": 11.09, "close": 11.20, "high": 11.23, "low": 11.08, "volume": 532556.0, "money": 594385527.0},
+        {
+            "open": 10.91,
+            "close": 10.94,
+            "high": 11.05,
+            "low": 10.90,
+            "volume": 827664.0,
+            "money": 909199430.0,
+        },
+        {
+            "open": 10.91,
+            "close": 11.02,
+            "high": 11.05,
+            "low": 10.83,
+            "volume": 884129.0,
+            "money": 972821270.0,
+        },
+        {
+            "open": 10.98,
+            "close": 10.99,
+            "high": 11.05,
+            "low": 10.94,
+            "volume": 632522.0,
+            "money": 696208267.0,
+        },
+        {
+            "open": 11.00,
+            "close": 11.08,
+            "high": 11.18,
+            "low": 10.99,
+            "volume": 1164565.0,
+            "money": 1294675716.0,
+        },
+        {
+            "open": 11.09,
+            "close": 11.20,
+            "high": 11.23,
+            "low": 11.08,
+            "volume": 532556.0,
+            "money": 594385527.0,
+        },
     ],
 }
 _DEFAULT_SYMBOL_NAMES = {
@@ -150,7 +226,9 @@ class StubDataAdapter(RemoteDataAdapter):
     def __init__(self) -> None:
         self._ticks: Dict[str, Dict] = {}
         self._trade_days = list(_DEFAULT_TRADE_DAYS)
-        self._history_rows = {key: [dict(row) for row in rows] for key, rows in _DEFAULT_HISTORY_ROWS.items()}
+        self._history_rows = {
+            key: [dict(row) for row in rows] for key, rows in _DEFAULT_HISTORY_ROWS.items()
+        }
 
     def _tick_for(self, symbol: str) -> Dict[str, Any]:
         now = "2026-04-01 09:30:00"
@@ -293,7 +371,9 @@ class StubBrokerAdapter(RemoteBrokerAdapter):
         state = self._account_state_for(account)
         market_value = 0.0
         for row in self._positions_for(account).values():
-            last_price = _as_float(_first_present(row.get("last_price"), row.get("current_price"), row.get("price")))
+            last_price = _as_float(
+                _first_present(row.get("last_price"), row.get("current_price"), row.get("price"))
+            )
             amount = _as_int(_first_present(row.get("amount"), row.get("volume")))
             row.setdefault("name", _stub_display_name(_normalize_security(row.get("security"))))
             row.setdefault("current_price", last_price)
@@ -301,7 +381,9 @@ class StubBrokerAdapter(RemoteBrokerAdapter):
             market_value += row["market_value"]
         state["market_value"] = round(market_value, 2)
         state["transferable_cash"] = round(state.get("available_cash", 0.0), 2)
-        state["total_value"] = round(state.get("available_cash", 0.0) + state.get("frozen_cash", 0.0) + market_value, 2)
+        state["total_value"] = round(
+            state.get("available_cash", 0.0) + state.get("frozen_cash", 0.0) + market_value, 2
+        )
         state["total_asset"] = state["total_value"]
 
     def _account_snapshot(self, account: AccountContext) -> Dict[str, Any]:
@@ -321,7 +403,9 @@ class StubBrokerAdapter(RemoteBrokerAdapter):
 
     def _scenario_payload(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         scenario = payload.get("stub_scenario")
-        if isinstance(payload.get("meta"), dict) and isinstance(payload["meta"].get("stub_scenario"), dict):
+        if isinstance(payload.get("meta"), dict) and isinstance(
+            payload["meta"].get("stub_scenario"), dict
+        ):
             scenario = payload["meta"]["stub_scenario"]
         if scenario in (None, "", {}):
             security = str(payload.get("security") or "").strip().upper()
@@ -372,13 +456,21 @@ class StubBrokerAdapter(RemoteBrokerAdapter):
         order["frozen_amount"] = 0
         if order["side"] == "BUY":
             if reserved_cash > 0:
-                state["frozen_cash"] = round(max(state.get("frozen_cash", 0.0) - reserved_cash, 0.0), 2)
+                state["frozen_cash"] = round(
+                    max(state.get("frozen_cash", 0.0) - reserved_cash, 0.0), 2
+                )
                 state["available_cash"] = round(
-                    state.get("available_cash", 0.0) + reserved_cash - deal_balance - commission - tax,
+                    state.get("available_cash", 0.0)
+                    + reserved_cash
+                    - deal_balance
+                    - commission
+                    - tax,
                     2,
                 )
             else:
-                state["available_cash"] = round(state.get("available_cash", 0.0) - deal_balance - commission - tax, 2)
+                state["available_cash"] = round(
+                    state.get("available_cash", 0.0) - deal_balance - commission - tax, 2
+                )
             if filled > 0:
                 position = positions.get(order["security"]) or {
                     "security": order["security"],
@@ -392,7 +484,11 @@ class StubBrokerAdapter(RemoteBrokerAdapter):
                 old_amount = _as_int(position.get("amount"))
                 old_cost = _as_float(position.get("avg_cost"))
                 new_amount = old_amount + filled
-                weighted_cost = traded_price if old_amount <= 0 else ((old_amount * old_cost) + deal_balance) / max(new_amount, 1)
+                weighted_cost = (
+                    traded_price
+                    if old_amount <= 0
+                    else ((old_amount * old_cost) + deal_balance) / max(new_amount, 1)
+                )
                 position.update(
                     {
                         "amount": new_amount,
@@ -406,7 +502,9 @@ class StubBrokerAdapter(RemoteBrokerAdapter):
                 )
                 positions[order["security"]] = position
         else:
-            state["available_cash"] = round(state.get("available_cash", 0.0) + deal_balance - commission - tax, 2)
+            state["available_cash"] = round(
+                state.get("available_cash", 0.0) + deal_balance - commission - tax, 2
+            )
             position = positions.get(order["security"]) or {
                 "security": order["security"],
                 "amount": 0,
@@ -420,7 +518,9 @@ class StubBrokerAdapter(RemoteBrokerAdapter):
             current_available = _as_int(position.get("available_amount"))
             current_frozen = _as_int(position.get("frozen_volume"))
             if reserved_amount > 0:
-                new_available = min(current_available + max(reserved_amount - filled, 0), new_amount)
+                new_available = min(
+                    current_available + max(reserved_amount - filled, 0), new_amount
+                )
                 new_frozen = max(current_frozen - reserved_amount, 0)
             else:
                 new_available = min(current_available, new_amount)
@@ -460,7 +560,9 @@ class StubBrokerAdapter(RemoteBrokerAdapter):
         state = self._account_state_for(account)
         positions = self._positions_for(account)
         if order["side"] == "BUY":
-            freeze_cash = round(_as_float(order.get("order_price")) * _as_int(order.get("amount")), 2)
+            freeze_cash = round(
+                _as_float(order.get("order_price")) * _as_int(order.get("amount")), 2
+            )
             state["available_cash"] = round(state.get("available_cash", 0.0) - freeze_cash, 2)
             state["frozen_cash"] = round(state.get("frozen_cash", 0.0) + freeze_cash, 2)
             order["frozen_cash"] = freeze_cash
@@ -488,17 +590,23 @@ class StubBrokerAdapter(RemoteBrokerAdapter):
             order["frozen_amount"] = freeze_amount
         self._recalculate_account_totals(account)
 
-    async def get_account_info(self, account: AccountContext, payload: Optional[Dict] = None) -> Dict:
+    async def get_account_info(
+        self, account: AccountContext, payload: Optional[Dict] = None
+    ) -> Dict:
         _ = payload
         self._recalculate_account_totals(account)
         return _dict_payload(self._account_snapshot(account))
 
-    async def get_positions(self, account: AccountContext, payload: Optional[Dict] = None) -> List[Dict]:
+    async def get_positions(
+        self, account: AccountContext, payload: Optional[Dict] = None
+    ) -> List[Dict]:
         _ = payload
         self._recalculate_account_totals(account)
         return [dict(row) for row in self._positions_for(account).values()]
 
-    async def list_orders(self, account: AccountContext, filters: Optional[Dict] = None) -> List[Dict]:
+    async def list_orders(
+        self, account: AccountContext, filters: Optional[Dict] = None
+    ) -> List[Dict]:
         rows = list(self._orders_for(account))
         if filters and filters.get("order_id"):
             rows = [row for row in rows if str(row.get("order_id")) == str(filters["order_id"])]
@@ -506,7 +614,9 @@ class StubBrokerAdapter(RemoteBrokerAdapter):
             rows = [row for row in rows if str(row.get("security")) == str(filters["security"])]
         return [dict(row) for row in rows]
 
-    async def list_trades(self, account: AccountContext, filters: Optional[Dict] = None) -> List[Dict]:
+    async def list_trades(
+        self, account: AccountContext, filters: Optional[Dict] = None
+    ) -> List[Dict]:
         rows = list(self._trades_for(account))
         if filters and filters.get("order_id"):
             rows = [row for row in rows if str(row.get("order_id")) == str(filters["order_id"])]
@@ -514,7 +624,12 @@ class StubBrokerAdapter(RemoteBrokerAdapter):
             rows = [row for row in rows if str(row.get("security")) == str(filters["security"])]
         return [dict(row) for row in rows]
 
-    async def get_order_status(self, account: AccountContext, order_id: Optional[str] = None, payload: Optional[Dict] = None) -> Dict:
+    async def get_order_status(
+        self,
+        account: AccountContext,
+        order_id: Optional[str] = None,
+        payload: Optional[Dict] = None,
+    ) -> Dict:
         if not order_id and payload:
             order_id = payload.get("order_id")
         for order in self._orders_for(account):
@@ -526,8 +641,12 @@ class StubBrokerAdapter(RemoteBrokerAdapter):
         scenario = self._scenario_payload(payload)
         side = str(payload.get("side") or "BUY").upper()
         style = payload.get("style") or {}
-        style_type = "market" if bool(payload.get("market")) else str(style.get("type") or "limit").lower()
-        order_price = _as_float(_first_present(style.get("price"), style.get("protect_price"), payload.get("price")))
+        style_type = (
+            "market" if bool(payload.get("market")) else str(style.get("type") or "limit").lower()
+        )
+        order_price = _as_float(
+            _first_present(style.get("price"), style.get("protect_price"), payload.get("price"))
+        )
         amount = _as_int(_first_present(payload.get("amount"), payload.get("volume")))
         status = _normalize_status(scenario.get("status") or "open")
         order_idx = len(self._orders_for(account)) + 1
@@ -553,6 +672,9 @@ class StubBrokerAdapter(RemoteBrokerAdapter):
             "frozen_amount": 0,
             "order_remark": payload.get("order_remark") or payload.get("remark") or "bullet-trade",
             "strategy_name": payload.get("strategy_name") or "bullet-trade",
+            "idempotency_key": payload.get("idempotency_key"),
+            "client_order_id": payload.get("client_order_id"),
+            "request_id": payload.get("request_id"),
             "status_msg": str(scenario.get("status_msg") or ""),
             "price_type": _price_type_for(style_type),
             "order_time": _as_int(scenario.get("order_time"), int(time.time())),
@@ -563,8 +685,12 @@ class StubBrokerAdapter(RemoteBrokerAdapter):
         if status in {"filled", "partly_canceled", "partly_filled", "rejected"}:
             filled_default = amount if status == "filled" else 0
             filled = min(_as_int(scenario.get("filled"), filled_default), amount)
-            traded_price = _as_float(_first_present(scenario.get("traded_price"), scenario.get("price"), order_price))
-            commission = _as_float(_first_present(scenario.get("commission_fee"), scenario.get("commission")), 0.0)
+            traded_price = _as_float(
+                _first_present(scenario.get("traded_price"), scenario.get("price"), order_price)
+            )
+            commission = _as_float(
+                _first_present(scenario.get("commission_fee"), scenario.get("commission")), 0.0
+            )
             tax = _as_float(scenario.get("tax"), 0.0)
             self._apply_terminal_execution(
                 account=account,
@@ -579,7 +705,12 @@ class StubBrokerAdapter(RemoteBrokerAdapter):
             self._apply_open_reservation(account=account, order=order)
         return order
 
-    async def cancel_order(self, account: AccountContext, order_id: Optional[str] = None, payload: Optional[Dict] = None) -> Dict:
+    async def cancel_order(
+        self,
+        account: AccountContext,
+        order_id: Optional[str] = None,
+        payload: Optional[Dict] = None,
+    ) -> Dict:
         if not order_id and payload:
             order_id = payload.get("order_id")
         orders = self._orders_for(account)
@@ -592,18 +723,27 @@ class StubBrokerAdapter(RemoteBrokerAdapter):
                     state = self._account_state_for(account)
                     if _as_float(order.get("frozen_cash")) > 0:
                         release_cash = _as_float(order.get("frozen_cash"))
-                        state["available_cash"] = round(state.get("available_cash", 0.0) + release_cash, 2)
-                        state["frozen_cash"] = round(max(state.get("frozen_cash", 0.0) - release_cash, 0.0), 2)
+                        state["available_cash"] = round(
+                            state.get("available_cash", 0.0) + release_cash, 2
+                        )
+                        state["frozen_cash"] = round(
+                            max(state.get("frozen_cash", 0.0) - release_cash, 0.0), 2
+                        )
                         order["frozen_cash"] = 0.0
                     if _as_int(order.get("frozen_amount")) > 0:
                         position = self._positions_for(account).get(order["security"])
                         if position is not None:
                             release_amount = _as_int(order.get("frozen_amount"))
-                            available = min(_as_int(position.get("available_amount")) + release_amount, _as_int(position.get("amount")))
+                            available = min(
+                                _as_int(position.get("available_amount")) + release_amount,
+                                _as_int(position.get("amount")),
+                            )
                             position["available_amount"] = available
                             position["closeable_amount"] = available
                             position["can_use_volume"] = available
-                            position["frozen_volume"] = max(_as_int(position.get("frozen_volume")) - release_amount, 0)
+                            position["frozen_volume"] = max(
+                                _as_int(position.get("frozen_volume")) - release_amount, 0
+                            )
                         order["frozen_amount"] = 0
                     self._recalculate_account_totals(account)
                 snapshot = dict(order)
@@ -619,9 +759,26 @@ class StubBrokerAdapter(RemoteBrokerAdapter):
 
 
 def build_stub_bundle(config: ServerConfig, router: AccountRouter) -> AdapterBundle:
+    """构造显式豁免持久幂等要求的内存测试 bundle。
+
+    Args:
+        config: server 配置；stub 不读取真实交易凭据。
+        router: 内存账户路由器。
+
+    Returns:
+        AdapterBundle: 仅供测试和文档演示使用的 adapter 组合。
+    """
+
+    _ = config
     if not router.list_accounts():
-        router._accounts["default"] = AccountContext(AccountConfig(key="default", account_id="demo"))
-    return AdapterBundle(data_adapter=StubDataAdapter(), broker_adapter=StubBrokerAdapter(router))
+        router._accounts["default"] = AccountContext(
+            AccountConfig(key="default", account_id="demo")
+        )
+    return AdapterBundle(
+        data_adapter=StubDataAdapter(),
+        broker_adapter=StubBrokerAdapter(router),
+        broker_writes_require_persistent_idempotency=False,
+    )
 
 
 register_adapter("stub", build_stub_bundle)

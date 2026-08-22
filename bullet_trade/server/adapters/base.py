@@ -30,10 +30,14 @@ class RemoteBrokerAdapter(Protocol):
     async def get_positions(self, account: AccountContext) -> List[Dict]:
         ...
 
-    async def list_orders(self, account: AccountContext, filters: Optional[Dict] = None) -> List[Dict]:
+    async def list_orders(
+        self, account: AccountContext, filters: Optional[Dict] = None
+    ) -> List[Dict]:
         ...
 
-    async def list_trades(self, account: AccountContext, filters: Optional[Dict] = None) -> List[Dict]:
+    async def list_trades(
+        self, account: AccountContext, filters: Optional[Dict] = None
+    ) -> List[Dict]:
         ...
 
     async def get_order_status(self, account: AccountContext, order_id: str) -> Dict:
@@ -68,8 +72,16 @@ class RemoteDataAdapter(Protocol):
 
 @dataclass
 class AdapterBundle:
+    """聚合行情与券商 adapter，并声明交易写入安全能力。
+
+    默认只要提供 broker adapter，就必须启用持久幂等账本。只有明确的测试 adapter
+    可以把 ``broker_writes_require_persistent_idempotency`` 设为 False，避免未知或
+    第三方真实交易 adapter 因名称未进入枚举而绕过安全门禁。
+    """
+
     data_adapter: Optional[RemoteDataAdapter]
     broker_adapter: Optional[RemoteBrokerAdapter]
+    broker_writes_require_persistent_idempotency: bool = True
 
 
 class AccountRouter:
@@ -83,7 +95,13 @@ class AccountRouter:
         }
         if "default" not in self._accounts and configs:
             self._accounts["default"] = AccountContext(configs[0])
-        self._lock = asyncio.Lock()
+        self._lock: Optional[asyncio.Lock] = None
+
+    @property
+    def lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     def list_accounts(self) -> List[AccountContext]:
         return list(self._accounts.values())
@@ -96,7 +114,7 @@ class AccountRouter:
         raise KeyError("未配置有效的 account_key")
 
     async def attach_handle(self, key: str, handle: object) -> None:
-        async with self._lock:
+        async with self.lock:
             ctx = self.get(key)
             ctx.broker_handle = handle
 
@@ -116,9 +134,17 @@ class VirtualAccountManager:
         self._configs: Dict[str, SubAccountState] = {
             cfg.sub_account_id: SubAccountState(cfg) for cfg in configs
         }
-        self._lock = asyncio.Lock()
+        self._lock: Optional[asyncio.Lock] = None
 
-    def resolve(self, account_key: Optional[str], sub_account_id: Optional[str]) -> Tuple[str, Optional[SubAccountConfig]]:
+    @property
+    def lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    def resolve(
+        self, account_key: Optional[str], sub_account_id: Optional[str]
+    ) -> Tuple[str, Optional[SubAccountConfig]]:
         if not sub_account_id:
             return account_key or "default", None
         actual_sub = sub_account_id
@@ -134,7 +160,9 @@ class VirtualAccountManager:
         cfg = state.config if state else None
         return parent_key, cfg
 
-    async def ensure_within_limit(self, sub_cfg: Optional[SubAccountConfig], order_value: Optional[float]) -> None:
+    async def ensure_within_limit(
+        self, sub_cfg: Optional[SubAccountConfig], order_value: Optional[float]
+    ) -> None:
         if sub_cfg is None or sub_cfg.order_limit is None:
             return
         if order_value is None:

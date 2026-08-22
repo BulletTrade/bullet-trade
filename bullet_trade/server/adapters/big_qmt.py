@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import time
 import urllib.error
@@ -22,7 +23,6 @@ from .base import (
     RemoteDataAdapter,
 )
 from .qmt import dataframe_to_payload, dict_payload
-
 
 _DATA_ACTIONS = (
     "data.history",
@@ -121,7 +121,9 @@ class BigQmtGatewayClient:
     async def post(self, path: str, payload: Optional[Dict[str, Any]] = None) -> Any:
         return await self._run_blocking(self.request_json, path, payload or {}, "POST")
 
-    async def post_first(self, paths: Iterable[str], payload: Optional[Dict[str, Any]] = None) -> Any:
+    async def post_first(
+        self, paths: Iterable[str], payload: Optional[Dict[str, Any]] = None
+    ) -> Any:
         last_error: Optional[BigQmtGatewayError] = None
         for path in paths:
             try:
@@ -289,14 +291,19 @@ class BigQmtDataAdapter(RemoteDataAdapter):
 
     async def get_live_current(self, payload: Dict) -> Dict:
         security = payload.get("security")
-        data = await self.client.post_first(("/data/live_current", "/data/current_tick", "/data/snapshot"), payload)
+        data = await self.client.post_first(
+            ("/data/live_current", "/data/current_tick", "/data/snapshot"), payload
+        )
         return _normalize_live_current_tick(_select_tick(data, security))
 
     async def get_trade_days(self, payload: Dict) -> Dict:
         data = await self.client.post("/data/trade_days", payload)
         if isinstance(data, dict) and data.get("dtype") == "list":
             values = _extract_list(data, "values")
-            return {"dtype": "list", "values": [_normalize_trade_day_value(item) for item in values]}
+            return {
+                "dtype": "list",
+                "values": [_normalize_trade_day_value(item) for item in values],
+            }
         values = _extract_list(data, "values")
         return {"dtype": "list", "values": [_normalize_trade_day_value(item) for item in values]}
 
@@ -369,7 +376,9 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
             if isinstance(item, dict)
         ]
 
-    async def list_orders(self, account: AccountContext, filters: Optional[Dict] = None) -> List[Dict]:
+    async def list_orders(
+        self, account: AccountContext, filters: Optional[Dict] = None
+    ) -> List[Dict]:
         payload = self._account_payload(account)
         payload.update(_gateway_order_filters(filters or {}))
         data = await self.client.post("/orders", payload)
@@ -380,7 +389,9 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
         ]
         return _filter_orders(orders, filters or {})
 
-    async def list_trades(self, account: AccountContext, filters: Optional[Dict] = None) -> List[Dict]:
+    async def list_trades(
+        self, account: AccountContext, filters: Optional[Dict] = None
+    ) -> List[Dict]:
         payload = self._account_payload(account)
         payload.update(_gateway_order_filters(filters or {}))
         data = await self.client.post("/trades", payload)
@@ -401,6 +412,8 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
         request = self._account_payload(account)
         request.update(payload or {})
         _ensure_virtual_account_remark(request)
+        _ensure_gateway_submission_identity(request)
+        submitted_at = time.time()
         wait_timeout = _positive_float((payload or {}).get("wait_timeout"))
         known_order_ids = set()
         if wait_timeout > 0:
@@ -408,8 +421,13 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
         data = await self.client.post("/place_order", request)
         order = _normalize_order(_extract_dict(data))
         if wait_timeout <= 0:
-            return order
-        return await self._confirm_place_order_submission(account, request, order, wait_timeout, known_order_ids)
+            return _submission_unknown_order(
+                order,
+                "big QMT 下单未配置确认等待窗口，不能仅凭 passorder 返回确认订单",
+            )
+        return await self._confirm_place_order_submission(
+            account, request, order, wait_timeout, known_order_ids, submitted_at
+        )
 
     async def _confirm_place_order_submission(
         self,
@@ -418,16 +436,22 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
         order: Dict[str, Any],
         wait_timeout: float,
         known_order_ids: Optional[set] = None,
+        submitted_at: Optional[float] = None,
     ) -> Dict[str, Any]:
         deadline = time.monotonic() + wait_timeout
         last_snapshot: Optional[Dict[str, Any]] = None
         while True:
-            matched = await self._find_submitted_order(account, request, order, known_order_ids or set())
+            matched = await self._find_submitted_order(
+                account, request, order, known_order_ids or set(), submitted_at
+            )
             if matched:
                 last_snapshot = dict(matched)
                 if not _order_has_order_id(matched) and time.monotonic() < deadline:
                     await asyncio.sleep(
-                        min(_ORDER_CONFIRM_POLL_INTERVAL_SECONDS, max(0.0, deadline - time.monotonic()))
+                        min(
+                            _ORDER_CONFIRM_POLL_INTERVAL_SECONDS,
+                            max(0.0, deadline - time.monotonic()),
+                        )
                     )
                     continue
                 confirmed = dict(matched)
@@ -455,7 +479,9 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
                 return confirmed
             if time.monotonic() >= deadline:
                 break
-            await asyncio.sleep(min(_ORDER_CONFIRM_POLL_INTERVAL_SECONDS, max(0.0, deadline - time.monotonic())))
+            await asyncio.sleep(
+                min(_ORDER_CONFIRM_POLL_INTERVAL_SECONDS, max(0.0, deadline - time.monotonic()))
+            )
         result = dict(order)
         result["status"] = "submit_unknown"
         result["submit_unknown"] = True
@@ -481,9 +507,12 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
         request: Dict[str, Any],
         order: Dict[str, Any],
         known_order_ids: Optional[set] = None,
+        submitted_at: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
         known = {str(item) for item in (known_order_ids or set()) if str(item)}
-        qmt_user_order_id = str(order.get("qmt_user_order_id") or "").strip()
+        qmt_user_order_id = str(
+            request.get("qmt_user_order_id") or order.get("qmt_user_order_id") or ""
+        ).strip()
         order_id = str(order.get("order_id") or order.get("order_ref") or "").strip()
         if order_id and order_id != "0":
             filters = {"order_id": order_id}
@@ -491,9 +520,14 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
             if sub_account_id:
                 filters["sub_account_id"] = sub_account_id
             orders = await self.list_orders(account, filters)
-            if orders:
-                return orders[0]
-        filters = {"security": request.get("security") or request.get("stock") or request.get("stockcode")}
+            for item in orders:
+                if _matches_confirmed_big_qmt_submission(
+                    item, request, qmt_user_order_id, known, submitted_at
+                ):
+                    return item
+        filters = {
+            "security": request.get("security") or request.get("stock") or request.get("stockcode")
+        }
         sub_account_id = _virtual_account_id(request)
         if sub_account_id:
             filters["sub_account_id"] = sub_account_id
@@ -502,35 +536,10 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
             item_id = str(item.get("order_id") or "").strip()
             if item_id and item_id in known:
                 continue
-            if _order_matches_qmt_user_order_id(item, qmt_user_order_id):
+            if _matches_confirmed_big_qmt_submission(
+                item, request, qmt_user_order_id, known, submitted_at
+            ):
                 return item
-        for item in orders:
-            item_id = str(item.get("order_id") or "").strip()
-            if item_id and item_id in known:
-                continue
-            if _order_matches_place_request(item, request):
-                return item
-        security = request.get("security") or request.get("stock") or request.get("stockcode")
-        if security:
-            # Big QMT passorder often returns 0 and may not echo our remark.
-            # Fall back to a before/after order-id diff, then match the economic
-            # order fields without trusting stale helper-side tag mappings.
-            candidates = await self.list_orders(account, {"security": security})
-            if qmt_user_order_id:
-                for item in candidates:
-                    item_id = str(item.get("order_id") or "").strip()
-                    if item_id and item_id in known:
-                        continue
-                    if _order_matches_qmt_user_order_id(item, qmt_user_order_id):
-                        return item
-            for item in candidates:
-                item_id = str(item.get("order_id") or "").strip()
-                if not item_id:
-                    continue
-                if item_id in known:
-                    continue
-                if _order_matches_place_request_relaxed(item, request):
-                    return item
         return None
 
     async def _snapshot_order_ids(self, account: AccountContext, request: Dict[str, Any]) -> set:
@@ -565,7 +574,9 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
         if remark:
             tag["order_remark"] = remark
             tag["remark"] = remark
-        strategy_name = str(request.get("strategy_name") or request.get("strategyName") or "").strip()
+        strategy_name = str(
+            request.get("strategy_name") or request.get("strategyName") or ""
+        ).strip()
         if strategy_name:
             tag["strategy_name"] = strategy_name
         if tag:
@@ -624,7 +635,9 @@ def _build_action_status(
         else:
             status[action] = _status("ready", "")
     for action in _BROKER_READ_ACTIONS:
-        status[action] = _status("ready" if server_config.enable_broker else "unavailable", "broker module disabled")
+        status[action] = _status(
+            "ready" if server_config.enable_broker else "unavailable", "broker module disabled"
+        )
     place_state = "ready" if server_config.enable_broker else "unavailable"
     place_reason = "" if place_state == "ready" else "broker module disabled"
     status["broker.place_order"] = _status(place_state, place_reason)
@@ -777,9 +790,7 @@ def _as_float(value: Any, default: float = 0.0) -> float:
 def _normalize_snapshot_tick(tick: Dict[str, Any], security: Optional[str]) -> Dict:
     if not tick:
         return {}
-    last_price = _as_float_or_none(
-        _first_present(tick, "last_price", "lastPrice", "price", "last")
-    )
+    last_price = _as_float_or_none(_first_present(tick, "last_price", "lastPrice", "price", "last"))
     if last_price is None:
         return dict(tick)
     sid = (
@@ -797,9 +808,7 @@ def _normalize_snapshot_tick(tick: Dict[str, Any], security: Optional[str]) -> D
 def _normalize_live_current_tick(tick: Dict[str, Any]) -> Dict:
     if not tick:
         return {}
-    last_price = _as_float_or_none(
-        _first_present(tick, "last_price", "lastPrice", "price", "last")
-    )
+    last_price = _as_float_or_none(_first_present(tick, "last_price", "lastPrice", "price", "last"))
     if last_price is None:
         return dict(tick)
     paused = tick.get("paused")
@@ -850,7 +859,7 @@ def _extract_virtual_account_from_remark(remark: Any) -> str:
         item = token.strip()
         for prefix in ("sub:", "sub_account_id=", "virtual_account_id=", "sub=", "virtual="):
             if item.startswith(prefix):
-                return item[len(prefix):].strip()
+                return item[len(prefix) :].strip()
     return ""
 
 
@@ -891,6 +900,31 @@ def _ensure_virtual_account_remark(payload: Dict[str, Any]) -> None:
         encoded = f"{encoded}|{remark}"
     payload["order_remark"] = encoded
     payload.setdefault("remark", encoded)
+
+
+def _ensure_gateway_submission_identity(payload: Dict[str, Any]) -> None:
+    """为 Big QMT 下单生成可回查且不泄漏原幂等键的强关联标识。
+
+    Args:
+        payload: 即将发往 gateway 的下单请求，会原地补充 `qmt_user_order_id`。
+
+    Returns:
+        None。
+
+    Side Effects:
+        使用原幂等键的 SHA-256 截断摘要生成稳定标识，禁止依赖证券/价格/数量等经济字段。
+    """
+
+    if str(payload.get("qmt_user_order_id") or "").strip():
+        return
+    idempotency_key = str(payload.get("idempotency_key") or "").strip()
+    if not idempotency_key:
+        # 直接调用 adapter 的离线/兼容入口不经过 ServerApplication；仍生成一次性强键，
+        # 但生产远程写必须由服务端提供可持久化的原 idempotency_key。
+        idempotency_key = f"big-qmt-direct-{uuid4().hex}"
+        payload["idempotency_key"] = idempotency_key
+    digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:28]
+    payload["qmt_user_order_id"] = f"BT-{digest}"
 
 
 def _positive_float(value: Any) -> float:
@@ -948,9 +982,113 @@ def _order_matches_qmt_user_order_id(order: Dict[str, Any], qmt_user_order_id: s
     return any(str(item or "").strip() == qmt_user_order_id for item in candidates)
 
 
+def _matches_confirmed_big_qmt_submission(
+    order: Dict[str, Any],
+    request: Dict[str, Any],
+    qmt_user_order_id: str,
+    known_order_ids: set,
+    submitted_at: Optional[float],
+) -> bool:
+    """确认 Big QMT 订单具备强身份、方向和安全时间证据。
+
+    Args:
+        order: 当前轮询得到的归一化订单。
+        request: 原始下单请求。
+        qmt_user_order_id: 下单前生成并透传的强关联标识。
+        known_order_ids: 下单前已经存在的订单号集合。
+        submitted_at: 请求发送前的 wall-clock 时间戳。
+
+    Returns:
+        bool: 订单号新出现、强标识、证券/方向/数量和时间证据全部一致时返回 True。
+    """
+
+    order_id = str(order.get("order_id") or "").strip()
+    if not order_id or order_id in known_order_ids:
+        return False
+    if not _has_strong_submission_identity(order, request, qmt_user_order_id):
+        return False
+    if not _order_matches_place_request(order, request):
+        return False
+    return _order_has_safe_submission_time(order, submitted_at)
+
+
+def _has_strong_submission_identity(
+    order: Dict[str, Any], request: Dict[str, Any], qmt_user_order_id: str
+) -> bool:
+    """确认回报回显了强客户键，或完全相同的显式订单备注。
+
+    Args:
+        order: 当前轮询得到的归一化订单。
+        request: 原始下单请求。
+        qmt_user_order_id: 服务端由幂等键导出的客户标识。
+
+    Returns:
+        bool: 客户键精确相同，或明确携带的订单备注完全相同时返回 True。
+    """
+
+    if qmt_user_order_id and _order_matches_qmt_user_order_id(order, qmt_user_order_id):
+        return True
+    request_remark = str(request.get("order_remark") or request.get("remark") or "").strip()
+    order_remark = str(order.get("order_remark") or order.get("remark") or "").strip()
+    return bool(request_remark and order_remark and request_remark == order_remark)
+
+
+def _order_has_safe_submission_time(order: Dict[str, Any], submitted_at: Optional[float]) -> bool:
+    """校验订单回报时间没有早于本次下单开始，拒绝旧委托误认。
+
+    Args:
+        order: 归一化订单事实。
+        submitted_at: 请求发送前的 wall-clock 时间戳。
+
+    Returns:
+        bool: 找到可解析订单时间且它不早于请求前五秒时返回 True。
+    """
+
+    if submitted_at is None:
+        return False
+    for key in ("order_time", "insert_time", "datetime", "time", "m_strInsertTime"):
+        value = order.get(key)
+        parsed = _parse_order_timestamp(value)
+        if parsed is not None:
+            return parsed >= submitted_at - 5.0
+    return False
+
+
+def _parse_order_timestamp(value: Any) -> Optional[float]:
+    """解析 gateway 订单时间为 Unix 秒，无法解析则返回 None。
+
+    Args:
+        value: epoch 秒/毫秒或 ISO 格式的订单时间。
+
+    Returns:
+        Optional[float]: Unix 秒时间戳；格式不可信时为 None。
+    """
+
+    if value in (None, ""):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        number = 0.0
+    if number > 100000000000:
+        return number / 1000.0
+    if number > 1000000000:
+        return number
+    if isinstance(value, str):
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+    return None
+
+
 def _order_matches_place_request(order: Dict[str, Any], request: Dict[str, Any]) -> bool:
     security = request.get("security") or request.get("stock") or request.get("stockcode")
     if security and order.get("security") != security:
+        return False
+    request_side = str(request.get("side") or "").strip().upper()
+    order_side = str(order.get("side") or order.get("direction") or "").strip().upper()
+    if not request_side or request_side != order_side:
         return False
     amount = request.get("amount") or request.get("volume")
     if amount not in (None, ""):
@@ -980,32 +1118,38 @@ def _order_matches_place_request(order: Dict[str, Any], request: Dict[str, Any])
         or order.get("remark") == remark
         or (
             bool(sub_account_id)
-            and _remark_matches_virtual_account(order.get("order_remark") or order.get("remark"), sub_account_id)
+            and _remark_matches_virtual_account(
+                order.get("order_remark") or order.get("remark"), sub_account_id
+            )
         )
     ):
         return False
     return True
 
 
-def _order_matches_place_request_relaxed(order: Dict[str, Any], request: Dict[str, Any]) -> bool:
-    security = request.get("security") or request.get("stock") or request.get("stockcode")
-    if security and order.get("security") != security:
-        return False
-    amount = request.get("amount") or request.get("volume")
-    if amount not in (None, ""):
-        try:
-            if int(order.get("amount") or 0) != int(amount):
-                return False
-        except (TypeError, ValueError):
-            return False
-    price = _request_order_price(request)
-    order_price = order.get("order_price")
-    if order_price in (None, ""):
-        order_price = order.get("price")
-    if price not in (None, "") and order_price not in (None, "", 0, 0.0):
-        if not _float_close(order_price, price):
-            return False
-    return True
+def _submission_unknown_order(order: Dict[str, Any], warning: str) -> Dict[str, Any]:
+    """将未获强确认的 Big QMT 回应转换为 fail-closed 未知态。
+
+    Args:
+        order: gateway 初始回包的归一化订单。
+        warning: 未确认原因。
+
+    Returns:
+        Dict[str, Any]: 保留最小回包字段且标记 `submit_unknown` 的结果。
+    """
+
+    result = dict(order)
+    result.update(
+        {
+            "status": "submit_unknown",
+            "submission_state": "submit_unknown",
+            "submit_unknown": True,
+            "timed_out": True,
+            "async_tracking": True,
+            "warning": warning,
+        }
+    )
+    return result
 
 
 def _normalize_position(row: Dict[str, Any]) -> Dict[str, Any]:
@@ -1035,16 +1179,24 @@ def _normalize_order(row: Dict[str, Any]) -> Dict[str, Any]:
         security = _security_from_qmt_fields(item)
         if security:
             item["security"] = security
-    item.setdefault("order_id", item.get("order_sys_id") or item.get("m_strOrderSysID") or item.get("entrust_no"))
+    item.setdefault(
+        "order_id",
+        item.get("order_sys_id") or item.get("m_strOrderSysID") or item.get("entrust_no"),
+    )
     item.setdefault("filled", item.get("traded") or item.get("m_nTradedVolume"))
     item.setdefault("amount", item.get("volume") or item.get("m_nVolume"))
     item.setdefault("price", item.get("order_price") or item.get("m_dLimitPrice"))
-    item.setdefault("order_remark", item.get("remark") or item.get("m_strRemark") or item.get("m_strUserOrderId"))
+    item.setdefault(
+        "order_remark",
+        item.get("remark") or item.get("m_strRemark") or item.get("m_strUserOrderId"),
+    )
     if item.get("order_remark") and "remark" not in item:
         item["remark"] = item.get("order_remark")
     sub_account_id = item.get("sub_account_id") or item.get("virtual_account_id")
     if not sub_account_id:
-        sub_account_id = _extract_virtual_account_from_remark(item.get("order_remark") or item.get("remark"))
+        sub_account_id = _extract_virtual_account_from_remark(
+            item.get("order_remark") or item.get("remark")
+        )
     if sub_account_id:
         item.setdefault("sub_account_id", sub_account_id)
         item.setdefault("virtual_account_id", sub_account_id)
@@ -1061,12 +1213,17 @@ def _normalize_trade(row: Dict[str, Any]) -> Dict[str, Any]:
     item.setdefault("order_id", item.get("m_strOrderSysID") or item.get("order_sys_id"))
     item.setdefault("amount", item.get("volume") or item.get("m_nVolume"))
     item.setdefault("price", item.get("trade_price") or item.get("m_dTradePrice"))
-    item.setdefault("order_remark", item.get("remark") or item.get("m_strRemark") or item.get("m_strUserOrderId"))
+    item.setdefault(
+        "order_remark",
+        item.get("remark") or item.get("m_strRemark") or item.get("m_strUserOrderId"),
+    )
     if item.get("order_remark") and "remark" not in item:
         item["remark"] = item.get("order_remark")
     sub_account_id = item.get("sub_account_id") or item.get("virtual_account_id")
     if not sub_account_id:
-        sub_account_id = _extract_virtual_account_from_remark(item.get("order_remark") or item.get("remark"))
+        sub_account_id = _extract_virtual_account_from_remark(
+            item.get("order_remark") or item.get("remark")
+        )
     if sub_account_id:
         item.setdefault("sub_account_id", sub_account_id)
         item.setdefault("virtual_account_id", sub_account_id)
@@ -1089,8 +1246,11 @@ def _filter_orders(orders: List[Dict], filters: Dict) -> List[Dict]:
         orders = [
             item
             for item in orders
-            if str(item.get("sub_account_id") or item.get("virtual_account_id") or "") == sub_account_id
-            or _remark_matches_virtual_account(item.get("order_remark") or item.get("remark"), sub_account_id)
+            if str(item.get("sub_account_id") or item.get("virtual_account_id") or "")
+            == sub_account_id
+            or _remark_matches_virtual_account(
+                item.get("order_remark") or item.get("remark"), sub_account_id
+            )
         ]
     return orders
 
@@ -1120,8 +1280,11 @@ def _filter_trades(trades: List[Dict], filters: Dict) -> List[Dict]:
         trades = [
             item
             for item in trades
-            if str(item.get("sub_account_id") or item.get("virtual_account_id") or "") == sub_account_id
-            or _remark_matches_virtual_account(item.get("order_remark") or item.get("remark"), sub_account_id)
+            if str(item.get("sub_account_id") or item.get("virtual_account_id") or "")
+            == sub_account_id
+            or _remark_matches_virtual_account(
+                item.get("order_remark") or item.get("remark"), sub_account_id
+            )
         ]
     return trades
 

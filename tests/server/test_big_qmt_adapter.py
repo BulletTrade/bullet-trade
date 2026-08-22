@@ -1,4 +1,5 @@
 import asyncio
+import time
 from pathlib import Path
 
 import pytest
@@ -96,8 +97,9 @@ def test_big_qmt_adapter_is_registered_and_health_reports_backend(monkeypatch):
     assert health["qmt"]["actions"]["data.snapshot"]["status"] == "ready"
     assert health["qmt"]["actions"]["data.current_tick"]["status"] == "ready"
     assert health["qmt"]["actions"]["data.subscribe"]["status"] == "degraded"
-    assert health["qmt"]["actions"]["broker.place_order"]["status"] == "ready"
-    assert health["qmt"]["actions"]["broker.cancel_order"]["status"] == "ready"
+    assert health["qmt"]["actions"]["broker.place_order"]["status"] == "unavailable"
+    assert health["qmt"]["actions"]["broker.cancel_order"]["status"] == "unavailable"
+    assert health["idempotency_journal"]["ready"] is False
 
 
 @pytest.mark.asyncio
@@ -105,7 +107,11 @@ async def test_big_qmt_data_adapter_normalizes_gateway_payloads():
     client = _FakeGatewayClient(
         {
             "/data/history": {"records": [{"open": 1.0, "close": 2.0}]},
-            "/data/snapshot": {"ticks": {"000001.XSHE": {"lastPrice": 12.3, "time": 1783043331000, "bidPrice": [12.2]}}},
+            "/data/snapshot": {
+                "ticks": {
+                    "000001.XSHE": {"lastPrice": 12.3, "time": 1783043331000, "bidPrice": [12.2]}
+                }
+            },
             "/data/live_current": {
                 "ticks": {
                     "000001.XSHE": {
@@ -117,7 +123,9 @@ async def test_big_qmt_data_adapter_normalizes_gateway_payloads():
                     }
                 }
             },
-            "/data/current_tick": {"ticks": {"000001.XSHE": {"lastPrice": 12.4, "timetag": "20260703 09:30:00"}}},
+            "/data/current_tick": {
+                "ticks": {"000001.XSHE": {"lastPrice": 12.4, "timetag": "20260703 09:30:00"}}
+            },
             "/data/trade_days": {"values": ["20260701"]},
             "/data/security_info": {"display_name": "平安银行", "type": "stock"},
             "/data/ensure_cache": {"requested": True, "security": "000001.XSHE"},
@@ -177,13 +185,17 @@ async def test_big_qmt_data_adapter_normalizes_gateway_payloads():
 async def test_server_dispatches_data_current_tick_with_payload():
     client = _FakeGatewayClient(
         {
-            "/data/snapshot": {"ticks": {"000001.XSHE": {"lastPrice": 12.3, "time": 1783043331000}}},
+            "/data/snapshot": {
+                "ticks": {"000001.XSHE": {"lastPrice": 12.3, "time": 1783043331000}}
+            },
         }
     )
     config = _server_config(enable_broker=False)
     router = AccountRouter(config.accounts)
     adapter = BigQmtDataAdapter(client)
-    app = ServerApplication(config, router, AdapterBundle(data_adapter=adapter, broker_adapter=None))
+    app = ServerApplication(
+        config, router, AdapterBundle(data_adapter=adapter, broker_adapter=None)
+    )
 
     current_tick = await app._dispatch_data("current_tick", {"security": "000001.XSHE"})
 
@@ -315,10 +327,12 @@ async def test_big_qmt_trading_and_cancel_forward_by_default():
     ctx = router.get("default")
     adapter = BigQmtBrokerAdapter(config, router, client)
 
-    order = await adapter.place_order(ctx, {"security": "000001.XSHE", "amount": 100, "side": "BUY"})
+    order = await adapter.place_order(
+        ctx, {"security": "000001.XSHE", "amount": 100, "side": "BUY"}
+    )
     cancel = await adapter.cancel_order(ctx, "O-default")
 
-    assert order["order_id"] == "O-default"
+    assert order["status"] == "submit_unknown"
     assert cancel["value"]["success"] is True
     assert client.calls[0][1] == "/place_order"
     assert client.calls[1][1] == "/cancel_order"
@@ -349,7 +363,7 @@ async def test_big_qmt_trading_and_cancel_forward_account_payload_when_enabled()
     )
     cancel = await adapter.cancel_order(ctx, "O2")
 
-    assert order["status"] == "open"
+    assert order["status"] == "submit_unknown"
     assert cancel["value"]["value"] is True
     assert client.calls[0][1] == "/place_order"
     assert client.calls[0][2]["account_id"] == "demo"
@@ -373,11 +387,13 @@ async def test_big_qmt_place_order_confirms_submission_in_adapter():
                 {
                     "order_id": "O-confirmed",
                     "security": "000001.XSHE",
+                    "side": "BUY",
                     "amount": 100,
                     "order_price": 1.0,
                     "raw_status": 50,
                     "order_remark": "sub:sub-a|bt:alpha:abcd1234",
                     "sub_account_id": "sub-a",
+                    "order_time": time.time(),
                 }
             ]
         }
@@ -405,8 +421,8 @@ async def test_big_qmt_place_order_confirms_submission_in_adapter():
         ctx,
         {
             "security": "000001.XSHE",
-            "amount": 100,
             "side": "BUY",
+            "amount": 100,
             "style": {"type": "limit", "price": 1.0},
             "sub_account_id": "sub-a",
             "order_remark": "bt:alpha:abcd1234",
@@ -440,6 +456,8 @@ async def test_big_qmt_place_order_skips_known_order_ids_when_confirming():
             "order_remark": "sub:sub-a|bt:old",
             "sub_account_id": "sub-a",
             "qmt_user_order_id": "BT-old",
+            "side": "BUY",
+            "order_time": time.time() - 30,
         }
         new_order = {
             "order_id": "O-new",
@@ -447,8 +465,10 @@ async def test_big_qmt_place_order_skips_known_order_ids_when_confirming():
             "amount": 100,
             "order_price": 10.0,
             "raw_status": 56,
-            "order_remark": "BT-new",
+            "order_remark": "sub:sub-a|bt:new",
             "qmt_user_order_id": "BT-new",
+            "side": "BUY",
+            "order_time": time.time(),
         }
         if orders_calls == 1:
             return {"orders": [old_order]}
@@ -483,6 +503,7 @@ async def test_big_qmt_place_order_skips_known_order_ids_when_confirming():
             "style": {"type": "limit", "price": 10.0},
             "sub_account_id": "sub-a",
             "order_remark": "bt:new",
+            "qmt_user_order_id": "BT-new",
             "wait_timeout": 0.05,
         },
     )
@@ -509,6 +530,8 @@ async def test_big_qmt_place_order_waits_for_non_empty_order_id():
             "raw_status": 50,
             "order_remark": "BT-ready",
             "qmt_user_order_id": "BT-ready",
+            "side": "BUY",
+            "order_time": time.time(),
         }
         return {"orders": [row]}
 
@@ -537,6 +560,7 @@ async def test_big_qmt_place_order_waits_for_non_empty_order_id():
             "amount": 100,
             "side": "BUY",
             "style": {"type": "limit", "price": 10.0},
+            "qmt_user_order_id": "BT-ready",
             "wait_timeout": 0.3,
         },
     )
@@ -547,7 +571,7 @@ async def test_big_qmt_place_order_waits_for_non_empty_order_id():
 
 
 @pytest.mark.asyncio
-async def test_big_qmt_place_order_matches_new_order_when_gateway_tag_is_stale():
+async def test_big_qmt_place_order_does_not_match_new_order_when_gateway_tag_is_stale():
     orders_calls = 0
 
     def _orders(_payload):
@@ -615,13 +639,8 @@ async def test_big_qmt_place_order_matches_new_order_when_gateway_tag_is_stale()
             "wait_timeout": 0.05,
         },
     )
-    filtered_orders = await adapter.list_orders(ctx, {"sub_account_id": "sim_a"})
 
-    assert order["order_id"] == "O-new"
-    assert order["sub_account_id"] == "sim_a"
-    assert order["order_remark"] == "sub:sim_a|bt:test"
-    assert filtered_orders[-1]["order_id"] == "O-new"
-    assert filtered_orders[-1]["sub_account_id"] == "sim_a"
+    assert order["status"] == "submit_unknown"
 
 
 @pytest.mark.asyncio
@@ -658,3 +677,55 @@ async def test_big_qmt_place_order_returns_submit_unknown_when_not_visible():
     assert order["timed_out"] is True
     assert order["async_tracking"] is True
     assert "no matching order" in order["warning"]
+
+
+@pytest.mark.asyncio
+async def test_big_qmt_confirmation_rejects_reverse_order_with_same_economic_fields():
+    """同标的/数量/价格的 SELL 不能确认本次 BUY，必须保持 submit_unknown。"""
+
+    calls = 0
+    submission_identity = {"value": ""}
+
+    def _place(payload):
+        submission_identity["value"] = payload["qmt_user_order_id"]
+        return {"order_id": "", "passorder_return": 0}
+
+    def _orders(_payload):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"orders": []}
+        return {
+            "orders": [
+                {
+                    "order_id": "reverse-sell",
+                    "security": "511880.XSHG",
+                    "side": "SELL",
+                    "amount": 100,
+                    "order_price": 100.0,
+                    "qmt_user_order_id": submission_identity["value"],
+                    "order_time": time.time(),
+                    "raw_status": 50,
+                }
+            ]
+        }
+
+    client = _FakeGatewayClient({"/place_order": _place, "/orders": _orders})
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    adapter = BigQmtBrokerAdapter(config, router, client)
+
+    order = await adapter.place_order(
+        router.get("default"),
+        {
+            "security": "511880.XSHG",
+            "side": "BUY",
+            "amount": 100,
+            "style": {"type": "limit", "price": 100.0},
+            "idempotency_key": "reverse-direction-key",
+            "wait_timeout": 0.01,
+        },
+    )
+
+    assert order["status"] == "submit_unknown"
+    assert submission_identity["value"].startswith("BT-")

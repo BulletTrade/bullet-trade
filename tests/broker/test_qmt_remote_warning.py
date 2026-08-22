@@ -139,6 +139,36 @@ def test_remote_qmt_broker_market_order_with_price_keeps_explicit_protect_price(
     assert payload["style"] == {"type": "market", "protect_price": 10.5}
 
 
+def test_remote_qmt_broker_forwards_explicit_market_type(monkeypatch):
+    """远程原生市价单应把明确市场类型透传给 server。"""
+
+    monkeypatch.setenv("QMT_SERVER_TOKEN", "dummy-token")
+    broker = RemoteQmtBroker(account_id="acc")
+    fake_conn = _FakeConn()
+    broker._connection = fake_conn  # type: ignore
+    broker.connect()
+
+    broker._place_order_sync(
+        "BUY",
+        "511880.XSHG",
+        100,
+        101.212,
+        16,
+        market=True,
+        extra={
+            "idempotency_key": "huaxin-dg14-o2-opponent-best",
+            "market_type": "opponent_best",
+        },
+    )
+
+    action, payload = fake_conn.requests[0]
+    assert action == "broker.place_order"
+    assert payload["market"] is True
+    assert payload["style"] == {"type": "market", "protect_price": 101.212}
+    assert payload["market_type"] == "opponent_best"
+    assert payload["idempotency_key"] == "huaxin-dg14-o2-opponent-best"
+
+
 def test_remote_qmt_broker_forwards_order_extra_metadata(monkeypatch):
     """远程券商下单应把 live 订单扩展审计字段透传到 server。"""
 
@@ -161,6 +191,12 @@ def test_remote_qmt_broker_forwards_order_extra_metadata(monkeypatch):
             "strategy_name": "btsim_byf_b2",
             "request_id": "sigexec-151-BUY-000001.XSHE",
             "idempotency_key": "sigexec-151-BUY-000001.XSHE",
+            "execution_claim_token": "claim-151",
+            "execution_claim_generation": 3,
+            "gateway_id_snapshot": 7,
+            "sub_account_binding_id_snapshot": 69,
+            "backend_provider": "bullet_trade_remote",
+            "binding_version": "a" * 64,
             "order_price": 10.5,
         },
     )
@@ -173,6 +209,12 @@ def test_remote_qmt_broker_forwards_order_extra_metadata(monkeypatch):
     assert payload["strategy_name"] == "btsim_byf_b2"
     assert payload["request_id"] == "sigexec-151-BUY-000001.XSHE"
     assert payload["idempotency_key"] == "sigexec-151-BUY-000001.XSHE"
+    assert payload["execution_claim_token"] == "claim-151"
+    assert payload["execution_claim_generation"] == 3
+    assert payload["gateway_id_snapshot"] == 7
+    assert payload["sub_account_binding_id_snapshot"] == 69
+    assert payload["backend_provider"] == "bullet_trade_remote"
+    assert payload["binding_version"] == "a" * 64
     assert "order_price" not in payload
 
 
@@ -180,7 +222,9 @@ def test_remote_qmt_broker_place_order_rpc_timeout_has_margin(monkeypatch):
     """单笔等待窗口应自动扩展远程下单 RPC timeout。"""
 
     monkeypatch.setenv("QMT_SERVER_TOKEN", "dummy-token")
-    broker = RemoteQmtBroker(account_id="acc", config={"rpc_timeout": 30, "place_order_timeout_margin": 30})
+    broker = RemoteQmtBroker(
+        account_id="acc", config={"rpc_timeout": 30, "place_order_timeout_margin": 30}
+    )
     fake_conn = _FakeConn()
     broker._connection = fake_conn  # type: ignore
     broker.connect()
@@ -202,7 +246,9 @@ def test_remote_qmt_broker_warns_when_default_timeout_budget_is_risky(monkeypatc
         lambda message, *args, **kwargs: warnings.append(message % args if args else message),
     )
 
-    broker = RemoteQmtBroker(account_id="acc", config={"rpc_timeout": 30, "place_order_timeout_margin": 30})
+    broker = RemoteQmtBroker(
+        account_id="acc", config={"rpc_timeout": 30, "place_order_timeout_margin": 30}
+    )
 
     assert broker.rpc_timeout == 30.0
     assert broker._resolve_place_order_rpc_timeout(30) == 60.0
@@ -214,7 +260,9 @@ def test_remote_qmt_broker_respects_explicit_zero_timeout_margin(monkeypatch):
 
     monkeypatch.setenv("QMT_SERVER_TOKEN", "dummy-token")
 
-    broker = RemoteQmtBroker(account_id="acc", config={"rpc_timeout": 30, "place_order_timeout_margin": 0})
+    broker = RemoteQmtBroker(
+        account_id="acc", config={"rpc_timeout": 30, "place_order_timeout_margin": 0}
+    )
 
     assert broker.place_order_timeout_margin == 0.0
     assert broker._resolve_place_order_rpc_timeout(30) == 30.0
