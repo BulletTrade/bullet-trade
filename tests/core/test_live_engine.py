@@ -1045,6 +1045,87 @@ async def test_live_account_sync_positions_support_broker_suffix_aliases(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_live_account_sync_accepts_huaxin_nullable_market_fields_atomically(tmp_path):
+    """验证华鑫不提供市值和现价时仍保留真实可卖持仓。
+
+    Args:
+        tmp_path: pytest 提供的临时运行目录。
+
+    Returns:
+        None；合法空行情字段成功应用，非法后续快照不清空旧持仓即通过。
+    """
+
+    class HuaxinNullableMarketDummy(DummyBroker):
+        """返回华鑫 Trader 真实 nullable 行情字段形态的 Broker 替身。"""
+
+        def sync_account(self):
+            """返回资金和 511880 可卖持仓联合快照。
+
+            Returns:
+                dict: ``price`` 与 ``market_value`` 均为 None 的合法快照。
+            """
+
+            self.account_sync_calls += 1
+            return {
+                "available_cash": 1326.84,
+                "total_value": None,
+                "positions": [
+                    {
+                        "security": "511880.XSHG",
+                        "amount": 2000,
+                        "closeable_amount": 2000,
+                        "avg_cost": 100.0,
+                        "price": None,
+                        "market_value": None,
+                    }
+                ],
+            }
+
+    strategy = _write_strategy(tmp_path)
+    broker = HuaxinNullableMarketDummy()
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=lambda: broker,
+        live_config={
+            "runtime_dir": str(tmp_path / "runtime"),
+            "g_autosave_enabled": False,
+            "account_sync_enabled": False,
+            "order_sync_enabled": False,
+            "tick_sync_enabled": False,
+            "risk_check_enabled": False,
+            "broker_heartbeat_interval": 0,
+        },
+    )
+    engine._loop = asyncio.get_running_loop()
+    engine._stop_event = asyncio.Event()
+    engine.event_bus = EventBus(engine._loop)
+    engine.async_scheduler = AsyncScheduler()
+
+    await engine._bootstrap()
+    await engine._account_sync_step()
+
+    position = engine.context.portfolio.positions["511880.XSHG"]
+    assert position.total_amount == 2000
+    assert position.closeable_amount == 2000
+    assert position.price == 0.0
+    assert position.value == 0.0
+    last_refresh = engine._last_account_refresh
+
+    broker.sync_account = lambda: {
+        "available_cash": 0,
+        "positions": [{"security": "511880.XSHG", "amount": "invalid"}],
+    }
+    await engine._account_sync_step()
+
+    preserved = engine.context.portfolio.positions["511880.XSHG"]
+    assert preserved.total_amount == 2000
+    assert preserved.closeable_amount == 2000
+    assert engine._last_account_refresh == last_refresh
+
+    await engine._shutdown()
+
+
+@pytest.mark.asyncio
 async def test_scheduler_resets_future_cursor(tmp_path):
     strategy = _write_strategy(tmp_path)
     cfg = {

@@ -3306,71 +3306,105 @@ class LiveEngine:
             self._last_account_refresh = now
 
     def _apply_account_snapshot(self, snapshot: Dict[str, Any]) -> None:
-        try:
-            target = (
-                self.portfolio_proxy.backing
-                if isinstance(self.context.portfolio, LivePortfolioProxy)
-                else self.context.portfolio
+        """原子地把券商账户快照应用到策略组合。
+
+        Args:
+            snapshot: 券商返回的资金与持仓联合快照。
+
+        Returns:
+            None。
+
+        Raises:
+            TypeError: 持仓列表或数值字段结构非法时抛出。
+            ValueError: 数值字段无法转换时抛出。
+
+        Side Effects:
+            只有完整快照解析成功后才替换组合资金和持仓；失败时保留上一份组合，
+            由上层同步任务记录失败且不得推进刷新时间。
+        """
+
+        target = (
+            self.portfolio_proxy.backing
+            if isinstance(self.context.portfolio, LivePortfolioProxy)
+            else self.context.portfolio
+        )
+        raw_positions = snapshot.get("positions") or []
+        if not isinstance(raw_positions, (list, tuple)):
+            raise TypeError("账户快照 positions 必须为列表")
+
+        parsed_positions: List[Tuple[str, Position]] = []
+        for item in raw_positions:
+            if not isinstance(item, Mapping):
+                raise TypeError("账户快照持仓行必须为对象")
+            security = str(item.get("security") or "").strip()
+            if not security:
+                continue
+            amount = int(item.get("amount", item.get("total_amount", 0)) or 0)
+            price = float(item.get("current_price", item.get("price", 0.0)) or 0.0)
+            raw_market_value = item.get("market_value")
+            market_value = (
+                amount * price if raw_market_value in (None, "") else float(raw_market_value)
             )
-            cash = snapshot.get("available_cash")
-            transferable = snapshot.get("transferable_cash")
-            locked = snapshot.get("locked_cash")
-            if locked is None:
-                locked = snapshot.get("frozen_cash")
-            total = snapshot.get("total_value")
-            if cash is not None:
-                target.available_cash = float(cash)
-            if transferable is not None:
-                target.transferable_cash = float(transferable)
-            if locked is not None:
-                target.locked_cash = float(locked)
-            if total is not None:
-                target.total_value = float(total)
-            positions = snapshot.get("positions") or []
-            target.positions.clear()
-            stock_subportfolio = None
-            try:
-                stock_subportfolio = target.subportfolios.get("stock")
-            except Exception:
-                stock_subportfolio = None
+            parsed_positions.append(
+                (
+                    security,
+                    Position(
+                        security=security,
+                        total_amount=amount,
+                        closeable_amount=int(item.get("closeable_amount", amount) or 0),
+                        avg_cost=float(item.get("avg_cost", 0.0) or 0.0),
+                        price=price,
+                        value=market_value,
+                        buy_time=self._parse_datetime_value(
+                            item.get("buy_time", item.get("init_time"))
+                        ),
+                        last_buy_time=self._parse_datetime_value(
+                            item.get(
+                                "last_buy_time",
+                                item.get(
+                                    "transact_time",
+                                    item.get("buy_time", item.get("init_time")),
+                                ),
+                            )
+                        ),
+                    ),
+                )
+            )
+
+        cash = snapshot.get("available_cash")
+        transferable = snapshot.get("transferable_cash")
+        locked = snapshot.get("locked_cash")
+        if locked is None:
+            locked = snapshot.get("frozen_cash")
+        total = snapshot.get("total_value")
+        parsed_cash = float(cash) if cash is not None else None
+        parsed_transferable = float(transferable) if transferable is not None else None
+        parsed_locked = float(locked) if locked is not None else None
+        parsed_total = float(total) if total is not None else None
+
+        if parsed_cash is not None:
+            target.available_cash = parsed_cash
+        if parsed_transferable is not None:
+            target.transferable_cash = parsed_transferable
+        if parsed_locked is not None:
+            target.locked_cash = parsed_locked
+        if parsed_total is not None:
+            target.total_value = parsed_total
+        target.positions.clear()
+        stock_subportfolio = target.subportfolios.get("stock")
+        if stock_subportfolio is not None:
+            stock_subportfolio.available_cash = float(
+                getattr(target, "available_cash", 0.0) or 0.0
+            )
+            stock_subportfolio.transferable_cash = float(
+                getattr(target, "transferable_cash", 0.0) or 0.0
+            )
+            stock_subportfolio.positions.clear()
+        for security, position in parsed_positions:
+            target.positions[security] = position
             if stock_subportfolio is not None:
-                stock_subportfolio.available_cash = float(
-                    getattr(target, "available_cash", 0.0) or 0.0
-                )
-                stock_subportfolio.transferable_cash = float(
-                    getattr(target, "transferable_cash", 0.0) or 0.0
-                )
-                stock_subportfolio.positions.clear()
-            for item in positions:
-                security = item.get("security")
-                if not security:
-                    continue
-                amount = int(item.get("amount", item.get("total_amount", 0)) or 0)
-                price = float(item.get("current_price", item.get("price", 0.0)) or 0.0)
-                position = Position(
-                    security=security,
-                    total_amount=amount,
-                    closeable_amount=int(item.get("closeable_amount", amount)),
-                    avg_cost=float(item.get("avg_cost", 0.0) or 0.0),
-                    price=price,
-                    value=float(item.get("market_value", amount * price)),
-                    buy_time=self._parse_datetime_value(
-                        item.get("buy_time", item.get("init_time"))
-                    ),
-                    last_buy_time=self._parse_datetime_value(
-                        item.get(
-                            "last_buy_time",
-                            item.get("transact_time", item.get("buy_time", item.get("init_time"))),
-                        )
-                    ),
-                )
-                target.positions[security] = position
-                if stock_subportfolio is not None:
-                    stock_subportfolio.positions[security] = position
-            target.update_value()
-        except Exception as exc:
-            log.debug(f"应用账户快照失败: {exc}")
-            return
+                stock_subportfolio.positions[security] = position
+        target.update_value()
 
         if not self._initial_nav_synced and getattr(target, "total_value", 0) > 0:
             try:
