@@ -22,6 +22,10 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime
 from typing import Any, Callable, Dict, List, Mapping, Optional, Set
 
+from bullet_trade.integrations.huaxin.asset_consolidation import (
+    HuaxinAssetConsolidationConfig,
+    HuaxinAssetConsolidationCoordinator,
+)
 from bullet_trade.integrations.huaxin.broker import HuaxinBroker
 from bullet_trade.integrations.huaxin.errors import (
     HUAXIN_MARKET_ORDER_DISABLED,
@@ -218,6 +222,11 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
         *,
         broker_config: Optional[Mapping[str, Any]] = None,
         broker_factory: Callable[..., HuaxinBroker] = HuaxinBroker,
+        consolidation_config: Optional[HuaxinAssetConsolidationConfig] = None,
+        consolidation_factory: Callable[..., HuaxinAssetConsolidationCoordinator] = (
+            HuaxinAssetConsolidationCoordinator
+        ),
+        source_snapshot_provider: Optional[Callable[[], Mapping[str, Any]]] = None,
     ) -> None:
         """保存服务配置并创建华鑫专用 executor。
 
@@ -226,6 +235,9 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
             account_router: 父账户路由器。
             broker_config: 可注入的私密 Trader 配置；默认从环境读取。
             broker_factory: 测试可注入的 HuaxinBroker 等价工厂。
+            consolidation_config: 可注入节点资产归集配置；默认从环境读取。
+            consolidation_factory: 测试可注入的归集协调器工厂。
+            source_snapshot_provider: 可注入源节点权威快照函数。
 
         Returns:
             None。
@@ -249,6 +261,16 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
         self._ever_ready = False
         self._rebuild_required = False
         self._reconnect_count = 0
+        self._consolidation_task: Optional[asyncio.Task] = None
+        self._consolidation_config = (
+            consolidation_config or HuaxinAssetConsolidationConfig.from_env()
+        )
+        self._asset_consolidation: Optional[HuaxinAssetConsolidationCoordinator] = None
+        if self._consolidation_config.enabled:
+            self._asset_consolidation = consolidation_factory(
+                self._consolidation_config,
+                source_snapshot_provider=source_snapshot_provider,
+            )
 
     async def start(self) -> None:
         """依次创建并连接全部配置账户。
@@ -282,6 +304,11 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
             self._watchdog_loop(),
             name="huaxin-trader-recovery",
         )
+        if self._asset_consolidation is not None:
+            self._consolidation_task = asyncio.create_task(
+                self._asset_consolidation_loop(),
+                name="huaxin-asset-consolidation",
+            )
 
     async def stop(self) -> None:
         """幂等断开全部 Trader 会话并关闭专用 executor。
@@ -301,6 +328,14 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
             self._watchdog_stop.set()
         task = self._watchdog_task
         self._watchdog_task = None
+        consolidation_task = self._consolidation_task
+        self._consolidation_task = None
+        if consolidation_task is not None:
+            consolidation_task.cancel()
+            try:
+                await consolidation_task
+            except asyncio.CancelledError:
+                pass
         if task is not None:
             task.cancel()
             try:
@@ -439,6 +474,9 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
             Dict[str, Any]: accepted、rejected 或 submit_unknown 响应。
         """
 
+        consolidation = self._asset_consolidation
+        if consolidation is not None and not consolidation.order_allowed():
+            return consolidation.blocked_order_result()
         style = payload.get("style") or {"type": "limit"}
         if not isinstance(style, Mapping):
             raise ValueError("Huaxin server style 必须为对象")
@@ -494,7 +532,8 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
             extra["market_type"] = market_type
         return dict(
             await self._run_ready(
-                broker.submit_order,
+                self._submit_order_if_allowed_sync,
+                broker,
                 direction,
                 str(payload.get("security") or ""),
                 amount,
@@ -568,6 +607,24 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
             and bool(item.get("security_order_constraints_ready"))
             for item in accounts.values()
         )
+        consolidation = self._asset_consolidation
+        consolidation_health = (
+            consolidation.health_snapshot()
+            if consolidation is not None
+            else {
+                "enabled": False,
+                "mode": "off",
+                "source_mode": "off",
+                "state": "off",
+                "reason": None,
+                "trading_day": None,
+                "action_count": 0,
+                "action_states": {},
+                "updated_at": None,
+            }
+        )
+        consolidation_order_ready = consolidation is None or consolidation.order_allowed()
+        order_ready = order_ready and consolidation_order_ready
         cancel_ready = query_ready and all(
             bool(item.get("ready_for_cancel"))
             and bool(item.get("cancel_order_enabled"))
@@ -593,12 +650,20 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
             "reason": reason,
             "reconnect_count": self._reconnect_count,
             "accounts": accounts,
+            "asset_consolidation": consolidation_health,
             "actions": {
                 "broker.account": {"status": query_action_status},
                 "broker.positions": {"status": query_action_status},
                 "broker.orders": {"status": query_action_status},
                 "broker.trades": {"status": query_action_status},
-                "broker.place_order": {"status": "ready" if order_ready else "unavailable"},
+                "broker.place_order": {
+                    "status": "ready" if order_ready else "unavailable",
+                    "reason": (
+                        None
+                        if order_ready or consolidation_order_ready
+                        else consolidation_health.get("reason")
+                    ),
+                },
                 "broker.cancel_order": {"status": "ready" if cancel_ready else "unavailable"},
             },
         }
@@ -635,6 +700,37 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
         if not self._brokers:
             raise RuntimeError("Huaxin broker 尚未连接")
         return self._brokers[sorted(self._brokers)[0]]
+
+    def _submit_order_if_allowed_sync(
+        self,
+        broker: HuaxinBroker,
+        direction: str,
+        security: str,
+        amount: Any,
+        price: Any,
+        **kwargs: Any,
+    ) -> Dict[str, Any]:
+        """在 Trader executor 内二次检查归集门禁后提交订单。
+
+        Args:
+            broker: 已路由目标 HuaxinBroker。
+            direction: 买卖方向。
+            security: 标准证券代码。
+            amount: 订单数量。
+            price: 限价或保护价。
+            **kwargs: market、extra 和 wait_timeout 等 Broker 参数。
+
+        Returns:
+            Dict[str, Any]: 稳定归集拒绝或 Broker 原始提交结果。
+
+        Side Effects:
+            只有二次门禁仍放行时才调用 native 下单路径。
+        """
+
+        consolidation = self._asset_consolidation
+        if consolidation is not None and not consolidation.order_allowed():
+            return consolidation.blocked_order_result()
+        return dict(broker.submit_order(direction, security, amount, price, **kwargs) or {})
 
     async def _connect_all(self) -> None:
         """按账户配置创建并连接一套新的 Broker 映射。
@@ -781,6 +877,37 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
                 await asyncio.wait_for(
                     self._watchdog_stop.wait(),
                     timeout=max(0.01, float(self._watchdog_interval_seconds)),
+                )
+            except asyncio.TimeoutError:
+                pass
+
+    async def _asset_consolidation_loop(self) -> None:
+        """在 Server 启动后独立推进节点资产归集，不阻塞监听启动。
+
+        Returns:
+            None。
+
+        Side Effects:
+            Trader 查询 ready 时在线程池串行运行协调器；写入语义由协调器状态机约束。
+        """
+
+        assert self._watchdog_stop is not None
+        consolidation = self._asset_consolidation
+        assert consolidation is not None
+        while not self._stopped and not self._watchdog_stop.is_set():
+            try:
+                if await self._brokers_are_ready():
+                    broker = self._default_broker()
+                    await self._run(consolidation.drive_once, broker)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                consolidation.record_runtime_error(exc)
+                log.warning("华鑫节点资产归集本轮未推进: %s", type(exc).__name__)
+            try:
+                await asyncio.wait_for(
+                    self._watchdog_stop.wait(),
+                    timeout=max(0.01, float(consolidation.poll_seconds)),
                 )
             except asyncio.TimeoutError:
                 pass

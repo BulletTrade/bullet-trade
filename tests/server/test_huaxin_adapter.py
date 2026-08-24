@@ -10,6 +10,10 @@ from types import SimpleNamespace
 import pytest
 
 from bullet_trade.data.providers.huaxin import HuaxinDataProvider
+from bullet_trade.integrations.huaxin.asset_consolidation import (
+    HUAXIN_ASSET_CONSOLIDATION_ORDER_BLOCKED,
+    HuaxinAssetConsolidationConfig,
+)
 from bullet_trade.integrations.huaxin.errors import (
     HuaxinNativeUnavailableError,
     HuaxinTradingDisabledError,
@@ -1341,6 +1345,94 @@ class _FakeBroker:
         }
 
 
+class _GateCoordinator:
+    """提供 Adapter 生命周期与双门禁测试的内存归集协调器。"""
+
+    def __init__(self, config, source_snapshot_provider=None):
+        """保存配置并默认阻断新下单。
+
+        Args:
+            config: 归集配置。
+            source_snapshot_provider: 测试中未使用的源快照注入。
+
+        Returns:
+            None。
+        """
+
+        del source_snapshot_provider
+        self.config = config
+        self.poll_seconds = 0.01
+        self.drive_count = 0
+        self.allowed = False
+
+    def order_allowed(self):
+        """返回当前下单门禁。
+
+        Returns:
+            bool: allowed 测试状态。
+        """
+
+        return self.allowed
+
+    def drive_once(self, broker):
+        """记录后台协调器已经独立执行。
+
+        Args:
+            broker: Adapter 默认 Broker。
+
+        Returns:
+            dict: 脱敏归集健康摘要。
+        """
+
+        del broker
+        self.drive_count += 1
+        return self.health_snapshot()
+
+    def record_runtime_error(self, exc):
+        """记录测试后台异常类型。
+
+        Args:
+            exc: 后台异常。
+
+        Returns:
+            None。
+        """
+
+        self.error_type = type(exc).__name__
+
+    def health_snapshot(self):
+        """返回不含私密身份的归集状态。
+
+        Returns:
+            dict: observing 健康摘要。
+        """
+
+        return {
+            "enabled": True,
+            "mode": self.config.mode,
+            "state": "observing",
+            "reason": "stable_samples_pending",
+            "trading_day": "20260825",
+            "action_count": 0,
+            "action_states": {},
+            "updated_at": None,
+        }
+
+    def blocked_order_result(self):
+        """返回稳定的新下单阻断结果。
+
+        Returns:
+            dict: rejected 响应。
+        """
+
+        return {
+            "value": False,
+            "status": "rejected",
+            "submission_state": "rejected",
+            "reason": HUAXIN_ASSET_CONSOLIDATION_ORDER_BLOCKED,
+        }
+
+
 @pytest.mark.asyncio
 async def test_adapter_delegates_queries_and_preserves_cancel_payload() -> None:
     """验证 adapter 对查询、限价/显式市价和撤单幂等载荷的精确透传。"""
@@ -1407,6 +1499,155 @@ async def test_adapter_delegates_queries_and_preserves_cancel_payload() -> None:
     await adapter.cancel_order_request(ctx, cancel_payload)
     assert broker.cancel_payload[1] == cancel_payload
     assert adapter.backend_status()["actions"]["broker.place_order"]["status"] == "ready"
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_asset_consolidation_runs_in_background_and_blocks_only_new_orders(tmp_path) -> None:
+    """验证归集后台任务不阻塞启动，查询和精确撤单保留而新下单被拒绝。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        None。
+    """
+
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    consolidation_config = HuaxinAssetConsolidationConfig.from_mapping(
+        {
+            "mode": "full",
+            "source_mode": "external_snapshot",
+            "source_snapshot_path": tmp_path / "source.json",
+            "state_path": tmp_path / "state.json",
+            "source_node_id": 22,
+            "target_node_id": 11,
+            "source_role": "source-query",
+            "target_role": "target-writer",
+            "source_host": "source-host",
+            "target_host": "target-host",
+        }
+    )
+    adapter = HuaxinBrokerAdapter(
+        config,
+        router,
+        broker_config={"enable_trading": True, "enable_cancel": True},
+        broker_factory=_FakeBroker,
+        consolidation_config=consolidation_config,
+        consolidation_factory=_GateCoordinator,
+    )
+
+    await adapter.start()
+    context = router.get("default")
+    account = await adapter.get_account_info(context)
+    blocked = await adapter.place_order(
+        context,
+        {
+            "security": "511880.XSHG",
+            "side": "BUY",
+            "amount": 100,
+            "style": {"type": "limit", "price": 100.2},
+        },
+    )
+    cancel = await adapter.cancel_order_request(context, {"order_id": "SYS1"})
+    health = adapter.backend_status()
+
+    assert account["value"]["available_cash"] == 1000
+    assert blocked["reason"] == HUAXIN_ASSET_CONSOLIDATION_ORDER_BLOCKED
+    assert cancel["order_id"] == "SYS1"
+    assert adapter._brokers["default"].place_call_count == 0
+    assert adapter._brokers["default"].cancel_payload is not None
+    assert health["ready"] is True
+    assert health["actions"]["broker.place_order"]["status"] == "unavailable"
+    assert health["actions"]["broker.cancel_order"]["status"] == "ready"
+    assert health["asset_consolidation"]["state"] == "observing"
+    assert adapter._consolidation_task is not None
+    await adapter.stop()
+    assert adapter._consolidation_task is None
+
+
+@pytest.mark.asyncio
+async def test_asset_consolidation_second_gate_prevents_executor_race() -> None:
+    """验证快速门禁后状态关闭时，executor 内二次门禁仍阻止 native 下单。"""
+
+    class _RaceGate(_GateCoordinator):
+        """第一次允许、第二次拒绝以模拟入队后的归集状态竞争。"""
+
+        def __init__(self):
+            """初始化门禁调用计数。
+
+            Returns:
+                None。
+            """
+
+            self.calls = 0
+            self.config = type("Config", (), {"mode": "full"})()
+
+        def order_allowed(self):
+            """仅第一次快速检查返回允许。
+
+            Returns:
+                bool: 首次 True，后续 False。
+            """
+
+            self.calls += 1
+            return self.calls == 1
+
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    adapter = HuaxinBrokerAdapter(
+        config,
+        router,
+        broker_config={"enable_trading": True},
+        broker_factory=_FakeBroker,
+        consolidation_config=HuaxinAssetConsolidationConfig(),
+    )
+    await adapter.start()
+    adapter._asset_consolidation = _RaceGate()
+
+    result = await adapter.place_order(
+        router.get("default"),
+        {
+            "security": "511880.XSHG",
+            "side": "BUY",
+            "amount": 100,
+            "style": {"type": "limit", "price": 100.2},
+        },
+    )
+
+    assert result["reason"] == HUAXIN_ASSET_CONSOLIDATION_ORDER_BLOCKED
+    assert adapter._brokers["default"].place_call_count == 0
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_asset_consolidation_off_creates_no_coordinator_task_or_state_file(tmp_path) -> None:
+    """验证显式 off 不创建协调器任务，也不读写任何归集状态文件。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        None。
+    """
+
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    adapter = HuaxinBrokerAdapter(
+        config,
+        router,
+        broker_config={"enable_trading": True},
+        broker_factory=_FakeBroker,
+        consolidation_config=HuaxinAssetConsolidationConfig(),
+    )
+
+    await adapter.start()
+
+    assert adapter._asset_consolidation is None
+    assert adapter._consolidation_task is None
+    assert adapter.backend_status()["asset_consolidation"]["state"] == "off"
+    assert list(tmp_path.iterdir()) == []
     await adapter.stop()
 
 
