@@ -34,7 +34,7 @@ struct bt_huaxin_handle;
 namespace {
 
 constexpr char kVendorSchemaId[] = "bullet_trade.huaxin.tora_trader.v1";
-constexpr char kFieldSetVersion[] = "tora-stock-v4.1.8-order-v2";
+constexpr char kFieldSetVersion[] = "tora-v4.1.8-node-transfer-v1";
 constexpr uint32_t kVendorSchemaIdSize =
     static_cast<uint32_t>(sizeof(kVendorSchemaId) - 1u);
 constexpr uint32_t kFieldSetVersionSize =
@@ -84,6 +84,7 @@ struct SessionValues {
     bool encrypt = false;
     bool enable_trading = false;
     bool enable_cancel = false;
+    bool enable_node_transfer = false;
 
     SessionValues() = default;
     SessionValues(const SessionValues &) = default;
@@ -166,6 +167,24 @@ public:
         int request_id,
         bool is_last
     ) override;
+    void OnRspQrySystemNodeInfo(
+        CTORATstpSystemNodeInfoField *field,
+        CTORATstpRspInfoField *info,
+        int request_id,
+        bool is_last
+    ) override;
+    void OnRspQryFundTransferDetail(
+        CTORATstpFundTransferDetailField *field,
+        CTORATstpRspInfoField *info,
+        int request_id,
+        bool is_last
+    ) override;
+    void OnRspQryPositionTransferDetail(
+        CTORATstpPositionTransferDetailField *field,
+        CTORATstpRspInfoField *info,
+        int request_id,
+        bool is_last
+    ) override;
     void OnRspOrderInsert(
         CTORATstpInputOrderField *field,
         CTORATstpRspInfoField *info,
@@ -188,6 +207,28 @@ public:
     ) override;
     void OnRtnOrder(CTORATstpOrderField *field) override;
     void OnRtnTrade(CTORATstpTradeField *field) override;
+    void OnRspTransferFund(
+        CTORATstpInputTransferFundField *field,
+        CTORATstpRspInfoField *info,
+        int request_id
+    ) override;
+    void OnErrRtnTransferFund(
+        CTORATstpInputTransferFundField *field,
+        CTORATstpRspInfoField *info,
+        int request_id
+    ) override;
+    void OnRtnTransferFund(CTORATstpTransferFundField *field) override;
+    void OnRspTransferPosition(
+        CTORATstpInputTransferPositionField *field,
+        CTORATstpRspInfoField *info,
+        int request_id
+    ) override;
+    void OnErrRtnTransferPosition(
+        CTORATstpInputTransferPositionField *field,
+        CTORATstpRspInfoField *info,
+        int request_id
+    ) override;
+    void OnRtnTransferPosition(CTORATstpTransferPositionField *field) override;
 
 private:
     bt_huaxin_handle *handle_;
@@ -216,6 +257,11 @@ static_assert(offsetof(bt_huaxin_order_request, volume_condition) == 23u);
 static_assert(offsetof(bt_huaxin_order_request, limit_price) == 24u);
 static_assert(offsetof(bt_huaxin_order_request, exchange) == 40u);
 static_assert(sizeof(bt_huaxin_cancel_order_request) <= BT_HUAXIN_REQUEST_PAYLOAD_CAPACITY);
+static_assert(sizeof(bt_huaxin_system_node_query_request) <= BT_HUAXIN_REQUEST_PAYLOAD_CAPACITY);
+static_assert(sizeof(bt_huaxin_fund_transfer_detail_query_request) <= BT_HUAXIN_REQUEST_PAYLOAD_CAPACITY);
+static_assert(sizeof(bt_huaxin_position_transfer_detail_query_request) <= BT_HUAXIN_REQUEST_PAYLOAD_CAPACITY);
+static_assert(sizeof(bt_huaxin_transfer_fund_request) <= BT_HUAXIN_REQUEST_PAYLOAD_CAPACITY);
+static_assert(sizeof(bt_huaxin_transfer_position_request) <= BT_HUAXIN_REQUEST_PAYLOAD_CAPACITY);
 static_assert(sizeof(bt_huaxin_state_event) <= BT_HUAXIN_OWNED_EVENT_PAYLOAD_CAPACITY);
 static_assert(sizeof(bt_huaxin_error_event) <= BT_HUAXIN_OWNED_EVENT_PAYLOAD_CAPACITY);
 static_assert(sizeof(bt_huaxin_login_event) <= BT_HUAXIN_OWNED_EVENT_PAYLOAD_CAPACITY);
@@ -228,6 +274,10 @@ static_assert(offsetof(bt_huaxin_security_event, lower_limit_price) == 352u);
 static_assert(sizeof(bt_huaxin_shareholder_event) <= BT_HUAXIN_OWNED_EVENT_PAYLOAD_CAPACITY);
 static_assert(sizeof(bt_huaxin_account_event) <= BT_HUAXIN_OWNED_EVENT_PAYLOAD_CAPACITY);
 static_assert(sizeof(bt_huaxin_position_event) <= BT_HUAXIN_OWNED_EVENT_PAYLOAD_CAPACITY);
+static_assert(sizeof(bt_huaxin_system_node_event) <= BT_HUAXIN_OWNED_EVENT_PAYLOAD_CAPACITY);
+static_assert(sizeof(bt_huaxin_transfer_response_event) <= BT_HUAXIN_OWNED_EVENT_PAYLOAD_CAPACITY);
+static_assert(sizeof(bt_huaxin_fund_transfer_event) <= BT_HUAXIN_OWNED_EVENT_PAYLOAD_CAPACITY);
+static_assert(sizeof(bt_huaxin_position_transfer_event) <= BT_HUAXIN_OWNED_EVENT_PAYLOAD_CAPACITY);
 static_assert(sizeof(bt_huaxin_order_event) <= BT_HUAXIN_OWNED_EVENT_PAYLOAD_CAPACITY);
 static_assert(sizeof(bt_huaxin_order_event) == 504u);
 static_assert(offsetof(bt_huaxin_order_event, direction) == 124u);
@@ -357,6 +407,8 @@ struct bt_huaxin_handle {
     CTORATstpTraderApi *api = nullptr;
     TraderSpi *spi = nullptr;
     std::unordered_map<int, QueryProgress> queries;
+    std::unordered_map<int, uint64_t> fund_transfer_requests;
+    std::unordered_map<int, uint64_t> position_transfer_requests;
 };
 
 namespace {
@@ -556,6 +608,107 @@ uint8_t normalized_volume_condition(TTORATstpVolumeConditionType value) noexcept
             return BT_HUAXIN_VOLUME_ALL;
         default:
             return static_cast<uint8_t>(value);
+    }
+}
+
+uint8_t normalized_transfer_direction(TTORATstpTransferDirectionType value) noexcept {
+    if (value == TORA_TSTP_TRNSD_NodeMoveIn) {
+        return BT_HUAXIN_TRANSFER_NODE_MOVE_IN;
+    }
+    if (value == TORA_TSTP_TRNSD_NodeMoveOut) {
+        return BT_HUAXIN_TRANSFER_NODE_MOVE_OUT;
+    }
+    return BT_HUAXIN_TRANSFER_DIRECTION_ANY;
+}
+
+bool transfer_direction_value(
+    uint8_t value,
+    bool allow_any,
+    TTORATstpTransferDirectionType *out
+) noexcept {
+    if (out == nullptr) {
+        return false;
+    }
+    if (allow_any && value == BT_HUAXIN_TRANSFER_DIRECTION_ANY) {
+        *out = static_cast<TTORATstpTransferDirectionType>(0);
+        return true;
+    }
+    if (value == BT_HUAXIN_TRANSFER_NODE_MOVE_IN) {
+        *out = TORA_TSTP_TRNSD_NodeMoveIn;
+        return true;
+    }
+    if (value == BT_HUAXIN_TRANSFER_NODE_MOVE_OUT) {
+        *out = TORA_TSTP_TRNSD_NodeMoveOut;
+        return true;
+    }
+    return false;
+}
+
+uint8_t normalized_transfer_position_type(TTORATstpTransferPositionTypeType value) noexcept {
+    switch (value) {
+        case TORA_TSTP_TPT_ALL:
+            return BT_HUAXIN_TRANSFER_POSITION_ALL;
+        case TORA_TSTP_TPT_History:
+            return BT_HUAXIN_TRANSFER_POSITION_HISTORY;
+        case TORA_TSTP_TPT_TodayBS:
+            return BT_HUAXIN_TRANSFER_POSITION_TODAY_BUY_SELL;
+        case TORA_TSTP_TPT_TodayPR:
+            return BT_HUAXIN_TRANSFER_POSITION_TODAY_PURCHASE_REDEEM;
+        case TORA_TSTP_TPT_TodaySM:
+            return BT_HUAXIN_TRANSFER_POSITION_TODAY_SPLIT_MERGE;
+        default:
+            return 0u;
+    }
+}
+
+bool transfer_position_type_value(
+    uint8_t value,
+    TTORATstpTransferPositionTypeType *out
+) noexcept {
+    if (out == nullptr) {
+        return false;
+    }
+    switch (value) {
+        case BT_HUAXIN_TRANSFER_POSITION_ALL:
+            *out = TORA_TSTP_TPT_ALL;
+            return true;
+        case BT_HUAXIN_TRANSFER_POSITION_HISTORY:
+            *out = TORA_TSTP_TPT_History;
+            return true;
+        case BT_HUAXIN_TRANSFER_POSITION_TODAY_BUY_SELL:
+            *out = TORA_TSTP_TPT_TodayBS;
+            return true;
+        case BT_HUAXIN_TRANSFER_POSITION_TODAY_PURCHASE_REDEEM:
+            *out = TORA_TSTP_TPT_TodayPR;
+            return true;
+        case BT_HUAXIN_TRANSFER_POSITION_TODAY_SPLIT_MERGE:
+            *out = TORA_TSTP_TPT_TodaySM;
+            return true;
+        default:
+            return false;
+    }
+}
+
+uint8_t normalized_transfer_status(TTORATstpTransferStatusType value) noexcept {
+    switch (value) {
+        case TORA_TSTP_TRANST_TranferHandling:
+            return BT_HUAXIN_TRANSFER_STATUS_HANDLING;
+        case TORA_TSTP_TRANST_TransferSuccess:
+            return BT_HUAXIN_TRANSFER_STATUS_SUCCESS;
+        case TORA_TSTP_TRANST_TransferFail:
+            return BT_HUAXIN_TRANSFER_STATUS_FAILED;
+        case TORA_TSTP_TRANST_RepealHandling:
+            return BT_HUAXIN_TRANSFER_STATUS_REPEAL_HANDLING;
+        case TORA_TSTP_TRANST_RepealSuccess:
+            return BT_HUAXIN_TRANSFER_STATUS_REPEAL_SUCCESS;
+        case TORA_TSTP_TRANST_RepealFail:
+            return BT_HUAXIN_TRANSFER_STATUS_REPEAL_FAILED;
+        case TORA_TSTP_TRANST_ExternalAccepted:
+            return BT_HUAXIN_TRANSFER_STATUS_EXTERNAL_ACCEPTED;
+        case TORA_TSTP_TRANST_SendTradeEngine:
+            return BT_HUAXIN_TRANSFER_STATUS_SENT_TO_ENGINE;
+        default:
+            return BT_HUAXIN_TRANSFER_STATUS_UNKNOWN;
     }
 }
 
@@ -805,7 +958,8 @@ int32_t validate_session_config(const bt_huaxin_session_config *config) noexcept
     if (!schema_identity_matches(config->schema)) {
         return BT_HUAXIN_SCHEMA_INCOMPATIBLE;
     }
-    if (config->reserved_flags != 0u || config->encrypt > 1u ||
+    if ((config->reserved_flags & ~BT_HUAXIN_SESSION_FLAG_ENABLE_NODE_TRANSFER) != 0u ||
+        config->encrypt > 1u ||
         config->enable_trading > 1u || config->enable_cancel > 1u ||
         config->login_account_type < BT_HUAXIN_LOGIN_USER_ID ||
         config->login_account_type > BT_HUAXIN_LOGIN_BJ_STOCK ||
@@ -919,6 +1073,8 @@ SessionValues copy_session_values(const bt_huaxin_session_config &config) {
     values.encrypt = config.encrypt != 0u;
     values.enable_trading = config.enable_trading != 0u;
     values.enable_cancel = config.enable_cancel != 0u;
+    values.enable_node_transfer =
+        (config.reserved_flags & BT_HUAXIN_SESSION_FLAG_ENABLE_NODE_TRANSFER) != 0u;
     return values;
 }
 
@@ -977,6 +1133,8 @@ void TraderSpi::OnFrontDisconnected(int reason) {
     handle_->ready_for_queries = false;
     handle_->initial_query_mask = 0u;
     handle_->queries.clear();
+    handle_->fund_transfer_requests.clear();
+    handle_->position_transfer_requests.clear();
     handle_->state = BT_HUAXIN_STATE_DISCONNECTED;
     emit_state_locked(handle_, reason);
 }
@@ -1214,6 +1372,12 @@ void TraderSpi::OnRspQryPosition(
         copy_event_text(field->ShareholderID, event.shareholder_id, &event.shareholder_id_size);
         copy_event_text(field->SecurityID, event.security, &event.security_size);
         copy_event_text(field->TradingDay, event.trading_day, &event.trading_day_size);
+        copy_event_text(
+            field->BusinessUnitID,
+            event.business_unit_id,
+            &event.business_unit_id_size
+        );
+        event.market_id = static_cast<unsigned char>(field->MarketID);
         copy_position_numeric_fields(*field, &event);
         (void)push_owned_event_locked(
             handle_,
@@ -1225,6 +1389,321 @@ void TraderSpi::OnRspQryPosition(
         increment_query_count_locked(handle_, request_id);
     }
     finish_query_locked(handle_, request_id, is_last, info);
+}
+
+void TraderSpi::OnRspQrySystemNodeInfo(
+    CTORATstpSystemNodeInfoField *field,
+    CTORATstpRspInfoField *info,
+    int request_id,
+    bool is_last
+) {
+    std::lock_guard<std::mutex> lock(handle_->mutex);
+    if (field != nullptr) {
+        bt_huaxin_system_node_event event{};
+        event.node_id = field->NodeID;
+        event.current = field->bCurrent ? 1u : 0u;
+        copy_event_text(field->NodeInfo, event.node_info, &event.node_info_size);
+        (void)push_owned_event_locked(
+            handle_,
+            BT_HUAXIN_EVENT_SYSTEM_NODE,
+            static_cast<uint64_t>(request_id),
+            &event,
+            static_cast<uint32_t>(sizeof(event))
+        );
+        increment_query_count_locked(handle_, request_id);
+    }
+    finish_query_locked(handle_, request_id, is_last, info);
+}
+
+namespace {
+
+bt_huaxin_fund_transfer_event make_fund_transfer_detail_event(
+    const CTORATstpFundTransferDetailField &field
+) noexcept {
+    bt_huaxin_fund_transfer_event event{};
+    event.fund_serial = field.FundSerial;
+    event.apply_serial = field.ApplySerial;
+    event.front_id = field.FrontID;
+    event.session_id = field.SessionID;
+    event.external_node_id = field.ExternalNodeID;
+    event.currency = static_cast<uint8_t>(field.CurrencyID);
+    event.transfer_direction = normalized_transfer_direction(field.TransferDirection);
+    event.transfer_status = normalized_transfer_status(field.TransferStatus);
+    event.amount = field.Amount;
+    copy_event_text(field.DepartmentID, event.department_id, &event.department_id_size);
+    copy_event_text(field.AccountID, event.account_id, &event.account_id_size);
+    copy_event_text(field.InvestorID, event.investor_id, &event.investor_id_size);
+    copy_event_text(
+        field.BusinessUnitID,
+        event.business_unit_id,
+        &event.business_unit_id_size
+    );
+    copy_event_text(field.OperateDate, event.operate_date, &event.operate_date_size);
+    copy_event_text(field.OperateTime, event.operate_time, &event.operate_time_size);
+    copy_event_text(field.StatusMsg, event.status_message, &event.status_message_size);
+    return event;
+}
+
+bt_huaxin_fund_transfer_event make_fund_transfer_event(
+    const CTORATstpTransferFundField &field
+) noexcept {
+    bt_huaxin_fund_transfer_event event{};
+    event.fund_serial = field.FundSerial;
+    event.apply_serial = field.ApplySerial;
+    event.front_id = field.FrontID;
+    event.session_id = field.SessionID;
+    event.external_node_id = field.ExternalNodeID;
+    event.currency = static_cast<uint8_t>(field.CurrencyID);
+    event.transfer_direction = normalized_transfer_direction(field.TransferDirection);
+    event.transfer_status = normalized_transfer_status(field.TransferStatus);
+    event.amount = field.Amount;
+    copy_event_text(field.DepartmentID, event.department_id, &event.department_id_size);
+    copy_event_text(field.AccountID, event.account_id, &event.account_id_size);
+    copy_event_text(field.InvestorID, event.investor_id, &event.investor_id_size);
+    copy_event_text(
+        field.BusinessUnitID,
+        event.business_unit_id,
+        &event.business_unit_id_size
+    );
+    copy_event_text(field.OperateDate, event.operate_date, &event.operate_date_size);
+    copy_event_text(field.OperateTime, event.operate_time, &event.operate_time_size);
+    return event;
+}
+
+bt_huaxin_position_transfer_event make_position_transfer_detail_event(
+    const CTORATstpPositionTransferDetailField &field
+) noexcept {
+    bt_huaxin_position_transfer_event event{};
+    event.position_serial = field.PositionSerial;
+    event.apply_serial = field.ApplySerial;
+    event.front_id = field.FrontID;
+    event.session_id = field.SessionID;
+    event.market_id = static_cast<unsigned char>(field.MarketID);
+    event.external_node_id = field.ExternalNodeID;
+    event.history_volume = field.HistoryVolume;
+    event.today_bs_volume = field.TodayBSVolume;
+    event.today_pr_volume = field.TodayPRVolume;
+    event.today_sm_volume = field.TodaySMVolume;
+    event.transfer_direction = normalized_transfer_direction(field.TransferDirection);
+    event.transfer_position_type = normalized_transfer_position_type(field.TransferPositionType);
+    event.transfer_status = normalized_transfer_status(field.TransferStatus);
+    copy_literal_text(exchange_name(field.ExchangeID), event.exchange, &event.exchange_size);
+    copy_event_text(field.InvestorID, event.investor_id, &event.investor_id_size);
+    copy_event_text(
+        field.BusinessUnitID,
+        event.business_unit_id,
+        &event.business_unit_id_size
+    );
+    copy_event_text(field.ShareholderID, event.shareholder_id, &event.shareholder_id_size);
+    copy_event_text(field.SecurityID, event.security, &event.security_size);
+    copy_event_text(field.TradingDay, event.trading_day, &event.trading_day_size);
+    copy_event_text(field.OperateDate, event.operate_date, &event.operate_date_size);
+    copy_event_text(field.OperateTime, event.operate_time, &event.operate_time_size);
+    copy_event_text(field.StatusMsg, event.status_message, &event.status_message_size);
+    return event;
+}
+
+bt_huaxin_position_transfer_event make_position_transfer_event(
+    const CTORATstpTransferPositionField &field
+) noexcept {
+    bt_huaxin_position_transfer_event event{};
+    event.position_serial = field.PositionSerial;
+    event.apply_serial = field.ApplySerial;
+    event.front_id = field.FrontID;
+    event.session_id = field.SessionID;
+    event.market_id = static_cast<unsigned char>(field.MarketID);
+    event.external_node_id = field.ExternalNodeID;
+    event.history_volume = field.HistoryVolume;
+    event.today_bs_volume = field.TodayBSVolume;
+    event.today_pr_volume = field.TodayPRVolume;
+    event.today_sm_volume = field.TodaySMVolume;
+    event.transfer_direction = normalized_transfer_direction(field.TransferDirection);
+    event.transfer_position_type = normalized_transfer_position_type(field.TransferPositionType);
+    event.transfer_status = normalized_transfer_status(field.TransferStatus);
+    copy_literal_text(exchange_name(field.ExchangeID), event.exchange, &event.exchange_size);
+    copy_event_text(field.InvestorID, event.investor_id, &event.investor_id_size);
+    copy_event_text(
+        field.BusinessUnitID,
+        event.business_unit_id,
+        &event.business_unit_id_size
+    );
+    copy_event_text(field.ShareholderID, event.shareholder_id, &event.shareholder_id_size);
+    copy_event_text(field.SecurityID, event.security, &event.security_size);
+    copy_event_text(field.TradingDay, event.trading_day, &event.trading_day_size);
+    copy_event_text(field.OperateDate, event.operate_date, &event.operate_date_size);
+    copy_event_text(field.OperateTime, event.operate_time, &event.operate_time_size);
+    return event;
+}
+
+void emit_transfer_response_locked(
+    bt_huaxin_handle *handle,
+    uint32_t event_type,
+    int request_id,
+    int apply_serial,
+    const CTORATstpRspInfoField *info
+) noexcept {
+    bt_huaxin_transfer_response_event event{};
+    event.error_id = response_error_id(info);
+    event.apply_serial = apply_serial;
+    const char *message = response_error_message(info);
+    const size_t message_size = info == nullptr
+        ? 0u
+        : bounded_text_length(message, sizeof(info->ErrorMsg));
+    const size_t copy_size = std::min(
+        message_size,
+        static_cast<size_t>(BT_HUAXIN_ERROR_MESSAGE_CAPACITY)
+    );
+    event.message_size = static_cast<uint32_t>(copy_size);
+    if (copy_size != 0u) {
+        std::memcpy(event.message, message, copy_size);
+    }
+    (void)push_owned_event_locked(
+        handle,
+        event_type,
+        request_id > 0 ? static_cast<uint64_t>(request_id) : 0u,
+        &event,
+        static_cast<uint32_t>(sizeof(event))
+    );
+}
+
+}  // namespace
+
+void TraderSpi::OnRspQryFundTransferDetail(
+    CTORATstpFundTransferDetailField *field,
+    CTORATstpRspInfoField *info,
+    int request_id,
+    bool is_last
+) {
+    std::lock_guard<std::mutex> lock(handle_->mutex);
+    if (field != nullptr) {
+        const auto event = make_fund_transfer_detail_event(*field);
+        (void)push_owned_event_locked(
+            handle_,
+            BT_HUAXIN_EVENT_FUND_TRANSFER_DETAIL,
+            static_cast<uint64_t>(request_id),
+            &event,
+            static_cast<uint32_t>(sizeof(event))
+        );
+        increment_query_count_locked(handle_, request_id);
+    }
+    finish_query_locked(handle_, request_id, is_last, info);
+}
+
+void TraderSpi::OnRspQryPositionTransferDetail(
+    CTORATstpPositionTransferDetailField *field,
+    CTORATstpRspInfoField *info,
+    int request_id,
+    bool is_last
+) {
+    std::lock_guard<std::mutex> lock(handle_->mutex);
+    if (field != nullptr) {
+        const auto event = make_position_transfer_detail_event(*field);
+        (void)push_owned_event_locked(
+            handle_,
+            BT_HUAXIN_EVENT_POSITION_TRANSFER_DETAIL,
+            static_cast<uint64_t>(request_id),
+            &event,
+            static_cast<uint32_t>(sizeof(event))
+        );
+        increment_query_count_locked(handle_, request_id);
+    }
+    finish_query_locked(handle_, request_id, is_last, info);
+}
+
+void TraderSpi::OnRspTransferFund(
+    CTORATstpInputTransferFundField *field,
+    CTORATstpRspInfoField *info,
+    int request_id
+) {
+    std::lock_guard<std::mutex> lock(handle_->mutex);
+    emit_transfer_response_locked(
+        handle_,
+        BT_HUAXIN_EVENT_FUND_TRANSFER_RESPONSE,
+        request_id,
+        field == nullptr ? 0 : field->ApplySerial,
+        info
+    );
+}
+
+void TraderSpi::OnErrRtnTransferFund(
+    CTORATstpInputTransferFundField *field,
+    CTORATstpRspInfoField *info,
+    int request_id
+) {
+    OnRspTransferFund(field, info, request_id);
+}
+
+void TraderSpi::OnRtnTransferFund(CTORATstpTransferFundField *field) {
+    if (field == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(handle_->mutex);
+    const auto event = make_fund_transfer_event(*field);
+    const auto found = handle_->fund_transfer_requests.find(field->ApplySerial);
+    const uint64_t request_id = found == handle_->fund_transfer_requests.end()
+        ? 0u
+        : found->second;
+    (void)push_owned_event_locked(
+        handle_,
+        BT_HUAXIN_EVENT_FUND_TRANSFER,
+        request_id,
+        &event,
+        static_cast<uint32_t>(sizeof(event))
+    );
+    if (event.transfer_status == BT_HUAXIN_TRANSFER_STATUS_SUCCESS ||
+        event.transfer_status == BT_HUAXIN_TRANSFER_STATUS_FAILED ||
+        event.transfer_status == BT_HUAXIN_TRANSFER_STATUS_REPEAL_SUCCESS ||
+        event.transfer_status == BT_HUAXIN_TRANSFER_STATUS_REPEAL_FAILED) {
+        handle_->fund_transfer_requests.erase(field->ApplySerial);
+    }
+}
+
+void TraderSpi::OnRspTransferPosition(
+    CTORATstpInputTransferPositionField *field,
+    CTORATstpRspInfoField *info,
+    int request_id
+) {
+    std::lock_guard<std::mutex> lock(handle_->mutex);
+    emit_transfer_response_locked(
+        handle_,
+        BT_HUAXIN_EVENT_POSITION_TRANSFER_RESPONSE,
+        request_id,
+        field == nullptr ? 0 : field->ApplySerial,
+        info
+    );
+}
+
+void TraderSpi::OnErrRtnTransferPosition(
+    CTORATstpInputTransferPositionField *field,
+    CTORATstpRspInfoField *info,
+    int request_id
+) {
+    OnRspTransferPosition(field, info, request_id);
+}
+
+void TraderSpi::OnRtnTransferPosition(CTORATstpTransferPositionField *field) {
+    if (field == nullptr) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(handle_->mutex);
+    const auto event = make_position_transfer_event(*field);
+    const auto found = handle_->position_transfer_requests.find(field->ApplySerial);
+    const uint64_t request_id = found == handle_->position_transfer_requests.end()
+        ? 0u
+        : found->second;
+    (void)push_owned_event_locked(
+        handle_,
+        BT_HUAXIN_EVENT_POSITION_TRANSFER,
+        request_id,
+        &event,
+        static_cast<uint32_t>(sizeof(event))
+    );
+    if (event.transfer_status == BT_HUAXIN_TRANSFER_STATUS_SUCCESS ||
+        event.transfer_status == BT_HUAXIN_TRANSFER_STATUS_FAILED ||
+        event.transfer_status == BT_HUAXIN_TRANSFER_STATUS_REPEAL_SUCCESS ||
+        event.transfer_status == BT_HUAXIN_TRANSFER_STATUS_REPEAL_FAILED) {
+        handle_->position_transfer_requests.erase(field->ApplySerial);
+    }
 }
 
 namespace {
@@ -2064,10 +2543,16 @@ int32_t bt_huaxin_submit_request(
                 !handle->session.enable_cancel) {
                 return BT_HUAXIN_CANCEL_DISABLED;
             }
+            if ((request->request_type == BT_HUAXIN_REQUEST_TRANSFER_FUND ||
+                 request->request_type == BT_HUAXIN_REQUEST_TRANSFER_POSITION) &&
+                !handle->session.enable_node_transfer) {
+                return BT_HUAXIN_TRADING_DISABLED;
+            }
             api = handle->api;
         }
         const int request_id = static_cast<int>(request->request_id);
         int vendor_result = 0;
+        int transfer_apply_serial = 0;
         switch (request->request_type) {
             case BT_HUAXIN_REQUEST_QUERY_SECURITY: {
                 if (request->payload_size != sizeof(bt_huaxin_query_request)) {
@@ -2142,6 +2627,79 @@ int32_t bt_huaxin_submit_request(
                     handle->queries[request_id] = {request->request_type, 0u};
                 }
                 vendor_result = api->ReqQryTrade(&query, request_id);
+                break;
+            }
+            case BT_HUAXIN_REQUEST_QUERY_SYSTEM_NODE: {
+                if (request->payload_size != sizeof(bt_huaxin_system_node_query_request)) {
+                    return BT_HUAXIN_INVALID_ARGUMENT;
+                }
+                bt_huaxin_system_node_query_request value{};
+                std::memcpy(&value, request->payload, sizeof(value));
+                if (value.node_id < 0) {
+                    return BT_HUAXIN_INVALID_ARGUMENT;
+                }
+                CTORATstpQrySystemNodeInfoField query{};
+                query.NodeID = value.node_id;
+                {
+                    std::lock_guard<std::mutex> lock(handle->mutex);
+                    handle->queries[request_id] = {request->request_type, 0u};
+                }
+                vendor_result = api->ReqQrySystemNodeInfo(&query, request_id);
+                break;
+            }
+            case BT_HUAXIN_REQUEST_QUERY_FUND_TRANSFER_DETAIL: {
+                if (request->payload_size != sizeof(bt_huaxin_fund_transfer_detail_query_request)) {
+                    return BT_HUAXIN_INVALID_ARGUMENT;
+                }
+                bt_huaxin_fund_transfer_detail_query_request value{};
+                std::memcpy(&value, request->payload, sizeof(value));
+                if (!bytes_are_c_text(value.department_id, value.department_id_size, BT_HUAXIN_DEPARTMENT_CAPACITY) ||
+                    !bytes_are_c_text(value.account_id, value.account_id_size, BT_HUAXIN_LOGIN_ACCOUNT_CAPACITY) ||
+                    !bytes_are_c_text(value.investor_id, value.investor_id_size, BT_HUAXIN_INVESTOR_CAPACITY)) {
+                    return BT_HUAXIN_INVALID_ARGUMENT;
+                }
+                CTORATstpQryFundTransferDetailField query{};
+                if (!copy_vendor_text(query.DepartmentID, bytes_to_string(value.department_id, value.department_id_size)) ||
+                    !copy_vendor_text(query.AccountID, bytes_to_string(value.account_id, value.account_id_size)) ||
+                    !copy_vendor_text(query.InvestorID, bytes_to_string(value.investor_id, value.investor_id_size)) ||
+                    !transfer_direction_value(value.transfer_direction, true, &query.TransferDirection)) {
+                    return BT_HUAXIN_INVALID_ARGUMENT;
+                }
+                query.CurrencyID = static_cast<TTORATstpCurrencyIDType>(value.currency);
+                {
+                    std::lock_guard<std::mutex> lock(handle->mutex);
+                    handle->queries[request_id] = {request->request_type, 0u};
+                }
+                vendor_result = api->ReqQryFundTransferDetail(&query, request_id);
+                break;
+            }
+            case BT_HUAXIN_REQUEST_QUERY_POSITION_TRANSFER_DETAIL: {
+                if (request->payload_size != sizeof(bt_huaxin_position_transfer_detail_query_request)) {
+                    return BT_HUAXIN_INVALID_ARGUMENT;
+                }
+                bt_huaxin_position_transfer_detail_query_request value{};
+                std::memcpy(&value, request->payload, sizeof(value));
+                if (!bytes_are_c_text(value.exchange, value.exchange_size, BT_HUAXIN_EXCHANGE_CAPACITY) ||
+                    !bytes_are_c_text(value.investor_id, value.investor_id_size, BT_HUAXIN_INVESTOR_CAPACITY) ||
+                    !bytes_are_c_text(value.business_unit_id, value.business_unit_id_size, BT_HUAXIN_BUSINESS_UNIT_CAPACITY) ||
+                    !bytes_are_c_text(value.shareholder_id, value.shareholder_id_size, BT_HUAXIN_SHAREHOLDER_CAPACITY) ||
+                    !bytes_are_c_text(value.security, value.security_size, BT_HUAXIN_SECURITY_CAPACITY)) {
+                    return BT_HUAXIN_INVALID_ARGUMENT;
+                }
+                CTORATstpQryPositionTransferDetailField query{};
+                if (!parse_exchange(value.exchange, value.exchange_size, &query.ExchangeID) ||
+                    !copy_vendor_text(query.InvestorID, bytes_to_string(value.investor_id, value.investor_id_size)) ||
+                    !copy_vendor_text(query.BusinessUnitID, bytes_to_string(value.business_unit_id, value.business_unit_id_size)) ||
+                    !copy_vendor_text(query.ShareholderID, bytes_to_string(value.shareholder_id, value.shareholder_id_size)) ||
+                    !copy_vendor_text(query.SecurityID, bytes_to_string(value.security, value.security_size)) ||
+                    !transfer_direction_value(value.transfer_direction, true, &query.TransferDirection)) {
+                    return BT_HUAXIN_INVALID_ARGUMENT;
+                }
+                {
+                    std::lock_guard<std::mutex> lock(handle->mutex);
+                    handle->queries[request_id] = {request->request_type, 0u};
+                }
+                vendor_result = api->ReqQryPositionTransferDetail(&query, request_id);
                 break;
             }
             case BT_HUAXIN_REQUEST_PLACE_LIMIT: {
@@ -2244,6 +2802,85 @@ int32_t bt_huaxin_submit_request(
                 vendor_result = api->ReqOrderAction(&action, request_id);
                 break;
             }
+            case BT_HUAXIN_REQUEST_TRANSFER_FUND: {
+                if (request->payload_size != sizeof(bt_huaxin_transfer_fund_request)) {
+                    return BT_HUAXIN_INVALID_ARGUMENT;
+                }
+                bt_huaxin_transfer_fund_request value{};
+                std::memcpy(&value, request->payload, sizeof(value));
+                if (value.apply_serial <= 0 || value.external_node_id <= 0 ||
+                    !std::isfinite(value.amount) || value.amount <= 0.0 || value.currency == 0u ||
+                    value.department_id_size == 0u || value.account_id_size == 0u ||
+                    !bytes_are_c_text(value.department_id, value.department_id_size, BT_HUAXIN_DEPARTMENT_CAPACITY) ||
+                    !bytes_are_c_text(value.account_id, value.account_id_size, BT_HUAXIN_LOGIN_ACCOUNT_CAPACITY)) {
+                    return BT_HUAXIN_INVALID_ARGUMENT;
+                }
+                CTORATstpInputTransferFundField transfer{};
+                if (!copy_vendor_text(transfer.DepartmentID, bytes_to_string(value.department_id, value.department_id_size)) ||
+                    !copy_vendor_text(transfer.AccountID, bytes_to_string(value.account_id, value.account_id_size)) ||
+                    !transfer_direction_value(value.transfer_direction, false, &transfer.TransferDirection)) {
+                    return BT_HUAXIN_INVALID_ARGUMENT;
+                }
+                transfer.UserRequestID = request_id;
+                transfer.CurrencyID = static_cast<TTORATstpCurrencyIDType>(value.currency);
+                transfer.ApplySerial = value.apply_serial;
+                transfer.Amount = value.amount;
+                transfer.ExternalNodeID = value.external_node_id;
+                {
+                    std::lock_guard<std::mutex> lock(handle->mutex);
+                    if (handle->fund_transfer_requests.count(value.apply_serial) != 0u) {
+                        return BT_HUAXIN_INVALID_STATE;
+                    }
+                    handle->fund_transfer_requests[value.apply_serial] = request->request_id;
+                }
+                transfer_apply_serial = value.apply_serial;
+                vendor_result = api->ReqTransferFund(&transfer, request_id);
+                secure_clear_bytes(&transfer, sizeof(transfer));
+                break;
+            }
+            case BT_HUAXIN_REQUEST_TRANSFER_POSITION: {
+                if (request->payload_size != sizeof(bt_huaxin_transfer_position_request)) {
+                    return BT_HUAXIN_INVALID_ARGUMENT;
+                }
+                bt_huaxin_transfer_position_request value{};
+                std::memcpy(&value, request->payload, sizeof(value));
+                if (value.apply_serial <= 0 || value.external_node_id <= 0 || value.volume <= 0 ||
+                    value.exchange_size == 0u || value.investor_id_size == 0u ||
+                    value.shareholder_id_size == 0u || value.security_size == 0u ||
+                    !bytes_are_c_text(value.exchange, value.exchange_size, BT_HUAXIN_EXCHANGE_CAPACITY) ||
+                    !bytes_are_c_text(value.investor_id, value.investor_id_size, BT_HUAXIN_INVESTOR_CAPACITY) ||
+                    !bytes_are_c_text(value.business_unit_id, value.business_unit_id_size, BT_HUAXIN_BUSINESS_UNIT_CAPACITY) ||
+                    !bytes_are_c_text(value.shareholder_id, value.shareholder_id_size, BT_HUAXIN_SHAREHOLDER_CAPACITY) ||
+                    !bytes_are_c_text(value.security, value.security_size, BT_HUAXIN_SECURITY_CAPACITY)) {
+                    return BT_HUAXIN_INVALID_ARGUMENT;
+                }
+                CTORATstpInputTransferPositionField transfer{};
+                if (!parse_exchange(value.exchange, value.exchange_size, &transfer.ExchangeID) ||
+                    !copy_vendor_text(transfer.InvestorID, bytes_to_string(value.investor_id, value.investor_id_size)) ||
+                    !copy_vendor_text(transfer.BusinessUnitID, bytes_to_string(value.business_unit_id, value.business_unit_id_size)) ||
+                    !copy_vendor_text(transfer.ShareholderID, bytes_to_string(value.shareholder_id, value.shareholder_id_size)) ||
+                    !copy_vendor_text(transfer.SecurityID, bytes_to_string(value.security, value.security_size)) ||
+                    !transfer_direction_value(value.transfer_direction, false, &transfer.TransferDirection) ||
+                    !transfer_position_type_value(value.transfer_position_type, &transfer.TransferPositionType)) {
+                    return BT_HUAXIN_INVALID_ARGUMENT;
+                }
+                transfer.UserRequestID = request_id;
+                transfer.ApplySerial = value.apply_serial;
+                transfer.Volume = static_cast<TTORATstpVolumeType>(value.volume);
+                transfer.MarketID = static_cast<TTORATstpMarketIDType>(value.market_id);
+                transfer.ExternalNodeID = value.external_node_id;
+                {
+                    std::lock_guard<std::mutex> lock(handle->mutex);
+                    if (handle->position_transfer_requests.count(value.apply_serial) != 0u) {
+                        return BT_HUAXIN_INVALID_STATE;
+                    }
+                    handle->position_transfer_requests[value.apply_serial] = request->request_id;
+                }
+                transfer_apply_serial = value.apply_serial;
+                vendor_result = api->ReqTransferPosition(&transfer, request_id);
+                secure_clear_bytes(&transfer, sizeof(transfer));
+                break;
+            }
             default:
                 return BT_HUAXIN_UNSUPPORTED_REQUEST;
         }
@@ -2251,6 +2888,11 @@ int32_t bt_huaxin_submit_request(
             {
                 std::lock_guard<std::mutex> lock(handle->mutex);
                 handle->queries.erase(request_id);
+                if (request->request_type == BT_HUAXIN_REQUEST_TRANSFER_FUND) {
+                    handle->fund_transfer_requests.erase(transfer_apply_serial);
+                } else if (request->request_type == BT_HUAXIN_REQUEST_TRANSFER_POSITION) {
+                    handle->position_transfer_requests.erase(transfer_apply_serial);
+                }
             }
             emit_vendor_call_error(handle, request->request_id, request_id, vendor_result);
             return BT_HUAXIN_VENDOR_ERROR;

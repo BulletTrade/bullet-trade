@@ -20,9 +20,13 @@ from bullet_trade.integrations.huaxin import (
     EVENT_SECURITY,
     NativeCancelOrderRequest,
     NativeEvent,
+    NativeFundTransferDetailQuery,
     NativeLimitOrderRequest,
     NativeOrderRequest,
+    NativePositionTransferDetailQuery,
     NativeSessionConfig,
+    NativeTransferFundRequest,
+    NativeTransferPositionRequest,
 )
 
 
@@ -651,12 +655,14 @@ def test_position_event_preserves_authoritative_balance_and_in_flight_fields() -
         ("shareholder_id", "shareholder", native_module.SHAREHOLDER_CAPACITY),
         ("security", "000001", native_module.SECURITY_CAPACITY),
         ("trading_day", "20260817", native_module.DATE_CAPACITY),
+        ("business_unit_id", "unit", native_module.BUSINESS_UNIT_CAPACITY),
     ):
         native_module._assign_text(raw, field_name, text, capacity)
+    raw.market_id = ord("1")
     payload = native_module._structure_bytes(raw)
     data = native_module._decode_event_data(EVENT_POSITION, payload)
 
-    assert len(payload) == 248
+    assert len(payload) == 288
     assert native_module._PositionEvent.current_position.offset == 124
     assert native_module._PositionEvent.total_cost.offset == 160
     assert native_module._PositionEvent.today_sm.offset == 168
@@ -682,6 +688,115 @@ def test_position_event_preserves_authoritative_balance_and_in_flight_fields() -
     assert data["collateral_buy_untrade_amount"] == 73.25
     assert data["credit_buy_untrade_amount"] == 79.5
     assert data["credit_sell_untrade_amount"] == 83.75
+    assert data["business_unit_id"] == "unit"
+    assert data["market_id"] == ord("1")
+
+
+@pytest.mark.unit
+def test_node_transfer_payloads_are_bounded_and_require_explicit_identity() -> None:
+    """验证节点查询、流水查询和两类写请求均适配固定 ABI 且严格校验。
+
+    Returns:
+        None；合法 payload 不越界、缺失同行身份时写请求失败即通过。
+    """
+
+    payloads = (
+        native_module._system_node_query_payload(16),
+        native_module._fund_transfer_detail_query_payload(
+            NativeFundTransferDetailQuery(
+                account_id="acct",
+                investor_id="investor",
+                currency="1",
+                transfer_direction="node_move_in",
+            )
+        ),
+        native_module._position_transfer_detail_query_payload(
+            NativePositionTransferDetailQuery(
+                exchange="SSE",
+                investor_id="investor",
+                shareholder_id="shareholder",
+                security="511880",
+                transfer_direction="node_move_in",
+            )
+        ),
+        native_module._transfer_fund_payload(
+            NativeTransferFundRequest(
+                department_id="dept",
+                account_id="acct",
+                currency="1",
+                transfer_direction="node_move_in",
+                amount=100.0,
+                apply_serial=7001,
+                external_node_id=16,
+            )
+        ),
+        native_module._transfer_position_payload(
+            NativeTransferPositionRequest(
+                exchange="SSE",
+                investor_id="investor",
+                business_unit_id="unit",
+                shareholder_id="shareholder",
+                security="511880",
+                market_id=ord("1"),
+                transfer_direction="node_move_in",
+                transfer_position_type="all",
+                volume=100,
+                apply_serial=7002,
+                external_node_id=16,
+            )
+        ),
+    )
+
+    assert all(len(payload) <= native_module.REQUEST_PAYLOAD_CAPACITY for payload in payloads)
+    with pytest.raises(ValueError, match="shareholder_id"):
+        native_module._transfer_position_payload(
+            NativeTransferPositionRequest(
+                exchange="SSE",
+                investor_id="investor",
+                business_unit_id="unit",
+                shareholder_id="",
+                security="511880",
+                market_id=ord("1"),
+                transfer_direction="node_move_in",
+                transfer_position_type="all",
+                volume=100,
+                apply_serial=7002,
+                external_node_id=16,
+            )
+        )
+
+
+@pytest.mark.unit
+def test_transfer_response_and_final_event_are_distinct_facts() -> None:
+    """验证接受回执与最终成功事件使用不同事件类型和数据合同。
+
+    Returns:
+        None；响应只含接受信息，最终事件才含成功状态和柜台流水即通过。
+    """
+
+    response = native_module._TransferResponseEvent(error_id=0, apply_serial=7001)
+    response_data = native_module._decode_event_data(
+        native_module.EVENT_FUND_TRANSFER_RESPONSE,
+        native_module._structure_bytes(response),
+    )
+    final = native_module._FundTransferEvent(
+        fund_serial=9001,
+        apply_serial=7001,
+        external_node_id=16,
+        currency=ord("1"),
+        transfer_direction=1,
+        transfer_status=2,
+        amount=100.0,
+    )
+    final_data = native_module._decode_event_data(
+        native_module.EVENT_FUND_TRANSFER,
+        native_module._structure_bytes(final),
+    )
+
+    assert response_data == {"error_id": 0, "apply_serial": 7001, "error_message": ""}
+    assert "transfer_status" not in response_data
+    assert final_data["transfer_status"] == "success"
+    assert final_data["fund_serial"] == 9001
 
 
 @pytest.mark.unit

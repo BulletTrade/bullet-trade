@@ -56,6 +56,10 @@ extern "C" {
 #define BT_HUAXIN_DATE_CAPACITY 16u
 #define BT_HUAXIN_TIME_CAPACITY 16u
 #define BT_HUAXIN_ERROR_MESSAGE_CAPACITY 256u
+#define BT_HUAXIN_NODE_INFO_CAPACITY 32u
+
+/* session_config.reserved_flags 的已发布语义位；其余位必须保持为零。 */
+#define BT_HUAXIN_SESSION_FLAG_ENABLE_NODE_TRANSFER 0x01u
 
 /* 数值一经发布不得复用或改变语义。 */
 typedef enum bt_huaxin_result {
@@ -100,10 +104,41 @@ typedef enum bt_huaxin_request_type {
     BT_HUAXIN_REQUEST_QUERY_POSITION = 103,
     BT_HUAXIN_REQUEST_QUERY_ORDER = 104,
     BT_HUAXIN_REQUEST_QUERY_TRADE = 105,
+    BT_HUAXIN_REQUEST_QUERY_SYSTEM_NODE = 106,
+    BT_HUAXIN_REQUEST_QUERY_FUND_TRANSFER_DETAIL = 107,
+    BT_HUAXIN_REQUEST_QUERY_POSITION_TRANSFER_DETAIL = 108,
     BT_HUAXIN_REQUEST_PLACE_LIMIT = 120,
     BT_HUAXIN_REQUEST_CANCEL_ORDER = 121,
-    BT_HUAXIN_REQUEST_PLACE_ORDER = 122
+    BT_HUAXIN_REQUEST_PLACE_ORDER = 122,
+    BT_HUAXIN_REQUEST_TRANSFER_FUND = 123,
+    BT_HUAXIN_REQUEST_TRANSFER_POSITION = 124
 } bt_huaxin_request_type;
+
+typedef enum bt_huaxin_transfer_direction {
+    BT_HUAXIN_TRANSFER_DIRECTION_ANY = 0,
+    BT_HUAXIN_TRANSFER_NODE_MOVE_IN = 1,
+    BT_HUAXIN_TRANSFER_NODE_MOVE_OUT = 2
+} bt_huaxin_transfer_direction;
+
+typedef enum bt_huaxin_transfer_position_type {
+    BT_HUAXIN_TRANSFER_POSITION_ALL = 1,
+    BT_HUAXIN_TRANSFER_POSITION_HISTORY = 2,
+    BT_HUAXIN_TRANSFER_POSITION_TODAY_BUY_SELL = 3,
+    BT_HUAXIN_TRANSFER_POSITION_TODAY_PURCHASE_REDEEM = 4,
+    BT_HUAXIN_TRANSFER_POSITION_TODAY_SPLIT_MERGE = 5
+} bt_huaxin_transfer_position_type;
+
+typedef enum bt_huaxin_transfer_status {
+    BT_HUAXIN_TRANSFER_STATUS_UNKNOWN = 0,
+    BT_HUAXIN_TRANSFER_STATUS_HANDLING = 1,
+    BT_HUAXIN_TRANSFER_STATUS_SUCCESS = 2,
+    BT_HUAXIN_TRANSFER_STATUS_FAILED = 3,
+    BT_HUAXIN_TRANSFER_STATUS_REPEAL_HANDLING = 4,
+    BT_HUAXIN_TRANSFER_STATUS_REPEAL_SUCCESS = 5,
+    BT_HUAXIN_TRANSFER_STATUS_REPEAL_FAILED = 6,
+    BT_HUAXIN_TRANSFER_STATUS_EXTERNAL_ACCEPTED = 7,
+    BT_HUAXIN_TRANSFER_STATUS_SENT_TO_ENGINE = 8
+} bt_huaxin_transfer_status;
 
 /*
  * 以下枚举是 BulletTrade 自有稳定值，不等于也不接受 TORA 原始 char 常量。
@@ -141,8 +176,15 @@ typedef enum bt_huaxin_event_type {
     BT_HUAXIN_EVENT_ORDER = 114,
     BT_HUAXIN_EVENT_TRADE = 115,
     BT_HUAXIN_EVENT_QUERY_END = 116,
+    BT_HUAXIN_EVENT_SYSTEM_NODE = 117,
+    BT_HUAXIN_EVENT_FUND_TRANSFER_DETAIL = 118,
+    BT_HUAXIN_EVENT_POSITION_TRANSFER_DETAIL = 119,
     BT_HUAXIN_EVENT_ORDER_INSERT_RESPONSE = 120,
-    BT_HUAXIN_EVENT_ORDER_ACTION_RESPONSE = 121
+    BT_HUAXIN_EVENT_ORDER_ACTION_RESPONSE = 121,
+    BT_HUAXIN_EVENT_FUND_TRANSFER_RESPONSE = 122,
+    BT_HUAXIN_EVENT_POSITION_TRANSFER_RESPONSE = 123,
+    BT_HUAXIN_EVENT_FUND_TRANSFER = 124,
+    BT_HUAXIN_EVENT_POSITION_TRANSFER = 125
 } bt_huaxin_event_type;
 
 typedef enum bt_huaxin_login_account_type {
@@ -334,6 +376,70 @@ typedef struct bt_huaxin_cancel_order_request {
     uint8_t order_sys_id[BT_HUAXIN_ORDER_SYS_ID_CAPACITY];
 } bt_huaxin_cancel_order_request;
 
+typedef struct bt_huaxin_system_node_query_request {
+    int32_t node_id;
+} bt_huaxin_system_node_query_request;
+
+typedef struct bt_huaxin_fund_transfer_detail_query_request {
+    uint32_t department_id_size;
+    uint32_t account_id_size;
+    uint32_t investor_id_size;
+    uint8_t currency;
+    uint8_t transfer_direction;
+    uint8_t reserved[2];
+    uint8_t department_id[BT_HUAXIN_DEPARTMENT_CAPACITY];
+    uint8_t account_id[BT_HUAXIN_LOGIN_ACCOUNT_CAPACITY];
+    uint8_t investor_id[BT_HUAXIN_INVESTOR_CAPACITY];
+} bt_huaxin_fund_transfer_detail_query_request;
+
+typedef struct bt_huaxin_position_transfer_detail_query_request {
+    uint32_t exchange_size;
+    uint32_t investor_id_size;
+    uint32_t business_unit_id_size;
+    uint32_t shareholder_id_size;
+    uint32_t security_size;
+    uint8_t transfer_direction;
+    uint8_t reserved[3];
+    uint8_t exchange[BT_HUAXIN_EXCHANGE_CAPACITY];
+    uint8_t investor_id[BT_HUAXIN_INVESTOR_CAPACITY];
+    uint8_t business_unit_id[BT_HUAXIN_BUSINESS_UNIT_CAPACITY];
+    uint8_t shareholder_id[BT_HUAXIN_SHAREHOLDER_CAPACITY];
+    uint8_t security[BT_HUAXIN_SECURITY_CAPACITY];
+} bt_huaxin_position_transfer_detail_query_request;
+
+typedef struct bt_huaxin_transfer_fund_request {
+    uint32_t department_id_size;
+    uint32_t account_id_size;
+    int32_t apply_serial;
+    int32_t external_node_id;
+    uint8_t currency;
+    uint8_t transfer_direction;
+    uint8_t reserved[6];
+    double amount;
+    uint8_t department_id[BT_HUAXIN_DEPARTMENT_CAPACITY];
+    uint8_t account_id[BT_HUAXIN_LOGIN_ACCOUNT_CAPACITY];
+} bt_huaxin_transfer_fund_request;
+
+typedef struct bt_huaxin_transfer_position_request {
+    uint32_t exchange_size;
+    uint32_t investor_id_size;
+    uint32_t business_unit_id_size;
+    uint32_t shareholder_id_size;
+    uint32_t security_size;
+    int32_t apply_serial;
+    int32_t volume;
+    int32_t market_id;
+    int32_t external_node_id;
+    uint8_t transfer_direction;
+    uint8_t transfer_position_type;
+    uint8_t reserved[2];
+    uint8_t exchange[BT_HUAXIN_EXCHANGE_CAPACITY];
+    uint8_t investor_id[BT_HUAXIN_INVESTOR_CAPACITY];
+    uint8_t business_unit_id[BT_HUAXIN_BUSINESS_UNIT_CAPACITY];
+    uint8_t shareholder_id[BT_HUAXIN_SHAREHOLDER_CAPACITY];
+    uint8_t security[BT_HUAXIN_SECURITY_CAPACITY];
+} bt_huaxin_transfer_position_request;
+
 /* 单个事件是无外部指针的 POD；动态内容以显式长度保存在固定 bytes 中。 */
 typedef struct bt_huaxin_event {
     uint32_t abi_version;
@@ -512,7 +618,87 @@ typedef struct bt_huaxin_position_event {
     double collateral_buy_untrade_amount;
     double credit_buy_untrade_amount;
     double credit_sell_untrade_amount;
+    uint32_t business_unit_id_size;
+    int32_t market_id;
+    uint8_t business_unit_id[BT_HUAXIN_BUSINESS_UNIT_CAPACITY];
 } bt_huaxin_position_event;
+
+typedef struct bt_huaxin_system_node_event {
+    int32_t node_id;
+    uint32_t node_info_size;
+    uint8_t current;
+    uint8_t reserved[3];
+    uint8_t node_info[BT_HUAXIN_NODE_INFO_CAPACITY];
+} bt_huaxin_system_node_event;
+
+typedef struct bt_huaxin_transfer_response_event {
+    int32_t error_id;
+    int32_t apply_serial;
+    uint32_t message_size;
+    uint8_t message[BT_HUAXIN_ERROR_MESSAGE_CAPACITY];
+} bt_huaxin_transfer_response_event;
+
+typedef struct bt_huaxin_fund_transfer_event {
+    uint32_t department_id_size;
+    uint32_t account_id_size;
+    uint32_t investor_id_size;
+    uint32_t business_unit_id_size;
+    uint32_t operate_date_size;
+    uint32_t operate_time_size;
+    uint32_t status_message_size;
+    int32_t fund_serial;
+    int32_t apply_serial;
+    int32_t front_id;
+    int32_t session_id;
+    int32_t external_node_id;
+    uint8_t currency;
+    uint8_t transfer_direction;
+    uint8_t transfer_status;
+    uint8_t reserved;
+    double amount;
+    uint8_t department_id[BT_HUAXIN_DEPARTMENT_CAPACITY];
+    uint8_t account_id[BT_HUAXIN_LOGIN_ACCOUNT_CAPACITY];
+    uint8_t investor_id[BT_HUAXIN_INVESTOR_CAPACITY];
+    uint8_t business_unit_id[BT_HUAXIN_BUSINESS_UNIT_CAPACITY];
+    uint8_t operate_date[BT_HUAXIN_DATE_CAPACITY];
+    uint8_t operate_time[BT_HUAXIN_TIME_CAPACITY];
+    uint8_t status_message[BT_HUAXIN_ERROR_MESSAGE_CAPACITY];
+} bt_huaxin_fund_transfer_event;
+
+typedef struct bt_huaxin_position_transfer_event {
+    uint32_t exchange_size;
+    uint32_t investor_id_size;
+    uint32_t business_unit_id_size;
+    uint32_t shareholder_id_size;
+    uint32_t security_size;
+    uint32_t trading_day_size;
+    uint32_t operate_date_size;
+    uint32_t operate_time_size;
+    uint32_t status_message_size;
+    int32_t position_serial;
+    int32_t apply_serial;
+    int32_t front_id;
+    int32_t session_id;
+    int32_t market_id;
+    int32_t external_node_id;
+    int32_t history_volume;
+    int32_t today_bs_volume;
+    int32_t today_pr_volume;
+    int32_t today_sm_volume;
+    uint8_t transfer_direction;
+    uint8_t transfer_position_type;
+    uint8_t transfer_status;
+    uint8_t reserved;
+    uint8_t exchange[BT_HUAXIN_EXCHANGE_CAPACITY];
+    uint8_t investor_id[BT_HUAXIN_INVESTOR_CAPACITY];
+    uint8_t business_unit_id[BT_HUAXIN_BUSINESS_UNIT_CAPACITY];
+    uint8_t shareholder_id[BT_HUAXIN_SHAREHOLDER_CAPACITY];
+    uint8_t security[BT_HUAXIN_SECURITY_CAPACITY];
+    uint8_t trading_day[BT_HUAXIN_DATE_CAPACITY];
+    uint8_t operate_date[BT_HUAXIN_DATE_CAPACITY];
+    uint8_t operate_time[BT_HUAXIN_TIME_CAPACITY];
+    uint8_t status_message[BT_HUAXIN_ERROR_MESSAGE_CAPACITY];
+} bt_huaxin_position_transfer_event;
 
 typedef struct bt_huaxin_order_event {
     uint32_t exchange_size;

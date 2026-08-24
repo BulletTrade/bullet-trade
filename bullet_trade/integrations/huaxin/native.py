@@ -31,7 +31,7 @@ ABI_VERSION = 2
 VENDOR_SCHEMA_ID = "bullet_trade.huaxin.offline_fake.v1"
 FIELD_SET_VERSION = "1"
 TRADER_VENDOR_SCHEMA_ID = "bullet_trade.huaxin.tora_trader.v1"
-TRADER_FIELD_SET_VERSION = "tora-stock-v4.1.8-order-v2"
+TRADER_FIELD_SET_VERSION = "tora-v4.1.8-node-transfer-v1"
 MODE_OFFLINE_FAKE = "offline_fake"
 MODE_TRADER = "trader"
 VENDOR_SCHEMA_ID_CAPACITY = 64
@@ -47,9 +47,14 @@ REQUEST_QUERY_TRADING_ACCOUNT = 102
 REQUEST_QUERY_POSITION = 103
 REQUEST_QUERY_ORDER = 104
 REQUEST_QUERY_TRADE = 105
+REQUEST_QUERY_SYSTEM_NODE = 106
+REQUEST_QUERY_FUND_TRANSFER_DETAIL = 107
+REQUEST_QUERY_POSITION_TRANSFER_DETAIL = 108
 REQUEST_PLACE_LIMIT = 120
 REQUEST_CANCEL_ORDER = 121
 REQUEST_PLACE_ORDER = 122
+REQUEST_TRANSFER_FUND = 123
+REQUEST_TRANSFER_POSITION = 124
 
 EVENT_BRIDGE_CREATED = 1
 EVENT_OFFLINE_READY = 2
@@ -64,8 +69,15 @@ EVENT_POSITION = 113
 EVENT_ORDER = 114
 EVENT_TRADE = 115
 EVENT_QUERY_END = 116
+EVENT_SYSTEM_NODE = 117
+EVENT_FUND_TRANSFER_DETAIL = 118
+EVENT_POSITION_TRANSFER_DETAIL = 119
 EVENT_ORDER_INSERT_RESPONSE = 120
 EVENT_ORDER_ACTION_RESPONSE = 121
+EVENT_FUND_TRANSFER_RESPONSE = 122
+EVENT_POSITION_TRANSFER_RESPONSE = 123
+EVENT_FUND_TRANSFER = 124
+EVENT_POSITION_TRANSFER = 125
 
 EVENT_NAMES = {
     EVENT_BRIDGE_CREATED: "bridge_created",
@@ -81,8 +93,15 @@ EVENT_NAMES = {
     EVENT_ORDER: "order",
     EVENT_TRADE: "trade",
     EVENT_QUERY_END: "query_end",
+    EVENT_SYSTEM_NODE: "system_node",
+    EVENT_FUND_TRANSFER_DETAIL: "fund_transfer_detail",
+    EVENT_POSITION_TRANSFER_DETAIL: "position_transfer_detail",
     EVENT_ORDER_INSERT_RESPONSE: "order_insert_response",
     EVENT_ORDER_ACTION_RESPONSE: "order_action_response",
+    EVENT_FUND_TRANSFER_RESPONSE: "fund_transfer_response",
+    EVENT_POSITION_TRANSFER_RESPONSE: "position_transfer_response",
+    EVENT_FUND_TRANSFER: "fund_transfer",
+    EVENT_POSITION_TRANSFER: "position_transfer",
 }
 
 FLOW_PATH_CAPACITY = 256
@@ -107,6 +126,9 @@ TRADE_ID_CAPACITY = 32
 DATE_CAPACITY = 16
 TIME_CAPACITY = 16
 ERROR_MESSAGE_CAPACITY = 256
+NODE_INFO_CAPACITY = 32
+
+SESSION_FLAG_ENABLE_NODE_TRANSFER = 0x01
 
 _LOGIN_ACCOUNT_TYPES = {
     "user_id": 0,
@@ -132,6 +154,25 @@ _ORDER_PRICE_TYPES = {
 }
 _TIME_CONDITIONS = {"gfd": 1, "ioc": 2}
 _VOLUME_CONDITIONS = {"any": 1, "all": 2}
+_TRANSFER_DIRECTIONS = {"node_move_in": 1, "node_move_out": 2}
+_TRANSFER_POSITION_TYPES = {
+    "all": 1,
+    "history": 2,
+    "today_buy_sell": 3,
+    "today_purchase_redeem": 4,
+    "today_split_merge": 5,
+}
+_TRANSFER_STATUSES = {
+    0: "unknown",
+    1: "handling",
+    2: "success",
+    3: "failed",
+    4: "repeal_handling",
+    5: "repeal_success",
+    6: "repeal_failed",
+    7: "external_accepted",
+    8: "sent_to_engine",
+}
 
 _SSE_ORDER_COMBINATIONS = {
     ("limit", "gfd", "any"),
@@ -396,6 +437,88 @@ class _CancelOrderRequest(ctypes.Structure):
     ]
 
 
+class _SystemNodeQueryRequest(ctypes.Structure):
+    """映射按节点号过滤的系统节点查询；零表示查询全部。"""
+
+    _fields_ = [("node_id", ctypes.c_int32)]
+
+
+class _FundTransferDetailQueryRequest(ctypes.Structure):
+    """映射资金划拨流水查询过滤条件。"""
+
+    _fields_ = [
+        ("department_id_size", ctypes.c_uint32),
+        ("account_id_size", ctypes.c_uint32),
+        ("investor_id_size", ctypes.c_uint32),
+        ("currency", ctypes.c_uint8),
+        ("transfer_direction", ctypes.c_uint8),
+        ("reserved", ctypes.c_uint8 * 2),
+        ("department_id", ctypes.c_uint8 * DEPARTMENT_CAPACITY),
+        ("account_id", ctypes.c_uint8 * LOGIN_ACCOUNT_CAPACITY),
+        ("investor_id", ctypes.c_uint8 * INVESTOR_CAPACITY),
+    ]
+
+
+class _PositionTransferDetailQueryRequest(ctypes.Structure):
+    """映射证券划拨流水查询过滤条件。"""
+
+    _fields_ = [
+        ("exchange_size", ctypes.c_uint32),
+        ("investor_id_size", ctypes.c_uint32),
+        ("business_unit_id_size", ctypes.c_uint32),
+        ("shareholder_id_size", ctypes.c_uint32),
+        ("security_size", ctypes.c_uint32),
+        ("transfer_direction", ctypes.c_uint8),
+        ("reserved", ctypes.c_uint8 * 3),
+        ("exchange", ctypes.c_uint8 * EXCHANGE_CAPACITY),
+        ("investor_id", ctypes.c_uint8 * INVESTOR_CAPACITY),
+        ("business_unit_id", ctypes.c_uint8 * BUSINESS_UNIT_CAPACITY),
+        ("shareholder_id", ctypes.c_uint8 * SHAREHOLDER_CAPACITY),
+        ("security", ctypes.c_uint8 * SECURITY_CAPACITY),
+    ]
+
+
+class _TransferFundRequest(ctypes.Structure):
+    """映射默认关闭的跨节点资金划拨写请求。"""
+
+    _fields_ = [
+        ("department_id_size", ctypes.c_uint32),
+        ("account_id_size", ctypes.c_uint32),
+        ("apply_serial", ctypes.c_int32),
+        ("external_node_id", ctypes.c_int32),
+        ("currency", ctypes.c_uint8),
+        ("transfer_direction", ctypes.c_uint8),
+        ("reserved", ctypes.c_uint8 * 6),
+        ("amount", ctypes.c_double),
+        ("department_id", ctypes.c_uint8 * DEPARTMENT_CAPACITY),
+        ("account_id", ctypes.c_uint8 * LOGIN_ACCOUNT_CAPACITY),
+    ]
+
+
+class _TransferPositionRequest(ctypes.Structure):
+    """映射使用同一持仓行完整身份的跨节点证券划拨请求。"""
+
+    _fields_ = [
+        ("exchange_size", ctypes.c_uint32),
+        ("investor_id_size", ctypes.c_uint32),
+        ("business_unit_id_size", ctypes.c_uint32),
+        ("shareholder_id_size", ctypes.c_uint32),
+        ("security_size", ctypes.c_uint32),
+        ("apply_serial", ctypes.c_int32),
+        ("volume", ctypes.c_int32),
+        ("market_id", ctypes.c_int32),
+        ("external_node_id", ctypes.c_int32),
+        ("transfer_direction", ctypes.c_uint8),
+        ("transfer_position_type", ctypes.c_uint8),
+        ("reserved", ctypes.c_uint8 * 2),
+        ("exchange", ctypes.c_uint8 * EXCHANGE_CAPACITY),
+        ("investor_id", ctypes.c_uint8 * INVESTOR_CAPACITY),
+        ("business_unit_id", ctypes.c_uint8 * BUSINESS_UNIT_CAPACITY),
+        ("shareholder_id", ctypes.c_uint8 * SHAREHOLDER_CAPACITY),
+        ("security", ctypes.c_uint8 * SECURITY_CAPACITY),
+    ]
+
+
 class _OwnedEvent(ctypes.Structure):
     """映射真实 Trader bridge-owned 大 payload 事件。"""
 
@@ -580,6 +703,102 @@ class _PositionEvent(ctypes.Structure):
         ("collateral_buy_untrade_amount", ctypes.c_double),
         ("credit_buy_untrade_amount", ctypes.c_double),
         ("credit_sell_untrade_amount", ctypes.c_double),
+        ("business_unit_id_size", ctypes.c_uint32),
+        ("market_id", ctypes.c_int32),
+        ("business_unit_id", ctypes.c_uint8 * BUSINESS_UNIT_CAPACITY),
+    ]
+
+
+class _SystemNodeEvent(ctypes.Structure):
+    """映射柜台系统节点目录记录。"""
+
+    _fields_ = [
+        ("node_id", ctypes.c_int32),
+        ("node_info_size", ctypes.c_uint32),
+        ("current", ctypes.c_uint8),
+        ("reserved", ctypes.c_uint8 * 3),
+        ("node_info", ctypes.c_uint8 * NODE_INFO_CAPACITY),
+    ]
+
+
+class _TransferResponseEvent(ctypes.Structure):
+    """映射仅表示请求接受或拒绝的划拨响应。"""
+
+    _fields_ = [
+        ("error_id", ctypes.c_int32),
+        ("apply_serial", ctypes.c_int32),
+        ("message_size", ctypes.c_uint32),
+        ("message", ctypes.c_uint8 * ERROR_MESSAGE_CAPACITY),
+    ]
+
+
+class _FundTransferEvent(ctypes.Structure):
+    """映射资金划拨最终回报或权威流水记录。"""
+
+    _fields_ = [
+        ("department_id_size", ctypes.c_uint32),
+        ("account_id_size", ctypes.c_uint32),
+        ("investor_id_size", ctypes.c_uint32),
+        ("business_unit_id_size", ctypes.c_uint32),
+        ("operate_date_size", ctypes.c_uint32),
+        ("operate_time_size", ctypes.c_uint32),
+        ("status_message_size", ctypes.c_uint32),
+        ("fund_serial", ctypes.c_int32),
+        ("apply_serial", ctypes.c_int32),
+        ("front_id", ctypes.c_int32),
+        ("session_id", ctypes.c_int32),
+        ("external_node_id", ctypes.c_int32),
+        ("currency", ctypes.c_uint8),
+        ("transfer_direction", ctypes.c_uint8),
+        ("transfer_status", ctypes.c_uint8),
+        ("reserved", ctypes.c_uint8),
+        ("amount", ctypes.c_double),
+        ("department_id", ctypes.c_uint8 * DEPARTMENT_CAPACITY),
+        ("account_id", ctypes.c_uint8 * LOGIN_ACCOUNT_CAPACITY),
+        ("investor_id", ctypes.c_uint8 * INVESTOR_CAPACITY),
+        ("business_unit_id", ctypes.c_uint8 * BUSINESS_UNIT_CAPACITY),
+        ("operate_date", ctypes.c_uint8 * DATE_CAPACITY),
+        ("operate_time", ctypes.c_uint8 * TIME_CAPACITY),
+        ("status_message", ctypes.c_uint8 * ERROR_MESSAGE_CAPACITY),
+    ]
+
+
+class _PositionTransferEvent(ctypes.Structure):
+    """映射证券划拨最终回报或权威流水记录。"""
+
+    _fields_ = [
+        ("exchange_size", ctypes.c_uint32),
+        ("investor_id_size", ctypes.c_uint32),
+        ("business_unit_id_size", ctypes.c_uint32),
+        ("shareholder_id_size", ctypes.c_uint32),
+        ("security_size", ctypes.c_uint32),
+        ("trading_day_size", ctypes.c_uint32),
+        ("operate_date_size", ctypes.c_uint32),
+        ("operate_time_size", ctypes.c_uint32),
+        ("status_message_size", ctypes.c_uint32),
+        ("position_serial", ctypes.c_int32),
+        ("apply_serial", ctypes.c_int32),
+        ("front_id", ctypes.c_int32),
+        ("session_id", ctypes.c_int32),
+        ("market_id", ctypes.c_int32),
+        ("external_node_id", ctypes.c_int32),
+        ("history_volume", ctypes.c_int32),
+        ("today_bs_volume", ctypes.c_int32),
+        ("today_pr_volume", ctypes.c_int32),
+        ("today_sm_volume", ctypes.c_int32),
+        ("transfer_direction", ctypes.c_uint8),
+        ("transfer_position_type", ctypes.c_uint8),
+        ("transfer_status", ctypes.c_uint8),
+        ("reserved", ctypes.c_uint8),
+        ("exchange", ctypes.c_uint8 * EXCHANGE_CAPACITY),
+        ("investor_id", ctypes.c_uint8 * INVESTOR_CAPACITY),
+        ("business_unit_id", ctypes.c_uint8 * BUSINESS_UNIT_CAPACITY),
+        ("shareholder_id", ctypes.c_uint8 * SHAREHOLDER_CAPACITY),
+        ("security", ctypes.c_uint8 * SECURITY_CAPACITY),
+        ("trading_day", ctypes.c_uint8 * DATE_CAPACITY),
+        ("operate_date", ctypes.c_uint8 * DATE_CAPACITY),
+        ("operate_time", ctypes.c_uint8 * TIME_CAPACITY),
+        ("status_message", ctypes.c_uint8 * ERROR_MESSAGE_CAPACITY),
     ]
 
 
@@ -756,6 +975,7 @@ class NativeSessionConfig:
     public_topic: Optional[str] = None
     enable_trading: bool = False
     enable_cancel: bool = False
+    enable_node_transfer: bool = False
 
     @classmethod
     def from_mapping(
@@ -808,6 +1028,7 @@ class NativeSessionConfig:
             ),
             enable_trading=bool(config.get("enable_trading", False)),
             enable_cancel=bool(config.get("enable_cancel", False)),
+            enable_node_transfer=bool(config.get("enable_node_transfer", False)),
         )
 
 
@@ -858,6 +1079,59 @@ class NativeCancelOrderRequest:
     front_id: int = 0
     session_id: int = 0
     order_ref: int = 0
+
+
+@dataclass(frozen=True)
+class NativeFundTransferDetailQuery:
+    """表示资金划拨流水的可选权威查询过滤条件。"""
+
+    department_id: str = ""
+    account_id: str = ""
+    investor_id: str = ""
+    currency: str = ""
+    transfer_direction: str = ""
+
+
+@dataclass(frozen=True)
+class NativePositionTransferDetailQuery:
+    """表示证券划拨流水的可选权威查询过滤条件。"""
+
+    exchange: str = ""
+    investor_id: str = ""
+    business_unit_id: str = ""
+    shareholder_id: str = ""
+    security: str = ""
+    transfer_direction: str = ""
+
+
+@dataclass(frozen=True)
+class NativeTransferFundRequest:
+    """表示显式 ApplySerial 的跨节点资金划拨写请求。"""
+
+    department_id: str
+    account_id: str
+    currency: str
+    transfer_direction: str
+    amount: float
+    apply_serial: int
+    external_node_id: int
+
+
+@dataclass(frozen=True)
+class NativeTransferPositionRequest:
+    """表示使用同一持仓行完整身份的跨节点证券划拨写请求。"""
+
+    exchange: str
+    investor_id: str
+    business_unit_id: str
+    shareholder_id: str
+    security: str
+    market_id: int
+    transfer_direction: str
+    transfer_position_type: str
+    volume: int
+    apply_serial: int
+    external_node_id: int
 
 
 def _schema_identity(
@@ -1089,7 +1363,7 @@ def _session_config_to_raw(
         encrypt=int(config.encrypt),
         enable_trading=int(config.enable_trading),
         enable_cancel=int(config.enable_cancel),
-        reserved_flags=0,
+        reserved_flags=(SESSION_FLAG_ENABLE_NODE_TRANSFER if config.enable_node_transfer else 0),
         login_account_type=_LOGIN_ACCOUNT_TYPES[config.login_account_type],
         trade_comm_mode=_TRADE_COMM_MODES[config.trade_comm_mode],
         private_topic=_TOPIC_MODES[config.private_topic],
@@ -1368,6 +1642,194 @@ def _cancel_order_payload(cancel: NativeCancelOrderRequest) -> bytes:
     return _structure_bytes(raw)
 
 
+def _transfer_direction_code(value: str, *, allow_empty: bool) -> int:
+    """把公开节点划拨方向转换为稳定 C ABI 值。
+
+    Args:
+        value: ``node_move_in``、``node_move_out``，查询可传空。
+        allow_empty: 是否允许空方向作为查询通配。
+
+    Returns:
+        int: 稳定 ABI 方向值。
+
+    Raises:
+        ValueError: 方向不在白名单中。
+    """
+
+    text = str(value or "").strip().lower()
+    if allow_empty and not text:
+        return 0
+    if text not in _TRANSFER_DIRECTIONS:
+        raise ValueError("transfer_direction 仅允许 node_move_in 或 node_move_out")
+    return _TRANSFER_DIRECTIONS[text]
+
+
+def _single_char_code(value: str, field_name: str, *, allow_empty: bool) -> int:
+    """把单字节厂商字符字段转换为无符号整数。
+
+    Args:
+        value: 单个 ASCII 字符。
+        field_name: 错误信息字段名。
+        allow_empty: 是否允许空文本并返回零。
+
+    Returns:
+        int: 0..127 字节值。
+
+    Raises:
+        ValueError: 值不是允许的单字节 ASCII。
+    """
+
+    text = str(value or "")
+    if allow_empty and not text:
+        return 0
+    encoded = text.encode("ascii", errors="strict")
+    if len(encoded) != 1 or encoded[0] == 0:
+        raise ValueError(f"{field_name} 必须为单个非 NUL ASCII 字符")
+    return encoded[0]
+
+
+def _system_node_query_payload(node_id: int = 0) -> bytes:
+    """构造系统节点查询 payload。
+
+    Args:
+        node_id: 零查询全部，正数查询指定节点。
+
+    Returns:
+        bytes: 固定布局查询参数。
+    """
+
+    if isinstance(node_id, bool) or not isinstance(node_id, int) or node_id < 0:
+        raise ValueError("node_id 必须为非负 int")
+    return _structure_bytes(_SystemNodeQueryRequest(node_id=node_id))
+
+
+def _fund_transfer_detail_query_payload(query: NativeFundTransferDetailQuery) -> bytes:
+    """构造资金划拨流水查询 payload。
+
+    Args:
+        query: 可选账户和方向过滤。
+
+    Returns:
+        bytes: 固定布局查询参数。
+    """
+
+    if not isinstance(query, NativeFundTransferDetailQuery):
+        raise TypeError("query 必须为 NativeFundTransferDetailQuery")
+    raw = _FundTransferDetailQueryRequest(
+        currency=_single_char_code(query.currency, "currency", allow_empty=True),
+        transfer_direction=_transfer_direction_code(query.transfer_direction, allow_empty=True),
+    )
+    _assign_text(raw, "department_id", query.department_id, DEPARTMENT_CAPACITY)
+    _assign_text(raw, "account_id", query.account_id, LOGIN_ACCOUNT_CAPACITY)
+    _assign_text(raw, "investor_id", query.investor_id, INVESTOR_CAPACITY)
+    return _structure_bytes(raw)
+
+
+def _position_transfer_detail_query_payload(
+    query: NativePositionTransferDetailQuery,
+) -> bytes:
+    """构造证券划拨流水查询 payload。
+
+    Args:
+        query: 可选证券身份和方向过滤。
+
+    Returns:
+        bytes: 固定布局查询参数。
+    """
+
+    if not isinstance(query, NativePositionTransferDetailQuery):
+        raise TypeError("query 必须为 NativePositionTransferDetailQuery")
+    raw = _PositionTransferDetailQueryRequest(
+        transfer_direction=_transfer_direction_code(query.transfer_direction, allow_empty=True)
+    )
+    _assign_text(raw, "exchange", query.exchange, EXCHANGE_CAPACITY)
+    _assign_text(raw, "investor_id", query.investor_id, INVESTOR_CAPACITY)
+    _assign_text(raw, "business_unit_id", query.business_unit_id, BUSINESS_UNIT_CAPACITY)
+    _assign_text(raw, "shareholder_id", query.shareholder_id, SHAREHOLDER_CAPACITY)
+    _assign_text(raw, "security", query.security, SECURITY_CAPACITY)
+    return _structure_bytes(raw)
+
+
+def _transfer_fund_payload(transfer: NativeTransferFundRequest) -> bytes:
+    """校验并构造跨节点资金划拨 payload。
+
+    Args:
+        transfer: 显式方向、金额、节点和 ApplySerial。
+
+    Returns:
+        bytes: 固定布局写请求。
+    """
+
+    if not isinstance(transfer, NativeTransferFundRequest):
+        raise TypeError("transfer 必须为 NativeTransferFundRequest")
+    try:
+        amount = float(transfer.amount)
+    except (TypeError, ValueError, OverflowError):
+        raise ValueError("amount 必须为有限正数") from None
+    if not math.isfinite(amount) or amount <= 0.0:
+        raise ValueError("amount 必须为有限正数")
+    for field_name, value in (
+        ("apply_serial", transfer.apply_serial),
+        ("external_node_id", transfer.external_node_id),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or not (1 <= value < (1 << 31)):
+            raise ValueError(f"{field_name} 必须为正 int32")
+    raw = _TransferFundRequest(
+        apply_serial=transfer.apply_serial,
+        external_node_id=transfer.external_node_id,
+        currency=_single_char_code(transfer.currency, "currency", allow_empty=False),
+        transfer_direction=_transfer_direction_code(transfer.transfer_direction, allow_empty=False),
+        amount=amount,
+    )
+    _assign_text(raw, "department_id", transfer.department_id, DEPARTMENT_CAPACITY, True)
+    _assign_text(raw, "account_id", transfer.account_id, LOGIN_ACCOUNT_CAPACITY, True)
+    return _structure_bytes(raw)
+
+
+def _transfer_position_payload(transfer: NativeTransferPositionRequest) -> bytes:
+    """校验并构造同一持仓身份的跨节点证券划拨 payload。
+
+    Args:
+        transfer: 持仓同行身份、数量、方向和 ApplySerial。
+
+    Returns:
+        bytes: 固定布局写请求。
+    """
+
+    if not isinstance(transfer, NativeTransferPositionRequest):
+        raise TypeError("transfer 必须为 NativeTransferPositionRequest")
+    for field_name, value in (
+        ("apply_serial", transfer.apply_serial),
+        ("external_node_id", transfer.external_node_id),
+        ("volume", transfer.volume),
+    ):
+        if isinstance(value, bool) or not isinstance(value, int) or not (1 <= value < (1 << 31)):
+            raise ValueError(f"{field_name} 必须为正 int32")
+    if (
+        isinstance(transfer.market_id, bool)
+        or not isinstance(transfer.market_id, int)
+        or not (1 <= transfer.market_id <= 255)
+    ):
+        raise ValueError("market_id 必须为 1..255 的整数")
+    position_type = str(transfer.transfer_position_type or "").strip().lower()
+    if position_type not in _TRANSFER_POSITION_TYPES:
+        raise ValueError("transfer_position_type 不在受控枚举中")
+    raw = _TransferPositionRequest(
+        apply_serial=transfer.apply_serial,
+        volume=transfer.volume,
+        market_id=transfer.market_id,
+        external_node_id=transfer.external_node_id,
+        transfer_direction=_transfer_direction_code(transfer.transfer_direction, allow_empty=False),
+        transfer_position_type=_TRANSFER_POSITION_TYPES[position_type],
+    )
+    _assign_text(raw, "exchange", transfer.exchange, EXCHANGE_CAPACITY, True)
+    _assign_text(raw, "investor_id", transfer.investor_id, INVESTOR_CAPACITY, True)
+    _assign_text(raw, "business_unit_id", transfer.business_unit_id, BUSINESS_UNIT_CAPACITY)
+    _assign_text(raw, "shareholder_id", transfer.shareholder_id, SHAREHOLDER_CAPACITY, True)
+    _assign_text(raw, "security", transfer.security, SECURITY_CAPACITY, True)
+    return _structure_bytes(raw)
+
+
 def _decode_event_text(raw: Any, size: int, capacity: int, field_name: str) -> str:
     """按显式长度解码可能为 UTF-8 或 GB18030 的厂商文本。
 
@@ -1497,6 +1959,38 @@ def _volume_condition_value(value: int) -> str:
 
     names = {code: name for name, code in _VOLUME_CONDITIONS.items()}
     return names.get(value, _char_value(value))
+
+
+def _transfer_direction_name(value: int) -> str:
+    """把稳定划拨方向整数转换为公开名称。
+
+    Args:
+        value: C ABI 稳定方向值。
+
+    Returns:
+        str: canonical 方向或 ``unknown``。
+    """
+
+    return {1: "node_move_in", 2: "node_move_out"}.get(value, "unknown")
+
+
+def _transfer_position_type_name(value: int) -> str:
+    """把稳定持仓划拨类型整数转换为公开名称。
+
+    Args:
+        value: C ABI 稳定持仓类型。
+
+    Returns:
+        str: canonical 持仓类型或 ``unknown``。
+    """
+
+    return {
+        1: "all",
+        2: "history",
+        3: "today_buy_sell",
+        4: "today_purchase_redeem",
+        5: "today_split_merge",
+    }.get(value, "unknown")
 
 
 def _decode_event_data(event_type: int, payload: bytes) -> Mapping[str, object]:
@@ -1681,6 +2175,147 @@ def _decode_event_data(event_type: int, payload: bytes) -> Mapping[str, object]:
             "collateral_buy_untrade_amount": float(value.collateral_buy_untrade_amount),
             "credit_buy_untrade_amount": float(value.credit_buy_untrade_amount),
             "credit_sell_untrade_amount": float(value.credit_sell_untrade_amount),
+            "business_unit_id": _decode_event_text(
+                value.business_unit_id,
+                int(value.business_unit_id_size),
+                BUSINESS_UNIT_CAPACITY,
+                "business_unit_id",
+            ),
+            "market_id": int(value.market_id),
+        }
+    if event_type == EVENT_SYSTEM_NODE:
+        value = _payload_as(payload, _SystemNodeEvent)
+        return {
+            "node_id": int(value.node_id),
+            "node_info": _decode_event_text(
+                value.node_info,
+                int(value.node_info_size),
+                NODE_INFO_CAPACITY,
+                "node_info",
+            ),
+            "current": bool(value.current),
+        }
+    if event_type in {EVENT_FUND_TRANSFER_DETAIL, EVENT_FUND_TRANSFER}:
+        value = _payload_as(payload, _FundTransferEvent)
+        return {
+            "department_id": _decode_event_text(
+                value.department_id,
+                int(value.department_id_size),
+                DEPARTMENT_CAPACITY,
+                "department_id",
+            ),
+            "account_id": _decode_event_text(
+                value.account_id,
+                int(value.account_id_size),
+                LOGIN_ACCOUNT_CAPACITY,
+                "account_id",
+            ),
+            "investor_id": _decode_event_text(
+                value.investor_id,
+                int(value.investor_id_size),
+                INVESTOR_CAPACITY,
+                "investor_id",
+            ),
+            "business_unit_id": _decode_event_text(
+                value.business_unit_id,
+                int(value.business_unit_id_size),
+                BUSINESS_UNIT_CAPACITY,
+                "business_unit_id",
+            ),
+            "operate_date": _decode_event_text(
+                value.operate_date,
+                int(value.operate_date_size),
+                DATE_CAPACITY,
+                "operate_date",
+            ),
+            "operate_time": _decode_event_text(
+                value.operate_time,
+                int(value.operate_time_size),
+                TIME_CAPACITY,
+                "operate_time",
+            ),
+            "status_message": _decode_event_text(
+                value.status_message,
+                int(value.status_message_size),
+                ERROR_MESSAGE_CAPACITY,
+                "status_message",
+            ),
+            "fund_serial": int(value.fund_serial),
+            "apply_serial": int(value.apply_serial),
+            "front_id": int(value.front_id),
+            "session_id": int(value.session_id),
+            "external_node_id": int(value.external_node_id),
+            "currency": _char_value(int(value.currency)),
+            "transfer_direction": _transfer_direction_name(int(value.transfer_direction)),
+            "transfer_status": _TRANSFER_STATUSES.get(int(value.transfer_status), "unknown"),
+            "amount": float(value.amount),
+        }
+    if event_type in {EVENT_POSITION_TRANSFER_DETAIL, EVENT_POSITION_TRANSFER}:
+        value = _payload_as(payload, _PositionTransferEvent)
+        return {
+            "exchange": _decode_event_text(
+                value.exchange, int(value.exchange_size), EXCHANGE_CAPACITY, "exchange"
+            ),
+            "investor_id": _decode_event_text(
+                value.investor_id,
+                int(value.investor_id_size),
+                INVESTOR_CAPACITY,
+                "investor_id",
+            ),
+            "business_unit_id": _decode_event_text(
+                value.business_unit_id,
+                int(value.business_unit_id_size),
+                BUSINESS_UNIT_CAPACITY,
+                "business_unit_id",
+            ),
+            "shareholder_id": _decode_event_text(
+                value.shareholder_id,
+                int(value.shareholder_id_size),
+                SHAREHOLDER_CAPACITY,
+                "shareholder_id",
+            ),
+            "security": _decode_event_text(
+                value.security, int(value.security_size), SECURITY_CAPACITY, "security"
+            ),
+            "trading_day": _decode_event_text(
+                value.trading_day,
+                int(value.trading_day_size),
+                DATE_CAPACITY,
+                "trading_day",
+            ),
+            "operate_date": _decode_event_text(
+                value.operate_date,
+                int(value.operate_date_size),
+                DATE_CAPACITY,
+                "operate_date",
+            ),
+            "operate_time": _decode_event_text(
+                value.operate_time,
+                int(value.operate_time_size),
+                TIME_CAPACITY,
+                "operate_time",
+            ),
+            "status_message": _decode_event_text(
+                value.status_message,
+                int(value.status_message_size),
+                ERROR_MESSAGE_CAPACITY,
+                "status_message",
+            ),
+            "position_serial": int(value.position_serial),
+            "apply_serial": int(value.apply_serial),
+            "front_id": int(value.front_id),
+            "session_id": int(value.session_id),
+            "market_id": int(value.market_id),
+            "external_node_id": int(value.external_node_id),
+            "history_volume": int(value.history_volume),
+            "today_bs_volume": int(value.today_bs_volume),
+            "today_pr_volume": int(value.today_pr_volume),
+            "today_sm_volume": int(value.today_sm_volume),
+            "transfer_direction": _transfer_direction_name(int(value.transfer_direction)),
+            "transfer_position_type": _transfer_position_type_name(
+                int(value.transfer_position_type)
+            ),
+            "transfer_status": _TRANSFER_STATUSES.get(int(value.transfer_status), "unknown"),
         }
     if event_type == EVENT_ORDER:
         value = _payload_as(payload, _OrderEvent)
@@ -1815,6 +2450,18 @@ def _decode_event_data(event_type: int, payload: bytes) -> Mapping[str, object]:
                 ORDER_SYS_ID_CAPACITY,
                 "order_sys_id",
             ),
+            "error_message": _decode_event_text(
+                value.message,
+                int(value.message_size),
+                ERROR_MESSAGE_CAPACITY,
+                "error_message",
+            ),
+        }
+    if event_type in {EVENT_FUND_TRANSFER_RESPONSE, EVENT_POSITION_TRANSFER_RESPONSE}:
+        value = _payload_as(payload, _TransferResponseEvent)
+        return {
+            "error_id": int(value.error_id),
+            "apply_serial": int(value.apply_serial),
             "error_message": _decode_event_text(
                 value.message,
                 int(value.message_size),
@@ -2382,7 +3029,9 @@ class NativeRuntime:
             handle = self._require_handle()
             result = int(self._bridge._library.bt_huaxin_submit_request(handle, ctypes.byref(raw)))
             if result != 0:
-                print(f"[DEBUG NATIVE] bt_huaxin_submit_request operation={operation} result={result} request_type={raw.request_type} payload_len={len(payload)}")
+                print(
+                    f"[DEBUG NATIVE] bt_huaxin_submit_request operation={operation} result={result} request_type={raw.request_type} payload_len={len(payload)}"
+                )
             self._bridge._raise_for_result(result, operation)
 
     def start_session(self, config: NativeSessionConfig) -> None:
@@ -2517,6 +3166,68 @@ class NativeRuntime:
 
         self._submit_payload(request_id, b"", REQUEST_QUERY_TRADE, "query_trades")
 
+    def query_system_nodes(self, request_id: int, node_id: int = 0) -> None:
+        """提交柜台系统节点目录查询。
+
+        Args:
+            request_id: 正 int32 请求标识。
+            node_id: 零查询全部，正数查询指定节点。
+
+        Returns:
+            None；记录与 query_end 通过 drain 返回。
+        """
+
+        self._submit_payload(
+            request_id,
+            _system_node_query_payload(node_id),
+            REQUEST_QUERY_SYSTEM_NODE,
+            "query_system_nodes",
+        )
+
+    def query_fund_transfer_details(
+        self,
+        request_id: int,
+        query: Optional[NativeFundTransferDetailQuery] = None,
+    ) -> None:
+        """提交资金划拨流水查询。
+
+        Args:
+            request_id: 正 int32 请求标识。
+            query: 可选过滤条件；缺省查询当前账户可见流水。
+
+        Returns:
+            None；记录与 query_end 通过 drain 返回。
+        """
+
+        self._submit_payload(
+            request_id,
+            _fund_transfer_detail_query_payload(query or NativeFundTransferDetailQuery()),
+            REQUEST_QUERY_FUND_TRANSFER_DETAIL,
+            "query_fund_transfer_details",
+        )
+
+    def query_position_transfer_details(
+        self,
+        request_id: int,
+        query: Optional[NativePositionTransferDetailQuery] = None,
+    ) -> None:
+        """提交证券划拨流水查询。
+
+        Args:
+            request_id: 正 int32 请求标识。
+            query: 可选过滤条件；缺省查询当前账户可见流水。
+
+        Returns:
+            None；记录与 query_end 通过 drain 返回。
+        """
+
+        self._submit_payload(
+            request_id,
+            _position_transfer_detail_query_payload(query or NativePositionTransferDetailQuery()),
+            REQUEST_QUERY_POSITION_TRANSFER_DETAIL,
+            "query_position_transfer_details",
+        )
+
     def place_limit(self, request_id: int, order: NativeLimitOrderRequest) -> None:
         """提交受 native 交易门禁保护的限价委托。
 
@@ -2579,6 +3290,46 @@ class NativeRuntime:
             _cancel_order_payload(cancel),
             REQUEST_CANCEL_ORDER,
             "cancel_order",
+        )
+
+    def transfer_fund(self, request_id: int, transfer: NativeTransferFundRequest) -> None:
+        """提交默认关闭且不自动重试的跨节点资金划拨。
+
+        Args:
+            request_id: 正 int32 请求标识。
+            transfer: 已持久化 ApplySerial 的资金动作。
+
+        Returns:
+            None；接受响应和最终回报通过 owned events 返回。
+        """
+
+        self._submit_payload(
+            request_id,
+            _transfer_fund_payload(transfer),
+            REQUEST_TRANSFER_FUND,
+            "transfer_fund",
+        )
+
+    def transfer_position(
+        self,
+        request_id: int,
+        transfer: NativeTransferPositionRequest,
+    ) -> None:
+        """提交默认关闭且不自动重试的跨节点证券划拨。
+
+        Args:
+            request_id: 正 int32 请求标识。
+            transfer: 已持久化 ApplySerial 和同行身份的证券动作。
+
+        Returns:
+            None；接受响应和最终回报通过 owned events 返回。
+        """
+
+        self._submit_payload(
+            request_id,
+            _transfer_position_payload(transfer),
+            REQUEST_TRANSFER_POSITION,
+            "transfer_position",
         )
 
     def drain(self, max_events: int) -> List[NativeEvent]:

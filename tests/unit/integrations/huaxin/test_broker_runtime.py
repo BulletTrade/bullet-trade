@@ -37,6 +37,12 @@ class _FakeRuntime:
         self.started = None
         self.place_calls = []
         self.cancel_calls = []
+        self.transfer_calls = []
+        self.transfer_emit_final = True
+        self.transfer_final_before_response = False
+        self.transfer_final_apply_serial_delta = 0
+        self.transfer_response_error_id = 0
+        self.transfer_response_error_message = ""
         self.closed = False
         self.dropped_events = 0
         self.query_end_record_count_delta = 0
@@ -135,7 +141,14 @@ class _FakeRuntime:
         self._query(
             request_id,
             "trading_account",
-            {"account_id": "acct", "available_cash": 1000, "frozen_cash": 20},
+            {
+                "department_id": "dept",
+                "account_id": "acct",
+                "currency": "1",
+                "available_cash": 1000,
+                "transferable_cash": 900,
+                "frozen_cash": 20,
+            },
         )
 
     def query_positions(self, request_id):
@@ -157,6 +170,10 @@ class _FakeRuntime:
                 "current_position": 100,
                 "available_position": 80,
                 "total_cost": 10020,
+                "investor_id": "investor",
+                "business_unit_id": "unit",
+                "shareholder_id": "shareholder",
+                "market_id": ord("1"),
             },
         )
 
@@ -271,6 +288,132 @@ class _FakeRuntime:
             },
         )
 
+    def query_system_nodes(self, request_id, node_id=0):
+        """生成柜台节点目录记录。
+
+        Args:
+            request_id: 请求标识。
+            node_id: 可选节点过滤。
+
+        Returns:
+            None。
+        """
+
+        self._query(
+            request_id,
+            "system_node",
+            {"node_id": node_id or 14, "node_info": "DG", "current": True},
+        )
+
+    def query_fund_transfer_details(self, request_id, query):
+        """生成资金划拨成功流水。
+
+        Args:
+            request_id: 请求标识。
+            query: 资金流水查询条件。
+
+        Returns:
+            None。
+        """
+
+        del query
+        self._query(
+            request_id,
+            "fund_transfer_detail",
+            {"apply_serial": 7001, "transfer_status": "success"},
+        )
+
+    def query_position_transfer_details(self, request_id, query):
+        """生成证券划拨成功流水。
+
+        Args:
+            request_id: 请求标识。
+            query: 证券流水查询条件。
+
+        Returns:
+            None。
+        """
+
+        del query
+        self._query(
+            request_id,
+            "position_transfer_detail",
+            {"apply_serial": 7002, "transfer_status": "success"},
+        )
+
+    def transfer_fund(self, request_id, request):
+        """生成资金划拨接受及可选最终成功回报。
+
+        Args:
+            request_id: 请求标识。
+            request: 资金划拨请求。
+
+        Returns:
+            None。
+        """
+
+        self.transfer_calls.append(("fund", request_id, request))
+        response = self._event(
+            request_id,
+            "fund_transfer_response",
+            {
+                "error_id": self.transfer_response_error_id,
+                "error_message": self.transfer_response_error_message,
+                "apply_serial": request.apply_serial,
+            },
+        )
+        emitted = [response]
+        if self.transfer_emit_final:
+            final = self._event(
+                request_id,
+                "fund_transfer",
+                {
+                    "apply_serial": (request.apply_serial + self.transfer_final_apply_serial_delta),
+                    "transfer_status": "success",
+                    "fund_serial": 9001,
+                },
+            )
+            emitted = (
+                [final, response] if self.transfer_final_before_response else [response, final]
+            )
+        self.events.extend(emitted)
+
+    def transfer_position(self, request_id, request):
+        """生成证券划拨接受及可选最终成功回报。
+
+        Args:
+            request_id: 请求标识。
+            request: 证券划拨请求。
+
+        Returns:
+            None。
+        """
+
+        self.transfer_calls.append(("position", request_id, request))
+        self.events.append(
+            self._event(
+                request_id,
+                "position_transfer_response",
+                {
+                    "error_id": self.transfer_response_error_id,
+                    "error_message": self.transfer_response_error_message,
+                    "apply_serial": request.apply_serial,
+                },
+            )
+        )
+        if self.transfer_emit_final:
+            self.events.append(
+                self._event(
+                    request_id,
+                    "position_transfer",
+                    {
+                        "apply_serial": request.apply_serial,
+                        "transfer_status": "success",
+                        "position_serial": 9002,
+                    },
+                )
+            )
+
     def place_order(self, request_id, request):
         """记录统一限价/市价请求并生成订单事实和成功响应。
 
@@ -348,6 +491,11 @@ class _FakeRuntime:
             "position": broker_module.native_api.REQUEST_QUERY_POSITION,
             "order": broker_module.native_api.REQUEST_QUERY_ORDER,
             "trade": broker_module.native_api.REQUEST_QUERY_TRADE,
+            "system_node": broker_module.native_api.REQUEST_QUERY_SYSTEM_NODE,
+            "fund_transfer_detail": broker_module.native_api.REQUEST_QUERY_FUND_TRANSFER_DETAIL,
+            "position_transfer_detail": (
+                broker_module.native_api.REQUEST_QUERY_POSITION_TRANSFER_DETAIL
+            ),
         }
         request_type = request_types[event_name]
         if self.query_end_request_type_override is not None:
@@ -1257,3 +1405,197 @@ def test_security_status_mask_is_not_filtered_by_client_allowlist() -> None:
     )
 
     assert broker._security_order_constraints_ready is True
+
+
+def test_node_and_transfer_detail_queries_require_query_end() -> None:
+    """验证节点目录和两类划拨流水均走统一 query_end 完整性合同。
+
+    Returns:
+        None；三类记录均由 fake runtime 权威返回即通过。
+    """
+
+    broker = _connected_broker(_FakeRuntime())
+
+    assert broker.get_system_nodes(14)[0]["current"] is True
+    assert (
+        broker.get_fund_transfer_details({"apply_serial": 7001})[0]["transfer_status"] == "success"
+    )
+    assert broker.get_position_transfer_details({"security": "511880"})[0]["apply_serial"] == 7002
+    assert broker.get_fund_transfer_details({"apply_serial": 9999}) == []
+    assert broker.get_position_transfer_details({"apply_serial": 9999}) == []
+
+
+def test_public_shareholder_accounts_can_refresh_or_reuse_cache() -> None:
+    """验证公开股东账户接口既可权威重查，也可只读复用缓存。
+
+    Returns:
+        None；两种读取方式均返回隔离副本即通过。
+    """
+
+    broker = _connected_broker(_FakeRuntime())
+
+    refreshed = broker.get_shareholder_accounts()
+    refreshed[0]["shareholder_id"] = "mutated"
+    cached = broker.get_shareholder_accounts(refresh=False)
+
+    assert cached[0]["shareholder_id"] == "shareholder"
+
+
+def test_node_transfer_primitives_use_source_row_and_final_fact() -> None:
+    """验证 DG14 划拨原语使用源行身份且只有 OnRtn 成功才返回 succeeded。
+
+    Returns:
+        None；资金和证券各调用一次并保留 ApplySerial 即通过。
+    """
+
+    runtime = _FakeRuntime()
+    broker = _connected_broker(runtime, enable_node_transfer=True)
+    account = broker.get_account_info()
+    position = broker.get_positions()[0]
+
+    fund = broker.submit_fund_transfer(
+        account,
+        amount=100.0,
+        apply_serial=7001,
+        external_node_id=16,
+    )
+    security = broker.submit_position_transfer(
+        position,
+        volume=80,
+        apply_serial=7002,
+        external_node_id=16,
+    )
+
+    assert fund["submission_state"] == "succeeded"
+    assert security["submission_state"] == "succeeded"
+    assert [item[0] for item in runtime.transfer_calls] == ["fund", "position"]
+    assert runtime.transfer_calls[0][2].account_id == "acct"
+    assert runtime.transfer_calls[1][2].shareholder_id == "shareholder"
+    assert runtime.transfer_calls[1][2].business_unit_id == "unit"
+
+
+def test_accepted_transfer_timeout_returns_unknown_without_retry() -> None:
+    """验证只有接受回执时返回 unknown，Broker 不自动再次调用 native。
+
+    Returns:
+        None；调用次数保持一且状态不冒充完成即通过。
+    """
+
+    runtime = _FakeRuntime()
+    runtime.transfer_emit_final = False
+    broker = _connected_broker(runtime, enable_node_transfer=True)
+
+    result = broker.submit_fund_transfer(
+        broker.get_account_info(),
+        amount=100.0,
+        apply_serial=7001,
+        external_node_id=16,
+        wait_timeout=0,
+    )
+
+    assert result["submission_state"] == "unknown"
+    assert result["reason"] == "accepted_without_terminal_fact"
+    assert len(runtime.transfer_calls) == 1
+
+
+def test_rejected_transfer_preserves_vendor_error_message() -> None:
+    """验证划拨拒绝时保留 native 已复制的华鑫错误文本。
+
+    Returns:
+        None；错误码和错误文本均原样返回且不等待最终回报即通过。
+    """
+
+    runtime = _FakeRuntime()
+    runtime.transfer_response_error_id = 372
+    runtime.transfer_response_error_message = "vendor-transfer-rejected"
+    broker = _connected_broker(runtime, enable_node_transfer=True)
+
+    result = broker.submit_position_transfer(
+        broker.get_positions()[0],
+        volume=80,
+        apply_serial=7002,
+        external_node_id=16,
+    )
+
+    assert result["submission_state"] == "rejected"
+    assert result["error_id"] == 372
+    assert result["error_message"] == "vendor-transfer-rejected"
+
+
+def test_transfer_matches_apply_serial_when_final_precedes_response() -> None:
+    """验证异步最终回报先于接受响应时仍只按 ApplySerial 收口。
+
+    Returns:
+        None；正确流水先到仍成功，错误流水不被误认即通过。
+    """
+
+    runtime = _FakeRuntime()
+    runtime.transfer_final_before_response = True
+    broker = _connected_broker(runtime, enable_node_transfer=True)
+
+    succeeded = broker.submit_fund_transfer(
+        broker.get_account_info(),
+        amount=100.0,
+        apply_serial=7001,
+        external_node_id=16,
+    )
+    assert succeeded["submission_state"] == "succeeded"
+
+    runtime.transfer_final_apply_serial_delta = 1
+    ignored = broker.submit_fund_transfer(
+        broker.get_account_info(),
+        amount=100.0,
+        apply_serial=7002,
+        external_node_id=16,
+        wait_timeout=0,
+    )
+    assert ignored["submission_state"] == "unknown"
+    assert ignored["reason"] == "accepted_without_terminal_fact"
+
+
+def test_transfer_rejects_amount_or_volume_above_source_snapshot() -> None:
+    """验证冻结动作不能超过来源权威行的可划资金或持仓。
+
+    Returns:
+        None；两类越界均在 native 写入前拒绝即通过。
+    """
+
+    runtime = _FakeRuntime()
+    broker = _connected_broker(runtime, enable_node_transfer=True)
+
+    with pytest.raises(ValueError, match="transferable_cash"):
+        broker.submit_fund_transfer(
+            broker.get_account_info(),
+            amount=901.0,
+            apply_serial=7001,
+            external_node_id=16,
+        )
+    with pytest.raises(ValueError, match="available_position"):
+        broker.submit_position_transfer(
+            broker.get_positions()[0],
+            volume=81,
+            apply_serial=7002,
+            external_node_id=16,
+        )
+    assert runtime.transfer_calls == []
+
+
+def test_query_only_broker_rejects_transfer_before_native_call() -> None:
+    """验证 JQ16 query-only 会话在 Python 类边界拒绝节点划拨。
+
+    Returns:
+        None；未启用门禁时 fake runtime 调用次数保持零即通过。
+    """
+
+    runtime = _FakeRuntime()
+    broker = _connected_broker(runtime, enable_node_transfer=False)
+
+    with pytest.raises(HuaxinTradingDisabledError, match="节点资产划拨未启用"):
+        broker.submit_fund_transfer(
+            broker.get_account_info(),
+            amount=100.0,
+            apply_serial=7001,
+            external_node_id=16,
+        )
+
+    assert runtime.transfer_calls == []

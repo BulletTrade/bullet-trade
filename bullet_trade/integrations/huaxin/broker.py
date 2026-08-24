@@ -286,6 +286,7 @@ class HuaxinBroker(BrokerBase):
         self._config.setdefault("account_id", account_id)
         self._enable_trading = bool(self._config.get("enable_trading", False))
         self._enable_cancel = bool(self._config.get("enable_cancel", False))
+        self._enable_node_transfer = bool(self._config.get("enable_node_transfer", False))
         self._order_ref = 0
         self._order_ref_lock = threading.Lock()
         self._order_ref_allocator_ready = True
@@ -680,6 +681,221 @@ class HuaxinBroker(BrokerBase):
         ]
         self._successful_baseline_queries.add("positions")
         return rows
+
+    def get_shareholder_accounts(self, *, refresh: bool = True) -> List[Dict[str, Any]]:
+        """公开读取股东账户身份，默认向柜台重新查询权威快照。
+
+        Args:
+            refresh: 为 True 时重新查询；为 False 且已有缓存时返回缓存副本。
+
+        Returns:
+            List[Dict[str, Any]]: 股东账号、投资者和营业单元等身份记录副本。
+
+        Side Effects:
+            重新查询时刷新当前 Broker 的只读身份缓存，不发起任何写请求。
+        """
+
+        if refresh or not self._shareholder_accounts:
+            self._query_shareholder_accounts()
+        return [dict(row) for row in self._shareholder_accounts]
+
+    def get_system_nodes(self, node_id: int = 0) -> List[Dict[str, Any]]:
+        """查询柜台系统节点目录并等待明确 query_end。
+
+        Args:
+            node_id: 零查询全部，正数仅查询指定节点。
+
+        Returns:
+            List[Dict[str, Any]]: 含 node_id、node_info 和 current 的权威记录。
+        """
+
+        return self._query_rows(
+            "query_system_nodes",
+            "system_node",
+            native_api.REQUEST_QUERY_SYSTEM_NODE,
+            node_id,
+        )
+
+    def get_fund_transfer_details(
+        self,
+        filters: Optional[Mapping[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """查询当前 Trader 会话可见的资金划拨流水。
+
+        Args:
+            filters: 可选账户、投资者、币种和节点方向过滤。
+
+        Returns:
+            List[Dict[str, Any]]: 柜台资金划拨明细。
+        """
+
+        body = dict(filters or {})
+        query = native_api.NativeFundTransferDetailQuery(
+            department_id=str(body.get("department_id") or ""),
+            account_id=str(body.get("account_id") or ""),
+            investor_id=str(body.get("investor_id") or ""),
+            currency=str(body.get("currency") or ""),
+            transfer_direction=str(body.get("transfer_direction") or ""),
+        )
+        rows = self._query_rows(
+            "query_fund_transfer_details",
+            "fund_transfer_detail",
+            native_api.REQUEST_QUERY_FUND_TRANSFER_DETAIL,
+            query,
+        )
+        if body.get("apply_serial") not in (None, ""):
+            apply_serial = _as_int(body.get("apply_serial"), -1)
+            rows = [row for row in rows if _as_int(row.get("apply_serial"), -2) == apply_serial]
+        return rows
+
+    def get_position_transfer_details(
+        self,
+        filters: Optional[Mapping[str, Any]] = None,
+    ) -> List[Dict[str, Any]]:
+        """查询当前 Trader 会话可见的证券划拨流水。
+
+        Args:
+            filters: 可选证券同行身份和节点方向过滤。
+
+        Returns:
+            List[Dict[str, Any]]: 柜台证券划拨明细。
+        """
+
+        body = dict(filters or {})
+        query = native_api.NativePositionTransferDetailQuery(
+            exchange=str(body.get("exchange") or ""),
+            investor_id=str(body.get("investor_id") or ""),
+            business_unit_id=str(body.get("business_unit_id") or ""),
+            shareholder_id=str(body.get("shareholder_id") or ""),
+            security=str(body.get("security") or ""),
+            transfer_direction=str(body.get("transfer_direction") or ""),
+        )
+        rows = self._query_rows(
+            "query_position_transfer_details",
+            "position_transfer_detail",
+            native_api.REQUEST_QUERY_POSITION_TRANSFER_DETAIL,
+            query,
+        )
+        if body.get("apply_serial") not in (None, ""):
+            apply_serial = _as_int(body.get("apply_serial"), -1)
+            rows = [row for row in rows if _as_int(row.get("apply_serial"), -2) == apply_serial]
+        return rows
+
+    def submit_fund_transfer(
+        self,
+        source_account: Mapping[str, Any],
+        *,
+        amount: float,
+        apply_serial: int,
+        external_node_id: int,
+        transfer_direction: str = "node_move_in",
+        wait_timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """用同一资金行身份提交一次跨节点资金划拨且绝不自动重试。
+
+        Args:
+            source_account: 上海权威资金行，提供营业部、资金账号和币种。
+            amount: 不超过该行 transferable_cash 的已冻结金额。
+            apply_serial: 调用前已持久化的正 int32 申请流水。
+            external_node_id: 经系统节点查询验证的上海节点 ID。
+            transfer_direction: 固定生产路径使用 ``node_move_in``。
+            wait_timeout: 最终回报最长等待秒数。
+
+        Returns:
+            Dict[str, Any]: succeeded、rejected 或 unknown，不把接受回执当成功。
+        """
+
+        if not self._enable_node_transfer:
+            raise HuaxinTradingDisabledError(
+                HUAXIN_TRADING_DISABLED,
+                "华鑫节点资产划拨未启用",
+                {"required_config": "enable_node_transfer"},
+            )
+        frozen_amount = _as_float(amount, float("nan"))
+        transferable_cash = _as_float(source_account.get("transferable_cash"), float("nan"))
+        if not math.isfinite(frozen_amount) or frozen_amount <= 0:
+            raise ValueError("amount 必须为正有限数")
+        if not math.isfinite(transferable_cash) or transferable_cash < frozen_amount:
+            raise ValueError("amount 不得超过来源资金行 transferable_cash")
+        transfer_type = getattr(native_api, "NativeTransferFundRequest")
+        transfer = transfer_type(
+            department_id=str(source_account.get("department_id") or ""),
+            account_id=str(source_account.get("account_id") or ""),
+            currency=str(source_account.get("currency") or ""),
+            transfer_direction=transfer_direction,
+            amount=amount,
+            apply_serial=apply_serial,
+            external_node_id=external_node_id,
+        )
+        return self._submit_transfer_once(
+            "transfer_fund",
+            transfer,
+            apply_serial=apply_serial,
+            response_event="fund_transfer_response",
+            final_event="fund_transfer",
+            wait_timeout=wait_timeout,
+        )
+
+    def submit_position_transfer(
+        self,
+        source_position: Mapping[str, Any],
+        *,
+        volume: int,
+        apply_serial: int,
+        external_node_id: int,
+        transfer_direction: str = "node_move_in",
+        transfer_position_type: str = "all",
+        wait_timeout: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        """用同一持仓行完整身份提交一次跨节点证券划拨且绝不自动重试。
+
+        Args:
+            source_position: 上海权威持仓行，不跨行补技术身份。
+            volume: 不超过该行 available_position 的已冻结数量。
+            apply_serial: 调用前已持久化的正 int32 申请流水。
+            external_node_id: 经系统节点查询验证的上海节点 ID。
+            transfer_direction: 固定生产路径使用 ``node_move_in``。
+            transfer_position_type: canary 证明前仅允许显式配置的柜台持仓类型。
+            wait_timeout: 最终回报最长等待秒数。
+
+        Returns:
+            Dict[str, Any]: succeeded、rejected 或 unknown，不把接受回执当成功。
+        """
+
+        if not self._enable_node_transfer:
+            raise HuaxinTradingDisabledError(
+                HUAXIN_TRADING_DISABLED,
+                "华鑫节点资产划拨未启用",
+                {"required_config": "enable_node_transfer"},
+            )
+        frozen_volume = _as_int(volume, -1)
+        available_position = _as_int(source_position.get("available_position"), -1)
+        if isinstance(volume, bool) or frozen_volume <= 0:
+            raise ValueError("volume 必须为正整数")
+        if frozen_volume != volume or available_position < frozen_volume:
+            raise ValueError("volume 不得超过来源持仓行 available_position")
+        transfer_type = getattr(native_api, "NativeTransferPositionRequest")
+        transfer = transfer_type(
+            exchange=str(source_position.get("exchange") or ""),
+            investor_id=str(source_position.get("investor_id") or ""),
+            business_unit_id=str(source_position.get("business_unit_id") or ""),
+            shareholder_id=str(source_position.get("shareholder_id") or ""),
+            security=str(source_position.get("security") or "").split(".", 1)[0],
+            market_id=_as_int(source_position.get("market_id")),
+            transfer_direction=transfer_direction,
+            transfer_position_type=transfer_position_type,
+            volume=volume,
+            apply_serial=apply_serial,
+            external_node_id=external_node_id,
+        )
+        return self._submit_transfer_once(
+            "transfer_position",
+            transfer,
+            apply_serial=apply_serial,
+            response_event="position_transfer_response",
+            final_event="position_transfer",
+            wait_timeout=wait_timeout,
+        )
 
     def get_orders(
         self,
@@ -1826,6 +2042,101 @@ class HuaxinBroker(BrokerBase):
                     },
                 )
             return rows
+
+    def _submit_transfer_once(
+        self,
+        method_name: str,
+        transfer: Any,
+        *,
+        apply_serial: int,
+        response_event: str,
+        final_event: str,
+        wait_timeout: Optional[float],
+    ) -> Dict[str, Any]:
+        """调用一次 native 划拨并只按明确最终回报收口。
+
+        Args:
+            method_name: Runtime 的 ``transfer_fund`` 或 ``transfer_position``。
+            transfer: 已严格校验的公开 native 请求对象。
+            apply_serial: 调用前由上层持久化的申请流水。
+            response_event: 仅表示接受/拒绝的响应事件名。
+            final_event: 含柜台划拨状态的最终事件名。
+            wait_timeout: 最终回报最长等待秒数。
+
+        Returns:
+            Dict[str, Any]: succeeded、rejected 或 unknown；unknown 绝不触发重发。
+        """
+
+        timeout = self._write_timeout(wait_timeout)
+        with self._runtime_lock:
+            runtime = self._require_runtime_ready("ready_for_queries")
+            request_id = self._next_request_id()
+            dropped_before = _as_int(_mapping(runtime.health()).get("dropped_events"))
+            getattr(runtime, method_name)(request_id, transfer)
+            deadline = time.monotonic() + timeout
+            collected: List[Any] = []
+            accepted = False
+            while True:
+                self._drain_into_pending()
+                events = self._pending_events.pop(request_id, [])
+                for event in events:
+                    collected.append(event)
+                    name = self._event_name(event)
+                    data = self._event_data(event)
+                    if _as_int(data.get("apply_serial")) not in {0, apply_serial}:
+                        continue
+                    if name == response_event:
+                        error_id = _as_int(data.get("error_id"))
+                        if error_id:
+                            return {
+                                "request_id": request_id,
+                                "apply_serial": apply_serial,
+                                "status": "rejected",
+                                "submission_state": "rejected",
+                                "error_id": error_id,
+                                "error_message": str(data.get("error_message") or ""),
+                            }
+                        accepted = True
+                    elif name == final_event:
+                        status = str(data.get("transfer_status") or "unknown")
+                        if status in {"success", "repeal_success"}:
+                            return {
+                                "request_id": request_id,
+                                "apply_serial": apply_serial,
+                                "status": "succeeded",
+                                "submission_state": "succeeded",
+                                "detail": data,
+                            }
+                        if status in {"failed", "repeal_failed"}:
+                            return {
+                                "request_id": request_id,
+                                "apply_serial": apply_serial,
+                                "status": "rejected",
+                                "submission_state": "rejected",
+                                "detail": data,
+                            }
+                dropped_after = _as_int(_mapping(runtime.health()).get("dropped_events"))
+                if dropped_after != dropped_before:
+                    return {
+                        "request_id": request_id,
+                        "apply_serial": apply_serial,
+                        "status": "unknown",
+                        "submission_state": "unknown",
+                        "reason": "native_event_queue_dropped",
+                    }
+                if time.monotonic() >= deadline:
+                    return {
+                        "request_id": request_id,
+                        "apply_serial": apply_serial,
+                        "status": "unknown",
+                        "submission_state": "unknown",
+                        "reason": (
+                            "accepted_without_terminal_fact"
+                            if accepted
+                            else "transfer_response_timeout"
+                        ),
+                    }
+                time.sleep(0.01)
 
     def _query_shareholder_accounts(self) -> List[Dict[str, Any]]:
         """查询并缓存股东账户身份。
