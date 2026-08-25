@@ -1111,10 +1111,32 @@ def _normalise_price_multiindex_columns(columns: pd.MultiIndex) -> pd.MultiIndex
 
 
 def dataframe_to_payload(df):
+    """把 pandas DataFrame 转换为可逆的远程传输载荷。
+
+    Args:
+        df: 待编码的 DataFrame；为 ``None`` 时返回空表载荷。
+
+    Returns:
+        Dict[str, Any]: 包含列、记录以及可选索引元数据的 JSON 兼容字典。
+
+    Notes:
+        默认 ``RangeIndex(0, len(df), 1)`` 不进入 wire，避免普通行号被客户端
+        误判为交易时间；其他索引必须连同显式列名和类型元数据一起传输。
+    """
+
     if df is None:
         return {"dtype": "dataframe", "columns": [], "records": []}
 
     def _coerce_value(value):
+        """把 pandas、datetime 和 numpy 标量转换为 JSON 兼容值。
+
+        Args:
+            value: 单个 DataFrame、列或索引值。
+
+        Returns:
+            Any: 可由 JSON 编码器处理的普通 Python 值。
+        """
+
         if value is None:
             return None
         try:
@@ -1141,26 +1163,71 @@ def dataframe_to_payload(df):
         return value
 
     metadata: Dict[str, Any] = {}
-    try:
-        if isinstance(getattr(df, "columns", None), pd.MultiIndex):
-            df = df.copy()
-            df.columns = _normalise_price_multiindex_columns(df.columns)
-            metadata["column_tuples"] = [
-                [_coerce_value(item) for item in col] for col in df.columns.tolist()
+    if isinstance(getattr(df, "columns", None), pd.MultiIndex):
+        df = df.copy()
+        df.columns = _normalise_price_multiindex_columns(df.columns)
+        metadata["column_tuples"] = [
+            [_coerce_value(item) for item in col] for col in df.columns.tolist()
+        ]
+        metadata["column_index_names"] = [_coerce_value(name) for name in (df.columns.names or [])]
+
+    data_columns = [str(column) for column in list(getattr(df, "columns", []))]
+    index = getattr(df, "index", None)
+    is_default_range = (
+        isinstance(index, pd.RangeIndex)
+        and index.start == 0
+        and index.stop == len(df)
+        and index.step == 1
+        and index.name is None
+    )
+    include_index = index is not None and not is_default_range
+    index_columns: List[str] = []
+    index_rows: List[List[Any]] = [[] for _ in range(len(df))]
+    if include_index:
+        index_names = list(index.names) if isinstance(index, pd.MultiIndex) else [index.name]
+        occupied_columns = set(data_columns)
+        for level, raw_name in enumerate(index_names):
+            preferred = str(raw_name or ("index" if len(index_names) == 1 else f"level_{level}"))
+            wire_name = preferred
+            suffix = 0
+            while not wire_name or wire_name in occupied_columns:
+                suffix += 1
+                wire_name = f"__bt_index_{level}_{suffix}__"
+            occupied_columns.add(wire_name)
+            index_columns.append(wire_name)
+
+        if isinstance(index, pd.MultiIndex):
+            index_rows = [
+                [index.get_level_values(level)[row] for level in range(index.nlevels)]
+                for row in range(len(index))
             ]
-            metadata["column_index_names"] = [
-                _coerce_value(name) for name in (df.columns.names or [])
+            index_dtypes = [
+                str(index.get_level_values(level).dtype) for level in range(index.nlevels)
             ]
-        columns = list(df.columns)
-        raw = df.reset_index().values.tolist() if df.index.name else df.values.tolist()
-        records = [[_coerce_value(v) for v in row] for row in raw]
-    except Exception:
-        columns = getattr(df, "columns", [])
-        raw = getattr(df, "values", [])
-        records = [[_coerce_value(v) for v in row] for row in raw]
+        else:
+            index_rows = [[value] for value in index.tolist()]
+            index_dtypes = [str(index.dtype)]
+        metadata.update(
+            {
+                "index_columns": index_columns,
+                "index_names": [_coerce_value(name) for name in index_names],
+                "index_type": type(index).__name__,
+                "index_dtypes": index_dtypes,
+            }
+        )
+        if isinstance(index, pd.RangeIndex):
+            metadata["index_range"] = {
+                "start": int(index.start),
+                "stop": int(index.stop),
+                "step": int(index.step),
+            }
+
+    data_rows = getattr(df, "values", []).tolist()
+    raw = [index_row + list(data_row) for index_row, data_row in zip(index_rows, data_rows)]
+    records = [[_coerce_value(value) for value in row] for row in raw]
     payload = {
         "dtype": "dataframe",
-        "columns": [str(col) for col in columns],
+        "columns": index_columns + data_columns,
         "records": records,
     }
     payload.update(metadata)
