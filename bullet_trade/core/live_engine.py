@@ -506,7 +506,14 @@ class LiveEngine:
             self._persist_strategy_start_date()
         try:
             provider = get_data_provider()
-            calendar_days = provider.get_trade_days(end_date=current_date, count=180) or []
+            calendar_days = (
+                await asyncio.to_thread(
+                    provider.get_trade_days,
+                    end_date=current_date,
+                    count=180,
+                )
+                or []
+            )
             calendar_dates = [pd.to_datetime(d).date() for d in calendar_days]
             if calendar_dates:
                 set_trade_calendar(calendar_dates, self._strategy_start_date)
@@ -3010,7 +3017,7 @@ class TradingCalendarGuard:
         try:
             from bullet_trade.data.api import get_trade_days
 
-            days = get_trade_days(str(target), str(target))
+            days = await asyncio.to_thread(get_trade_days, str(target), str(target))
             if hasattr(days, "empty"):
                 result = not days.empty
                 if not result:

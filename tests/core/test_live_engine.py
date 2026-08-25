@@ -1298,6 +1298,151 @@ async def test_calendar_guard_list_includes_target(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_calendar_guard_queries_provider_outside_event_loop(monkeypatch):
+    """验证交易日 guard 在线程中调用同步 provider，兼容 Django ORM。
+
+    Args:
+        monkeypatch: pytest 属性替换夹具，用于注入只能在线程中调用的交易日函数。
+
+    Returns:
+        None: 查询在线程池完成且目标交易日被确认。
+    """
+
+    event_loop_thread = threading.get_ident()
+    query_threads: list[int] = []
+
+    def _thread_only_days(*_args: Any, **_kwargs: Any) -> list[str]:
+        """模拟在事件循环线程调用时会失败的同步 Django provider。
+
+        Args:
+            *_args: 兼容 ``get_trade_days`` 的位置参数。
+            **_kwargs: 兼容 ``get_trade_days`` 的关键字参数。
+
+        Returns:
+            list[str]: 包含目标日期的固定交易日结果。
+        """
+
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("同步交易日查询仍运行在 asyncio event loop")
+        query_threads.append(threading.get_ident())
+        return ["2025-01-06"]
+
+    monkeypatch.setattr(
+        "bullet_trade.data.api.get_trade_days",
+        _thread_only_days,
+        raising=False,
+    )
+    guard = TradingCalendarGuard(
+        {"calendar_skip_weekend": True, "calendar_retry_minutes": 1}
+    )
+
+    result = await guard.ensure_trade_day(datetime(2025, 1, 6, 9, 0))
+
+    assert result is True
+    assert query_threads
+    assert all(thread_id != event_loop_thread for thread_id in query_threads)
+
+
+@pytest.mark.asyncio
+async def test_live_engine_refreshes_trade_calendar_outside_event_loop(tmp_path, monkeypatch):
+    """验证新交易日的 180 日 provider 刷新同样在线程池执行。
+
+    Args:
+        tmp_path: pytest 临时目录，用于隔离策略和 LiveRuntime 文件。
+        monkeypatch: pytest 属性替换夹具，用于注入线程敏感 provider。
+
+    Returns:
+        None: 日历刷新完成且同步 provider 未进入 asyncio event loop。
+    """
+
+    event_loop_thread = threading.get_ident()
+    query_threads: list[int] = []
+
+    class _ThreadOnlyProvider:
+        """模拟只能在非事件循环线程执行的同步行情 provider。
+
+        职责：冻结新交易日刷新所需的最小同步日历合同。
+        核心协作对象：``LiveEngine._ensure_trading_day`` 的 provider 调用边界。
+        关键状态：通过外层 ``query_threads`` 记录实际调用线程，不访问网络或磁盘。
+        """
+
+        def get_trade_days(self, **_kwargs: Any) -> list[date]:
+            """返回固定日历并拒绝事件循环线程调用。
+
+            Args:
+                **_kwargs: 兼容 provider 交易日查询参数。
+
+            Returns:
+                list[date]: 包含目标交易日的固定日期列表。
+            """
+
+            try:
+                asyncio.get_running_loop()
+            except RuntimeError:
+                pass
+            else:
+                raise AssertionError("同步 provider 刷新仍运行在 asyncio event loop")
+            query_threads.append(threading.get_ident())
+            return [date(2025, 1, 2)]
+
+    def _frozen_now() -> datetime:
+        """返回测试使用的固定当前时间。
+
+        Returns:
+            datetime: 2025-01-02 09:00 的固定时间。
+        """
+
+        return datetime(2025, 1, 2, 9, 0)
+
+    def _build_thread_only_provider() -> _ThreadOnlyProvider:
+        """构造本测试的线程敏感 provider。
+
+        Returns:
+            _ThreadOnlyProvider: 不访问网络的同步日历 provider。
+        """
+
+        return _ThreadOnlyProvider()
+
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={
+            "runtime_dir": str(tmp_path / "runtime-calendar-thread"),
+            "g_autosave_enabled": False,
+            "account_sync_enabled": False,
+            "order_sync_enabled": False,
+            "tick_sync_enabled": False,
+            "risk_check_enabled": False,
+            "broker_heartbeat_interval": 0,
+            "scheduler_market_periods": "09:30-11:30,13:00-15:00",
+        },
+        now_provider=_frozen_now,
+    )
+    loop = asyncio.get_running_loop()
+    engine._loop = loop
+    engine._stop_event = asyncio.Event()
+    engine.event_bus = EventBus(loop)
+    engine.async_scheduler = AsyncScheduler()
+    await engine._bootstrap()
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.get_data_provider",
+        _build_thread_only_provider,
+    )
+
+    await engine._ensure_trading_day(date(2025, 1, 2))
+
+    assert query_threads
+    assert all(thread_id != event_loop_thread for thread_id in query_threads)
+    assert date(2025, 1, 2) in engine._trade_calendar
+    await engine._shutdown()
+
+
+@pytest.mark.asyncio
 async def test_calendar_guard_list_missing_target(monkeypatch):
     guard = TradingCalendarGuard({"calendar_skip_weekend": True, "calendar_retry_minutes": 1})
 
