@@ -2,6 +2,7 @@ import asyncio
 import concurrent.futures
 import threading
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pandas as pd
 import pytest
@@ -643,6 +644,49 @@ def test_remote_data_provider_security_info_supports_flat_response():
     info = provider.get_security_info("518880.XSHG")
     assert info["display_name"] == "黄金ETF"
     assert info["type"] == "etf"
+
+
+def test_remote_data_provider_routes_live_current_contract():
+    """验证实时当前行情只路由正式 action，并原样透传服务端字段。"""
+
+    from bullet_trade.data.providers.remote_qmt import RemoteQmtProvider
+
+    provider = object.__new__(RemoteQmtProvider)
+    response = {
+        "security": "159915.XSHE",
+        "last_price": 2.345,
+        "paused": False,
+        "high_limit": 2.57,
+        "low_limit": 2.1,
+    }
+    request = Mock(return_value=response)
+    provider._connection = SimpleNamespace(request=request)
+
+    result = provider.get_live_current("159915.XSHE")
+
+    assert result is response
+    request.assert_called_once_with(
+        "data.live_current",
+        {"security": "159915.XSHE"},
+    )
+
+
+def test_remote_data_provider_live_current_fails_closed():
+    """验证实时当前行情远端失败时向上抛错且不会回退到 snapshot。"""
+
+    from bullet_trade.data.providers.remote_qmt import RemoteQmtProvider
+
+    provider = object.__new__(RemoteQmtProvider)
+    request = Mock(side_effect=RuntimeError("live current unavailable"))
+    provider._connection = SimpleNamespace(request=request)
+
+    with pytest.raises(RuntimeError, match="live current unavailable"):
+        provider.get_live_current("159915.XSHE")
+
+    request.assert_called_once_with(
+        "data.live_current",
+        {"security": "159915.XSHE"},
+    )
 
 
 @pytest.mark.asyncio
