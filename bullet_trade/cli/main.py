@@ -9,6 +9,7 @@ BulletTrade 命令行主入口
     bullet-trade report --input backtest_results/demo --format html --output reports/demo.html
     bullet-trade server --server-type qmt --listen 0.0.0.0 --port 8080
     bullet-trade lab --notebook-dir notebooks --no-browser --port 8088
+    bullet-trade tushare_sync --tasks-file tasks_sync.json --duckdb-path ./duckdb/tushare.duckdb
     bullet-trade --env-file .env.dev backtest strategy.py --start 2023-01-01 --end 2023-12-31
 """
 
@@ -335,6 +336,24 @@ def create_parser():
     lab_parser.add_argument(
         "--diagnose", dest="diagnose", action="store_true", help="仅做依赖/端口诊断，不启动服务"
     )
+
+    # tushare_sync 命令（Tushare → DuckDB 持久化）
+    tushare_parser = subparsers.add_parser(
+        "tushare_sync", help="将 Tushare 数据持久化到 DuckDB（批量任务）"
+    )
+    tushare_parser.add_argument(
+        "--token", dest="token", default=None, help="Tushare Token（默认读取 TUSHARE_TOKEN 环境变量）"
+    )
+    tushare_parser.add_argument(
+        "--tasks-file", dest="tushare_tasks_file", default=None,
+        help="同步任务文件路径（JSON，批量模式；缺省读取 .env 的 tushare_tasks_file）",
+    )
+    tushare_parser.add_argument(
+        "--duckdb-path", dest="tushare_duckdb_path", default=None,
+        help="DuckDB 数据库文件路径（缺省读取 .env 的 tushare_duckdb_path）",
+    )
+ 
+
     return parser
 
 
@@ -382,6 +401,10 @@ def main():
         from bullet_trade.cli.jupyterlab import run_lab
 
         return run_lab(args)
+    elif args.command in ("tushare_sync", "tushare_persist", "tushare_duckdb"):
+        from bullet_trade.cli.tushare_duckdb import run_persistence
+    
+        return run_persistence(args)
     else:
         print(f"未知命令: {args.command}")
         return 1

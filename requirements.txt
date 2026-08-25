@@ -28,3 +28,6 @@ pytest-xdist>=2.5.0  # 并行测试
 
 # 事件循环（高性能，仅非 Windows 平台）
 uvloop>=0.19.0; sys_platform != 'win32'
+
+# tushare_duckdb 依赖
+duckdb>=1.5.5

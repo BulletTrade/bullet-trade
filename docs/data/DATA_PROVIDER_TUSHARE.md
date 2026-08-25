@@ -31,4 +31,16 @@
 3. **资产类型判断**：常见股票/指数/ETF 代码会先通过后缀和前缀快速判断；无法确定时回退到 `index_basic` / `fund_basic` / `stock_basic` 目录查询。
 4. **分钟线权限**：若账号未开通分钟级别数据，`ts.pro_bar` 会返回空 DataFrame；框架会在日志层面记录，策略需自行兜底。
 
+## duckdb持久化Tushare数据的查询功能开启
+- 配置.env参数**tushare_duckdb_path=/path**，开启本地tushare数据查询，开启前请先执行/helps/tushare_persistence/sync_table.py持久化数据前置任务。
+- 数据获取逻辑“bullet-trade”回测框架-->TushareProvider-->若tushare_duckdb成功查询数据返回 | 否则退回tushare原生接口。
+- 目前仅对股票、基金日线数据做持久化，其它证券数据可以参考代码进行拓展。
+>> 因tushare库原生接口仅支持单一证券代码查询，当查询证券代码列表日线价格，需要逐个代码查询tushare接口耗时长。如下
+>> ```bash
+>> get_price(all_stocks.index.tolist(), end_date=end_date, count=trade_days, fields=['close','money'], panel=False)
+>> ```
+>> duckdb持久化为改善以上性能问题而开发
+
+    
+
 总体而言，TushareProvider 在无需依赖聚宽账号的情况下提供了等价的 API 行为，并支持动态复权与标准化分红事件，是纯离线或学术环境的推荐选择。***

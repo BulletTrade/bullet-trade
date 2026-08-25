@@ -31,6 +31,8 @@ class TushareProvider(DataProvider):
         self._pro = None
         self._asset_type_cache: Dict[str, str] = {}
 
+        self._tushare_duckdb_path = self.config.get("tushare_duckdb_path",None) 
+
     # ------------------------ 公共工具 ------------------------
     @classmethod
     def _to_ts_code(cls, security: str) -> str:
@@ -52,8 +54,17 @@ class TushareProvider(DataProvider):
             return f"{code}.{mapped}"
         return security
 
-    @staticmethod
-    def _ensure_ts_module():
+    def _ensure_ts_module(self):
+        """返回 tushare 模块；配置了 tushare_duckdb_path 时返回本地优先的 tushare_duckdb。"""
+        if self._tushare_duckdb_path is not None:
+            try:
+                from . import tushare_duckdb as ts
+            except ImportError as exc:  # pragma: no cover - 仅在缺失依赖时触发
+                raise ImportError(
+                    "未安装 tushare_duckdb 依赖(duckdb)，无法使用本地 DuckDB，请执行 `pip install duckdb`"
+                ) from exc
+            ts.set_db_path(self._tushare_duckdb_path)
+            return ts
         try:
             import tushare as ts  # type: ignore
 
@@ -196,6 +207,8 @@ class TushareProvider(DataProvider):
         ts = self._ensure_ts_module()
         self._pro = ts.pro_api(token)
         self._token = token
+        # tushare_duckdb 回退远程时内部会调用无参的 pro_api()，需要全局 token
+        ts.set_token(token)
         # 支持自定义 API URL
         tushare_custom_url = host or self._tushare_custom_url
         if tushare_custom_url:
@@ -286,7 +299,6 @@ class TushareProvider(DataProvider):
         pro = self._ensure_client()
         asset = asset or self._infer_asset(security)
         ts_code = self._to_ts_code(security)
-
         df = ts.pro_bar(
             ts_code=ts_code,
             start_date=start_str,
@@ -663,8 +675,9 @@ class TushareProvider(DataProvider):
         def _fetch(kw: Dict[str, Any]) -> List[str]:
             pro = self._ensure_client()
             index_code = self._to_ts_code(kw["index_symbol"])
-            target_date = self._format_date(kw.get("date")) or datetime.today().strftime("%Y%m%d")
-            df = pro.index_weight(index_code=index_code, trade_date=target_date)
+            start_date = self._format_date(kw.get("date")) or datetime.today().strftime("%Y%m01")
+            end_date = (pd.Timestamp(start_date) + pd.offsets.MonthEnd(0)).strftime("%Y%m%d")
+            df = pro.index_weight(index_code=index_code, start_date=start_date, end_date=end_date)
             if df is None or df.empty:
                 return []
             return [self._to_jq_code(code) for code in df["con_code"].dropna().tolist()]
