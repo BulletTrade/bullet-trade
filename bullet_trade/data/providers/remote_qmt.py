@@ -356,8 +356,22 @@ class RemoteQmtProvider(DataProvider):
         return resp or {}
 
     def get_live_current(self, security: str) -> Dict[str, Any]:
-        """获取目标证券的实时快照数据。"""
-        return self.get_current_tick(security)
+        """通过远端实时行情合同获取目标证券的当前数据。
+
+        Args:
+            security: 标准化或兼容格式的证券代码。
+
+        Returns:
+            Dict[str, Any]: 服务端 ``data.live_current`` 返回的当前行情字段；
+            空响应规范化为空字典。
+
+        Raises:
+            Exception: 远端请求失败时原样抛出，禁止回退到弱快照语义。
+        """
+
+        payload = {"security": security}
+        resp = self._connection.request("data.live_current", payload)
+        return resp or {}
 
     def _handle_tick_event(self, payload: Dict[str, Any]) -> None:
         """规范化远程 tick 事件并按新旧回调合同安全分发。
