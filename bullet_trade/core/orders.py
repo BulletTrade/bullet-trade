@@ -41,15 +41,21 @@ def _generate_order_id() -> str:
 
 
 def _trigger_order_processing(wait_timeout: Optional[float] = None) -> None:
-    """
-    触发订单处理：
-    - 实盘：将 _process_orders 投递到事件循环，避免当前协程阻塞；
-    - 回测/模拟：order_match_mode=immediate 时同步处理。
+    """按当前引擎语义触发订单队列处理。
+
+    Args:
+        wait_timeout: 实盘等待 broker 处理的超时秒数；None 使用原有阻塞语义。
+
+    Returns:
+        None。严格 checkpoint 实盘引擎只保留队列，由分钟持久化成功后统一排空；
+        其他实盘与回测保持原有投递语义。
     """
     try:
         settings = get_settings()
         engine = get_current_engine()
         if getattr(engine, "is_live", False):
+            if getattr(engine, "defer_order_processing", False):
+                return
             loop = getattr(engine, "_loop", None)
             if loop and loop.is_running():
                 wait_for_result = wait_timeout is None or wait_timeout > 0
@@ -201,16 +207,30 @@ def order(
 
 
 def cancel_order(order_or_id: Union[Order, str]) -> bool:
-    """
-    撤单：优先取消本地队列订单，若已下到券商且有券商订单号则调用券商撤单。
-    
+    """撤销本地待处理订单或向 broker 提交已落柜撤单。
+
     Args:
-        order_or_id: Order 对象或订单 ID
-    
+        order_or_id: Order 对象或订单 ID。
+
     Returns:
-        是否成功接受撤单
+        bool: 本地订单已移除或 broker 接受撤单时为 True。
+
+    Raises:
+        RuntimeError: 严格 checkpoint 模式检测到已提交 broker 的订单时抛出，
+        防止撤单在本分钟 ``g`` 保存前形成外部副作用。
     """
+
     target_id = order_or_id.order_id if isinstance(order_or_id, Order) else str(order_or_id)
+    engine = get_current_engine()
+    broker_id = None
+    if isinstance(order_or_id, Order):
+        broker_id = getattr(order_or_id, "_broker_order_id", None)
+    if getattr(engine, "defer_order_processing", False) and broker_id:
+        raise RuntimeError(
+            "严格 checkpoint 模式拒绝直接撤销已提交 broker 的订单；"
+            "请在受 checkpoint 保护的执行层处理撤单"
+        )
+
     removed = False
     for idx, queued in list(enumerate(_order_queue)):
         if queued.order_id == target_id:
@@ -222,10 +242,6 @@ def cancel_order(order_or_id: Union[Order, str]) -> bool:
                 pass
             removed = True
             break
-    engine = get_current_engine()
-    broker_id = None
-    if isinstance(order_or_id, Order):
-        broker_id = getattr(order_or_id, "_broker_order_id", None)
     if engine and getattr(engine, "broker", None) and broker_id:
         try:
             result = engine.broker.cancel_order(str(broker_id))

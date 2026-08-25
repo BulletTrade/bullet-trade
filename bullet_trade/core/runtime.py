@@ -23,13 +23,24 @@ def get_current_engine() -> Optional[object]:
 
 
 def process_orders_now() -> None:
-    """
-    立即处理订单队列。
-    依赖当前引擎的 `_process_orders` 方法，若当前引擎不存在则静默返回。
+    """立即处理订单队列。
+
+    Args:
+        无。
+
+    Returns:
+        None。当前引擎不存在时静默返回，其他模式保持原有即时处理语义。
+
+    Raises:
+        RuntimeError: 严格 checkpoint 引擎禁止在状态落盘前即时产生 broker 副作用。
     """
     engine = get_current_engine()
     if engine is None:
         return
+    if getattr(engine, "defer_order_processing", False):
+        raise RuntimeError(
+            "严格 checkpoint 模式禁止 process_orders_now() 绕过状态持久化"
+        )
 
     try:
         result = engine._process_orders(engine.context.current_dt)

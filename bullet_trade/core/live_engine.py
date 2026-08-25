@@ -72,6 +72,8 @@ from ..utils.env_loader import (
 from ..broker import BrokerBase, QmtBroker, RemoteQmtBroker
 from ..broker.simulator import SimulatorBroker
 from .live_runtime import (
+    LiveRuntimePersistenceError,
+    assert_live_runtime_healthy,
     init_live_runtime,
     start_g_autosave,
     stop_g_autosave,
@@ -123,12 +125,20 @@ class LiveConfig:
     calendar_retry_minutes: int = 1
     portfolio_refresh_throttle_ms: int = 200
     fail_on_schedule_error: bool = False
+    checkpoint_persistence_enabled: bool = False
 
     @classmethod
     def load(cls, overrides: Optional[Dict[str, Any]] = None) -> "LiveConfig":
         raw = get_live_trade_config()
         if overrides:
             raw.update(overrides)
+        checkpoint_persistence_enabled = parse_bool(
+            raw.get(
+                "checkpoint_persistence_enabled",
+                raw.get("enforce_checkpoint_persistence"),
+            ),
+            default=False,
+        )
         return cls(
             order_max_volume=int(raw.get('order_max_volume', 1_000_000)),
             trade_max_wait_time=int(raw.get('trade_max_wait_time', 16)),
@@ -140,7 +150,11 @@ class LiveConfig:
             order_sync_interval=int(raw.get('order_sync_interval', 10)),
             order_sync_enabled=parse_bool(raw.get('order_sync_enabled'), default=True),
             g_autosave_interval=int(raw.get('g_autosave_interval', 60)),
-            g_autosave_enabled=parse_bool(raw.get('g_autosave_enabled'), default=True),
+            g_autosave_enabled=(
+                False
+                if checkpoint_persistence_enabled
+                else parse_bool(raw.get('g_autosave_enabled'), default=True)
+            ),
             tick_subscription_limit=int(raw.get('tick_subscription_limit', 100)),
             tick_sync_interval=int(raw.get('tick_sync_interval', 2)),
             tick_sync_enabled=parse_bool(raw.get('tick_sync_enabled'), default=True),
@@ -154,6 +168,7 @@ class LiveConfig:
             calendar_retry_minutes=int(raw.get('calendar_retry_minutes', 1)),
             portfolio_refresh_throttle_ms=int(raw.get('portfolio_refresh_throttle_ms', 200)),
             fail_on_schedule_error=parse_bool(raw.get('fail_on_schedule_error'), default=False),
+            checkpoint_persistence_enabled=checkpoint_persistence_enabled,
         )
 
 
@@ -246,6 +261,9 @@ class LiveEngine:
         self._tick_subscription_updated: bool = False
         self._runtime_lock: Optional[ManagedLiveLock] = None
         self._instance_lock: Optional[ManagedLiveLock] = None
+        self._g_autosave_started: bool = False
+        self._runtime_ready_for_final_save: bool = False
+        self.defer_order_processing: bool = self.config.checkpoint_persistence_enabled
 
     @staticmethod
     def _amount_from_value(value: float, price: float) -> int:
@@ -280,20 +298,22 @@ class LiveEngine:
             print(f"✗ 策略文件不存在: {self.strategy_path}")
             return 1
 
+        exit_code = 0
         try:
             asyncio.run(self.start())
-            return 0
         except KeyboardInterrupt:
             log.info("⚠️  用户终止实盘运行")
-            return 0
         except Exception as exc:
             log.error(f"实盘引擎异常退出: {exc}", exc_info=True)
-            return 2
+            exit_code = 2
         finally:
-            try:
-                save_g()
-            except Exception:
-                pass
+            if getattr(self, "_runtime_ready_for_final_save", False):
+                try:
+                    save_g()
+                except Exception as exc:
+                    log.error(f"实盘引擎最终状态保存失败: {exc}", exc_info=True)
+                    exit_code = 2
+        return exit_code
 
     async def start(self) -> None:
         """
@@ -304,10 +324,12 @@ class LiveEngine:
         self._order_lock = asyncio.Lock()
         self.event_bus = EventBus(self._loop)
         self.async_scheduler = AsyncScheduler()
+        self._runtime_ready_for_final_save = False
 
         bootstrapped = False
         try:
             await self._bootstrap()
+            self._runtime_ready_for_final_save = True
             bootstrapped = True
             await self.event_bus.emit(SystemStartEvent())
             await self._run_loop()
@@ -345,8 +367,21 @@ class LiveEngine:
         self._acquire_live_locks()
 
         init_live_runtime(self.config.runtime_dir)
-        if self.config.g_autosave_enabled:
-            start_g_autosave(self.config.g_autosave_interval)
+        (
+            restored_runtime,
+            metadata,
+            symbols,
+            markets,
+            restored_cursor,
+        ) = self._load_and_validate_runtime_snapshot()
+        self._last_schedule_dt = restored_cursor
+        if self._last_schedule_dt:
+            current_minute = self._now().replace(second=0, microsecond=0)
+            if self._last_schedule_dt > current_minute:
+                if self.config.checkpoint_persistence_enabled:
+                    raise RuntimeError("严格 checkpoint 模式检测到未来调度游标，拒绝启动")
+                log.warning("检测到历史调度游标晚于当前系统时间，已忽略此前的游标值。")
+                self._last_schedule_dt = None
         g.live_trade = True
 
         reset_settings()
@@ -356,12 +391,14 @@ class LiveEngine:
         self.context.run_params['is_live'] = True
 
         current_hash = self._compute_strategy_hash()
-        restored_runtime = runtime_restored()
-        metadata = load_strategy_metadata()
         metadata_applied = False
         if restored_runtime and metadata:
             metadata_applied = self._restore_strategy_metadata(metadata)
             if not metadata_applied:
+                if self.config.checkpoint_persistence_enabled:
+                    raise RuntimeError(
+                        "严格 checkpoint 模式无法完整恢复策略元数据，拒绝重新执行 initialize()"
+                    )
                 log.warning("检测到历史 g 状态但缺少策略元数据，将重新执行 initialize()")
 
         log.debug(
@@ -407,7 +444,6 @@ class LiveEngine:
         self._migrate_scheduler_tasks()
         self._snapshot_strategy_metadata(current_hash)
 
-        symbols, markets = load_subscription_state()
         self._tick_symbols = set(symbols)
         self._tick_markets = set(markets)
         should_sync_initial = (
@@ -416,16 +452,86 @@ class LiveEngine:
         if should_sync_initial:
             self._sync_provider_subscription(initial=True)
 
-        self._last_schedule_dt = load_scheduler_cursor()
-        if self._last_schedule_dt:
-            current_minute = self._now().replace(second=0, microsecond=0)
-            if self._last_schedule_dt > current_minute:
-                log.warning(
-                    "检测到历史调度游标晚于当前系统时间，已忽略此前的游标值。"
-                )
-                self._last_schedule_dt = None
-
         self._start_background_jobs()
+        if self.config.g_autosave_enabled:
+            start_g_autosave(self.config.g_autosave_interval)
+            self._g_autosave_started = True
+
+    def _load_and_validate_runtime_snapshot(
+        self,
+    ) -> Tuple[bool, Dict[str, Any], Set[str], Set[str], Optional[datetime]]:
+        """一次性读取并校验启动恢复所需的完整运行态配对。
+
+        Args:
+            无。
+
+        Returns:
+            Tuple[bool, Dict[str, Any], Set[str], Set[str], Optional[datetime]]:
+            依次返回是否恢复 g、策略元数据、证券订阅、市场订阅和调度游标。
+
+        Raises:
+            RuntimeError: 严格 checkpoint 模式中的状态配对或 tick 约束不成立时抛出。
+            LiveRuntimePersistenceError: 任一状态文件读取或解析失败时抛出。
+        """
+
+        restored_runtime = runtime_restored()
+        metadata = load_strategy_metadata()
+        symbols, markets = load_subscription_state()
+        cursor = load_scheduler_cursor()
+        self._validate_checkpoint_runtime_constraints(
+            restored_runtime=restored_runtime,
+            metadata=metadata,
+            cursor=cursor,
+            symbols=symbols,
+            markets=markets,
+        )
+        return restored_runtime, metadata, symbols, markets, cursor
+
+    def _validate_checkpoint_runtime_constraints(
+        self,
+        *,
+        restored_runtime: bool,
+        metadata: Dict[str, Any],
+        cursor: Optional[datetime],
+        symbols: Sequence[str],
+        markets: Sequence[str],
+    ) -> None:
+        """验证严格分钟 checkpoint 的状态配对和异步输入边界。
+
+        Args:
+            restored_runtime: 是否从已有 ``g.pkl`` 恢复。
+            metadata: 原始 ``live_state.json`` 中的策略元数据。
+            cursor: 原始调度游标。
+            symbols: 从磁盘恢复的证券 tick 订阅。
+            markets: 从磁盘恢复的市场 tick 订阅。
+
+        Returns:
+            None。非严格模式或不存在异步 tick 状态时直接返回。
+
+        Raises:
+            RuntimeError: 严格模式检测到状态配对不成立或异步 tick 输入时抛出。
+        """
+
+        if not self.config.checkpoint_persistence_enabled:
+            return
+        if self.handle_tick_func is not None:
+            raise RuntimeError("严格 checkpoint 模式不支持 handle_tick 异步修改策略状态")
+        if symbols or markets:
+            raise RuntimeError("严格 checkpoint 模式不允许恢复历史 tick 订阅")
+        metadata_present = bool(metadata)
+        metadata_valid = metadata_present and metadata.get("version") == 1
+        if cursor is not None and not metadata_present:
+            raise RuntimeError("严格 checkpoint 模式检测到孤立调度游标但缺少策略元数据")
+        if not restored_runtime:
+            if cursor is not None:
+                raise RuntimeError("严格 checkpoint 模式检测到调度游标但缺少 g.pkl")
+            if metadata_present and not metadata_valid:
+                raise RuntimeError("严格 checkpoint 模式的 metadata-only 状态版本无效")
+            return
+        if not metadata_present:
+            raise RuntimeError("严格 checkpoint 模式检测到 g.pkl 但缺少策略元数据")
+        if not metadata_valid:
+            raise RuntimeError("严格 checkpoint 模式检测到 g.pkl 配套策略元数据无效")
 
     async def _shutdown(self) -> None:
         log.info("🛑 正在关闭 Live 引擎")
@@ -448,10 +554,11 @@ class LiveEngine:
             except Exception as exc:
                 log.warning(f"券商清理失败: {exc}")
 
-        if self.config.g_autosave_enabled:
+        if getattr(self, "_g_autosave_started", False):
             try:
                 stop_g_autosave()
             finally:
+                self._g_autosave_started = False
                 self._release_live_locks()
         else:
             self._release_live_locks()
@@ -463,6 +570,7 @@ class LiveEngine:
     async def _run_loop(self) -> None:
         assert self._loop is not None
         while not self._stop_event.is_set():
+            assert_live_runtime_healthy()
             now = self._now()
             if not await self._calendar_guard.ensure_trade_day(now):
                 await self._sleep_until_calendar_retry(now)
@@ -566,8 +674,12 @@ class LiveEngine:
             log.warning(
                 f"⏱️ 事件超时丢弃: scheduled={scheduled}, delay={delay:.1f}s (> {timeout}s)"
             )
-            self._last_schedule_dt = scheduled
+            assert_live_runtime_healthy()
+            if self.config.checkpoint_persistence_enabled:
+                save_g()
+                assert_live_runtime_healthy()
             persist_scheduler_cursor(scheduled)
+            self._last_schedule_dt = scheduled
             return
 
         schedule_results: Dict[str, Any] = {}
@@ -594,10 +706,14 @@ class LiveEngine:
 
         await self._maybe_emit_market_events(scheduled)
         await self._maybe_handle_data(scheduled)
+        assert_live_runtime_healthy()
+        if self.config.checkpoint_persistence_enabled:
+            save_g()
+            assert_live_runtime_healthy()
         await self._process_orders(scheduled)
-
-        self._last_schedule_dt = scheduled
+        assert_live_runtime_healthy()
         persist_scheduler_cursor(scheduled)
+        self._last_schedule_dt = scheduled
 
     def _is_bar_time(self, dt: datetime) -> bool:
         """
@@ -664,6 +780,7 @@ class LiveEngine:
     # ------------------------------------------------------------------
 
     async def _process_orders(self, current_dt: datetime) -> None:
+        assert_live_runtime_healthy()
         lock = self._order_lock or asyncio.Lock()
         if self._order_lock is None:
             self._order_lock = lock
@@ -748,6 +865,7 @@ class LiveEngine:
                     remark = self._prepare_order_metadata(order)
                     order_extra = self._order_extra_payload(order)
                     order_id: Optional[str] = None
+                    assert_live_runtime_healthy()
                     if plan.is_buy:
                         order_kwargs = {
                             "wait_timeout": plan.wait_timeout,
@@ -824,6 +942,8 @@ class LiveEngine:
                             meta["pre_amount"] = pre_amount
                             meta["pre_avg_cost"] = pre_avg_cost
                         meta["broker_order_ids"].append(str(order_id))
+                except LiveRuntimePersistenceError:
+                    raise
                 except Exception as exc:
                     log.error(f"委托失败 {order.security}: {exc}")
                     try:
@@ -1842,6 +1962,8 @@ class LiveEngine:
     # ------------------------------------------------------------------
 
     def register_tick_subscription(self, symbols: Sequence[str], markets: Sequence[str]) -> None:
+        if self.config.checkpoint_persistence_enabled:
+            raise RuntimeError("严格 checkpoint 模式不支持 tick 订阅")
         if not symbols and not markets:
             return
         limit = max(1, self.config.tick_subscription_limit)
@@ -1861,6 +1983,8 @@ class LiveEngine:
         )
 
     def unregister_tick_subscription(self, symbols: Sequence[str], markets: Sequence[str]) -> None:
+        if self.config.checkpoint_persistence_enabled:
+            raise RuntimeError("严格 checkpoint 模式不支持 tick 订阅变更")
         self._tick_subscription_updated = True
         for sym in symbols:
             self._tick_symbols.discard(sym)
@@ -1870,6 +1994,8 @@ class LiveEngine:
         self._sync_provider_subscription(unsubscribe=True, symbols=list(symbols), markets=list(markets))
 
     def unsubscribe_all_ticks(self) -> None:
+        if self.config.checkpoint_persistence_enabled:
+            raise RuntimeError("严格 checkpoint 模式不支持 tick 订阅变更")
         self._tick_subscription_updated = True
         self._tick_symbols.clear()
         self._tick_markets.clear()
@@ -2208,6 +2334,8 @@ class LiveEngine:
         time_expr: Any,
         weekday: Any,
         monthday: Any,
+        reference_security: Optional[str] = None,
+        force: Any = True,
     ) -> Tuple[Any, ...]:
         return (
             module or '',
@@ -2216,6 +2344,8 @@ class LiveEngine:
             str(time_expr) if time_expr is not None else '',
             None if weekday is None else int(weekday),
             None if monthday is None else int(monthday),
+            reference_security or '',
+            bool(force),
         )
 
     def _dedupe_scheduler_tasks(self) -> None:
@@ -2234,6 +2364,8 @@ class LiveEngine:
                 task.time,
                 task.weekday,
                 task.monthday,
+                getattr(task, 'reference_security', None),
+                getattr(task, 'force', True),
             )
             if key in seen:
                 continue
@@ -2326,6 +2458,18 @@ class LiveEngine:
                 )
 
     def _snapshot_strategy_metadata(self, strategy_hash: Optional[str]) -> None:
+        """收集并严格持久化策略元数据快照。
+
+        Args:
+            strategy_hash: 当前策略源码哈希；无法计算时可为 None。
+
+        Returns:
+            None。写入失败会阻断启动，不允许使用不可恢复的运行态继续执行。
+
+        Raises:
+            RuntimeError: 元数据收集或持久化失败时抛出并保留原异常链。
+        """
+
         try:
             metadata = {
                 "version": 1,
@@ -2337,9 +2481,22 @@ class LiveEngine:
                 metadata["strategy_start_date"] = self._strategy_start_date.isoformat()
             persist_strategy_metadata(metadata)
         except Exception as exc:
-            log.debug(f"策略元数据快照失败: {exc}")
+            log.error(f"策略元数据快照失败: {exc}", exc_info=True)
+            raise RuntimeError("策略元数据快照失败，拒绝启动实盘引擎") from exc
 
     def _persist_strategy_start_date(self) -> None:
+        """把首次实盘交易日严格写入策略元数据。
+
+        Args:
+            无。
+
+        Returns:
+            None。没有起始日或尚无元数据时不写入。
+
+        Raises:
+            RuntimeError: 元数据读取或持久化失败时抛出并保留原异常链。
+        """
+
         if not self._strategy_start_date:
             return
         try:
@@ -2352,7 +2509,8 @@ class LiveEngine:
             metadata['strategy_start_date'] = self._strategy_start_date.isoformat()
             persist_strategy_metadata(metadata)
         except Exception as exc:
-            log.debug(f"策略起始日写入失败: {exc}")
+            log.error(f"策略起始日写入失败: {exc}", exc_info=True)
+            raise RuntimeError("策略起始日写入失败，拒绝推进交易日") from exc
 
     def _apply_market_period_override(self) -> None:
         expr = (self.config.scheduler_market_periods or "").strip()
@@ -2406,13 +2564,29 @@ class LiveEngine:
                 payload['ratio'] = getattr(settings.slippage, 'ratio', None)
             if hasattr(settings.slippage, 'steps'):
                 payload['steps'] = getattr(settings.slippage, 'steps', None)
+            if (
+                self.config.checkpoint_persistence_enabled
+                and self._deserialize_slippage_config(payload) is None
+            ):
+                raise RuntimeError("严格 checkpoint 模式无法快照不支持的 slippage")
             snapshot['slippage'] = payload
         sl_map = getattr(settings, 'slippage_map', {}) or {}
         sl_map_snapshot: Dict[str, Any] = {}
         for key, cfg in sl_map.items():
             payload = self._serialize_slippage_config(cfg)
             if payload is not None:
+                if (
+                    self.config.checkpoint_persistence_enabled
+                    and self._deserialize_slippage_config(payload) is None
+                ):
+                    raise RuntimeError(
+                        f"严格 checkpoint 模式无法快照不支持的 slippage_map: {key}"
+                    )
                 sl_map_snapshot[key] = payload
+            elif self.config.checkpoint_persistence_enabled:
+                raise RuntimeError(
+                    f"严格 checkpoint 模式无法快照不支持的 slippage_map: {key}"
+                )
         if sl_map_snapshot:
             snapshot['slippage_map'] = sl_map_snapshot
         return snapshot
@@ -2489,6 +2663,18 @@ class LiveEngine:
         return None
 
     def _collect_scheduler_tasks_snapshot(self) -> List[Dict[str, Any]]:
+        """收集可被精确恢复的同步调度任务元数据。
+
+        Args:
+            无。
+
+        Returns:
+            List[Dict[str, Any]]: 去重后的任务快照，包含周/月任务的完整语义字段。
+
+        Raises:
+            RuntimeError: 严格 checkpoint 模式遇到无法定位的 callable 时抛出。
+        """
+
         tasks_meta: List[Dict[str, Any]] = []
         seen = set()
         for task in get_tasks():
@@ -2496,6 +2682,10 @@ class LiveEngine:
             module = getattr(func, '__module__', None)
             name = getattr(func, '__name__', None)
             if not module or not name:
+                if self.config.checkpoint_persistence_enabled:
+                    raise RuntimeError(
+                        "严格 checkpoint 模式无法快照无 module/name 的调度 callable"
+                    )
                 continue
             key = self._task_meta_key(
                 module,
@@ -2504,6 +2694,8 @@ class LiveEngine:
                 task.time,
                 task.weekday,
                 task.monthday,
+                getattr(task, 'reference_security', None),
+                getattr(task, 'force', True),
             )
             if key in seen:
                 continue
@@ -2516,6 +2708,8 @@ class LiveEngine:
                     'time': task.time,
                     'weekday': task.weekday,
                     'monthday': task.monthday,
+                    'reference_security': getattr(task, 'reference_security', None),
+                    'force': getattr(task, 'force', True),
                     'enabled': getattr(task, 'enabled', True),
                 }
             )
@@ -2531,30 +2725,63 @@ class LiveEngine:
                 if parsed_start_date:
                     self._strategy_start_date = parsed_start_date
                 else:
+                    if self.config.checkpoint_persistence_enabled:
+                        raise ValueError(f"策略起始日格式无效: {raw_start_date}")
                     log.debug(f"策略起始日格式无效: {raw_start_date}")
             self._apply_settings_snapshot(meta.get('settings') or {})
             self._apply_scheduler_tasks_snapshot(meta.get('tasks') or [])
             return True
         except Exception as exc:
+            if self.config.checkpoint_persistence_enabled:
+                log.error(f"严格 checkpoint 恢复策略元数据失败: {exc}", exc_info=True)
+                raise RuntimeError(
+                    "严格 checkpoint 模式无法完整恢复策略元数据"
+                ) from exc
             log.warning(f"恢复策略元数据失败: {exc}")
             return False
 
     def _apply_settings_snapshot(self, snapshot: Dict[str, Any]) -> None:
+        """恢复设置快照，并在严格模式验证恢复结果与输入 1:1 一致。
+
+        Args:
+            snapshot: 已通过 live_state 结构校验的 settings 映射。
+
+        Returns:
+            None。非严格模式保留原有尽力恢复语义。
+
+        Raises:
+            RuntimeError: 严格模式任一设置无法恢复或结果与快照不一致时抛出。
+        """
+
         if not snapshot:
             return
         benchmark = snapshot.get('benchmark')
-        if benchmark:
+        if benchmark or (
+            self.config.checkpoint_persistence_enabled and benchmark is not None
+        ):
             try:
                 set_benchmark(benchmark)
             except Exception as exc:
+                if self.config.checkpoint_persistence_enabled:
+                    raise RuntimeError("严格 checkpoint 模式恢复 benchmark 失败") from exc
                 log.warning(f"恢复 benchmark 失败: {exc}")
         options = snapshot.get('options') or {}
         for key, value in options.items():
             try:
                 if key == 'market_period' and value:
-                    value = self._deserialize_market_periods(value)
+                    restored_periods = self._deserialize_market_periods(value)
+                    if (
+                        self.config.checkpoint_persistence_enabled
+                        and len(restored_periods) != len(value)
+                    ):
+                        raise ValueError("market_period 包含无法恢复的时段")
+                    value = restored_periods
                 set_option(key, value)
             except Exception as exc:
+                if self.config.checkpoint_persistence_enabled:
+                    raise RuntimeError(
+                        f"严格 checkpoint 模式恢复 option({key}) 失败"
+                    ) from exc
                 log.debug(f"恢复 option {key} 失败: {exc}")
         order_costs = snapshot.get('order_cost') or {}
         for asset, payload in order_costs.items():
@@ -2562,6 +2789,10 @@ class LiveEngine:
                 cost = OrderCost(**payload)
                 set_order_cost(cost, type=asset)
             except Exception as exc:
+                if self.config.checkpoint_persistence_enabled:
+                    raise RuntimeError(
+                        f"严格 checkpoint 模式恢复 order_cost({asset}) 失败"
+                    ) from exc
                 log.debug(f"恢复 order_cost({asset}) 失败: {exc}")
         order_cost_overrides = snapshot.get('order_cost_overrides') or {}
         for asset, payload in order_cost_overrides.items():
@@ -2571,7 +2802,13 @@ class LiveEngine:
                 if '_' in asset:
                     type_prefix, ref_code = asset.split('_', 1)
                     set_order_cost(cost, type=type_prefix, ref=ref_code)
+                elif self.config.checkpoint_persistence_enabled:
+                    raise ValueError("order_cost_overrides 键缺少 type_ref 结构")
             except Exception as exc:
+                if self.config.checkpoint_persistence_enabled:
+                    raise RuntimeError(
+                        f"严格 checkpoint 模式恢复 order_cost_overrides({asset}) 失败"
+                    ) from exc
                 log.debug(f"恢复 order_cost_overrides({asset}) 失败: {exc}")
         sl_map = snapshot.get('slippage_map') or {}
         if sl_map:
@@ -2582,9 +2819,15 @@ class LiveEngine:
                     cfg = self._deserialize_slippage_config(payload)
                     if cfg:
                         settings.slippage_map[key] = cfg
+                    elif self.config.checkpoint_persistence_enabled:
+                        raise ValueError(f"不支持的 slippage_map payload: {key}")
                 if settings.slippage is None and 'all' in settings.slippage_map:
                     settings.slippage = settings.slippage_map.get('all')
             except Exception as exc:
+                if self.config.checkpoint_persistence_enabled:
+                    raise RuntimeError(
+                        "严格 checkpoint 模式恢复 slippage_map 失败"
+                    ) from exc
                 log.debug(f"恢复 slippage_map 失败: {exc}")
         slippage = snapshot.get('slippage')
         if slippage:
@@ -2596,17 +2839,41 @@ class LiveEngine:
                     set_slippage(PriceRelatedSlippage(slippage.get('ratio', 0.0)))
                 elif cls == 'StepRelatedSlippage':
                     set_slippage(StepRelatedSlippage(slippage.get('steps', 0)))
+                elif self.config.checkpoint_persistence_enabled:
+                    raise ValueError(f"不支持的 slippage payload: {cls}")
             except Exception as exc:
+                if self.config.checkpoint_persistence_enabled:
+                    raise RuntimeError("严格 checkpoint 模式恢复 slippage 失败") from exc
                 log.debug(f"恢复 slippage 失败: {exc}")
+        if self.config.checkpoint_persistence_enabled:
+            restored_snapshot = self._collect_settings_snapshot()
+            if restored_snapshot != snapshot:
+                raise RuntimeError(
+                    "严格 checkpoint 模式设置恢复结果与元数据不一致"
+                )
 
     def _apply_scheduler_tasks_snapshot(self, tasks: List[Dict[str, Any]]) -> None:
+        """恢复已持久化的调度任务并保留去重语义。
+
+        Args:
+            tasks: 经过运行态结构校验的调度任务快照。
+
+        Returns:
+            None。非严格模式保持原有警告后继续语义。
+
+        Raises:
+            RuntimeError: 严格 checkpoint 模式中清理、解析或注册任务失败时抛出。
+        """
+
         try:
             unschedule_all()
-        except Exception:
-            pass
+        except Exception as exc:
+            if self.config.checkpoint_persistence_enabled:
+                raise RuntimeError("严格 checkpoint 模式无法清理旧调度任务") from exc
         if not tasks:
             return
         normalized_tasks: List[Dict[str, Any]] = []
+        expected_snapshot: List[Dict[str, Any]] = []
         seen = set()
         for task_meta in tasks:
             key = self._task_meta_key(
@@ -2616,33 +2883,89 @@ class LiveEngine:
                 task_meta.get('time'),
                 task_meta.get('weekday'),
                 task_meta.get('monthday'),
+                task_meta.get('reference_security'),
+                task_meta.get('force', True),
             )
             if key in seen:
+                if self.config.checkpoint_persistence_enabled:
+                    raise RuntimeError(
+                        f"严格 checkpoint 模式检测到重复调度任务: {task_meta}"
+                    )
                 continue
             seen.add(key)
             normalized_tasks.append(task_meta)
+            expected_snapshot.append(
+                {
+                    'module': task_meta.get('module'),
+                    'func': task_meta.get('func'),
+                    'schedule_type': task_meta.get('schedule_type'),
+                    'time': task_meta.get('time', 'every_bar'),
+                    'weekday': task_meta.get('weekday'),
+                    'monthday': task_meta.get('monthday'),
+                    'reference_security': task_meta.get('reference_security'),
+                    'force': task_meta.get('force', True),
+                    'enabled': bool(task_meta.get('enabled', True)),
+                }
+            )
 
         for task_meta in normalized_tasks:
             func = self._resolve_callable(task_meta.get('module'), task_meta.get('func'))
             if not func:
+                if self.config.checkpoint_persistence_enabled:
+                    raise RuntimeError(
+                        f"严格 checkpoint 模式无法解析调度任务: {task_meta}"
+                    )
                 log.warning(f"无法恢复调度任务: {task_meta}")
                 continue
             schedule_type = task_meta.get('schedule_type')
             time_expr = task_meta.get('time', 'every_bar')
             enabled = bool(task_meta.get('enabled', True))
             try:
+                before_count = len(get_tasks())
                 if schedule_type == 'daily':
                     run_daily(func, time_expr)
                 elif schedule_type == 'weekly':
-                    run_weekly(func, task_meta.get('weekday'), time_expr)
+                    run_weekly(
+                        func,
+                        task_meta.get('weekday'),
+                        time_expr,
+                        task_meta.get('reference_security'),
+                        task_meta.get('force', True),
+                    )
                 elif schedule_type == 'monthly':
-                    run_monthly(func, task_meta.get('monthday'), time_expr)
+                    run_monthly(
+                        func,
+                        task_meta.get('monthday'),
+                        time_expr,
+                        task_meta.get('reference_security'),
+                        task_meta.get('force', True),
+                    )
+                else:
+                    raise ValueError(f"不支持的调度类型: {schedule_type}")
                 current_tasks = get_tasks()
-                if current_tasks:
-                    current_task = current_tasks[-1]
-                    current_task.enabled = bool(enabled)
+                if len(current_tasks) <= before_count:
+                    raise RuntimeError("调度 API 未登记新任务")
+                if (
+                    self.config.checkpoint_persistence_enabled
+                    and len(current_tasks) != before_count + 1
+                ):
+                    raise RuntimeError(
+                        "严格 checkpoint 模式调度 API 登记了非单一任务"
+                    )
+                current_task = current_tasks[-1]
+                current_task.enabled = bool(enabled)
             except Exception as exc:
+                if self.config.checkpoint_persistence_enabled:
+                    raise RuntimeError(
+                        f"严格 checkpoint 模式恢复调度任务失败: {task_meta}"
+                    ) from exc
                 log.warning(f"恢复调度任务失败 {task_meta}: {exc}")
+        if self.config.checkpoint_persistence_enabled:
+            restored_snapshot = self._collect_scheduler_tasks_snapshot()
+            if restored_snapshot != expected_snapshot:
+                raise RuntimeError(
+                    "严格 checkpoint 模式调度任务恢复数量或身份不一致"
+                )
 
     def _resolve_callable(self, module_name: Optional[str], func_name: Optional[str]) -> Optional[Callable]:
         if not module_name or not func_name:
