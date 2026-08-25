@@ -675,8 +675,9 @@ class TushareProvider(DataProvider):
         def _fetch(kw: Dict[str, Any]) -> List[str]:
             pro = self._ensure_client()
             index_code = self._to_ts_code(kw["index_symbol"])
-            target_date = self._format_date(kw.get("date")) or datetime.today().strftime("%Y%m%d")
-            df = pro.index_weight(index_code=index_code, trade_date=target_date)
+            start_date = self._format_date(kw.get("date")) or datetime.today().strftime("%Y%m01")
+            end_date = (pd.Timestamp(start_date) + pd.offsets.MonthEnd(0)).strftime("%Y%m%d")
+            df = pro.index_weight(index_code=index_code, start_date=start_date, end_date=end_date)
             if df is None or df.empty:
                 return []
             return [self._to_jq_code(code) for code in df["con_code"].dropna().tolist()]
