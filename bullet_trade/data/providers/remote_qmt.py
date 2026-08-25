@@ -40,17 +40,98 @@ def _env(key: str, default: Optional[str] = None) -> Optional[str]:
     return os.environ.get(key, default)
 
 
+def _restore_payload_index(df: pd.DataFrame, payload: Dict[str, Any]) -> pd.DataFrame:
+    """按服务端显式 metadata 恢复 DataFrame 行索引。
+
+    Args:
+        df: 已按 wire ``columns`` 和 ``records`` 构造的表。
+        payload: QMT server 返回的 dataframe payload。
+
+    Returns:
+        pd.DataFrame: 已移除 wire 索引列并恢复原索引的表。
+
+    Raises:
+        ValueError: 索引列、层数、类型或 RangeIndex 元数据不一致时抛出。
+    """
+
+    raw_columns = payload.get("index_columns") or []
+    if not raw_columns:
+        return df
+    if not isinstance(raw_columns, list) or not all(isinstance(item, str) for item in raw_columns):
+        raise ValueError("QMT dataframe index_columns 非法")
+    missing = [column for column in raw_columns if column not in df.columns]
+    if missing:
+        raise ValueError(f"QMT dataframe 缺少显式索引列: {missing}")
+
+    index_names = list(payload.get("index_names") or [])
+    if len(index_names) != len(raw_columns):
+        raise ValueError("QMT dataframe index_names 与 index_columns 层数不一致")
+    index_dtypes = list(payload.get("index_dtypes") or [])
+    if index_dtypes and len(index_dtypes) != len(raw_columns):
+        raise ValueError("QMT dataframe index_dtypes 与 index_columns 层数不一致")
+
+    arrays: List[Any] = []
+    for level, column in enumerate(raw_columns):
+        values = df.pop(column)
+        dtype = str(index_dtypes[level]) if index_dtypes else ""
+        if dtype.startswith("datetime64"):
+            values = pd.to_datetime(values, errors="raise")
+        elif dtype.startswith("timedelta64"):
+            values = pd.to_timedelta(values, errors="raise")
+        arrays.append(values)
+
+    index_type = str(payload.get("index_type") or "Index")
+    if len(arrays) == 1 and index_type == "RangeIndex":
+        range_meta = payload.get("index_range") or {}
+        candidate = pd.RangeIndex(
+            start=int(range_meta.get("start", 0)),
+            stop=int(range_meta.get("stop", 0)),
+            step=int(range_meta.get("step", 1)),
+            name=index_names[0],
+        )
+        if candidate.tolist() != arrays[0].tolist():
+            raise ValueError("QMT dataframe RangeIndex 元数据与 wire 值不一致")
+        df.index = candidate
+    elif len(arrays) == 1 and index_type == "DatetimeIndex":
+        restored_index = pd.DatetimeIndex(pd.to_datetime(arrays[0], errors="raise"))
+        restored_index.name = index_names[0]
+        df.index = restored_index
+    elif len(arrays) == 1:
+        df.index = pd.Index(arrays[0].tolist(), name=index_names[0])
+    else:
+        df.index = pd.MultiIndex.from_arrays(arrays, names=index_names)
+    return df
+
+
 def _dataframe_from_payload(payload: Dict[str, Any]) -> pd.DataFrame:
+    """把 QMT server 的 dataframe payload 无损恢复为 DataFrame。
+
+    Args:
+        payload: server 返回的 dataframe wire 字典。
+
+    Returns:
+        pd.DataFrame: 已恢复显式行索引与 MultiIndex 列的表；非 dataframe 返回空表。
+
+    Raises:
+        ValueError: wire 列数或索引/列 metadata 不一致时抛出。
+    """
+
     if not payload or payload.get("dtype") != "dataframe":
         return pd.DataFrame()
-    columns = payload.get("columns") or []
-    column_tuples = payload.get("column_tuples") or None
+    wire_columns = list(payload.get("columns") or [])
     records = payload.get("records") or []
+    df = pd.DataFrame(records, columns=wire_columns)
+    df = _restore_payload_index(df, payload)
+
+    column_tuples = payload.get("column_tuples") or None
     if column_tuples:
-        columns = _multiindex_from_payload_columns(column_tuples, payload.get("column_index_names"))
+        if len(column_tuples) != len(df.columns):
+            raise ValueError("QMT dataframe column_tuples 与数据列数不一致")
+        df.columns = _multiindex_from_payload_columns(
+            column_tuples, payload.get("column_index_names")
+        )
     else:
-        columns = _parse_legacy_tuple_columns(columns)
-    df = pd.DataFrame(records, columns=columns)
+        df.columns = _parse_legacy_tuple_columns(list(df.columns))
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = _normalise_price_multiindex_columns(df.columns)
     return df
