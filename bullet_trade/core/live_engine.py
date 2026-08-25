@@ -295,14 +295,14 @@ class LiveEngine:
         启动 LiveEngine（同步封装）。
         """
         if not self.strategy_path.exists():
-            print(f"✗ 策略文件不存在: {self.strategy_path}")
+            print(f"策略文件不存在: {self.strategy_path}")
             return 1
 
         exit_code = 0
         try:
             asyncio.run(self.start())
         except KeyboardInterrupt:
-            log.info("⚠️  用户终止实盘运行")
+            log.info("用户终止实盘运行")
         except Exception as exc:
             log.error(f"实盘引擎异常退出: {exc}", exc_info=True)
             exit_code = 2
@@ -343,7 +343,7 @@ class LiveEngine:
     # ------------------------------------------------------------------
 
     async def _bootstrap(self) -> None:
-        log.info("🧠 初始化 Live 引擎")
+        log.info("初始化 Live 引擎")
         if not self.strategy_path.exists():
             raise FileNotFoundError(f"策略文件不存在: {self.strategy_path}")
 
@@ -534,7 +534,7 @@ class LiveEngine:
             raise RuntimeError("严格 checkpoint 模式检测到 g.pkl 配套策略元数据无效")
 
     async def _shutdown(self) -> None:
-        log.info("🛑 正在关闭 Live 引擎")
+        log.info("正在关闭 Live 引擎")
         if self._stop_event:
             self._stop_event.set()
         for task in self._background_tasks:
@@ -640,7 +640,7 @@ class LiveEngine:
         self.context.previous_date = self._previous_trade_day
 
         await self.event_bus.emit(TradingDayStartEvent(date=current_date))
-        log.info(f"📅 新交易日：{current_date}")
+        log.info(f"新交易日：{current_date}")
 
         if self._last_schedule_dt and self._last_schedule_dt.date() != current_date:
             self._last_schedule_dt = None
@@ -672,7 +672,7 @@ class LiveEngine:
 
         if delay > timeout:
             log.warning(
-                f"⏱️ 事件超时丢弃: scheduled={scheduled}, delay={delay:.1f}s (> {timeout}s)"
+                f"事件超时丢弃: scheduled={scheduled}, delay={delay:.1f}s (> {timeout}s)"
             )
             assert_live_runtime_healthy()
             if self.config.checkpoint_persistence_enabled:
@@ -2210,7 +2210,7 @@ class LiveEngine:
         summary = self._safe_account_info()
         positions = summary.get('positions') or []
         log.info(
-            "✅ 券商 %s 连接成功: account_id=%s, type=%s, 可用资金=%s, 总资产=%s, 持仓数=%s",
+            "券商 %s 连接成功: account_id=%s, type=%s, 可用资金=%s, 总资产=%s, 持仓数=%s",
             self.broker.__class__.__name__,
             summary.get('account_id') or getattr(self.broker, 'account_id', ''),
             summary.get('account_type') or getattr(self.broker, 'account_type', ''),
@@ -2519,7 +2519,7 @@ class LiveEngine:
         try:
             periods = parse_market_periods_string(expr)
             set_option('market_period', [(start, end) for start, end in periods])
-            log.info("⚙️  已应用自定义交易时段: %s", expr)
+            log.info("已应用自定义交易时段: %s", expr)
         except Exception as exc:
             log.warning("环境变量 SCHEDULER_MARKET_PERIODS 解析失败(%s): %s", expr, exc)
 
@@ -3139,7 +3139,7 @@ class LiveEngine:
 
             position_ratio = (invested / total_value * 100.0) if total_value > 0 else 0.0
             log.info(
-                "📊 券商账户概览: 总资产 %s, 可用资金 %s, 仓位 %.2f%%",
+                "券商账户概览: 总资产 %s, 可用资金 %s, 仓位 %.2f%%",
                 self._format_currency(total_value),
                 self._format_currency(cash),
                 position_ratio,
