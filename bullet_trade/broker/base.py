@@ -211,6 +211,21 @@ class BrokerBase(ABC):
             是否已连接
         """
         return self._connected
+
+    def preflight(self) -> None:
+        """在策略初始化前执行无业务写入的本地前置检查。
+
+        Returns:
+            None。默认实现不做检查，保持既有券商兼容。
+
+        Raises:
+            RuntimeError: 子类可在平台、依赖或本地制品未就绪时抛出稳定错误。
+
+        Side Effects:
+            默认实现无副作用；子类不得在此连接柜台、启动监听、编译或发起交易。
+        """
+
+        return None
     
     def run_strategy(self, strategy_file: str, **kwargs):
         """

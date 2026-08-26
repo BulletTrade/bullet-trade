@@ -178,6 +178,7 @@ def get_data_provider_config() -> dict:
             "data_dir": get_env("QMT_DATA_PATH"),
             "auto_download": get_env_optional_bool("MINIQMT_AUTO_DOWNLOAD"),
             "market": get_env("MINIQMT_MARKET"),
+            "max_live_age_seconds": get_env_float("MINIQMT_LIVE_MAX_AGE_SECONDS", 5.0),
             "cache_dir": cache_dir_for("miniqmt"),
             "tushare_token": get_env("TUSHARE_TOKEN"),
             "tushare_custom_url": get_env("TUSHARE_CUSTOM_URL"),
@@ -230,6 +231,15 @@ def get_broker_config() -> dict:
             "tls_cert": get_env("QMT_SERVER_TLS_CERT"),
             "account_key": get_env("QMT_SERVER_ACCOUNT_KEY"),
             "sub_account_id": get_env("QMT_SERVER_SUB_ACCOUNT"),
+        },
+        "huaxin": {
+            "account_id": get_env("HUAXIN_ACCOUNT_ID"),
+            "account_type": get_env("HUAXIN_ACCOUNT_TYPE", "stock"),
+            "bundle_path": get_env("HUAXIN_NATIVE_BUNDLE"),
+            "runtime_mode": get_env("HUAXIN_RUNTIME_MODE", "server"),
+            "enable_trading": get_env_bool("HUAXIN_ENABLE_TRADING", False),
+            "enable_cancel": get_env_bool("HUAXIN_ENABLE_CANCEL", False),
+            "enable_node_transfer": get_env_bool("HUAXIN_ENABLE_NODE_TRANSFER", False),
         },
     }
 

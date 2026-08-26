@@ -7,6 +7,7 @@
 import importlib
 import inspect
 import json
+import math
 import os
 import re
 import threading
@@ -107,6 +108,12 @@ def _create_provider(
         provider_cfg = dict(config.get("easy_tdx", {}) or {})
         provider_cfg.update(overrides)
         return EasyTdxProvider(provider_cfg)
+    if target in ("huaxin", "huaxin_xmd", "xmd"):
+        from .providers.huaxin import HuaxinDataProvider
+
+        provider_cfg = dict(config.get("huaxin", {}) or {})
+        provider_cfg.update(overrides)
+        return HuaxinDataProvider(provider_cfg)
 
     raise ValueError(f"未知的数据提供者: {provider_name}")
 
@@ -1841,6 +1848,25 @@ class BacktestCurrentData:
         return self._cache.values()
 
 
+def _optional_float(value: Any) -> Optional[float]:
+    """把可选行情字段规范为有限浮点数。
+
+    Args:
+        value: 行情提供者返回的原始字段。
+
+    Returns:
+        Optional[float]: 有限数值返回 float；缺失、非法或非有限值返回 None。
+    """
+
+    if value in (None, ""):
+        return None
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
 class LiveCurrentData:
     """当前行情（实盘/tick 优先）。若 tick 不可用则回退到 BacktestCurrentData 逻辑。"""
 
@@ -1867,7 +1893,9 @@ class LiveCurrentData:
         requires_live = bool(getattr(provider, "requires_live_data", False))
         snap = None
         try:
-            get_fn = getattr(provider, "get_live_current", None)
+            get_fn = getattr(provider, "get_live_current", None) or getattr(
+                provider, "get_current_tick", None
+            )
             if callable(get_fn):
                 snap = get_fn(security)
         except Exception:
@@ -1900,6 +1928,14 @@ class LiveCurrentData:
                 received_time=snap.get("received_time"),
                 age_seconds=snap.get("age_seconds"),
                 source=snap.get("source"),
+                bid_price1=_optional_float(snap.get("bid_price1")),
+                ask_price1=_optional_float(snap.get("ask_price1")),
+                bid_volume1=_optional_float(snap.get("bid_volume1")),
+                ask_volume1=_optional_float(snap.get("ask_volume1")),
+                name=str(snap.get("name") or snap.get("security_name") or ""),
+                display_name=str(snap.get("display_name") or snap.get("short_name") or ""),
+                price_tick=float(snap.get("price_tick") or 0.01),
+                day_trading=bool(snap.get("day_trading", False)),
             )
         else:
             if requires_live:

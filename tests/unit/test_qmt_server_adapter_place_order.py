@@ -25,7 +25,9 @@ class _FakeBroker:
         )
         return "OID-1"
 
-    async def sell(self, security, amount, price=None, wait_timeout=None, remark=None, market=False):
+    async def sell(
+        self, security, amount, price=None, wait_timeout=None, remark=None, market=False
+    ):
         self.calls.append(
             {
                 "side": "SELL",
@@ -184,7 +186,9 @@ async def test_qmt_server_clamps_explicit_market_buy_protect_price_to_cage(monke
 
 
 @pytest.mark.asyncio
-async def test_remote_market_sell_without_price_uses_default_sell_protect_price(monkeypatch):
+async def test_remote_market_sell_without_price_uses_default_sell_protect_price(
+    monkeypatch, tmp_path
+):
     from bullet_trade.core import pricing
 
     async def _qmt_snapshot(_security):
@@ -203,6 +207,7 @@ async def test_remote_market_sell_without_price_uses_default_sell_protect_price(
         enable_data=True,
         enable_broker=True,
         accounts=[AccountConfig(key="default", account_id="demo")],
+        idempotency_journal_path=str(tmp_path / "sell-idempotency.sqlite3"),
     )
     router = AccountRouter(config.accounts)
     adapter = QmtBrokerAdapter(config, router)
@@ -222,6 +227,7 @@ async def test_remote_market_sell_without_price_uses_default_sell_protect_price(
         "amount": 1000,
         "style": {"type": "market"},
         "market": True,
+        "idempotency_key": "unit-market-sell-default-protect",
     }
 
     result = await app._dispatch_broker(_FakeSession(), "place_order", payload)
@@ -243,7 +249,7 @@ async def test_remote_market_sell_without_price_uses_default_sell_protect_price(
 
 @pytest.mark.asyncio
 async def test_remote_market_buy_without_price_ignores_prefill_and_uses_default_buy_protect_price(
-    monkeypatch,
+    monkeypatch, tmp_path
 ):
     from bullet_trade.core import pricing
 
@@ -263,6 +269,7 @@ async def test_remote_market_buy_without_price_ignores_prefill_and_uses_default_
         enable_data=True,
         enable_broker=True,
         accounts=[AccountConfig(key="default", account_id="demo")],
+        idempotency_journal_path=str(tmp_path / "buy-idempotency.sqlite3"),
     )
     router = AccountRouter(config.accounts)
     adapter = QmtBrokerAdapter(config, router)
@@ -273,7 +280,9 @@ async def test_remote_market_buy_without_price_ignores_prefill_and_uses_default_
     app = ServerApplication(
         config,
         router,
-        AdapterBundle(data_adapter=_FakeRemoteDataAdapter(last_price=103.0), broker_adapter=adapter),
+        AdapterBundle(
+            data_adapter=_FakeRemoteDataAdapter(last_price=103.0), broker_adapter=adapter
+        ),
     )
     payload = {
         "account_key": "default",
@@ -282,6 +291,7 @@ async def test_remote_market_buy_without_price_ignores_prefill_and_uses_default_
         "amount": 1000,
         "style": {"type": "market"},
         "market": True,
+        "idempotency_key": "unit-market-buy-default-protect",
     }
 
     result = await app._dispatch_broker(_FakeSession(), "place_order", payload)

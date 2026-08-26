@@ -194,11 +194,13 @@ class RemoteQmtProvider(DataProvider):
             raise RuntimeError("缺少 QMT_SERVER_TOKEN，用于鉴权远程 server")
         tls_cert = self.config.get("tls_cert") or _env("QMT_SERVER_TLS_CERT")
         tls_enabled = bool(tls_cert)
-        self._connection = RemoteQmtConnection(host, port, token, tls_cert=tls_cert, tls_enabled=tls_enabled)
+        self._connection = RemoteQmtConnection(
+            host, port, token, tls_cert=tls_cert, tls_enabled=tls_enabled
+        )
         self._connection.add_event_listener("tick", self._handle_tick_event)
         self._connection.start()
         self._subscription_key = "remote-provider"
-        self._tick_callback: Optional[Callable[[Any, Dict[str, Any]], None]] = None
+        self._tick_callback: Optional[Callable[..., None]] = None
         self._tick_context: Optional[Any] = None
 
     def get_price(
@@ -217,7 +219,6 @@ class RemoteQmtProvider(DataProvider):
         prefer_engine: bool = False,
         force_no_engine: bool = False,
     ) -> pd.DataFrame:
-
         def _is_minute_frequency(value: str) -> bool:
             freq = str(value or "").strip().lower()
             if "minute" in freq or "min" in freq:
@@ -226,7 +227,9 @@ class RemoteQmtProvider(DataProvider):
 
         def _str_format(date_obj):
             if date_obj and isinstance(date_obj, datetime):
-                return date_obj.strftime("%Y-%m-%d %H:%M:%S" if _is_minute_frequency(frequency) else "%Y-%m-%d")
+                return date_obj.strftime(
+                    "%Y-%m-%d %H:%M:%S" if _is_minute_frequency(frequency) else "%Y-%m-%d"
+                )
             return date_obj
 
         payload = {
@@ -273,7 +276,9 @@ class RemoteQmtProvider(DataProvider):
             securities = [security]
         return {str(sec): last_day for sec in securities}
 
-    def get_all_securities(self, types: Union[str, List[str]] = "stock", date: Optional[str] = None) -> pd.DataFrame:
+    def get_all_securities(
+        self, types: Union[str, List[str]] = "stock", date: Optional[str] = None
+    ) -> pd.DataFrame:
         payload = {"types": types, "date": date}
         resp = self._connection.request("data.get_all_securities", payload)
         return _dataframe_from_payload(resp)
@@ -311,7 +316,25 @@ class RemoteQmtProvider(DataProvider):
             if key not in {"dtype", "value"} and item is not None
         }
 
-    def set_tick_callback(self, callback: Callable[[Any, Dict[str, Any]], None], context: Any) -> None:
+    def set_tick_callback(
+        self,
+        callback: Callable[..., None],
+        context: Optional[Any] = None,
+    ) -> None:
+        """注册标准 provider tick 回调，并兼容旧版显式上下文。
+
+        Args:
+            callback: LiveEngine 使用 ``callback(tick)``；旧 Core API 可使用
+                ``callback(context, tick)``。
+            context: 旧版调用方绑定的上下文；省略时按标准单参数合同分发。
+
+        Returns:
+            None: 仅更新内存中的回调和可选上下文。
+
+        Side Effects:
+            后续远程 tick 事件会同步调用已注册回调。
+        """
+
         self._tick_callback = callback
         self._tick_context = context
 
@@ -351,6 +374,19 @@ class RemoteQmtProvider(DataProvider):
         return resp or {}
 
     def _handle_tick_event(self, payload: Dict[str, Any]) -> None:
+        """规范化远程 tick 事件并按新旧回调合同安全分发。
+
+        Args:
+            payload: 远程连接推送的原始 tick 字典。
+
+        Returns:
+            None: 无回调、缺证券代码或回调异常时静默返回。
+
+        Side Effects:
+            有显式旧版上下文时调用 ``callback(context, tick)``，否则调用
+            ``callback(tick)``。
+        """
+
         callback = self._tick_callback
         if not callback:
             return
@@ -363,7 +399,10 @@ class RemoteQmtProvider(DataProvider):
             "dt": payload.get("dt") or payload.get("time"),
         }
         try:
-            callback(self._tick_context, tick)
+            if self._tick_context is None:
+                callback(tick)
+            else:
+                callback(self._tick_context, tick)
         except Exception:
             pass
 

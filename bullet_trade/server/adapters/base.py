@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Protocol, Tuple
 
 from ..config import AccountConfig, ServerConfig, SubAccountConfig
@@ -30,10 +30,14 @@ class RemoteBrokerAdapter(Protocol):
     async def get_positions(self, account: AccountContext) -> List[Dict]:
         ...
 
-    async def list_orders(self, account: AccountContext, filters: Optional[Dict] = None) -> List[Dict]:
+    async def list_orders(
+        self, account: AccountContext, filters: Optional[Dict] = None
+    ) -> List[Dict]:
         ...
 
-    async def list_trades(self, account: AccountContext, filters: Optional[Dict] = None) -> List[Dict]:
+    async def list_trades(
+        self, account: AccountContext, filters: Optional[Dict] = None
+    ) -> List[Dict]:
         ...
 
     async def get_order_status(self, account: AccountContext, order_id: str) -> Dict:
@@ -68,8 +72,16 @@ class RemoteDataAdapter(Protocol):
 
 @dataclass
 class AdapterBundle:
+    """聚合行情与券商 adapter，并声明交易写入安全能力。
+
+    幂等键与持久账本是两个独立能力：真实 broker 默认两者都要求；明确由上游持有
+    持久账本的 adapter 可以只关闭持久要求，但仍保留每个写请求必须带幂等键。
+    """
+
     data_adapter: Optional[RemoteDataAdapter]
     broker_adapter: Optional[RemoteBrokerAdapter]
+    broker_writes_require_persistent_idempotency: bool = True
+    broker_writes_require_idempotency_key: bool = True
 
 
 class AccountRouter:
@@ -83,10 +95,30 @@ class AccountRouter:
         }
         if "default" not in self._accounts and configs:
             self._accounts["default"] = AccountContext(configs[0])
-        self._lock = asyncio.Lock()
+        self._lock: Optional[asyncio.Lock] = None
+
+    @property
+    def lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
 
     def list_accounts(self) -> List[AccountContext]:
-        return list(self._accounts.values())
+        """枚举去重后的真实账户上下文。
+
+        Returns:
+            List[AccountContext]: 按配置顺序返回的唯一上下文；默认回退别名不会重复出现。
+        """
+
+        accounts: List[AccountContext] = []
+        seen = set()
+        for context in self._accounts.values():
+            identity = context.config.key or "default"
+            if identity in seen:
+                continue
+            seen.add(identity)
+            accounts.append(context)
+        return accounts
 
     def get(self, key: Optional[str]) -> AccountContext:
         if key and key in self._accounts:
@@ -96,7 +128,7 @@ class AccountRouter:
         raise KeyError("未配置有效的 account_key")
 
     async def attach_handle(self, key: str, handle: object) -> None:
-        async with self._lock:
+        async with self.lock:
             ctx = self.get(key)
             ctx.broker_handle = handle
 
@@ -116,9 +148,17 @@ class VirtualAccountManager:
         self._configs: Dict[str, SubAccountState] = {
             cfg.sub_account_id: SubAccountState(cfg) for cfg in configs
         }
-        self._lock = asyncio.Lock()
+        self._lock: Optional[asyncio.Lock] = None
 
-    def resolve(self, account_key: Optional[str], sub_account_id: Optional[str]) -> Tuple[str, Optional[SubAccountConfig]]:
+    @property
+    def lock(self) -> asyncio.Lock:
+        if self._lock is None:
+            self._lock = asyncio.Lock()
+        return self._lock
+
+    def resolve(
+        self, account_key: Optional[str], sub_account_id: Optional[str]
+    ) -> Tuple[str, Optional[SubAccountConfig]]:
         if not sub_account_id:
             return account_key or "default", None
         actual_sub = sub_account_id
@@ -134,7 +174,9 @@ class VirtualAccountManager:
         cfg = state.config if state else None
         return parent_key, cfg
 
-    async def ensure_within_limit(self, sub_cfg: Optional[SubAccountConfig], order_value: Optional[float]) -> None:
+    async def ensure_within_limit(
+        self, sub_cfg: Optional[SubAccountConfig], order_value: Optional[float]
+    ) -> None:
         if sub_cfg is None or sub_cfg.order_limit is None:
             return
         if order_value is None:

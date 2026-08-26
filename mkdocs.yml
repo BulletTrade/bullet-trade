@@ -24,6 +24,7 @@ nav:
   - 回测数据会话优化: backtest-data-session.md
   - 参数优化: optimize.md
   - 实盘引擎: live.md
+  - 华鑫 TORA 接入（第一阶段）: huaxin.md
   - Tick 行情指南: tick.md
   - 交易支撑: trade-support.md
   - QMT 服务配置: qmt-server.md

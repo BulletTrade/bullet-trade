@@ -11,6 +11,10 @@ include env.live.example
 recursive-include bullet_trade/notebook *.ipynb
 recursive-include bullet_trade/notebook *.md
 recursive-include bullet_trade/contracts *.json
+include bullet_trade/integrations/huaxin/native_src/CMakeLists.txt
+include bullet_trade/integrations/huaxin/native_src/include/bt_huaxin_bridge.h
+include bullet_trade/integrations/huaxin/native_src/src/bt_huaxin_bridge.cpp
+include bullet_trade/integrations/huaxin/native_src/src/bt_huaxin_trader_bridge.cpp
 recursive-include helpers *.py
 
 # 排除文件
@@ -21,4 +25,5 @@ recursive-exclude docs *
 recursive-exclude examples *
 recursive-exclude scripts *
 exclude .env
+exclude .env.*
 exclude .gitignore

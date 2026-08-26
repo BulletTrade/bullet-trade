@@ -1,3 +1,12 @@
+"""
+作者: BruceLee
+文件说明:
+    通用远程券商协议的客户端长连接。
+    主要输入为远程 action、请求载荷和连接配置，主要输出为 RPC 响应与事件回调。
+    该层在 Broker/Provider 与 bullet-trade server 之间管理握手、心跳、重连和请求语义。
+    交易写请求在任何可能已写出的传输错误后均不得自动重发。
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -12,9 +21,95 @@ from typing import Any, Callable, Dict, List, Optional
 from bullet_trade.core.globals import log
 from bullet_trade.server.protocol import ProtocolError, encode_message, read_message
 
-
 _REQUEST_TIMEOUT_DEFAULT = object()
 _INSTALL_SOURCE_SNAPSHOT_ACTION = "broker.install_source_snapshot"
+_AMBIGUOUS_WRITE_ACTIONS = frozenset({"broker.place_order", "broker.cancel_order"})
+_IDEMPOTENT_TRANSITION_ACTIONS = frozenset(
+    {
+        "broker.install_source_snapshot",
+        "data.subscribe",
+        "data.unsubscribe",
+        "data.unsubscribe_all",
+    }
+)
+_AMBIGUOUS_SERVER_ERROR_CODES = frozenset({"REQUEST_FAILED", "REQUEST_TIMEOUT"})
+
+
+class RemoteServerError(RuntimeError):
+    """表示远程服务器已明确返回的错误。"""
+
+    def __init__(self, code: str, message: str) -> None:
+        """初始化服务器错误。
+
+        Args:
+            code: 服务器错误码。
+            message: 服务器错误文本。
+
+        Returns:
+            None。
+        """
+
+        super().__init__(message)
+        self.code = str(code or "REQUEST_FAILED")
+
+
+class RemoteSubmissionUnknownError(RuntimeError, TimeoutError):
+    """表示写请求可能已送达，但响应无法确认。"""
+
+    code = "SUBMIT_UNKNOWN"
+
+    def __init__(
+        self,
+        action: str,
+        idempotency_key: str,
+        request_payload: Dict[str, Any],
+        *,
+        message: Optional[str] = None,
+        resolution: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """初始化提交未知异常。
+
+        Args:
+            action: 原始写 action。
+            idempotency_key: 原始幂等键。
+            request_payload: 原始请求载荷快照。
+            message: 可选错误说明。
+            resolution: 可选的只读解析结果。
+
+        Returns:
+            None。
+
+        Side Effects:
+            无；调用方必须先查询对账，不得重发写 action。
+        """
+
+        self.action = str(action)
+        self.idempotency_key = str(idempotency_key)
+        self.request_payload = dict(request_payload)
+        self.resolution = dict(resolution or {})
+        detail = message or "transport error after write may have been dispatched"
+        super().__init__(
+            f"远程写请求状态=submit_unknown: action={self.action} "
+            f"idempotency_key={self.idempotency_key} detail={detail}"
+        )
+
+
+def classify_remote_action(action: str) -> str:
+    """按具体远程 action 返回副作用分类。
+
+    Args:
+        action: 远程 RPC action 名称。
+
+    Returns:
+        str: `ambiguous_write`、`idempotent_transition` 或 `none`。
+    """
+
+    normalized = str(action or "").strip()
+    if normalized in _AMBIGUOUS_WRITE_ACTIONS:
+        return "ambiguous_write"
+    if normalized in _IDEMPOTENT_TRANSITION_ACTIONS:
+        return "idempotent_transition"
+    return "none"
 
 
 class RemoteQmtConnection:
@@ -34,11 +129,33 @@ class RemoteQmtConnection:
         tls_enabled: bool = False,
         request_timeout: float = 60.0,
     ) -> None:
+        """创建尚未联网的远程连接。
+
+        Args:
+            host: 服务端主机或 IP。
+            port: 服务端 TCP 端口。
+            token: 握手固定 token。
+            tls_cert: 用于验证服务端的 CA/证书路径。
+            tls_enabled: 是否强制使用 TLS。
+            request_timeout: 默认 RPC 等待秒数。
+
+        Returns:
+            None。
+
+        Raises:
+            ValueError: 请求 TLS 却未提供验证证书时抛出，禁止静默降级明文。
+
+        Side Effects:
+            仅保存配置并创建本地同步原语；不发起网络连接。
+        """
+
+        if tls_enabled and not str(tls_cert or "").strip():
+            raise ValueError("启用远程 TLS 必须提供 tls_cert，禁止回退明文连接")
         self.host = host
         self.port = port
         self.token = token
         self.tls_cert = tls_cert
-        self.tls_enabled = tls_enabled and bool(tls_cert)
+        self.tls_enabled = bool(tls_enabled)
         self.request_timeout = max(5.0, float(request_timeout))
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
@@ -74,7 +191,10 @@ class RemoteQmtConnection:
         self._event_handlers.setdefault(event, []).append(handler)
 
     def request(
-        self, action: str, payload: Optional[Dict[str, Any]] = None, timeout: Any = _REQUEST_TIMEOUT_DEFAULT
+        self,
+        action: str,
+        payload: Optional[Dict[str, Any]] = None,
+        timeout: Any = _REQUEST_TIMEOUT_DEFAULT,
     ) -> Dict:
         """同步发送远程请求并等待响应。
 
@@ -94,14 +214,63 @@ class RemoteQmtConnection:
 
         if not self._loop:
             raise RuntimeError("remote connection 尚未启动")
-        coro = self._request_async(action, payload or {})
+        prepared_payload = self._prepare_request_payload(action, payload or {})
+        coro = self._request_async(action, prepared_payload)
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
         effective_timeout = self.request_timeout if timeout is _REQUEST_TIMEOUT_DEFAULT else timeout
         try:
             return future.result(timeout=effective_timeout)
         except concurrent.futures.TimeoutError as exc:
             future.cancel()
+            if classify_remote_action(action) == "ambiguous_write":
+                raise RemoteSubmissionUnknownError(
+                    action,
+                    prepared_payload["idempotency_key"],
+                    prepared_payload,
+                    message="client response timeout",
+                ) from exc
             raise TimeoutError(f"request timed out: action={action}") from exc
+
+    def resolve_submission(
+        self,
+        idempotency_key: str,
+        *,
+        write_action: str,
+        request_payload: Optional[Dict[str, Any]] = None,
+        order_id: Optional[str] = None,
+        context: Optional[Dict[str, Any]] = None,
+        timeout: Any = _REQUEST_TIMEOUT_DEFAULT,
+    ) -> Dict[str, Any]:
+        """使用原幂等键发起只读的写结果解析。
+
+        Args:
+            idempotency_key: 原始写请求的幂等键。
+            write_action: 原始写 action。
+            request_payload: 原始写请求载荷，用于服务端冲突校验。
+            order_id: 已知的精确订单号。
+            context: 账户和虚拟子账户等路由上下文。
+            timeout: 只读解析请求的超时秒数。
+
+        Returns:
+            Dict[str, Any]: 服务端返回的 accepted/rejected/unknown 解析结果。
+
+        Raises:
+            ValueError: 原 action 不是支持的模糊写请求时抛出。
+        """
+
+        if classify_remote_action(write_action) != "ambiguous_write":
+            raise ValueError(f"不支持解析非写 action: {write_action}")
+        payload = dict(context or {})
+        payload.update(
+            {
+                "idempotency_key": str(idempotency_key or "").strip(),
+                "write_action": str(write_action),
+                "request_payload": dict(request_payload or {}),
+            }
+        )
+        if order_id:
+            payload["order_id"] = str(order_id)
+        return self.request("broker.resolve_submission", payload, timeout=timeout)
 
     def subscribe(self, key: str, symbols: List[str]) -> Dict:
         current = self._subscriptions.setdefault(key, set())
@@ -167,7 +336,14 @@ class RemoteQmtConnection:
         reader, writer = await asyncio.open_connection(self.host, self.port, ssl=ssl_context)
         self._reader = reader
         self._writer = writer
-        await self._send({"type": "handshake", "token": self.token, "protocol": 1, "features": ["tick", "order_stream"]})
+        await self._send(
+            {
+                "type": "handshake",
+                "token": self.token,
+                "protocol": 1,
+                "features": ["tick", "order_stream"],
+            }
+        )
         ack = await read_message(reader)
         if ack.get("type") != "handshake_ack":
             raise ProtocolError("握手失败")
@@ -191,7 +367,10 @@ class RemoteQmtConnection:
                         self._pending.pop(req_id).set_result(msg.get("payload"))
                 elif msg_type == "error":
                     req_id = msg.get("id")
-                    err = RuntimeError(msg.get("message", "server error"))
+                    err = RemoteServerError(
+                        str(msg.get("code") or "REQUEST_FAILED"),
+                        str(msg.get("message") or "server error"),
+                    )
                     if req_id and req_id in self._pending:
                         self._pending.pop(req_id).set_exception(err)
                     else:
@@ -247,24 +426,29 @@ class RemoteQmtConnection:
             await asyncio.sleep(0.2)
 
     async def _request_async(self, action: str, payload: Dict) -> Dict:
-        """执行远程请求，并仅对快照安装施加一次重试上限。
+        """在后台事件循环执行一次 RPC 及其受控重试。
 
         Args:
-            action: 远程 RPC action 名称。
-            payload: 调用方提供的请求载荷。
+            action: 远程 RPC action。
+            payload: 请求载荷。
 
         Returns:
-            Dict: 服务端响应。
+            Dict: 远程响应。
 
         Raises:
-            Exception: 服务端明确错误、非瞬态错误，或快照安装第二次瞬态失败时抛出。
+            RemoteSubmissionUnknownError: 模糊写可能已送达且传输失败时抛出。
+            Exception: 服务端明确错误或只读请求重试仍失败时原样抛出。
 
         Side Effects:
-            普通 action 保留原有重试语义；快照安装始终复用同一份深拷贝载荷。
+            普通只读 action 保留原有重试语义；快照安装始终复用同一份
+            深拷贝载荷，且最多只允许一次重试。
         """
 
         install_snapshot = action == _INSTALL_SOURCE_SNAPSHOT_ACTION
-        request_payload = copy.deepcopy(payload) if install_snapshot else payload
+        prepared_payload = self._prepare_request_payload(action, payload)
+        if install_snapshot:
+            prepared_payload = copy.deepcopy(prepared_payload)
+        side_effect = classify_remote_action(action)
         last_error: Optional[Exception] = None
         install_retry_count = 0
         while not self._stop.is_set():
@@ -274,22 +458,61 @@ class RemoteQmtConnection:
             future: asyncio.Future = loop.create_future()
             self._pending[req_id] = future
             try:
-                await self._send({"type": "request", "id": req_id, "action": action, "payload": request_payload})
+                await self._send(
+                    {"type": "request", "id": req_id, "action": action, "payload": prepared_payload}
+                )
                 return await future
             except asyncio.CancelledError:
                 self._pending.pop(req_id, None)
                 raise
+            except RemoteServerError as exc:
+                self._pending.pop(req_id, None)
+                if side_effect == "ambiguous_write" and exc.code in _AMBIGUOUS_SERVER_ERROR_CODES:
+                    raise RemoteSubmissionUnknownError(
+                        action,
+                        prepared_payload["idempotency_key"],
+                        prepared_payload,
+                        message=f"server error code={exc.code}: {exc}",
+                    ) from exc
+                raise
             except Exception as exc:
                 self._pending.pop(req_id, None)
+                if side_effect == "ambiguous_write":
+                    raise RemoteSubmissionUnknownError(
+                        action,
+                        prepared_payload["idempotency_key"],
+                        prepared_payload,
+                        message=str(exc),
+                    ) from exc
                 if not self._should_retry(exc):
                     raise
                 last_error = exc
                 if install_snapshot:
                     install_retry_count += 1
                     if install_retry_count > 1:
-                        raise
+                        raise last_error
                 await asyncio.sleep(0.2)
         raise last_error or RuntimeError("连接已停止")
+
+    def _prepare_request_payload(self, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """复制请求载荷，并为模糊写分配稳定幂等键。
+
+        Args:
+            action: 远程 RPC action。
+            payload: 调用方提供的原始载荷。
+
+        Returns:
+            Dict[str, Any]: 不修改调用方对象的载荷副本。
+        """
+
+        prepared = dict(payload or {})
+        if classify_remote_action(action) != "ambiguous_write":
+            return prepared
+        key = str(prepared.get("idempotency_key") or prepared.get("request_id") or "").strip()
+        if not key:
+            key = f"bt-{action.rsplit('.', 1)[-1]}-{uuid.uuid4().hex}"
+        prepared["idempotency_key"] = key
+        return prepared
 
     async def _send(self, message: Dict[str, Any]) -> None:
         if not self._writer:

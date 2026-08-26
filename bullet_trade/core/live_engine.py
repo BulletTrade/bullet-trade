@@ -10,6 +10,7 @@ LiveEngine
 from __future__ import annotations
 
 import asyncio
+from contextlib import nullcontext
 import os
 import re
 import sys
@@ -20,7 +21,7 @@ import hashlib
 import inspect
 import unicodedata
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Mapping, Optional, Sequence, Set, Tuple
 import pandas as pd
 
 from .async_scheduler import AsyncScheduler, OverlapStrategy
@@ -69,8 +70,16 @@ from ..utils.env_loader import (
     get_live_trade_config,
     parse_bool,
 )
-from ..broker import BrokerBase, QmtBroker, RemoteQmtBroker
-from ..broker.simulator import SimulatorBroker
+from ..broker import BrokerBase, create_broker
+from ..market_data import (
+    CapabilityRequest,
+    DataCapabilityUnavailableError,
+    DataSourceRouter,
+    RouteDecision,
+    StrategyCapabilityPreflight,
+    StrategyCapabilityProfile,
+    StrategyCapabilityRequirements,
+)
 from .live_runtime import (
     LiveRuntimePersistenceError,
     assert_live_runtime_healthy,
@@ -86,7 +95,16 @@ from .live_runtime import (
     load_strategy_metadata,
     persist_strategy_metadata,
 )
-from .orders import get_order_queue, clear_order_queue, MarketOrderStyle, LimitOrderStyle
+from .orders import (
+    get_order_queue,
+    MarketOrderStyle,
+    LimitOrderStyle,
+    _complete_order_batch,
+    _drain_order_queue,
+    _order_batch_scope,
+    _OrderBatchContext,
+    _reject_order_batch,
+)
 from .live_lock import (
     ManagedLiveLock,
     build_lock_metadata,
@@ -140,34 +158,34 @@ class LiveConfig:
             default=False,
         )
         return cls(
-            order_max_volume=int(raw.get('order_max_volume', 1_000_000)),
-            trade_max_wait_time=int(raw.get('trade_max_wait_time', 16)),
-            event_time_out=int(raw.get('event_time_out', 60)),
-            strategy_name=raw.get('strategy_name'),
-            scheduler_market_periods=raw.get('scheduler_market_periods'),
-            account_sync_interval=int(raw.get('account_sync_interval', 60)),
-            account_sync_enabled=parse_bool(raw.get('account_sync_enabled'), default=True),
-            order_sync_interval=int(raw.get('order_sync_interval', 10)),
-            order_sync_enabled=parse_bool(raw.get('order_sync_enabled'), default=True),
-            g_autosave_interval=int(raw.get('g_autosave_interval', 60)),
+            order_max_volume=int(raw.get("order_max_volume", 1_000_000)),
+            trade_max_wait_time=int(raw.get("trade_max_wait_time", 16)),
+            event_time_out=int(raw.get("event_time_out", 60)),
+            strategy_name=raw.get("strategy_name"),
+            scheduler_market_periods=raw.get("scheduler_market_periods"),
+            account_sync_interval=int(raw.get("account_sync_interval", 60)),
+            account_sync_enabled=parse_bool(raw.get("account_sync_enabled"), default=True),
+            order_sync_interval=int(raw.get("order_sync_interval", 10)),
+            order_sync_enabled=parse_bool(raw.get("order_sync_enabled"), default=True),
+            g_autosave_interval=int(raw.get("g_autosave_interval", 60)),
             g_autosave_enabled=(
                 False
                 if checkpoint_persistence_enabled
-                else parse_bool(raw.get('g_autosave_enabled'), default=True)
+                else parse_bool(raw.get("g_autosave_enabled"), default=True)
             ),
-            tick_subscription_limit=int(raw.get('tick_subscription_limit', 100)),
-            tick_sync_interval=int(raw.get('tick_sync_interval', 2)),
-            tick_sync_enabled=parse_bool(raw.get('tick_sync_enabled'), default=True),
-            risk_check_interval=int(raw.get('risk_check_interval', 300)),
-            risk_check_enabled=parse_bool(raw.get('risk_check_enabled'), default=False),
-            broker_heartbeat_interval=int(raw.get('broker_heartbeat_interval', 30)),
-            runtime_dir=str(raw.get('runtime_dir', './runtime')),
-            buy_price_percent=float(raw.get('market_buy_price_percent', 0.015)),
-            sell_price_percent=float(raw.get('market_sell_price_percent', -0.015)),
-            calendar_skip_weekend=parse_bool(raw.get('calendar_skip_weekend'), default=True),
-            calendar_retry_minutes=int(raw.get('calendar_retry_minutes', 1)),
-            portfolio_refresh_throttle_ms=int(raw.get('portfolio_refresh_throttle_ms', 200)),
-            fail_on_schedule_error=parse_bool(raw.get('fail_on_schedule_error'), default=False),
+            tick_subscription_limit=int(raw.get("tick_subscription_limit", 100)),
+            tick_sync_interval=int(raw.get("tick_sync_interval", 2)),
+            tick_sync_enabled=parse_bool(raw.get("tick_sync_enabled"), default=True),
+            risk_check_interval=int(raw.get("risk_check_interval", 300)),
+            risk_check_enabled=parse_bool(raw.get("risk_check_enabled"), default=False),
+            broker_heartbeat_interval=int(raw.get("broker_heartbeat_interval", 30)),
+            runtime_dir=str(raw.get("runtime_dir", "./runtime")),
+            buy_price_percent=float(raw.get("market_buy_price_percent", 0.015)),
+            sell_price_percent=float(raw.get("market_sell_price_percent", -0.015)),
+            calendar_skip_weekend=parse_bool(raw.get("calendar_skip_weekend"), default=True),
+            calendar_retry_minutes=int(raw.get("calendar_retry_minutes", 1)),
+            portfolio_refresh_throttle_ms=int(raw.get("portfolio_refresh_throttle_ms", 200)),
+            fail_on_schedule_error=parse_bool(raw.get("fail_on_schedule_error"), default=False),
             checkpoint_persistence_enabled=checkpoint_persistence_enabled,
         )
 
@@ -202,6 +220,8 @@ class LiveEngine:
         broker_factory: Optional[Callable[[], BrokerBase]] = None,
         now_provider: Optional[Callable[[], datetime]] = None,
         sleep_provider: Optional[Callable[[float], Awaitable[None]]] = None,
+        data_source_router: Optional[DataSourceRouter] = None,
+        strategy_capability_requirements: Optional[StrategyCapabilityRequirements] = None,
     ):
         self.strategy_path = Path(strategy_file).resolve()
         self.broker_name = broker_name
@@ -209,6 +229,14 @@ class LiveEngine:
         self._broker_factory = broker_factory
         self._now = now_provider or datetime.now
         self._sleep = sleep_provider
+        self.data_source_router = data_source_router
+        self.strategy_capability_requirements = strategy_capability_requirements
+        self.strategy_capability_preflight: Optional[StrategyCapabilityPreflight] = None
+        self._dynamic_capability_decisions: Dict[str, RouteDecision] = {}
+        self._startup_phase = "created"
+        self._market_callbacks_enabled = False
+        self._schedule_batch_active = False
+        self._schedule_batch_failed_reason: Optional[str] = None
 
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._stop_event: Optional[asyncio.Event] = None
@@ -344,6 +372,8 @@ class LiveEngine:
 
     async def _bootstrap(self) -> None:
         log.info("初始化 Live 引擎")
+        self._startup_phase = "preflight"
+        self._market_callbacks_enabled = False
         if not self.strategy_path.exists():
             raise FileNotFoundError(f"策略文件不存在: {self.strategy_path}")
 
@@ -355,10 +385,14 @@ class LiveEngine:
         self.after_trading_end_func = self._strategy_loader.after_trading_end_func
         module = sys.modules.get("strategy")
         if module:
-            self.handle_tick_func = getattr(module, 'handle_tick', None)
+            self.handle_tick_func = getattr(module, "handle_tick", None)
             if self.process_initialize_func is None:
-                self.process_initialize_func = getattr(module, 'process_initialize', None)
-            self.after_code_changed_func = getattr(module, 'after_code_changed', None)
+                self.process_initialize_func = getattr(module, "process_initialize", None)
+            self.after_code_changed_func = getattr(module, "after_code_changed", None)
+            if self.strategy_capability_requirements is None:
+                self.strategy_capability_requirements = (
+                    self._read_static_strategy_capability_requirements(module)
+                )
         else:
             self.handle_tick_func = None
             self.after_code_changed_func = None
@@ -382,13 +416,15 @@ class LiveEngine:
                     raise RuntimeError("严格 checkpoint 模式检测到未来调度游标，拒绝启动")
                 log.warning("检测到历史调度游标晚于当前系统时间，已忽略此前的游标值。")
                 self._last_schedule_dt = None
+        self._preflight_live_components()
         g.live_trade = True
 
         reset_settings()
         set_current_engine(self)
         set_current_context(self.context)
-        self.context.run_params['run_type'] = 'LIVE'
-        self.context.run_params['is_live'] = True
+        self.context.run_params["run_type"] = "LIVE"
+        self.context.run_params["is_live"] = True
+        self.context.require_data_capabilities = self.require_data_capabilities
 
         current_hash = self._compute_strategy_hash()
         metadata_applied = False
@@ -396,10 +432,17 @@ class LiveEngine:
             metadata_applied = self._restore_strategy_metadata(metadata)
             if not metadata_applied:
                 if self.config.checkpoint_persistence_enabled:
-                    raise RuntimeError(
-                        "严格 checkpoint 模式无法完整恢复策略元数据，拒绝重新执行 initialize()"
-                    )
+                    raise RuntimeError("严格 checkpoint 模式无法完整恢复策略元数据，拒绝重新执行 initialize()")
                 log.warning("检测到历史 g 状态但缺少策略元数据，将重新执行 initialize()")
+            elif (
+                "strategy_capability_requirements" not in metadata
+                and self._callable_references_capability_api(self.initialize_func)
+            ):
+                metadata_applied = False
+                log.warning(
+                    "历史策略元数据缺少能力声明，且 initialize() 引用了 "
+                    "require_data_capabilities，本次将重新执行 initialize()"
+                )
 
         log.debug(
             "LiveEngine restore status: restored_runtime=%s, metadata_applied=%s",
@@ -407,32 +450,44 @@ class LiveEngine:
             metadata_applied,
         )
 
+        self._startup_phase = "initialize"
         if not restored_runtime or not metadata_applied:
             await self._call_hook(self.initialize_func)
 
         self._apply_market_period_override()
 
-        hash_changed = bool(metadata) and metadata.get('strategy_hash') and metadata.get('strategy_hash') != current_hash
+        hash_changed = (
+            bool(metadata)
+            and metadata.get("strategy_hash")
+            and metadata.get("strategy_hash") != current_hash
+        )
         if metadata:
             log.debug(
                 "LiveEngine: metadata_hash=%s, current_hash=%s, restored=%s",
-                metadata.get('strategy_hash'),
+                metadata.get("strategy_hash"),
                 current_hash,
                 hash_changed,
             )
         if hash_changed and self.after_code_changed_func:
             await self._call_hook(self.after_code_changed_func)
 
+        self._finalize_strategy_capabilities()
+
+        self._startup_phase = "connecting"
         self._init_broker()
+        self._startup_phase = "ready"
 
         await self._call_hook(self.process_initialize_func)
+        self._market_callbacks_enabled = True
 
         self._dedupe_scheduler_tasks()
 
         # 若策略已通过 run_daily/run_weekly 注册了相同函数，则避免 LiveEngine 再直接调用，防止重复触发
         try:
             tasks = get_tasks()
-            if self.before_trading_start_func and any(t.func is self.before_trading_start_func for t in tasks):
+            if self.before_trading_start_func and any(
+                t.func is self.before_trading_start_func for t in tasks
+            ):
                 log.debug("LiveEngine: before_market_open 已通过调度注册，跳过直接调用钩子")
                 self.before_trading_start_func = None
             if self.handle_data_func and any(t.func is self.handle_data_func for t in tasks):
@@ -446,8 +501,8 @@ class LiveEngine:
 
         self._tick_symbols = set(symbols)
         self._tick_markets = set(markets)
-        should_sync_initial = (
-            not self._tick_subscription_updated and (self._tick_symbols or self._tick_markets)
+        should_sync_initial = not self._tick_subscription_updated and (
+            self._tick_symbols or self._tick_markets
         )
         if should_sync_initial:
             self._sync_provider_subscription(initial=True)
@@ -535,6 +590,8 @@ class LiveEngine:
 
     async def _shutdown(self) -> None:
         log.info("正在关闭 Live 引擎")
+        self._market_callbacks_enabled = False
+        self._startup_phase = "stopped"
         if self._stop_event:
             self._stop_event.set()
         for task in self._background_tasks:
@@ -648,9 +705,7 @@ class LiveEngine:
     async def _handle_minute_tick(self, wall_clock: datetime) -> None:
         current_minute = wall_clock.replace(second=0, microsecond=0)
         if self._last_schedule_dt and self._last_schedule_dt > current_minute:
-            log.warning(
-                "检测到历史调度游标超前当前时间，将重置为当前分钟之前。"
-            )
+            log.warning("检测到历史调度游标超前当前时间，将重置为当前分钟之前。")
             self._last_schedule_dt = current_minute - timedelta(minutes=1)
         scheduled = current_minute
         if self._last_schedule_dt and scheduled <= self._last_schedule_dt:
@@ -671,9 +726,7 @@ class LiveEngine:
         log.set_strategy_time(scheduled)
 
         if delay > timeout:
-            log.warning(
-                f"事件超时丢弃: scheduled={scheduled}, delay={delay:.1f}s (> {timeout}s)"
-            )
+            log.warning(f"事件超时丢弃: scheduled={scheduled}, delay={delay:.1f}s (> {timeout}s)")
             assert_live_runtime_healthy()
             if self.config.checkpoint_persistence_enabled:
                 save_g()
@@ -683,26 +736,48 @@ class LiveEngine:
             return
 
         schedule_results: Dict[str, Any] = {}
+        schedule_batch: Optional[_OrderBatchContext] = None
+        schedule_failed = False
+        schedule_scope = (
+            _order_batch_scope() if self.config.fail_on_schedule_error else nullcontext(None)
+        )
         try:
-            if self.async_scheduler:
-                schedule_results = await self.async_scheduler.trigger(
-                    scheduled,
-                    self.context,
-                    is_bar=self._is_bar_time(scheduled),
-                )
-        except Exception as exc:
-            log.error(f"异步调度执行失败: {exc}", exc_info=True)
-            if self.config.fail_on_schedule_error:
-                raise RuntimeError("异步调度器触发失败，拒绝推进调度游标") from exc
+            with schedule_scope as schedule_batch:
+                self._schedule_batch_active = self.config.fail_on_schedule_error
+                try:
+                    if self.async_scheduler:
+                        schedule_results = await self.async_scheduler.trigger(
+                            scheduled,
+                            self.context,
+                            is_bar=self._is_bar_time(scheduled),
+                        )
+                except Exception as exc:
+                    log.error(f"异步调度执行失败: {exc}", exc_info=True)
+                    if self.config.fail_on_schedule_error:
+                        schedule_failed = True
+                        self._reject_schedule_batch_orders(
+                            schedule_batch,
+                            "scheduler_trigger_failed",
+                        )
+                        raise RuntimeError("异步调度器触发失败，拒绝推进调度游标") from exc
 
-        if self.config.fail_on_schedule_error:
-            schedule_errors = {
-                task_id: str(result.get('error') or '未提供错误信息')
-                for task_id, result in schedule_results.items()
-                if isinstance(result, dict) and 'error' in result
-            }
-            if schedule_errors:
-                raise RuntimeError(f"调度任务执行失败，拒绝推进调度游标: {schedule_errors}")
+                if self.config.fail_on_schedule_error:
+                    schedule_errors = {
+                        task_id: str(result.get("error") or "未提供错误信息")
+                        for task_id, result in schedule_results.items()
+                        if isinstance(result, dict) and "error" in result
+                    }
+                    if schedule_errors:
+                        schedule_failed = True
+                        self._reject_schedule_batch_orders(
+                            schedule_batch,
+                            "scheduler_task_failed",
+                        )
+                        raise RuntimeError("调度任务执行失败，拒绝推进调度游标: " f"{schedule_errors}")
+        finally:
+            self._schedule_batch_active = False
+            if schedule_batch is not None and not schedule_failed:
+                _complete_order_batch(schedule_batch)
 
         await self._maybe_emit_market_events(scheduled)
         await self._maybe_handle_data(scheduled)
@@ -714,6 +789,47 @@ class LiveEngine:
         assert_live_runtime_healthy()
         persist_scheduler_cursor(scheduled)
         self._last_schedule_dt = scheduled
+
+    def should_defer_order_processing(self) -> bool:
+        """判断订单入口是否应等待当前安全调度批次结束。
+
+        Returns:
+            bool: 调度失败保护开启且批次未完成时返回 True。
+
+        Side Effects:
+            无；仅读取引擎的调度批次状态。
+        """
+        return self._schedule_batch_active or self._schedule_batch_failed_reason is not None
+
+    def _reject_schedule_batch_orders(
+        self,
+        schedule_batch: _OrderBatchContext,
+        reason: str,
+    ) -> None:
+        """拒绝并移除本次失败调度批次中新建的订单。
+
+        Args:
+            schedule_batch: 由当前调度执行上下文传播的唯一批次状态。
+            reason: 写入订单扩展信息的稳定拒绝原因。
+
+        Returns:
+            None。
+
+        Side Effects:
+            原子锁死本引擎的新订单写入，并只拒绝、移除带当前批次
+            token 的订单；其他来源订单保持原状态和顺序。
+        """
+        rejected_count = _reject_order_batch(
+            schedule_batch,
+            self,
+            reason,
+        )
+        if rejected_count:
+            log.error(
+                "调度批次失败，已拒绝且移除本批新增订单: count=%s reason=%s",
+                rejected_count,
+                reason,
+            )
 
     def _is_bar_time(self, dt: datetime) -> bool:
         """
@@ -733,8 +849,8 @@ class LiveEngine:
 
     async def _maybe_emit_market_events(self, dt: datetime) -> None:
         assert self.event_bus is not None
-        if self._pre_open_dt and 'pre_open' not in self._markers_fired and dt >= self._pre_open_dt:
-            self._markers_fired.add('pre_open')
+        if self._pre_open_dt and "pre_open" not in self._markers_fired and dt >= self._pre_open_dt:
+            self._markers_fired.add("pre_open")
             await self.event_bus.emit(BeforeTradingStartEvent(date=dt.date()))
             await self._call_hook(self.before_trading_start_func)
             if not self._open_dt or dt < self._open_dt:
@@ -742,25 +858,31 @@ class LiveEngine:
             else:
                 log.info("跳过 broker.before_open：当前时间已过开盘时间 %s", self._open_dt.strftime("%H:%M:%S"))
 
-        if self._open_dt and 'open' not in self._markers_fired and dt >= self._open_dt:
-            self._markers_fired.add('open')
+        if self._open_dt and "open" not in self._markers_fired and dt >= self._open_dt:
+            self._markers_fired.add("open")
             await self.event_bus.emit(MarketOpenEvent(time=dt.strftime("%H:%M:%S")))
 
         if self._is_trading_minute(dt):
             await self.event_bus.emit(EveryMinuteEvent(time=dt.strftime("%H:%M:%S")))
 
-        if self._close_dt and 'close' not in self._markers_fired and dt >= self._close_dt:
-            self._markers_fired.add('close')
+        if self._close_dt and "close" not in self._markers_fired and dt >= self._close_dt:
+            self._markers_fired.add("close")
             await self.event_bus.emit(MarketCloseEvent(time=dt.strftime("%H:%M:%S")))
             await self._call_hook(self.after_trading_end_func)
             await self.event_bus.emit(AfterTradingEndEvent(date=dt.date()))
-            await self.event_bus.emit(TradingDayEndEvent(
-                date=dt.date(),
-                portfolio_value=self.context.portfolio.total_value,
-            ))
+            await self.event_bus.emit(
+                TradingDayEndEvent(
+                    date=dt.date(),
+                    portfolio_value=self.context.portfolio.total_value,
+                )
+            )
 
-        if self._post_close_dt and 'post_close' not in self._markers_fired and dt >= self._post_close_dt:
-            self._markers_fired.add('post_close')
+        if (
+            self._post_close_dt
+            and "post_close" not in self._markers_fired
+            and dt >= self._post_close_dt
+        ):
+            self._markers_fired.add("post_close")
             await self._call_broker_lifecycle_hook("after_close")
 
     async def _maybe_handle_data(self, dt: datetime) -> None:
@@ -781,28 +903,54 @@ class LiveEngine:
 
     async def _process_orders(self, current_dt: datetime) -> None:
         assert_live_runtime_healthy()
+        if self.should_defer_order_processing():
+            return
         lock = self._order_lock or asyncio.Lock()
         if self._order_lock is None:
             self._order_lock = lock
         async with lock:
-            orders = list(get_order_queue())
+            # 处理协程可能在批次开始前通过外层检查，
+            # 随后阻塞等待订单锁。
+            # 获得锁后必须复检，避免取走并提交安全批次中的订单。
+            if self.should_defer_order_processing():
+                return
+            orders = _drain_order_queue()
             if not orders:
                 return
-            # 先清空已取出的队列，避免后续处理时误清除新加入的订单
-            clear_order_queue()
             if not self.broker:
                 log.error("暂无券商实例，无法执行订单")
                 return
-            try:
-                current_data = get_current_data()
-            except Exception as exc:
-                log.warning(f"获取 current_data 失败，订单无法执行: {exc}")
+            eligible_orders: List[Order] = []
+            for order in orders:
+                try:
+                    self.validate_order_request(self._order_requires_realtime_snapshot(order))
+                except Exception as exc:
+                    log.error(f"订单能力门禁拒绝 {order.security}: {exc}")
+                    try:
+                        order.status = OrderStatus.rejected
+                    except Exception:
+                        pass
+                    continue
+                eligible_orders.append(order)
+            if not eligible_orders:
                 return
+            current_data = None
+            if any(self._order_requires_realtime_snapshot(order) for order in eligible_orders):
+                try:
+                    current_data = get_current_data()
+                except Exception as exc:
+                    log.warning(f"获取 current_data 失败，需实时价订单无法执行: {exc}")
             open_position_symbols = self._get_open_position_symbols()
             pending_new_positions: Set[str] = set()
             submitted_buys: Dict[str, Dict[str, Any]] = {}
-            for order in orders:
+            for order in eligible_orders:
                 self._register_order(order)
+                if self._order_requires_realtime_snapshot(order) and current_data is None:
+                    try:
+                        order.status = OrderStatus.rejected
+                    except Exception:
+                        pass
+                    continue
                 plan = self._build_order_plan(order, current_data)
                 if not plan:
                     try:
@@ -820,11 +968,13 @@ class LiveEngine:
                         except Exception:
                             pass
                         continue
-                    action = 'buy' if plan.is_buy else 'sell'
+                    action = "buy" if plan.is_buy else "sell"
                     risk = self._risk
                     if risk:
                         positions_count = len(open_position_symbols | pending_new_positions)
-                        total_value = float(getattr(self.context.portfolio, "total_value", 0.0) or 0.0)
+                        total_value = float(
+                            getattr(self.context.portfolio, "total_value", 0.0) or 0.0
+                        )
                         try:
                             risk.check_order(
                                 order_value=order_value,
@@ -964,17 +1114,25 @@ class LiveEngine:
                     self._apply_trade_snapshots(trade_snapshots)
             except Exception as exc:
                 log.debug(f"订单执行后同步成交快照失败: {exc}")
-            self._trace_submitted_buys("post_broker_sync", submitted_buys, order_snapshots, trade_snapshots)
+            self._trace_submitted_buys(
+                "post_broker_sync", submitted_buys, order_snapshots, trade_snapshots
+            )
             try:
                 self.refresh_account_snapshot(force=True)
             except Exception as exc:
                 log.debug(f"订单执行后刷新账户快照失败: {exc}")
-            self._trace_submitted_buys("post_account_refresh", submitted_buys, order_snapshots, trade_snapshots)
+            self._trace_submitted_buys(
+                "post_account_refresh", submitted_buys, order_snapshots, trade_snapshots
+            )
             try:
-                self._reconcile_submitted_buy_costs(submitted_buys, order_snapshots, trade_snapshots)
+                self._reconcile_submitted_buy_costs(
+                    submitted_buys, order_snapshots, trade_snapshots
+                )
             except Exception as exc:
                 log.debug(f"订单执行后修正持仓成本失败: {exc}")
-            self._trace_submitted_buys("post_cost_reconcile", submitted_buys, order_snapshots, trade_snapshots)
+            self._trace_submitted_buys(
+                "post_cost_reconcile", submitted_buys, order_snapshots, trade_snapshots
+            )
 
     def _register_order(self, order: Order) -> None:
         if not order:
@@ -1153,7 +1311,9 @@ class LiveEngine:
             "status": snapshot.get("status") or snapshot.get("state"),
             "raw_status": snapshot.get("raw_status"),
             "amount": snapshot.get("amount") or snapshot.get("order_volume"),
-            "filled": snapshot.get("filled") or snapshot.get("traded_volume") or snapshot.get("filled_amount"),
+            "filled": snapshot.get("filled")
+            or snapshot.get("traded_volume")
+            or snapshot.get("filled_amount"),
             "price": snapshot.get("price"),
             "order_price": snapshot.get("order_price"),
             "traded_price": snapshot.get("traded_price"),
@@ -1168,8 +1328,12 @@ class LiveEngine:
             "trade_id": snapshot.get("trade_id"),
             "order_id": snapshot.get("order_id") or snapshot.get("entrust_id"),
             "security": snapshot.get("security"),
-            "amount": snapshot.get("amount") or snapshot.get("volume") or snapshot.get("trade_volume"),
-            "price": snapshot.get("price") or snapshot.get("trade_price") or snapshot.get("traded_price"),
+            "amount": snapshot.get("amount")
+            or snapshot.get("volume")
+            or snapshot.get("trade_volume"),
+            "price": snapshot.get("price")
+            or snapshot.get("trade_price")
+            or snapshot.get("traded_price"),
             "time": snapshot.get("time") or snapshot.get("trade_time"),
         }
 
@@ -1195,17 +1359,21 @@ class LiveEngine:
             broker_order_id = snap.get("order_id") or snap.get("entrust_id")
             if broker_order_id is None:
                 continue
-            trades_by_order_id.setdefault(str(broker_order_id), []).append(self._compact_trade_snapshot(snap))
+            trades_by_order_id.setdefault(str(broker_order_id), []).append(
+                self._compact_trade_snapshot(snap)
+            )
 
         target = self._portfolio_target()
         for security, meta in submitted_buys.items():
             broker_order_ids = [str(item) for item in meta.get("broker_order_ids") or [] if item]
             position = target.positions.get(security)
-            order_rows = [order_by_id.get(order_id) for order_id in broker_order_ids if order_id in order_by_id]
-            trade_rows = [
-                row
+            order_rows = [
+                order_by_id.get(order_id)
                 for order_id in broker_order_ids
-                for row in trades_by_order_id.get(order_id, [])
+                if order_id in order_by_id
+            ]
+            trade_rows = [
+                row for order_id in broker_order_ids for row in trades_by_order_id.get(order_id, [])
             ]
             self._order_debug(
                 stage,
@@ -1221,9 +1389,26 @@ class LiveEngine:
                 trade_rows=trade_rows,
             )
 
-    def _sync_orders_from_broker(self, *, from_broker: bool = False) -> List[Dict[str, Any]]:
+    def _sync_orders_from_broker(
+        self, *, from_broker: bool = False, strict: bool = False
+    ) -> List[Dict[str, Any]]:
+        """从券商读取订单快照，可为资金操作启用严格异常语义。
+
+        Args:
+            from_broker: 是否要求券商返回柜台原始范围的当日订单。
+            strict: 为 True 时不把连接或查询异常降级为空列表。
+
+        Returns:
+            List[Dict[str, Any]]: 券商订单快照。
+
+        Raises:
+            RuntimeError: 严格模式下券商不存在或不支持订单查询。
+            Exception: 严格模式下原样传播券商查询异常。
+        """
         broker = self.broker
         if not broker:
+            if strict:
+                raise RuntimeError("BROKER_ORDER_QUERY_UNAVAILABLE")
             return []
         getter = getattr(broker, "get_orders", None)
         if callable(getter):
@@ -1233,14 +1418,22 @@ class LiveEngine:
                 try:
                     return getter() or []
                 except Exception:
+                    if strict:
+                        raise
                     return []
             except Exception:
+                if strict:
+                    raise
                 return []
         if broker.supports_orders_sync():
             try:
                 return broker.sync_orders() or []
             except Exception:
+                if strict:
+                    raise
                 return []
+        if strict:
+            raise RuntimeError("BROKER_ORDER_QUERY_UNAVAILABLE")
         return []
 
     def _snapshot_filled_amount(self, snapshot: Dict[str, Any]) -> int:
@@ -1529,6 +1722,7 @@ class LiveEngine:
     ) -> Optional[Order]:
         mapped = self._orders.get(mapped_order_id) if mapped_order_id else None
         order_remark = snapshot.get("order_remark") or snapshot.get("remark")
+        idempotency_key = snapshot.get("idempotency_key")
         strategy_name = snapshot.get("strategy_name")
         order_price = snapshot.get("order_price")
         order_sysid = snapshot.get("order_sysid")
@@ -1541,9 +1735,13 @@ class LiveEngine:
             extra["source"] = "broker"
             extra["is_external"] = False
             extra["engine_order_id"] = mapped_order_id
-            style_type = str(snapshot.get("style_type") or snapshot.get("style") or "").strip().lower()
+            style_type = (
+                str(snapshot.get("style_type") or snapshot.get("style") or "").strip().lower()
+            )
             if order_remark is not None:
                 extra["order_remark"] = order_remark
+            if idempotency_key is not None:
+                extra["idempotency_key"] = idempotency_key
             if strategy_name is not None:
                 extra["strategy_name"] = strategy_name
             if order_price is not None:
@@ -1599,6 +1797,8 @@ class LiveEngine:
         }
         if order_remark is not None:
             extra["order_remark"] = order_remark
+        if idempotency_key is not None:
+            extra["idempotency_key"] = idempotency_key
         if strategy_name is not None:
             extra["strategy_name"] = strategy_name
         if order_price is not None:
@@ -1671,7 +1871,9 @@ class LiveEngine:
         mapped_order_id = str(order_id) if order_id is not None else ""
         if order_id is not None:
             mapped_order_id = self._broker_order_index.get(str(order_id), str(order_id))
-        amount = snapshot.get("amount") or snapshot.get("volume") or snapshot.get("trade_volume") or 0
+        amount = (
+            snapshot.get("amount") or snapshot.get("volume") or snapshot.get("trade_volume") or 0
+        )
         price = snapshot.get("price") or snapshot.get("trade_price") or 0.0
         raw_time = snapshot.get("time") or snapshot.get("trade_time")
         trade_time = None
@@ -1696,16 +1898,34 @@ class LiveEngine:
             trade.trade_id = f"T{hashlib.md5(f'{trade.order_id}-{trade.time}-{trade.amount}-{trade.price}'.encode('utf-8')).hexdigest()[:12]}"
         return trade
 
-    def _sync_trades_from_broker(self) -> List[Dict[str, Any]]:
+    def _sync_trades_from_broker(self, *, strict: bool = False) -> List[Dict[str, Any]]:
+        """从券商读取成交快照，可选择不吞查询异常。
+
+        Args:
+            strict: 为 True 时不把连接或查询异常降级为空列表。
+
+        Returns:
+            List[Dict[str, Any]]: 券商成交快照。
+
+        Raises:
+            RuntimeError: 严格模式下券商不存在或不支持成交查询。
+            Exception: 严格模式下原样传播券商查询异常。
+        """
         broker = self.broker
         if not broker:
+            if strict:
+                raise RuntimeError("BROKER_TRADE_QUERY_UNAVAILABLE")
             return []
         getter = getattr(broker, "get_trades", None)
         if callable(getter):
             try:
                 return getter() or []
             except Exception:
+                if strict:
+                    raise
                 return []
+        if strict:
+            raise RuntimeError("BROKER_TRADE_QUERY_UNAVAILABLE")
         return []
 
     def _apply_trade_snapshots(self, snapshots: List[Dict[str, Any]]) -> None:
@@ -1725,10 +1945,14 @@ class LiveEngine:
         security: Optional[str] = None,
         status: Optional[object] = None,
         from_broker: bool = False,
+        strict: bool = False,
     ) -> Dict[str, Order]:
         for queued in list(get_order_queue() or []):
             self._register_order(queued)
-        snapshots = self._sync_orders_from_broker(from_broker=from_broker)
+        snapshots = self._sync_orders_from_broker(
+            from_broker=from_broker,
+            strict=strict,
+        )
         self._apply_order_snapshots(snapshots)
 
         status_val = self._normalize_status(status)
@@ -1766,14 +1990,19 @@ class LiveEngine:
         orders = self.get_orders()
         if not orders:
             return {}
-        return {oid: order for oid, order in orders.items() if self._status_value(order.status) in open_states}
+        return {
+            oid: order
+            for oid, order in orders.items()
+            if self._status_value(order.status) in open_states
+        }
 
     def get_trades(
         self,
         order_id: Optional[str] = None,
         security: Optional[str] = None,
+        strict: bool = False,
     ) -> Dict[str, Trade]:
-        snapshots = self._sync_trades_from_broker()
+        snapshots = self._sync_trades_from_broker(strict=strict)
         self._apply_trade_snapshots(snapshots)
         if not self._trades:
             return {}
@@ -1787,22 +2016,62 @@ class LiveEngine:
             result[tid] = trade
         return result
 
-    def _build_order_plan(self, order: Order, current_data) -> Optional[_ResolvedOrder]:
-        try:
-            snapshot = current_data[order.security]
-        except Exception:
-            log.warning(f"无法获取 {order.security} 的实时行情，忽略订单")
-            return None
-        if snapshot.paused:
-            log.warning(f"{order.security} 停牌，取消订单")
-            return None
-        last_price = float(snapshot.last_price or 0.0)
-        if last_price <= 0:
-            fallback = snapshot.high_limit or snapshot.low_limit
-            if not fallback or fallback <= 0:
-                log.warning(f"{order.security} 缺少可用价格，忽略订单")
+    @staticmethod
+    def _order_requires_realtime_snapshot(order: Order) -> bool:
+        """判断订单数量或保护价是否必须使用新鲜实时快照。
+
+        Args:
+            order: 待规划的 BulletTrade 订单。
+
+        Returns:
+            bool: 价值/目标价值或非明确限价意图返回 True。
+        """
+
+        is_value_intent = hasattr(order, "_target_value")
+        is_explicit_limit = isinstance(getattr(order, "style", None), LimitOrderStyle)
+        return is_value_intent or not is_explicit_limit
+
+    def _build_order_plan(self, order: Order, current_data: Any) -> Optional[_ResolvedOrder]:
+        """把公共订单转换为券商可执行的数量、方向和价格计划。
+
+        Args:
+            order: 待规划的 BulletTrade 订单。
+            current_data: 需实时价意图的快照集；明确股数限价时可为 None。
+
+        Returns:
+            Optional[_ResolvedOrder]: 可执行计划；停牌、缺价或无数量时为 None。
+
+        Side Effects:
+            只读取持仓和快照，不向 Broker 发送委托。
+        """
+
+        snapshot = None
+        style_obj = getattr(order, "style", None)
+        requires_snapshot = self._order_requires_realtime_snapshot(order)
+        if requires_snapshot:
+            try:
+                snapshot = current_data[order.security]
+            except Exception:
+                log.warning(f"无法获取 {order.security} 的实时行情，忽略订单")
                 return None
-            last_price = float(fallback)
+            if snapshot.paused:
+                log.warning(f"{order.security} 停牌，取消订单")
+                return None
+            last_price = float(snapshot.last_price or 0.0)
+            if last_price <= 0:
+                fallback = snapshot.high_limit or snapshot.low_limit
+                if not fallback or fallback <= 0:
+                    log.warning(f"{order.security} 缺少可用价格，忽略订单")
+                    return None
+                last_price = float(fallback)
+        elif isinstance(style_obj, LimitOrderStyle):
+            last_price = float(style_obj.price)
+            if last_price <= 0:
+                log.warning(f"{order.security} 限价必须大于 0，忽略订单")
+                return None
+        else:
+            log.error(f"{order.security} 订单意图缺少实时快照和明确限价")
+            return None
 
         amount, is_buy = self._resolve_order_amount(order, last_price)
         if amount <= 0:
@@ -1822,7 +2091,6 @@ class LiveEngine:
             return None
 
         exec_price: Optional[float] = None
-        style_obj = getattr(order, "style", None)
         if isinstance(style_obj, LimitOrderStyle):
             is_market = False
         elif isinstance(style_obj, MarketOrderStyle):
@@ -1832,6 +2100,7 @@ class LiveEngine:
         if isinstance(style_obj, LimitOrderStyle):
             exec_price = float(style_obj.price)
         elif isinstance(style_obj, MarketOrderStyle) and style_obj.limit_price is not None:
+            assert snapshot is not None
             exec_price = pricing.clamp_price_to_trade_bounds(
                 order.security,
                 float(style_obj.limit_price),
@@ -1841,6 +2110,7 @@ class LiveEngine:
                 is_buy,
             )
         else:
+            assert snapshot is not None
             percent = self._resolve_price_percent(style_obj, is_buy)
             try:
                 exec_price = pricing.compute_market_protect_price(
@@ -1915,6 +2185,14 @@ class LiveEngine:
     def _get_closeable_amount(self, security: str) -> int:
         pos = self.context.portfolio.positions.get(security)
         if not pos:
+            if self.broker and hasattr(self.broker, "get_positions"):
+                try:
+                    positions = self.broker.get_positions()
+                    for p in positions:
+                        if p.get("security") == security or p.get("code") == security:
+                            return int(p.get("closeable_amount", p.get("amount", 0)) or 0)
+                except Exception:
+                    pass
             return 0
         return int(pos.closeable_amount or pos.total_amount or 0)
 
@@ -1923,39 +2201,25 @@ class LiveEngine:
     # ------------------------------------------------------------------
 
     def _create_broker(self) -> BrokerBase:
+        """创建当前 LiveEngine 使用的券商实例。
+
+        Returns:
+            由显式 ``broker_factory`` 或全局券商注册表构造、尚未连接的券商实例。
+
+        Raises:
+            ValueError: 配置的券商名称尚未注册时抛出。
+            RuntimeError: 已注册券商缺少必需配置时抛出。
+
+        Side Effects:
+            仅构造对象，不调用 ``connect``，因此不会在策略初始化前建立网络连接。
+        """
+
         if self._broker_factory:
             return self._broker_factory()
 
         cfg = get_broker_config()
-        name = (self.broker_name or cfg.get('default') or 'simulator').lower()
-
-        if name == 'qmt':
-            qcfg = cfg.get('qmt') or {}
-            account_id = qcfg.get('account_id')
-            if not account_id:
-                raise RuntimeError("缺少 QMT_ACCOUNT_ID，请在 .env.live 中配置")
-            return QmtBroker(
-                account_id=account_id,
-                account_type=qcfg.get('account_type', 'stock'),
-                data_path=qcfg.get('data_path'),
-                session_id=qcfg.get('session_id'),
-                auto_subscribe=qcfg.get('auto_subscribe'),
-            )
-        if name == 'qmt-remote':
-            rcfg = cfg.get('qmt-remote') or {}
-            return RemoteQmtBroker(
-                account_id=rcfg.get('account_id') or rcfg.get('account_key') or 'remote',
-                account_type=rcfg.get('account_type', 'stock'),
-                config=rcfg,
-            )
-        if name == 'simulator':
-            scfg = cfg.get('simulator') or {}
-            return SimulatorBroker(
-                account_id=scfg.get('account_id', 'simulator'),
-                account_type=scfg.get('account_type', 'stock'),
-                initial_cash=scfg.get('initial_cash', 1_000_000),
-            )
-        raise ValueError(f"未知券商类型: {name}")
+        name = (self.broker_name or cfg.get("default") or "simulator").lower()
+        return create_broker(name, cfg)
 
     # ------------------------------------------------------------------
     # Tick 订阅
@@ -1991,7 +2255,9 @@ class LiveEngine:
         for mk in markets:
             self._tick_markets.discard(mk)
         persist_subscription_state(self._tick_symbols, self._tick_markets)
-        self._sync_provider_subscription(unsubscribe=True, symbols=list(symbols), markets=list(markets))
+        self._sync_provider_subscription(
+            unsubscribe=True, symbols=list(symbols), markets=list(markets)
+        )
 
     def unsubscribe_all_ticks(self) -> None:
         if self.config.checkpoint_persistence_enabled:
@@ -2066,12 +2332,13 @@ class LiveEngine:
         """
         数据源推送 tick 时的直通回调：不拆分、不加工，直接转发给策略的 handle_tick。
         """
-        if not self.handle_tick_func or not self._loop:
+        if not self._market_callbacks_enabled or not self.handle_tick_func or not self._loop:
             return
         try:
             asyncio.run_coroutine_threadsafe(self._call_hook(self.handle_tick_func, data), self._loop)  # type: ignore[arg-type]
         except Exception:
             pass
+
     async def _tick_loop(self) -> None:
         if not self.config.tick_sync_enabled:
             return
@@ -2089,7 +2356,9 @@ class LiveEngine:
             if self._tick_symbols:
                 for sym in list(self._tick_symbols):
                     try:
-                        tick = await self._loop.run_in_executor(None, self._fetch_tick_snapshot, sym)
+                        tick = await self._loop.run_in_executor(
+                            None, self._fetch_tick_snapshot, sym
+                        )
                     except Exception:
                         tick = None
                     if tick:
@@ -2107,41 +2376,51 @@ class LiveEngine:
     def _start_background_jobs(self) -> None:
         assert self._loop is not None
         if self.config.account_sync_enabled and self.broker and self.broker.supports_account_sync():
-            self._background_tasks.append(self._loop.create_task(
-                self._periodic_task(
-                    "account-sync",
-                    self.config.account_sync_interval,
-                    self._account_sync_step,
+            self._background_tasks.append(
+                self._loop.create_task(
+                    self._periodic_task(
+                        "account-sync",
+                        self.config.account_sync_interval,
+                        self._account_sync_step,
+                    )
                 )
-            ))
+            )
         if self.config.order_sync_enabled and self.broker and self.broker.supports_orders_sync():
-            self._background_tasks.append(self._loop.create_task(
-                self._periodic_task(
-                    "order-sync",
-                    self.config.order_sync_interval,
-                    self._order_sync_step,
+            self._background_tasks.append(
+                self._loop.create_task(
+                    self._periodic_task(
+                        "order-sync",
+                        self.config.order_sync_interval,
+                        self._order_sync_step,
+                    )
                 )
-            ))
+            )
         if self.config.risk_check_enabled:
-            self._background_tasks.append(self._loop.create_task(
-                self._periodic_task(
-                    "risk",
-                    self.config.risk_check_interval,
-                    self._risk_step,
+            self._background_tasks.append(
+                self._loop.create_task(
+                    self._periodic_task(
+                        "risk",
+                        self.config.risk_check_interval,
+                        self._risk_step,
+                    )
                 )
-            ))
+            )
         if self.config.broker_heartbeat_interval > 0 and self.broker:
-            self._background_tasks.append(self._loop.create_task(
-                self._periodic_task(
-                    "heartbeat",
-                    self.config.broker_heartbeat_interval,
-                    self._heartbeat_step,
+            self._background_tasks.append(
+                self._loop.create_task(
+                    self._periodic_task(
+                        "heartbeat",
+                        self.config.broker_heartbeat_interval,
+                        self._heartbeat_step,
+                    )
                 )
-            ))
+            )
         # Tick 轮询
         self._background_tasks.append(self._loop.create_task(self._tick_loop()))
 
-    async def _periodic_task(self, name: str, interval: int, coro_func: Callable[[], Awaitable[None]]) -> None:
+    async def _periodic_task(
+        self, name: str, interval: int, coro_func: Callable[[], Awaitable[None]]
+    ) -> None:
         if interval <= 0:
             return
         assert self._loop is not None and self._stop_event is not None
@@ -2208,14 +2487,14 @@ class LiveEngine:
         assert self.broker is not None
         self.broker.connect()
         summary = self._safe_account_info()
-        positions = summary.get('positions') or []
+        positions = summary.get("positions") or []
         log.info(
             "券商 %s 连接成功: account_id=%s, type=%s, 可用资金=%s, 总资产=%s, 持仓数=%s",
             self.broker.__class__.__name__,
-            summary.get('account_id') or getattr(self.broker, 'account_id', ''),
-            summary.get('account_type') or getattr(self.broker, 'account_type', ''),
-            summary.get('available_cash'),
-            summary.get('total_value'),
+            summary.get("account_id") or getattr(self.broker, "account_id", ""),
+            summary.get("account_type") or getattr(self.broker, "account_type", ""),
+            summary.get("available_cash"),
+            summary.get("total_value"),
             len(positions),
         )
         self._log_account_positions(summary)
@@ -2225,6 +2504,281 @@ class LiveEngine:
     def _ensure_broker_created(self) -> None:
         if self.broker is None:
             self.broker = self._create_broker()
+
+    @staticmethod
+    def _normalize_strategy_capability_profile(value: Any) -> StrategyCapabilityProfile:
+        """把字符串或枚举规范化为策略能力画像。
+
+        Args:
+            value: ``StrategyCapabilityProfile`` 或其字符串值。
+
+        Returns:
+            StrategyCapabilityProfile: 规范化后的画像枚举。
+
+        Raises:
+            ValueError: 画像名称不在公开枚举中时抛出。
+        """
+
+        if isinstance(value, StrategyCapabilityProfile):
+            return value
+        return StrategyCapabilityProfile(str(value).strip().lower())
+
+    @staticmethod
+    def _callable_references_capability_api(callback: Optional[Callable]) -> bool:
+        """检查策略回调是否静态引用能力声明 API。
+
+        Args:
+            callback: 已加载的 ``initialize`` 回调，可以为 None。
+
+        Returns:
+            bool: 代码对象或其嵌套代码引用
+            ``require_data_capabilities`` 时为 True。
+
+        Side Effects:
+            无；不执行策略回调，仅检查 Python 代码对象。
+        """
+
+        root_code = getattr(callback, "__code__", None)
+        if root_code is None:
+            return False
+        pending = [root_code]
+        while pending:
+            code = pending.pop()
+            if "require_data_capabilities" in code.co_names:
+                return True
+            pending.extend(item for item in code.co_consts if inspect.iscode(item))
+        return False
+
+    def _read_static_strategy_capability_requirements(
+        self, module: Any
+    ) -> Optional[StrategyCapabilityRequirements]:
+        """从策略模块读取无副作用的静态能力声明。
+
+        Args:
+            module: 已加载但尚未执行 ``initialize`` 的策略模块。
+
+        Returns:
+            Optional[StrategyCapabilityRequirements]: 已校验声明；未声明时为 None。
+
+        Raises:
+            TypeError: 声明不是公开对象、字符串或映射时抛出。
+            ValueError: 画像、版本或能力集合不合法时抛出。
+
+        Side Effects:
+            只读取模块属性，不初始化 Provider、Feed 或 Broker。
+        """
+
+        declaration = getattr(module, "STRATEGY_CAPABILITY_REQUIREMENTS", None)
+        if declaration is None:
+            profile_value = getattr(module, "STRATEGY_CAPABILITY_PROFILE", None)
+            if profile_value is None:
+                return None
+            profile = self._normalize_strategy_capability_profile(profile_value)
+            return StrategyCapabilityRequirements.for_profile(profile)
+        if isinstance(declaration, StrategyCapabilityRequirements):
+            return declaration
+        if isinstance(declaration, str):
+            profile = self._normalize_strategy_capability_profile(declaration)
+            return StrategyCapabilityRequirements.for_profile(profile)
+        if isinstance(declaration, Mapping):
+            profile = self._normalize_strategy_capability_profile(
+                declaration.get("profile", StrategyCapabilityProfile.EXECUTION_ONLY.value)
+            )
+            schema_version = str(declaration.get("schema_version", "1"))
+            if "required" in declaration or "optional" in declaration:
+                return StrategyCapabilityRequirements(
+                    profile=profile,
+                    required=tuple(declaration.get("required", ())),
+                    optional=tuple(declaration.get("optional", ())),
+                    schema_version=schema_version,
+                )
+            return StrategyCapabilityRequirements.for_profile(
+                profile=profile,
+                add_required=tuple(declaration.get("add_required", ())),
+                add_optional=tuple(declaration.get("add_optional", ())),
+                remove_required=tuple(declaration.get("remove_required", ())),
+                schema_version=schema_version,
+            )
+        raise TypeError(
+            "STRATEGY_CAPABILITY_REQUIREMENTS 必须是 " "StrategyCapabilityRequirements、profile 字符串或映射"
+        )
+
+    def require_data_capabilities(
+        self,
+        required: Sequence[str] = (),
+        optional: Sequence[str] = (),
+        profile: Optional[Any] = None,
+        schema_version: Optional[str] = None,
+    ) -> StrategyCapabilityRequirements:
+        """在 ``initialize`` 内追加本策略的原子数据能力要求。
+
+        Args:
+            required: 缺失或未就绪时必须停止启动的 capability ID。
+            optional: 缺失时只记录诊断、不阻断启动的 capability ID。
+            profile: 可选画像；必须与已声明画像一致。
+            schema_version: 可选声明版本；必须与已声明版本一致。
+
+        Returns:
+            StrategyCapabilityRequirements: 合并、去重后的不可变要求。
+
+        Raises:
+            RuntimeError: 在 ``initialize`` 之外尝试改变能力合同时抛出。
+            ValueError: 画像或版本与已有静态声明冲突时抛出。
+
+        Side Effects:
+            只更新引擎内存中的待预检清单，不解析路由、不连网且不调用 Broker。
+        """
+
+        if self._startup_phase != "initialize":
+            raise RuntimeError("数据能力要求只能在策略 initialize 阶段追加")
+        current = self.strategy_capability_requirements
+        requested_profile = (
+            self._normalize_strategy_capability_profile(profile) if profile is not None else None
+        )
+        if current is None:
+            current = StrategyCapabilityRequirements(
+                profile=requested_profile or StrategyCapabilityProfile.EXECUTION_ONLY,
+                required=(),
+                optional=(),
+                schema_version=schema_version or "1",
+            )
+        elif requested_profile is not None and requested_profile is not current.profile:
+            raise ValueError(
+                f"能力画像冲突: existing={current.profile.value}, " f"requested={requested_profile.value}"
+            )
+        if schema_version is not None and str(schema_version) != current.schema_version:
+            raise ValueError(
+                f"能力声明版本冲突: existing={current.schema_version}, " f"requested={schema_version}"
+            )
+        merged_required = set(current.required)
+        merged_required.update(str(item) for item in required)
+        merged_optional = set(current.optional)
+        merged_optional.update(str(item) for item in optional)
+        merged_optional.difference_update(merged_required)
+        self.strategy_capability_requirements = StrategyCapabilityRequirements(
+            profile=current.profile,
+            required=tuple(merged_required),
+            optional=tuple(merged_optional),
+            schema_version=current.schema_version,
+        )
+        return self.strategy_capability_requirements
+
+    def _preflight_strategy_capabilities(
+        self,
+    ) -> Optional[StrategyCapabilityPreflight]:
+        """对当前策略要求解析唯一 owner 并检查 readiness。
+
+        Returns:
+            Optional[StrategyCapabilityPreflight]: 固定的路由快照；未声明时为 None。
+
+        Raises:
+            DataCapabilityUnavailableError: 存在必需能力但未配置 Router 时抛出。
+            DataCapabilityError: Router 报告 owner 缺失或 readiness 不满足时原样抛出。
+
+        Side Effects:
+            只读取 manifest 和路由状态，不初始化 owner 或执行数据查询。
+        """
+
+        requirements = self.strategy_capability_requirements
+        if requirements is None:
+            return None
+        router = self.data_source_router
+        if router is None and requirements.required:
+            raise DataCapabilityUnavailableError(requirements.required[0], "router_not_configured")
+        return (router or DataSourceRouter()).preflight(requirements)
+
+    def _finalize_strategy_capabilities(self) -> None:
+        """在 ``initialize`` 返回后固定最终能力路由快照。
+
+        Returns:
+            None。
+
+        Raises:
+            DataCapabilityError: 新增必需能力无 owner 或未就绪时抛出。
+
+        Side Effects:
+            替换 ``strategy_capability_preflight`` 快照；不连接 Broker 或 Feed。
+        """
+
+        self.strategy_capability_preflight = self._preflight_strategy_capabilities()
+
+    def validate_broker_write_request(self, operation: str) -> None:
+        """确保一次实盘写意图不会穿过启动预检边界。
+
+        Args:
+            operation: 用于稳定错误信息的写操作名。
+
+        Returns:
+            None；引擎尚未启动的兼容测试态或已 ready 时正常返回。
+
+        Raises:
+            RuntimeError: initialize、连接、关闭或预检阶段请求写操作时抛出。
+        """
+
+        if operation == "order" and self._schedule_batch_failed_reason is not None:
+            raise RuntimeError(
+                "实盘写请求被拒绝: "
+                f"operation={operation}, "
+                "schedule_batch_state=failed, "
+                f"reason={self._schedule_batch_failed_reason}"
+            )
+        if self._startup_phase not in {"created", "ready"}:
+            raise RuntimeError(
+                f"实盘写请求被拒绝: operation={operation}, " f"startup_phase={self._startup_phase}"
+            )
+
+    def validate_order_request(self, requires_realtime_snapshot: bool) -> Optional[RouteDecision]:
+        """在订单入队前检查启动阶段和按需实时价能力。
+
+        Args:
+            requires_realtime_snapshot: 价值单、目标价值或市价保护价意图为 True。
+
+        Returns:
+            Optional[RouteDecision]: 能力合同已启用时的实时快照路由；
+            明确股数限价或旧兼容模式下为 None。
+
+        Raises:
+            RuntimeError: 启动预检尚未完成时抛出。
+            DataCapabilityError: 需要实时价但 owner 缺失、过期或未就绪时抛出。
+
+        Side Effects:
+            仅缓存 RouteDecision 供诊断，不读数据且不调用 Broker。
+        """
+
+        self.validate_broker_write_request("order")
+        capability_contract_enabled = (
+            self.data_source_router is not None or self.strategy_capability_requirements is not None
+        )
+        if not requires_realtime_snapshot or not capability_contract_enabled:
+            return None
+        if self.data_source_router is None:
+            raise DataCapabilityUnavailableError(
+                "realtime.snapshot.l1",
+                "router_not_configured_for_price_dependent_order",
+            )
+        decision = self.data_source_router.resolve(
+            CapabilityRequest(capability_id="realtime.snapshot.l1")
+        )
+        self._dynamic_capability_decisions[decision.capability_id] = decision
+        return decision
+
+    def _preflight_live_components(self) -> None:
+        """在策略 initialize 和任何网络连接前检查实盘组件。
+
+        Returns:
+            None；全部组件的本地前置条件满足时正常返回。
+
+        Raises:
+            RuntimeError: 券商平台、依赖、bundle、ABI 或策略必需路由未就绪时抛出。
+
+        Side Effects:
+            调用 BrokerBase.preflight 并读取 capability manifest；禁止编译、监听、柜台连接和交易写操作。
+        """
+
+        self._ensure_broker_created()
+        assert self.broker is not None
+        self.broker.preflight()
+        self.strategy_capability_preflight = self._preflight_strategy_capabilities()
 
     def _acquire_live_locks(self) -> None:
         if self._runtime_lock and self._instance_lock:
@@ -2296,11 +2850,15 @@ class LiveEngine:
         }
         cfg = getattr(broker, "config", None)
         if cfg:
-            raw_parts["account_key"] = raw_parts["account_key"] or _text(getattr(cfg, "account_key", None))
+            raw_parts["account_key"] = raw_parts["account_key"] or _text(
+                getattr(cfg, "account_key", None)
+            )
             raw_parts["sub_account_id"] = raw_parts["sub_account_id"] or _text(
                 getattr(cfg, "sub_account_id", None)
             )
-            raw_parts["account_id"] = raw_parts["account_id"] or _text(getattr(cfg, "account_id", None))
+            raw_parts["account_id"] = raw_parts["account_id"] or _text(
+                getattr(cfg, "account_id", None)
+            )
 
         parts = {key: value for key, value in raw_parts.items() if value}
         ordered: List[str] = []
@@ -2338,13 +2896,13 @@ class LiveEngine:
         force: Any = True,
     ) -> Tuple[Any, ...]:
         return (
-            module or '',
-            func_name or '',
-            schedule_type or '',
-            str(time_expr) if time_expr is not None else '',
+            module or "",
+            func_name or "",
+            schedule_type or "",
+            str(time_expr) if time_expr is not None else "",
             None if weekday is None else int(weekday),
             None if monthday is None else int(monthday),
-            reference_security or '',
+            reference_security or "",
             bool(force),
         )
 
@@ -2355,8 +2913,8 @@ class LiveEngine:
         seen = set()
         unique: List[Any] = []
         for task in tasks:
-            module = getattr(task.func, '__module__', None)
-            name = getattr(task.func, '__name__', None)
+            module = getattr(task.func, "__module__", None)
+            name = getattr(task.func, "__name__", None)
             key = self._task_meta_key(
                 module,
                 name,
@@ -2364,8 +2922,8 @@ class LiveEngine:
                 task.time,
                 task.weekday,
                 task.monthday,
-                getattr(task, 'reference_security', None),
-                getattr(task, 'force', True),
+                getattr(task, "reference_security", None),
+                getattr(task, "force", True),
             )
             if key in seen:
                 continue
@@ -2391,7 +2949,8 @@ class LiveEngine:
         positional = [
             p
             for p in params
-            if p.kind in (
+            if p.kind
+            in (
                 inspect.Parameter.POSITIONAL_ONLY,
                 inspect.Parameter.POSITIONAL_OR_KEYWORD,
             )
@@ -2436,9 +2995,9 @@ class LiveEngine:
             return
         for task in tasks:
             strategy = OverlapStrategy.SKIP
-            if task.schedule_type.value == 'daily':
+            if task.schedule_type.value == "daily":
                 self.async_scheduler.run_daily(task.func, task.time, strategy)
-            elif task.schedule_type.value == 'weekly':
+            elif task.schedule_type.value == "weekly":
                 self.async_scheduler.run_weekly(
                     task.func,
                     task.weekday,
@@ -2447,7 +3006,7 @@ class LiveEngine:
                     task.force,
                     strategy,
                 )
-            elif task.schedule_type.value == 'monthly':
+            elif task.schedule_type.value == "monthly":
                 self.async_scheduler.run_monthly(
                     task.func,
                     task.monthday,
@@ -2456,6 +3015,26 @@ class LiveEngine:
                     task.force,
                     strategy,
                 )
+
+    def _serialize_strategy_capability_requirements(self) -> Optional[Dict[str, Any]]:
+        """把当前最终策略能力要求转为可持久化字典。
+
+        Returns:
+            Optional[Dict[str, Any]]: 含版本、画像和能力集的字典；未声明时为 None。
+
+        Side Effects:
+            无；只读取不可变的内存声明。
+        """
+
+        requirements = self.strategy_capability_requirements
+        if requirements is None:
+            return None
+        return {
+            "schema_version": requirements.schema_version,
+            "profile": requirements.profile.value,
+            "required": list(requirements.required),
+            "optional": list(requirements.optional),
+        }
 
     def _snapshot_strategy_metadata(self, strategy_hash: Optional[str]) -> None:
         """收集并严格持久化策略元数据快照。
@@ -2477,6 +3056,9 @@ class LiveEngine:
                 "settings": self._collect_settings_snapshot(),
                 "tasks": self._collect_scheduler_tasks_snapshot(),
             }
+            capability_requirements = self._serialize_strategy_capability_requirements()
+            if capability_requirements is not None:
+                metadata["strategy_capability_requirements"] = capability_requirements
             if self._strategy_start_date:
                 metadata["strategy_start_date"] = self._strategy_start_date.isoformat()
             persist_strategy_metadata(metadata)
@@ -2501,12 +3083,12 @@ class LiveEngine:
             return
         try:
             metadata = load_strategy_metadata()
-            if not metadata or metadata.get('version') != 1:
+            if not metadata or metadata.get("version") != 1:
                 return
-            if metadata.get('strategy_start_date') == self._strategy_start_date.isoformat():
+            if metadata.get("strategy_start_date") == self._strategy_start_date.isoformat():
                 return
             metadata = dict(metadata)
-            metadata['strategy_start_date'] = self._strategy_start_date.isoformat()
+            metadata["strategy_start_date"] = self._strategy_start_date.isoformat()
             persist_strategy_metadata(metadata)
         except Exception as exc:
             log.error(f"策略起始日写入失败: {exc}", exc_info=True)
@@ -2518,7 +3100,7 @@ class LiveEngine:
             return
         try:
             periods = parse_market_periods_string(expr)
-            set_option('market_period', [(start, end) for start, end in periods])
+            set_option("market_period", [(start, end) for start, end in periods])
             log.info("已应用自定义交易时段: %s", expr)
         except Exception as exc:
             log.warning("环境变量 SCHEDULER_MARKET_PERIODS 解析失败(%s): %s", expr, exc)
@@ -2526,51 +3108,51 @@ class LiveEngine:
     def _collect_settings_snapshot(self) -> Dict[str, Any]:
         snapshot: Dict[str, Any] = {}
         settings = get_settings()
-        snapshot['benchmark'] = settings.benchmark
+        snapshot["benchmark"] = settings.benchmark
         options = self._serialize_options(settings.options or {})
-        if isinstance(options.get('market_period'), (list, tuple)):
-            options['market_period'] = self._serialize_market_periods(options['market_period'])
-        snapshot['options'] = options
+        if isinstance(options.get("market_period"), (list, tuple)):
+            options["market_period"] = self._serialize_market_periods(options["market_period"])
+        snapshot["options"] = options
         order_cost_snapshot: Dict[str, Dict[str, Any]] = {}
         order_cost_override_snapshot: Dict[str, Dict[str, Any]] = {}
         for asset, cost in (settings.order_cost or {}).items():
             order_cost_snapshot[str(asset)] = {
-                'open_tax': cost.open_tax,
-                'close_tax': cost.close_tax,
-                'open_commission': cost.open_commission,
-                'close_commission': cost.close_commission,
-                'min_commission': cost.min_commission,
-                'close_today_commission': cost.close_today_commission,
-                'commission_type': getattr(cost, 'commission_type', 'by_money'),
+                "open_tax": cost.open_tax,
+                "close_tax": cost.close_tax,
+                "open_commission": cost.open_commission,
+                "close_commission": cost.close_commission,
+                "min_commission": cost.min_commission,
+                "close_today_commission": cost.close_today_commission,
+                "commission_type": getattr(cost, "commission_type", "by_money"),
             }
-        snapshot['order_cost'] = order_cost_snapshot
-        for asset, cost in (getattr(settings, 'order_cost_overrides', {}) or {}).items():
+        snapshot["order_cost"] = order_cost_snapshot
+        for asset, cost in (getattr(settings, "order_cost_overrides", {}) or {}).items():
             order_cost_override_snapshot[str(asset)] = {
-                'open_tax': cost.open_tax,
-                'close_tax': cost.close_tax,
-                'open_commission': cost.open_commission,
-                'close_commission': cost.close_commission,
-                'min_commission': cost.min_commission,
-                'close_today_commission': cost.close_today_commission,
-                'commission_type': getattr(cost, 'commission_type', 'by_money'),
+                "open_tax": cost.open_tax,
+                "close_tax": cost.close_tax,
+                "open_commission": cost.open_commission,
+                "close_commission": cost.close_commission,
+                "min_commission": cost.min_commission,
+                "close_today_commission": cost.close_today_commission,
+                "commission_type": getattr(cost, "commission_type", "by_money"),
             }
         if order_cost_override_snapshot:
-            snapshot['order_cost_overrides'] = order_cost_override_snapshot
+            snapshot["order_cost_overrides"] = order_cost_override_snapshot
         if settings.slippage:
-            payload = {'class': settings.slippage.__class__.__name__}
-            if hasattr(settings.slippage, 'value'):
-                payload['value'] = getattr(settings.slippage, 'value', None)
-            if hasattr(settings.slippage, 'ratio'):
-                payload['ratio'] = getattr(settings.slippage, 'ratio', None)
-            if hasattr(settings.slippage, 'steps'):
-                payload['steps'] = getattr(settings.slippage, 'steps', None)
+            payload = {"class": settings.slippage.__class__.__name__}
+            if hasattr(settings.slippage, "value"):
+                payload["value"] = getattr(settings.slippage, "value", None)
+            if hasattr(settings.slippage, "ratio"):
+                payload["ratio"] = getattr(settings.slippage, "ratio", None)
+            if hasattr(settings.slippage, "steps"):
+                payload["steps"] = getattr(settings.slippage, "steps", None)
             if (
                 self.config.checkpoint_persistence_enabled
                 and self._deserialize_slippage_config(payload) is None
             ):
                 raise RuntimeError("严格 checkpoint 模式无法快照不支持的 slippage")
-            snapshot['slippage'] = payload
-        sl_map = getattr(settings, 'slippage_map', {}) or {}
+            snapshot["slippage"] = payload
+        sl_map = getattr(settings, "slippage_map", {}) or {}
         sl_map_snapshot: Dict[str, Any] = {}
         for key, cfg in sl_map.items():
             payload = self._serialize_slippage_config(cfg)
@@ -2579,16 +3161,12 @@ class LiveEngine:
                     self.config.checkpoint_persistence_enabled
                     and self._deserialize_slippage_config(payload) is None
                 ):
-                    raise RuntimeError(
-                        f"严格 checkpoint 模式无法快照不支持的 slippage_map: {key}"
-                    )
+                    raise RuntimeError(f"严格 checkpoint 模式无法快照不支持的 slippage_map: {key}")
                 sl_map_snapshot[key] = payload
             elif self.config.checkpoint_persistence_enabled:
-                raise RuntimeError(
-                    f"严格 checkpoint 模式无法快照不支持的 slippage_map: {key}"
-                )
+                raise RuntimeError(f"严格 checkpoint 模式无法快照不支持的 slippage_map: {key}")
         if sl_map_snapshot:
-            snapshot['slippage_map'] = sl_map_snapshot
+            snapshot["slippage_map"] = sl_map_snapshot
         return snapshot
 
     @staticmethod
@@ -2634,14 +3212,14 @@ class LiveEngine:
     @staticmethod
     def _serialize_slippage_config(config: Any) -> Optional[Dict[str, Any]]:
         if isinstance(config, PriceRelatedSlippage):
-            return {'class': 'PriceRelatedSlippage', 'ratio': float(config.ratio)}
+            return {"class": "PriceRelatedSlippage", "ratio": float(config.ratio)}
         if isinstance(config, StepRelatedSlippage):
-            return {'class': 'StepRelatedSlippage', 'steps': int(config.steps)}
+            return {"class": "StepRelatedSlippage", "steps": int(config.steps)}
         if isinstance(config, FixedSlippage):
-            return {'class': 'FixedSlippage', 'value': float(config.value)}
-        if hasattr(config, 'to_dict'):
+            return {"class": "FixedSlippage", "value": float(config.value)}
+        if hasattr(config, "to_dict"):
             try:
-                return {'class': config.__class__.__name__, **config.to_dict()}
+                return {"class": config.__class__.__name__, **config.to_dict()}
             except Exception:
                 return None
         return None
@@ -2650,14 +3228,14 @@ class LiveEngine:
     def _deserialize_slippage_config(payload: Dict[str, Any]) -> Optional[Any]:
         if not isinstance(payload, dict):
             return None
-        cls = payload.get('class')
+        cls = payload.get("class")
         try:
-            if cls == 'PriceRelatedSlippage':
-                return PriceRelatedSlippage(payload.get('ratio', 0.0))
-            if cls == 'StepRelatedSlippage':
-                return StepRelatedSlippage(payload.get('steps', 0))
-            if cls == 'FixedSlippage':
-                return FixedSlippage(payload.get('value', 0.0))
+            if cls == "PriceRelatedSlippage":
+                return PriceRelatedSlippage(payload.get("ratio", 0.0))
+            if cls == "StepRelatedSlippage":
+                return StepRelatedSlippage(payload.get("steps", 0))
+            if cls == "FixedSlippage":
+                return FixedSlippage(payload.get("value", 0.0))
         except Exception:
             return None
         return None
@@ -2679,13 +3257,11 @@ class LiveEngine:
         seen = set()
         for task in get_tasks():
             func = task.func
-            module = getattr(func, '__module__', None)
-            name = getattr(func, '__name__', None)
+            module = getattr(func, "__module__", None)
+            name = getattr(func, "__name__", None)
             if not module or not name:
                 if self.config.checkpoint_persistence_enabled:
-                    raise RuntimeError(
-                        "严格 checkpoint 模式无法快照无 module/name 的调度 callable"
-                    )
+                    raise RuntimeError("严格 checkpoint 模式无法快照无 module/name 的调度 callable")
                 continue
             key = self._task_meta_key(
                 module,
@@ -2694,32 +3270,32 @@ class LiveEngine:
                 task.time,
                 task.weekday,
                 task.monthday,
-                getattr(task, 'reference_security', None),
-                getattr(task, 'force', True),
+                getattr(task, "reference_security", None),
+                getattr(task, "force", True),
             )
             if key in seen:
                 continue
             seen.add(key)
             tasks_meta.append(
                 {
-                    'module': module,
-                    'func': name,
-                    'schedule_type': task.schedule_type.value,
-                    'time': task.time,
-                    'weekday': task.weekday,
-                    'monthday': task.monthday,
-                    'reference_security': getattr(task, 'reference_security', None),
-                    'force': getattr(task, 'force', True),
-                    'enabled': getattr(task, 'enabled', True),
+                    "module": module,
+                    "func": name,
+                    "schedule_type": task.schedule_type.value,
+                    "time": task.time,
+                    "weekday": task.weekday,
+                    "monthday": task.monthday,
+                    "reference_security": getattr(task, "reference_security", None),
+                    "force": getattr(task, "force", True),
+                    "enabled": getattr(task, "enabled", True),
                 }
             )
         return tasks_meta
 
     def _restore_strategy_metadata(self, meta: Dict[str, Any]) -> bool:
-        if not meta or meta.get('version') != 1:
+        if not meta or meta.get("version") != 1:
             return False
         try:
-            raw_start_date = meta.get('strategy_start_date')
+            raw_start_date = meta.get("strategy_start_date")
             if raw_start_date:
                 parsed_start_date = self._parse_date_value(raw_start_date)
                 if parsed_start_date:
@@ -2728,15 +3304,40 @@ class LiveEngine:
                     if self.config.checkpoint_persistence_enabled:
                         raise ValueError(f"策略起始日格式无效: {raw_start_date}")
                     log.debug(f"策略起始日格式无效: {raw_start_date}")
-            self._apply_settings_snapshot(meta.get('settings') or {})
-            self._apply_scheduler_tasks_snapshot(meta.get('tasks') or [])
+            raw_requirements = meta.get("strategy_capability_requirements")
+            if raw_requirements:
+                restored = self._read_static_strategy_capability_requirements(
+                    type(
+                        "_RestoredCapabilityModule",
+                        (),
+                        {"STRATEGY_CAPABILITY_REQUIREMENTS": raw_requirements},
+                    )
+                )
+                if restored is not None:
+                    current = self.strategy_capability_requirements
+                    if current is None:
+                        self.strategy_capability_requirements = restored
+                    else:
+                        if current.profile is not restored.profile:
+                            raise ValueError("持久化能力画像与当前静态声明冲突")
+                        if current.schema_version != restored.schema_version:
+                            raise ValueError("持久化能力版本与当前静态声明冲突")
+                        required = set(current.required).union(restored.required)
+                        optional = set(current.optional).union(restored.optional)
+                        optional.difference_update(required)
+                        self.strategy_capability_requirements = StrategyCapabilityRequirements(
+                            profile=current.profile,
+                            required=tuple(required),
+                            optional=tuple(optional),
+                            schema_version=current.schema_version,
+                        )
+            self._apply_settings_snapshot(meta.get("settings") or {})
+            self._apply_scheduler_tasks_snapshot(meta.get("tasks") or [])
             return True
         except Exception as exc:
             if self.config.checkpoint_persistence_enabled:
                 log.error(f"严格 checkpoint 恢复策略元数据失败: {exc}", exc_info=True)
-                raise RuntimeError(
-                    "严格 checkpoint 模式无法完整恢复策略元数据"
-                ) from exc
+                raise RuntimeError("严格 checkpoint 模式无法完整恢复策略元数据") from exc
             log.warning(f"恢复策略元数据失败: {exc}")
             return False
 
@@ -2755,52 +3356,45 @@ class LiveEngine:
 
         if not snapshot:
             return
-        benchmark = snapshot.get('benchmark')
-        if benchmark or (
-            self.config.checkpoint_persistence_enabled and benchmark is not None
-        ):
+        benchmark = snapshot.get("benchmark")
+        if benchmark or (self.config.checkpoint_persistence_enabled and benchmark is not None):
             try:
                 set_benchmark(benchmark)
             except Exception as exc:
                 if self.config.checkpoint_persistence_enabled:
                     raise RuntimeError("严格 checkpoint 模式恢复 benchmark 失败") from exc
                 log.warning(f"恢复 benchmark 失败: {exc}")
-        options = snapshot.get('options') or {}
+        options = snapshot.get("options") or {}
         for key, value in options.items():
             try:
-                if key == 'market_period' and value:
+                if key == "market_period" and value:
                     restored_periods = self._deserialize_market_periods(value)
-                    if (
-                        self.config.checkpoint_persistence_enabled
-                        and len(restored_periods) != len(value)
+                    if self.config.checkpoint_persistence_enabled and len(restored_periods) != len(
+                        value
                     ):
                         raise ValueError("market_period 包含无法恢复的时段")
                     value = restored_periods
                 set_option(key, value)
             except Exception as exc:
                 if self.config.checkpoint_persistence_enabled:
-                    raise RuntimeError(
-                        f"严格 checkpoint 模式恢复 option({key}) 失败"
-                    ) from exc
+                    raise RuntimeError(f"严格 checkpoint 模式恢复 option({key}) 失败") from exc
                 log.debug(f"恢复 option {key} 失败: {exc}")
-        order_costs = snapshot.get('order_cost') or {}
+        order_costs = snapshot.get("order_cost") or {}
         for asset, payload in order_costs.items():
             try:
                 cost = OrderCost(**payload)
                 set_order_cost(cost, type=asset)
             except Exception as exc:
                 if self.config.checkpoint_persistence_enabled:
-                    raise RuntimeError(
-                        f"严格 checkpoint 模式恢复 order_cost({asset}) 失败"
-                    ) from exc
+                    raise RuntimeError(f"严格 checkpoint 模式恢复 order_cost({asset}) 失败") from exc
                 log.debug(f"恢复 order_cost({asset}) 失败: {exc}")
-        order_cost_overrides = snapshot.get('order_cost_overrides') or {}
+        order_cost_overrides = snapshot.get("order_cost_overrides") or {}
         for asset, payload in order_cost_overrides.items():
             try:
                 cost = OrderCost(**payload)
                 # asset 形如 type_code
-                if '_' in asset:
-                    type_prefix, ref_code = asset.split('_', 1)
+                if "_" in asset:
+                    type_prefix, ref_code = asset.split("_", 1)
                     set_order_cost(cost, type=type_prefix, ref=ref_code)
                 elif self.config.checkpoint_persistence_enabled:
                     raise ValueError("order_cost_overrides 键缺少 type_ref 结构")
@@ -2810,7 +3404,7 @@ class LiveEngine:
                         f"严格 checkpoint 模式恢复 order_cost_overrides({asset}) 失败"
                     ) from exc
                 log.debug(f"恢复 order_cost_overrides({asset}) 失败: {exc}")
-        sl_map = snapshot.get('slippage_map') or {}
+        sl_map = snapshot.get("slippage_map") or {}
         if sl_map:
             try:
                 settings = get_settings()
@@ -2821,24 +3415,22 @@ class LiveEngine:
                         settings.slippage_map[key] = cfg
                     elif self.config.checkpoint_persistence_enabled:
                         raise ValueError(f"不支持的 slippage_map payload: {key}")
-                if settings.slippage is None and 'all' in settings.slippage_map:
-                    settings.slippage = settings.slippage_map.get('all')
+                if settings.slippage is None and "all" in settings.slippage_map:
+                    settings.slippage = settings.slippage_map.get("all")
             except Exception as exc:
                 if self.config.checkpoint_persistence_enabled:
-                    raise RuntimeError(
-                        "严格 checkpoint 模式恢复 slippage_map 失败"
-                    ) from exc
+                    raise RuntimeError("严格 checkpoint 模式恢复 slippage_map 失败") from exc
                 log.debug(f"恢复 slippage_map 失败: {exc}")
-        slippage = snapshot.get('slippage')
+        slippage = snapshot.get("slippage")
         if slippage:
-            cls = slippage.get('class')
+            cls = slippage.get("class")
             try:
-                if cls == 'FixedSlippage':
-                    set_slippage(FixedSlippage(slippage.get('value', 0.0)))
-                elif cls == 'PriceRelatedSlippage':
-                    set_slippage(PriceRelatedSlippage(slippage.get('ratio', 0.0)))
-                elif cls == 'StepRelatedSlippage':
-                    set_slippage(StepRelatedSlippage(slippage.get('steps', 0)))
+                if cls == "FixedSlippage":
+                    set_slippage(FixedSlippage(slippage.get("value", 0.0)))
+                elif cls == "PriceRelatedSlippage":
+                    set_slippage(PriceRelatedSlippage(slippage.get("ratio", 0.0)))
+                elif cls == "StepRelatedSlippage":
+                    set_slippage(StepRelatedSlippage(slippage.get("steps", 0)))
                 elif self.config.checkpoint_persistence_enabled:
                     raise ValueError(f"不支持的 slippage payload: {cls}")
             except Exception as exc:
@@ -2848,9 +3440,7 @@ class LiveEngine:
         if self.config.checkpoint_persistence_enabled:
             restored_snapshot = self._collect_settings_snapshot()
             if restored_snapshot != snapshot:
-                raise RuntimeError(
-                    "严格 checkpoint 模式设置恢复结果与元数据不一致"
-                )
+                raise RuntimeError("严格 checkpoint 模式设置恢复结果与元数据不一致")
 
     def _apply_scheduler_tasks_snapshot(self, tasks: List[Dict[str, Any]]) -> None:
         """恢复已持久化的调度任务并保留去重语义。
@@ -2877,68 +3467,64 @@ class LiveEngine:
         seen = set()
         for task_meta in tasks:
             key = self._task_meta_key(
-                task_meta.get('module'),
-                task_meta.get('func'),
-                task_meta.get('schedule_type'),
-                task_meta.get('time'),
-                task_meta.get('weekday'),
-                task_meta.get('monthday'),
-                task_meta.get('reference_security'),
-                task_meta.get('force', True),
+                task_meta.get("module"),
+                task_meta.get("func"),
+                task_meta.get("schedule_type"),
+                task_meta.get("time"),
+                task_meta.get("weekday"),
+                task_meta.get("monthday"),
+                task_meta.get("reference_security"),
+                task_meta.get("force", True),
             )
             if key in seen:
                 if self.config.checkpoint_persistence_enabled:
-                    raise RuntimeError(
-                        f"严格 checkpoint 模式检测到重复调度任务: {task_meta}"
-                    )
+                    raise RuntimeError(f"严格 checkpoint 模式检测到重复调度任务: {task_meta}")
                 continue
             seen.add(key)
             normalized_tasks.append(task_meta)
             expected_snapshot.append(
                 {
-                    'module': task_meta.get('module'),
-                    'func': task_meta.get('func'),
-                    'schedule_type': task_meta.get('schedule_type'),
-                    'time': task_meta.get('time', 'every_bar'),
-                    'weekday': task_meta.get('weekday'),
-                    'monthday': task_meta.get('monthday'),
-                    'reference_security': task_meta.get('reference_security'),
-                    'force': task_meta.get('force', True),
-                    'enabled': bool(task_meta.get('enabled', True)),
+                    "module": task_meta.get("module"),
+                    "func": task_meta.get("func"),
+                    "schedule_type": task_meta.get("schedule_type"),
+                    "time": task_meta.get("time", "every_bar"),
+                    "weekday": task_meta.get("weekday"),
+                    "monthday": task_meta.get("monthday"),
+                    "reference_security": task_meta.get("reference_security"),
+                    "force": task_meta.get("force", True),
+                    "enabled": bool(task_meta.get("enabled", True)),
                 }
             )
 
         for task_meta in normalized_tasks:
-            func = self._resolve_callable(task_meta.get('module'), task_meta.get('func'))
+            func = self._resolve_callable(task_meta.get("module"), task_meta.get("func"))
             if not func:
                 if self.config.checkpoint_persistence_enabled:
-                    raise RuntimeError(
-                        f"严格 checkpoint 模式无法解析调度任务: {task_meta}"
-                    )
+                    raise RuntimeError(f"严格 checkpoint 模式无法解析调度任务: {task_meta}")
                 log.warning(f"无法恢复调度任务: {task_meta}")
                 continue
-            schedule_type = task_meta.get('schedule_type')
-            time_expr = task_meta.get('time', 'every_bar')
-            enabled = bool(task_meta.get('enabled', True))
+            schedule_type = task_meta.get("schedule_type")
+            time_expr = task_meta.get("time", "every_bar")
+            enabled = bool(task_meta.get("enabled", True))
             try:
                 before_count = len(get_tasks())
-                if schedule_type == 'daily':
+                if schedule_type == "daily":
                     run_daily(func, time_expr)
-                elif schedule_type == 'weekly':
+                elif schedule_type == "weekly":
                     run_weekly(
                         func,
-                        task_meta.get('weekday'),
+                        task_meta.get("weekday"),
                         time_expr,
-                        task_meta.get('reference_security'),
-                        task_meta.get('force', True),
+                        task_meta.get("reference_security"),
+                        task_meta.get("force", True),
                     )
-                elif schedule_type == 'monthly':
+                elif schedule_type == "monthly":
                     run_monthly(
                         func,
-                        task_meta.get('monthday'),
+                        task_meta.get("monthday"),
                         time_expr,
-                        task_meta.get('reference_security'),
-                        task_meta.get('force', True),
+                        task_meta.get("reference_security"),
+                        task_meta.get("force", True),
                     )
                 else:
                     raise ValueError(f"不支持的调度类型: {schedule_type}")
@@ -2949,25 +3535,21 @@ class LiveEngine:
                     self.config.checkpoint_persistence_enabled
                     and len(current_tasks) != before_count + 1
                 ):
-                    raise RuntimeError(
-                        "严格 checkpoint 模式调度 API 登记了非单一任务"
-                    )
+                    raise RuntimeError("严格 checkpoint 模式调度 API 登记了非单一任务")
                 current_task = current_tasks[-1]
                 current_task.enabled = bool(enabled)
             except Exception as exc:
                 if self.config.checkpoint_persistence_enabled:
-                    raise RuntimeError(
-                        f"严格 checkpoint 模式恢复调度任务失败: {task_meta}"
-                    ) from exc
+                    raise RuntimeError(f"严格 checkpoint 模式恢复调度任务失败: {task_meta}") from exc
                 log.warning(f"恢复调度任务失败 {task_meta}: {exc}")
         if self.config.checkpoint_persistence_enabled:
             restored_snapshot = self._collect_scheduler_tasks_snapshot()
             if restored_snapshot != expected_snapshot:
-                raise RuntimeError(
-                    "严格 checkpoint 模式调度任务恢复数量或身份不一致"
-                )
+                raise RuntimeError("严格 checkpoint 模式调度任务恢复数量或身份不一致")
 
-    def _resolve_callable(self, module_name: Optional[str], func_name: Optional[str]) -> Optional[Callable]:
+    def _resolve_callable(
+        self, module_name: Optional[str], func_name: Optional[str]
+    ) -> Optional[Callable]:
         if not module_name or not func_name:
             return None
         module = sys.modules.get(module_name)
@@ -3009,7 +3591,11 @@ class LiveEngine:
         if not self.broker or not self.broker.supports_account_sync():
             return
         now = datetime.now()
-        if not force and self._last_account_refresh and (now - self._last_account_refresh).total_seconds() < 1:
+        if (
+            not force
+            and self._last_account_refresh
+            and (now - self._last_account_refresh).total_seconds() < 1
+        ):
             return
         try:
             snapshot = self.broker.sync_account()
@@ -3021,58 +3607,103 @@ class LiveEngine:
             self._last_account_refresh = now
 
     def _apply_account_snapshot(self, snapshot: Dict[str, Any]) -> None:
-        try:
-            target = self.portfolio_proxy.backing if isinstance(self.context.portfolio, LivePortfolioProxy) else self.context.portfolio
-            cash = snapshot.get('available_cash')
-            transferable = snapshot.get('transferable_cash')
-            locked = snapshot.get('locked_cash')
-            if locked is None:
-                locked = snapshot.get('frozen_cash')
-            total = snapshot.get('total_value')
-            if cash is not None:
-                target.available_cash = float(cash)
-            if transferable is not None:
-                target.transferable_cash = float(transferable)
-            if locked is not None:
-                target.locked_cash = float(locked)
-            if total is not None:
-                target.total_value = float(total)
-            positions = snapshot.get('positions') or []
-            target.positions.clear()
-            stock_subportfolio = None
-            try:
-                stock_subportfolio = target.subportfolios.get('stock')
-            except Exception:
-                stock_subportfolio = None
-            if stock_subportfolio is not None:
-                stock_subportfolio.available_cash = float(getattr(target, 'available_cash', 0.0) or 0.0)
-                stock_subportfolio.transferable_cash = float(getattr(target, 'transferable_cash', 0.0) or 0.0)
-                stock_subportfolio.positions.clear()
-            for item in positions:
-                security = item.get('security')
-                if not security:
-                    continue
-                amount = int(item.get('amount', item.get('total_amount', 0)) or 0)
-                price = float(item.get('current_price', item.get('price', 0.0)) or 0.0)
-                position = Position(
-                    security=security,
-                    total_amount=amount,
-                    closeable_amount=int(item.get('closeable_amount', amount)),
-                    avg_cost=float(item.get('avg_cost', 0.0) or 0.0),
-                    price=price,
-                    value=float(item.get('market_value', amount * price)),
-                    buy_time=self._parse_datetime_value(item.get('buy_time', item.get('init_time'))),
-                    last_buy_time=self._parse_datetime_value(
-                        item.get('last_buy_time', item.get('transact_time', item.get('buy_time', item.get('init_time'))))
+        """原子地把券商账户快照应用到策略组合。
+
+        Args:
+            snapshot: 券商返回的资金与持仓联合快照。
+
+        Returns:
+            None。
+
+        Raises:
+            TypeError: 持仓列表或数值字段结构非法时抛出。
+            ValueError: 数值字段无法转换时抛出。
+
+        Side Effects:
+            只有完整快照解析成功后才替换组合资金和持仓；失败时保留上一份组合，
+            由上层同步任务记录失败且不得推进刷新时间。
+        """
+
+        target = (
+            self.portfolio_proxy.backing
+            if isinstance(self.context.portfolio, LivePortfolioProxy)
+            else self.context.portfolio
+        )
+        raw_positions = snapshot.get("positions") or []
+        if not isinstance(raw_positions, (list, tuple)):
+            raise TypeError("账户快照 positions 必须为列表")
+
+        parsed_positions: List[Tuple[str, Position]] = []
+        for item in raw_positions:
+            if not isinstance(item, Mapping):
+                raise TypeError("账户快照持仓行必须为对象")
+            security = str(item.get("security") or "").strip()
+            if not security:
+                continue
+            amount = int(item.get("amount", item.get("total_amount", 0)) or 0)
+            price = float(item.get("current_price", item.get("price", 0.0)) or 0.0)
+            raw_market_value = item.get("market_value")
+            market_value = (
+                amount * price if raw_market_value in (None, "") else float(raw_market_value)
+            )
+            parsed_positions.append(
+                (
+                    security,
+                    Position(
+                        security=security,
+                        total_amount=amount,
+                        closeable_amount=int(item.get("closeable_amount", amount) or 0),
+                        avg_cost=float(item.get("avg_cost", 0.0) or 0.0),
+                        price=price,
+                        value=market_value,
+                        buy_time=self._parse_datetime_value(
+                            item.get("buy_time", item.get("init_time"))
+                        ),
+                        last_buy_time=self._parse_datetime_value(
+                            item.get(
+                                "last_buy_time",
+                                item.get(
+                                    "transact_time",
+                                    item.get("buy_time", item.get("init_time")),
+                                ),
+                            )
+                        ),
                     ),
                 )
-                target.positions[security] = position
-                if stock_subportfolio is not None:
-                    stock_subportfolio.positions[security] = position
-            target.update_value()
-        except Exception as exc:
-            log.debug(f"应用账户快照失败: {exc}")
-            return
+            )
+
+        cash = snapshot.get("available_cash")
+        transferable = snapshot.get("transferable_cash")
+        locked = snapshot.get("locked_cash")
+        if locked is None:
+            locked = snapshot.get("frozen_cash")
+        total = snapshot.get("total_value")
+        parsed_cash = float(cash) if cash is not None else None
+        parsed_transferable = float(transferable) if transferable is not None else None
+        parsed_locked = float(locked) if locked is not None else None
+        parsed_total = float(total) if total is not None else None
+
+        if parsed_cash is not None:
+            target.available_cash = parsed_cash
+        if parsed_transferable is not None:
+            target.transferable_cash = parsed_transferable
+        if parsed_locked is not None:
+            target.locked_cash = parsed_locked
+        if parsed_total is not None:
+            target.total_value = parsed_total
+        target.positions.clear()
+        stock_subportfolio = target.subportfolios.get("stock")
+        if stock_subportfolio is not None:
+            stock_subportfolio.available_cash = float(getattr(target, "available_cash", 0.0) or 0.0)
+            stock_subportfolio.transferable_cash = float(
+                getattr(target, "transferable_cash", 0.0) or 0.0
+            )
+            stock_subportfolio.positions.clear()
+        for security, position in parsed_positions:
+            target.positions[security] = position
+            if stock_subportfolio is not None:
+                stock_subportfolio.positions[security] = position
+        target.update_value()
 
         if not self._initial_nav_synced and getattr(target, "total_value", 0) > 0:
             try:
@@ -3088,7 +3719,14 @@ class LiveEngine:
             info = self.broker.get_account_info() or {}
             # 如果券商返回的是自定义对象，尽量转成 dict
             if not isinstance(info, dict):
-                info = getattr(info, '__dict__', {}) or {}
+                info = getattr(info, "__dict__", {}) or {}
+            if "positions" not in info and hasattr(self.broker, "get_positions"):
+                try:
+                    positions = self.broker.get_positions()
+                    if isinstance(positions, list):
+                        info["positions"] = positions
+                except Exception as exc:
+                    log.debug(f"获取持仓列表失败: {exc}")
             return info
         except Exception as exc:
             log.debug(f"获取账户信息失败: {exc}")
@@ -3099,41 +3737,43 @@ class LiveEngine:
         以 print_portfolio_info 风格输出券商账户概览，避免原始 list 噪音。
         """
         try:
-            positions = list(summary.get('positions') or [])
-            total_value = self._to_float(summary.get('total_value'))
-            cash = self._to_float(summary.get('available_cash'))
+            positions = list(summary.get("positions") or [])
+            total_value = self._to_float(summary.get("total_value"))
+            cash = self._to_float(summary.get("available_cash"))
             invested = 0.0
             entries: List[Dict[str, Any]] = []
             for item in positions:
-                code = item.get('security') or item.get('code')
+                code = item.get("security") or item.get("code")
                 if not code:
                     continue
-                amount = int(item.get('amount', item.get('total_amount', 0)) or 0)
+                amount = int(item.get("amount", item.get("total_amount", 0)) or 0)
                 if amount <= 0:
                     continue
-                closeable = int(item.get('closeable_amount', amount) or amount)
-                avg_cost = self._to_float(item.get('avg_cost'))
-                price = self._to_float(item.get('current_price', item.get('price')))
-                value = self._to_float(item.get('market_value'), default=price * amount)
+                closeable = int(item.get("closeable_amount", amount) or amount)
+                avg_cost = self._to_float(item.get("avg_cost"))
+                price = self._to_float(item.get("current_price", item.get("price")))
+                value = self._to_float(item.get("market_value"), default=price * amount)
                 if value == 0.0:
                     value = price * amount
                 invested += value
                 pnl = value - avg_cost * amount
                 pnl_pct = ((price / avg_cost - 1.0) * 100.0) if avg_cost > 0 else 0.0
                 weight = ((value / total_value) * 100.0) if total_value > 0 else 0.0
-                name = item.get('display_name') or item.get('name') or self._lookup_security_name(code)
+                name = (
+                    item.get("display_name") or item.get("name") or self._lookup_security_name(code)
+                )
                 entries.append(
                     {
-                        'code': code,
-                        'name': name,
-                        'amount': amount,
-                        'closeable': closeable,
-                        'avg_cost': avg_cost,
-                        'price': price,
-                        'value': value,
-                        'pnl': pnl,
-                        'pnl_pct': pnl_pct,
-                        'weight': weight,
+                        "code": code,
+                        "name": name,
+                        "amount": amount,
+                        "closeable": closeable,
+                        "avg_cost": avg_cost,
+                        "price": price,
+                        "value": value,
+                        "pnl": pnl,
+                        "pnl_pct": pnl_pct,
+                        "weight": weight,
                     }
                 )
 
@@ -3148,15 +3788,15 @@ class LiveEngine:
                 log.info("当前持仓：无")
                 return
 
-            entries.sort(key=lambda x: x['value'], reverse=True)
+            entries.sort(key=lambda x: x["value"], reverse=True)
             entries = entries[:limit]
             headers = ["股票代码", "名称", "持仓", "可用", "成本价", "现价", "市值", "盈亏", "盈亏%", "占比%"]
             rows = [
                 [
-                    entry['code'],
-                    entry['name'],
-                    str(entry['amount']),
-                    str(entry['closeable']),
+                    entry["code"],
+                    entry["name"],
+                    str(entry["amount"]),
+                    str(entry["closeable"]),
                     f"{entry['avg_cost']:.3f}",
                     f"{entry['price']:.3f}",
                     f"{entry['value']:,.2f}",
@@ -3200,8 +3840,7 @@ class LiveEngine:
 
         def _format_row(values: Sequence[str]) -> str:
             segments = [
-                f" {cls._pad_cell(str(value), widths[idx])} "
-                for idx, value in enumerate(values)
+                f" {cls._pad_cell(str(value), widths[idx])} " for idx, value in enumerate(values)
             ]
             return "|" + "|".join(segments) + "|"
 
@@ -3244,6 +3883,8 @@ class LiveEngine:
         current = cls._display_width(text)
         padding = max(target_width - current, 0)
         return text + (" " * padding)
+
+
 class LivePortfolioProxy:
     """
     代理 Portfolio，确保访问现金/持仓时优先刷新券商快照。
@@ -3358,29 +3999,28 @@ class TradingCalendarGuard:
                     reason="days_none",
                     extra={"query": query},
                 )
-                return False
-            if isinstance(days, (list, tuple, set)):
+            elif isinstance(days, (list, tuple, set)):
                 if not days:
                     self._log_calendar_diag(
                         now=datetime.now(),
                         target=target,
-                        reason="days_empty",
+                        reason="days_empty_fallback_to_weekday",
                         extra={"query": query},
                     )
+                else:
+                    for day in days:
+                        try:
+                            if pd.to_datetime(day).date() == target:
+                                return True
+                        except Exception:
+                            continue
+                    self._log_calendar_diag(
+                        now=datetime.now(),
+                        target=target,
+                        reason="target_not_in_days",
+                        extra={"query": query, "sample_days": self._sample_days(days)},
+                    )
                     return False
-                for day in days:
-                    try:
-                        if pd.to_datetime(day).date() == target:
-                            return True
-                    except Exception:
-                        continue
-                self._log_calendar_diag(
-                    now=datetime.now(),
-                    target=target,
-                    reason="target_not_in_days",
-                    extra={"query": query, "sample_days": self._sample_days(days)},
-                )
-                return False
             try:
                 iterator = iter(days)
             except TypeError:
@@ -3426,7 +4066,14 @@ class TradingCalendarGuard:
                 extra={"weekday": target.weekday()},
             )
             return False
-        return True
+        # 非周末且无法从数据源确认交易日时，严格拒绝盲目执行策略，避免节假日误扣冷静期
+        self._log_calendar_diag(
+            now=datetime.now(),
+            target=target,
+            reason="unconfirmed_trading_day_fail_closed",
+            extra={"weekday": target.weekday()},
+        )
+        return False
 
     @staticmethod
     def _sample_days(days: Any, limit: int = 5) -> str:

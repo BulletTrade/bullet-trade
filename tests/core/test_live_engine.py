@@ -5,6 +5,7 @@ LiveEngine 核心行为测试。
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import copy
 import importlib.util
 import shutil
@@ -42,12 +43,15 @@ from bullet_trade.core.models import Order, OrderStatus
 from bullet_trade.core.orders import (
     LimitOrderStyle,
     MarketOrderStyle,
+    cancel_order,
     clear_order_queue,
+    get_order_queue,
     order,
 )
 from bullet_trade.core.risk_control import RiskController
 from bullet_trade.core.runtime import set_current_engine
 from bullet_trade.data.providers.base import DataProvider
+from bullet_trade.data.providers.remote_qmt import RemoteQmtProvider
 
 WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
 V2_BRIDGE_PATH = WORKSPACE_ROOT / "strategies" / "bt_strategies" / "sim" / "common" / "v2_bridge.py"
@@ -1041,6 +1045,87 @@ async def test_live_account_sync_positions_support_broker_suffix_aliases(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_live_account_sync_accepts_huaxin_nullable_market_fields_atomically(tmp_path):
+    """验证华鑫不提供市值和现价时仍保留真实可卖持仓。
+
+    Args:
+        tmp_path: pytest 提供的临时运行目录。
+
+    Returns:
+        None；合法空行情字段成功应用，非法后续快照不清空旧持仓即通过。
+    """
+
+    class HuaxinNullableMarketDummy(DummyBroker):
+        """返回华鑫 Trader 真实 nullable 行情字段形态的 Broker 替身。"""
+
+        def sync_account(self):
+            """返回资金和 511880 可卖持仓联合快照。
+
+            Returns:
+                dict: ``price`` 与 ``market_value`` 均为 None 的合法快照。
+            """
+
+            self.account_sync_calls += 1
+            return {
+                "available_cash": 1326.84,
+                "total_value": None,
+                "positions": [
+                    {
+                        "security": "511880.XSHG",
+                        "amount": 2000,
+                        "closeable_amount": 2000,
+                        "avg_cost": 100.0,
+                        "price": None,
+                        "market_value": None,
+                    }
+                ],
+            }
+
+    strategy = _write_strategy(tmp_path)
+    broker = HuaxinNullableMarketDummy()
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=lambda: broker,
+        live_config={
+            "runtime_dir": str(tmp_path / "runtime"),
+            "g_autosave_enabled": False,
+            "account_sync_enabled": False,
+            "order_sync_enabled": False,
+            "tick_sync_enabled": False,
+            "risk_check_enabled": False,
+            "broker_heartbeat_interval": 0,
+        },
+    )
+    engine._loop = asyncio.get_running_loop()
+    engine._stop_event = asyncio.Event()
+    engine.event_bus = EventBus(engine._loop)
+    engine.async_scheduler = AsyncScheduler()
+
+    await engine._bootstrap()
+    await engine._account_sync_step()
+
+    position = engine.context.portfolio.positions["511880.XSHG"]
+    assert position.total_amount == 2000
+    assert position.closeable_amount == 2000
+    assert position.price == 0.0
+    assert position.value == 0.0
+    last_refresh = engine._last_account_refresh
+
+    broker.sync_account = lambda: {
+        "available_cash": 0,
+        "positions": [{"security": "511880.XSHG", "amount": "invalid"}],
+    }
+    await engine._account_sync_step()
+
+    preserved = engine.context.portfolio.positions["511880.XSHG"]
+    assert preserved.total_amount == 2000
+    assert preserved.closeable_amount == 2000
+    assert engine._last_account_refresh == last_refresh
+
+    await engine._shutdown()
+
+
+@pytest.mark.asyncio
 async def test_scheduler_resets_future_cursor(tmp_path):
     strategy = _write_strategy(tmp_path)
     cfg = {
@@ -1253,6 +1338,8 @@ async def test_strategy_start_date_persisted_and_restored(tmp_path):
 
 @pytest.mark.asyncio
 async def test_calendar_guard_skips_weekend(monkeypatch):
+    """验证交易日查询失败时，周末与工作日都保持失败关闭。"""
+
     guard = TradingCalendarGuard({"calendar_skip_weekend": True, "calendar_retry_minutes": 15})
 
     def _raise(*args, **kwargs):
@@ -1266,12 +1353,15 @@ async def test_calendar_guard_skips_weekend(monkeypatch):
 
     monday = datetime(2025, 1, 6, 9, 0)
     result = await guard.ensure_trade_day(monday)
-    assert result is True
-    assert guard._confirmed_date == monday.date()
+    assert result is False
+    assert guard._confirmed_date is None
+    assert guard._next_check == monday + timedelta(minutes=15)
 
 
 @pytest.mark.asyncio
 async def test_calendar_guard_weekend_allowed(monkeypatch):
+    """验证关闭周末快速跳过后，交易日查询异常仍不会放行。"""
+
     guard = TradingCalendarGuard({"calendar_skip_weekend": False})
 
     def _raise(*args, **kwargs):
@@ -1280,8 +1370,8 @@ async def test_calendar_guard_weekend_allowed(monkeypatch):
     monkeypatch.setattr("bullet_trade.data.api.get_trade_days", _raise, raising=False)
     sunday = datetime(2025, 1, 5, 9, 0)
     result = await guard.ensure_trade_day(sunday)
-    assert result is True
-    assert guard._confirmed_date == sunday.date()
+    assert result is False
+    assert guard._confirmed_date is None
 
 
 @pytest.mark.asyncio
@@ -1606,6 +1696,139 @@ async def test_live_engine_schedule_error_guard_preserves_cursor(tmp_path, monke
 
 
 @pytest.mark.asyncio
+async def test_schedule_error_guard_rejects_only_new_batch_orders(tmp_path):
+    """验证失败批次不提交新订单，且批次前已有订单保持在队列中。
+
+    Args:
+        tmp_path: pytest 提供的临时策略和运行目录。
+
+    Returns:
+        None。
+
+    Side Effects:
+        临时注册 LiveEngine 为当前引擎，并在结束时清空测试订单队列。
+    """
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={
+            "runtime_dir": str(tmp_path / "runtime"),
+            "fail_on_schedule_error": True,
+        },
+    )
+    engine._loop = asyncio.get_running_loop()
+    engine._startup_phase = "ready"
+    engine.broker = DummyBroker()
+    engine.async_scheduler = AsyncMock()
+    clear_order_queue()
+    set_current_engine(None)
+    existing_order = order("000002.XSHE", 100, price=9.0)
+    assert existing_order is not None
+    batch_order: Optional[Order] = None
+
+    async def _trigger(*_args, **_kwargs):
+        """在线程中创建本批订单并返回稳定的失败回执。
+
+        Args:
+            *_args: 兼容 AsyncScheduler.trigger 的位置参数。
+            **_kwargs: 兼容 AsyncScheduler.trigger 的关键字参数。
+
+        Returns:
+            Dict[str, Dict[str, str]]: 含任务错误的调度回执。
+
+        Side Effects:
+            创建一笔订单并写入 ``batch_order``。
+        """
+        nonlocal batch_order
+        batch_order = await asyncio.to_thread(
+            order,
+            "000001.XSHE",
+            100,
+            price=10.0,
+        )
+        await asyncio.sleep(0)
+        return {"daily__failed": {"error": "task failed"}}
+
+    engine.async_scheduler.trigger.side_effect = _trigger
+    set_current_engine(engine)
+    try:
+        with pytest.raises(RuntimeError, match="daily__failed"):
+            await engine._handle_minute_tick(datetime(2025, 1, 2, 9, 31))
+        await asyncio.sleep(0)
+
+        assert engine.broker.orders == []
+        assert get_order_queue() == [existing_order]
+        assert existing_order.status == OrderStatus.open
+        assert batch_order is not None
+        assert batch_order.status == OrderStatus.rejected
+        assert batch_order.extra["rejection_reason"] == "scheduler_task_failed"
+    finally:
+        clear_order_queue()
+        set_current_engine(None)
+
+
+@pytest.mark.asyncio
+async def test_schedule_error_guard_processes_batch_after_success(tmp_path):
+    """验证安全调度批次全部成功后才统一向内存 Broker 提交订单。
+
+    Args:
+        tmp_path: pytest 提供的临时策略和运行目录。
+
+    Returns:
+        None。
+
+    Side Effects:
+        临时注册 LiveEngine，并向 DummyBroker 提交一笔合成限价单。
+    """
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={
+            "runtime_dir": str(tmp_path / "runtime"),
+            "fail_on_schedule_error": True,
+        },
+    )
+    engine._loop = asyncio.get_running_loop()
+    engine._startup_phase = "ready"
+    engine.broker = DummyBroker()
+    engine.async_scheduler = AsyncMock()
+    engine._maybe_emit_market_events = AsyncMock()
+    engine._maybe_handle_data = AsyncMock()
+    clear_order_queue()
+
+    async def _trigger(*_args, **_kwargs):
+        """创建订单并确认调度结果确定前 Broker 仍为空。
+
+        Args:
+            *_args: 兼容 AsyncScheduler.trigger 的位置参数。
+            **_kwargs: 兼容 AsyncScheduler.trigger 的关键字参数。
+
+        Returns:
+            Dict[str, Dict[str, None]]: 成功调度回执。
+
+        Side Effects:
+            在线程中创建一笔合成订单。
+        """
+        await asyncio.to_thread(order, "000001.XSHE", 100, price=10.0)
+        await asyncio.sleep(0)
+        assert engine.broker.orders == []
+        return {"daily__success": {"result": None}}
+
+    engine.async_scheduler.trigger.side_effect = _trigger
+    set_current_engine(engine)
+    try:
+        await engine._handle_minute_tick(datetime(2025, 1, 2, 9, 31))
+
+        assert engine.broker.orders == [("000001.XSHE", 100, 10.0, "buy", False)]
+        assert get_order_queue() == []
+    finally:
+        clear_order_queue()
+        set_current_engine(None)
+
+
+@pytest.mark.asyncio
 async def test_live_engine_schedule_trigger_error_guard_stops_before_cursor_and_events(
     tmp_path, monkeypatch
 ):
@@ -1639,6 +1862,476 @@ async def test_live_engine_schedule_trigger_error_guard_stops_before_cursor_and_
     engine._maybe_emit_market_events.assert_not_awaited()
     engine._maybe_handle_data.assert_not_awaited()
     engine._process_orders.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_schedule_trigger_exception_rejects_new_batch_order(tmp_path):
+    """验证调度器自身抛异常时，本批订单同样不会到达 Broker。
+
+    Args:
+        tmp_path: pytest 提供的临时策略和运行目录。
+
+    Returns:
+        None。
+
+    Side Effects:
+        临时注册 LiveEngine，并在结束时清空测试订单队列。
+    """
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={
+            "runtime_dir": str(tmp_path / "runtime"),
+            "fail_on_schedule_error": True,
+        },
+    )
+    engine._loop = asyncio.get_running_loop()
+    engine._startup_phase = "ready"
+    engine.broker = DummyBroker()
+    engine.async_scheduler = AsyncMock()
+    clear_order_queue()
+    batch_order: Optional[Order] = None
+
+    async def _trigger(*_args, **_kwargs):
+        """创建批次订单后模拟调度器自身异常。
+
+        Args:
+            *_args: 兼容 AsyncScheduler.trigger 的位置参数。
+            **_kwargs: 兼容 AsyncScheduler.trigger 的关键字参数。
+
+        Returns:
+            None；固定抛出异常，不会正常返回。
+
+        Raises:
+            RuntimeError: 固定模拟调度器失败。
+
+        Side Effects:
+            创建一笔订单并写入 ``batch_order``。
+        """
+        nonlocal batch_order
+        batch_order = await asyncio.to_thread(
+            order,
+            "000001.XSHE",
+            100,
+            price=10.0,
+        )
+        await asyncio.sleep(0)
+        raise RuntimeError("trigger failed")
+
+    engine.async_scheduler.trigger.side_effect = _trigger
+    set_current_engine(engine)
+    try:
+        with pytest.raises(RuntimeError, match="调度器触发失败"):
+            await engine._handle_minute_tick(datetime(2025, 1, 2, 9, 31))
+        await asyncio.sleep(0)
+
+        assert engine.broker.orders == []
+        assert get_order_queue() == []
+        assert batch_order is not None
+        assert batch_order.status == OrderStatus.rejected
+        assert batch_order.extra["rejection_reason"] == "scheduler_trigger_failed"
+    finally:
+        clear_order_queue()
+        set_current_engine(None)
+
+
+@pytest.mark.asyncio
+async def test_live_order_drain_preserves_concurrent_append(monkeypatch, tmp_path):
+    """验证 LiveEngine 原子取单不会吞掉并发追加的下一批订单。
+
+    Args:
+        monkeypatch: pytest 提供的临时属性替换工具。
+        tmp_path: pytest 提供的临时策略和运行目录。
+
+    Returns:
+        None。
+
+    Side Effects:
+        启动一个受控线程向测试队列追加订单，结束时清理队列。
+    """
+    from bullet_trade.core import live_engine as live_engine_module
+
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={"runtime_dir": str(tmp_path / "runtime")},
+    )
+    engine._loop = asyncio.get_running_loop()
+    engine._startup_phase = "ready"
+    engine.broker = DummyBroker()
+    clear_order_queue()
+    set_current_engine(engine)
+    monkeypatch.setattr(
+        "bullet_trade.core.orders._trigger_order_processing",
+        lambda _timeout: None,
+    )
+    first_order = order("000001.XSHE", 100, price=10.0)
+    assert first_order is not None
+    drain_completed = threading.Event()
+    append_completed = threading.Event()
+    append_result: Dict[str, Any] = {}
+    original_drain = live_engine_module._drain_order_queue
+
+    def _controlled_drain() -> List[Order]:
+        """原子取出首批订单后等待并发订单进入新队列。
+
+        Returns:
+            List[Order]: 原子取出的首批订单。
+
+        Side Effects:
+            设置 ``drain_completed`` 并等待 ``append_completed``。
+        """
+        drained = original_drain()
+        drain_completed.set()
+        assert append_completed.wait(timeout=2)
+        return drained
+
+    def _append_after_drain() -> None:
+        """在首批队列已原子取出后追加下一批订单。
+
+        Returns:
+            None。
+
+        Side Effects:
+            写入 ``append_result`` 并设置 ``append_completed``。
+        """
+        try:
+            assert drain_completed.wait(timeout=2)
+            append_result["order"] = order("000002.XSHE", 100, price=9.0)
+        except BaseException as exc:
+            append_result["error"] = exc
+        finally:
+            append_completed.set()
+
+    monkeypatch.setattr(live_engine_module, "_drain_order_queue", _controlled_drain)
+    worker = threading.Thread(target=_append_after_drain)
+    worker.start()
+    try:
+        await engine._process_orders(datetime(2025, 1, 2, 9, 31))
+        worker.join(timeout=2)
+
+        assert worker.is_alive() is False
+        assert "error" not in append_result
+        assert engine.broker.orders == [("000001.XSHE", 100, 10.0, "buy", False)]
+        assert get_order_queue() == [append_result["order"]]
+    finally:
+        worker.join(timeout=2)
+        clear_order_queue()
+        set_current_engine(None)
+
+
+@pytest.mark.asyncio
+async def test_failed_batch_rejects_only_tagged_orders_and_latches_engine(
+    monkeypatch,
+    tmp_path,
+):
+    """验证失败分区不误拒批次外订单，并持久锁死后续写请求。
+
+    Args:
+        monkeypatch: pytest 提供的临时属性替换工具。
+        tmp_path: pytest 提供的临时策略和运行目录。
+
+    Returns:
+        None。
+
+    Side Effects:
+        启动一个不继承批次 ContextVar 的线程创建无关订单，
+        并在结束时清理测试队列和当前引擎。
+    """
+    from bullet_trade.core.orders import (
+        _order_batch_scope,
+        _reject_order_batch,
+    )
+
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={"runtime_dir": str(tmp_path / "runtime")},
+    )
+    engine._startup_phase = "ready"
+    engine._schedule_batch_active = True
+    engine.broker = DummyBroker()
+    clear_order_queue()
+    set_current_engine(engine)
+    monkeypatch.setattr(
+        "bullet_trade.core.orders._trigger_order_processing",
+        lambda _timeout: None,
+    )
+    unrelated_result: Dict[str, Any] = {}
+
+    def _create_unrelated_order() -> None:
+        """在独立线程中创建不继承调度批次 token 的订单。
+
+        Returns:
+            None。
+
+        Side Effects:
+            将订单或异常写入 ``unrelated_result``。
+        """
+        try:
+            unrelated_result["order"] = order("000003.XSHE", 100, price=8.0)
+        except BaseException as exc:
+            unrelated_result["error"] = exc
+
+    worker: Optional[threading.Thread] = None
+    try:
+        with _order_batch_scope() as batch:
+            batch_order = order("000002.XSHE", 100, price=9.0)
+            assert batch_order is not None
+
+            worker = threading.Thread(target=_create_unrelated_order)
+            worker.start()
+            worker.join(timeout=2)
+            assert worker.is_alive() is False
+            assert "error" not in unrelated_result
+
+            rejected_count = _reject_order_batch(
+                batch,
+                engine,
+                "scheduler_task_failed",
+            )
+
+        unrelated_order = unrelated_result["order"]
+        assert unrelated_order is not None
+        assert rejected_count == 1
+        assert batch_order.status == OrderStatus.rejected
+        assert unrelated_order.status != OrderStatus.rejected
+        assert "rejection_reason" not in unrelated_order.extra
+        assert get_order_queue() == [unrelated_order]
+
+        await engine._process_orders(datetime(2025, 1, 2, 9, 31))
+        assert engine.broker.orders == []
+        assert get_order_queue() == [unrelated_order]
+
+        with pytest.raises(RuntimeError, match="schedule_batch_state=failed"):
+            order("000004.XSHE", 100, price=7.0)
+    finally:
+        if worker is not None:
+            worker.join(timeout=2)
+        engine._schedule_batch_active = False
+        clear_order_queue()
+        set_current_engine(None)
+
+
+def test_failed_schedule_latch_keeps_broker_cancel_available(tmp_path):
+    """验证调度失败锁存阻止新单但不阻断处置已有订单的 Broker 撤单。
+
+    Args:
+        tmp_path: pytest 提供的临时策略和运行目录。
+
+    Returns:
+        None。
+
+    Side Effects:
+        通过 DummyBroker 执行一次内存撤单，并临时注册 LiveEngine。
+    """
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={"runtime_dir": str(tmp_path / "runtime")},
+    )
+    engine._startup_phase = "ready"
+    engine._schedule_batch_failed_reason = "scheduler_task_failed"
+    engine.broker = DummyBroker()
+    engine._loop = None
+    submitted_order = Order(
+        order_id="local-order",
+        security="000001.XSHE",
+        amount=100,
+        status=OrderStatus.open,
+    )
+    setattr(submitted_order, "_broker_order_id", "broker-order")
+    set_current_engine(engine)
+    try:
+        assert cancel_order(submitted_order) is True
+        assert submitted_order.status == OrderStatus.canceling
+    finally:
+        clear_order_queue()
+        set_current_engine(None)
+
+
+@pytest.mark.asyncio
+async def test_failed_batch_rejects_late_context_order_before_enqueue(
+    monkeypatch,
+    tmp_path,
+):
+    """验证已过前置校验但迟到入队的失败批次订单仍被原子拒绝。
+
+    Args:
+        monkeypatch: pytest 提供的临时属性替换工具。
+        tmp_path: pytest 提供的临时策略和运行目录。
+
+    Returns:
+        None。
+
+    Side Effects:
+        启动携带批次 ContextVar 的受控线程，并临时包装订单入队函数。
+    """
+    from bullet_trade.core import orders as orders_module
+
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={
+            "runtime_dir": str(tmp_path / "runtime"),
+            "fail_on_schedule_error": True,
+        },
+    )
+    engine._loop = asyncio.get_running_loop()
+    engine._startup_phase = "ready"
+    engine.broker = DummyBroker()
+    engine.async_scheduler = AsyncMock()
+    clear_order_queue()
+    set_current_engine(engine)
+
+    enqueue_entered = threading.Event()
+    release_enqueue = threading.Event()
+    late_result: Dict[str, Any] = {}
+    original_enqueue = orders_module._enqueue_order
+
+    def _controlled_enqueue(order_obj: Order) -> bool:
+        """在普通校验完成后暂停，等待调度失败门禁落盘。
+
+        Args:
+            order_obj: 已创建但尚未进入全局队列的订单。
+
+        Returns:
+            bool: 原子入队函数最终的接受或拒绝结果。
+
+        Side Effects:
+            设置 ``enqueue_entered`` 并等待 ``release_enqueue``。
+        """
+        enqueue_entered.set()
+        assert release_enqueue.wait(timeout=2)
+        return original_enqueue(order_obj)
+
+    monkeypatch.setattr(orders_module, "_enqueue_order", _controlled_enqueue)
+    worker: Optional[threading.Thread] = None
+
+    def _create_late_order(call_context: contextvars.Context) -> None:
+        """在复制的失败批次上下文中继续一笔迟到订单。
+
+        Args:
+            call_context: 从调度协程复制出的批次上下文。
+
+        Returns:
+            None。
+
+        Side Effects:
+            将订单或异常写入 ``late_result``。
+        """
+        try:
+            late_result["order"] = call_context.run(
+                order,
+                "000001.XSHE",
+                100,
+                10.0,
+            )
+        except BaseException as exc:
+            late_result["error"] = exc
+
+    async def _trigger(*_args, **_kwargs):
+        """启动迟到订单线程并立即返回失败回执。
+
+        Args:
+            *_args: 兼容 AsyncScheduler.trigger 的位置参数。
+            **_kwargs: 兼容 AsyncScheduler.trigger 的关键字参数。
+
+        Returns:
+            Dict[str, Dict[str, str]]: 固定失败调度回执。
+
+        Side Effects:
+            启动携带当前批次上下文的 worker 线程。
+        """
+        nonlocal worker
+        call_context = contextvars.copy_context()
+        worker = threading.Thread(
+            target=_create_late_order,
+            args=(call_context,),
+        )
+        worker.start()
+        assert enqueue_entered.wait(timeout=2)
+        return {"daily__failed": {"error": "task failed"}}
+
+    engine.async_scheduler.trigger.side_effect = _trigger
+    try:
+        with pytest.raises(RuntimeError, match="daily__failed"):
+            await engine._handle_minute_tick(datetime(2025, 1, 2, 9, 31))
+
+        release_enqueue.set()
+        worker.join(timeout=2)
+        assert worker.is_alive() is False
+        assert "error" not in late_result
+        late_order = late_result["order"]
+        assert late_order.status == OrderStatus.rejected
+        assert late_order.extra["rejection_reason"] == "scheduler_task_failed"
+        assert get_order_queue() == []
+        assert engine.broker.orders == []
+    finally:
+        release_enqueue.set()
+        if worker is not None:
+            worker.join(timeout=2)
+        clear_order_queue()
+        set_current_engine(None)
+
+
+@pytest.mark.asyncio
+async def test_waiting_order_processor_rechecks_batch_guard_after_lock(monkeypatch, tmp_path):
+    """验证已通过外层检查的等待协程拿到订单锁后仍会复检批次门禁。
+
+    Args:
+        monkeypatch: pytest 提供的临时属性替换工具。
+        tmp_path: pytest 提供的临时策略和运行目录。
+
+    Returns:
+        None。
+
+    Side Effects:
+        临时占用 LiveEngine 订单锁并修改批次状态，
+        结束时恢复全局测试状态。
+    """
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={"runtime_dir": str(tmp_path / "runtime")},
+    )
+    engine._loop = asyncio.get_running_loop()
+    engine._startup_phase = "ready"
+    engine.broker = DummyBroker()
+    engine._order_lock = asyncio.Lock()
+    clear_order_queue()
+    set_current_engine(engine)
+    monkeypatch.setattr(
+        "bullet_trade.core.orders._trigger_order_processing",
+        lambda _timeout: None,
+    )
+    queued = order("000001.XSHE", 100, price=10.0)
+    assert queued is not None
+
+    await engine._order_lock.acquire()
+    processor = asyncio.create_task(
+        engine._process_orders(datetime(2025, 1, 2, 9, 31))
+    )
+    await asyncio.sleep(0)
+    engine._schedule_batch_active = True
+    engine._order_lock.release()
+    try:
+        await processor
+
+        assert engine.broker.orders == []
+        assert get_order_queue() == [queued]
+    finally:
+        engine._schedule_batch_active = False
+        if engine._order_lock.locked():
+            engine._order_lock.release()
+        clear_order_queue()
+        set_current_engine(None)
 
 
 @pytest.mark.asyncio
@@ -1780,6 +2473,72 @@ async def test_handle_tick_hook_receives_context(tmp_path):
     assert payload["context"] is engine.context
     assert payload["tick"]["sid"] == "000001.XSHE"
     await engine._shutdown()
+
+
+@pytest.mark.asyncio
+async def test_live_engine_remote_provider_tick_contract(monkeypatch, tmp_path):
+    """验证 qmt-remote 单参数回调可完成订阅并注入 LiveEngine context。"""
+
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={
+            "runtime_dir": str(tmp_path / "runtime"),
+            "g_autosave_enabled": False,
+            "account_sync_enabled": False,
+            "order_sync_enabled": False,
+            "tick_sync_enabled": False,
+            "risk_check_enabled": False,
+            "broker_heartbeat_interval": 0,
+        },
+    )
+    provider = object.__new__(RemoteQmtProvider)
+    provider._tick_callback = None
+    provider._tick_context = None
+    subscriptions = []
+
+    def _subscribe_ticks(symbols):
+        """记录 LiveEngine 同步给远程 provider 的证券列表。"""
+
+        subscriptions.append(list(symbols))
+        return {"ok": True}
+
+    provider.subscribe_ticks = _subscribe_ticks
+    monkeypatch.setattr(
+        "bullet_trade.core.live_engine.get_data_provider",
+        lambda: provider,
+    )
+    loop = asyncio.get_running_loop()
+    engine._loop = loop
+    engine._market_callbacks_enabled = True
+    engine._tick_symbols.add("000001.XSHE")
+    received = {}
+    completed = asyncio.Event()
+
+    async def _handler(context, tick):
+        """记录策略最终收到的真实 LiveEngine context 与 tick。"""
+
+        received["context"] = context
+        received["tick"] = tick
+        completed.set()
+
+    engine.handle_tick_func = _handler
+
+    engine._sync_provider_subscription()
+    provider._handle_tick_event(
+        {"symbol": "000001.SZ", "lastPrice": 10.01, "time": "09:31:00"}
+    )
+    await asyncio.wait_for(completed.wait(), timeout=1)
+
+    assert subscriptions == [["000001.XSHE"]]
+    assert engine._provider_tick_callback_bound is True
+    assert received["context"] is engine.context
+    assert received["tick"] == {
+        "sid": "000001.XSHE",
+        "last_price": 10.01,
+        "dt": "09:31:00",
+    }
 
 
 @pytest.mark.asyncio

@@ -11,8 +11,8 @@
 
 from __future__ import annotations
 
-import asyncio
 import os
+import threading
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
@@ -320,7 +320,8 @@ class QmtAvailabilityGuard:
         self.last_error_at: Optional[float] = None
         self.next_probe_at = 0.0
         self._current_delay = max(0.0, self.config.initial_delay_seconds)
-        self._probe_lock = asyncio.Lock()
+        # 单飞门闩必须能在同步配置阶段创建；不能绑定可能已经关闭的 asyncio loop。
+        self._probe_lock = threading.Lock()
 
     @property
     def ready(self) -> bool:
@@ -516,9 +517,8 @@ class QmtAvailabilityGuard:
 
         if not self.is_probe_due():
             return False
-        if self._probe_lock.locked():
+        if not self._probe_lock.acquire(blocking=False):
             return False
-        await self._probe_lock.acquire()
         if not self.is_probe_due():
             self._probe_lock.release()
             return False

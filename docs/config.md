@@ -141,7 +141,7 @@ QMT_SERVER_SUB_ACCOUNT=demo@main
 | --- | --- | --- |
 | `BT_ENV_FILE` / `BULLET_TRADE_ENV_FILE` / `ENV_FILE` | `./.env.live` | 显式指定要加载的 `.env` 文件；优先于自动向上查找 `.env`。 |
 | `DEFAULT_DATA_PROVIDER` | `jqdata` | 默认行情源：`jqdata`、`tushare`、`qmt`、`qmt-remote`、`rqdata`、`easy_tdx`。RQData/easy_tdx 仍为 Beta，需要显式启用。 |
-| `DEFAULT_BROKER` | `simulator` | 默认券商/交易通道：`simulator`、`qmt`、`qmt-remote`。 |
+| `DEFAULT_BROKER` | `simulator` | 默认券商/交易通道：`simulator`、`qmt`、`qmt-remote`、`huaxin`；远程华鑫策略通常仍选择 `qmt-remote`，由 server 使用 `huaxin` adapter。 |
 | `LOG_DIR` | `./logs` | 日志目录。 |
 | `LOG_LEVEL` | `INFO` | 控制台日志级别。 |
 | `LOG_FILE_LEVEL` | 跟随 `LOG_LEVEL` | 文件日志级别。 |
@@ -197,6 +197,7 @@ QMT_SERVER_SUB_ACCOUNT=demo@main
 | `QMT_SERVER_RPC_TIMEOUT` | `60` | 远程 QMT 客户端默认 RPC 超时，只保护网络响应，不代表等待成交时间。 |
 | `QMT_PLACE_ORDER_TIMEOUT_MARGIN` | `30` | 远程下单请求超时相对订单等待窗口的默认余量。 |
 | `EVENT_TIME_OUT` | `60` | 策略事件超时秒数。 |
+| `BT_LIVE_FAIL_ON_SCHEDULE_ERROR` | `false` | 调度任务报错时拒绝该批委托、锁死后续新委托并让 LiveEngine 异常退出；查询和已知订单撤单仍可执行。生产环境建议显式设为 `true`。 |
 | `STRATEGY_NAME` | 空 | 策略名称，用于订单备注和日志标识；未设置时通常用策略文件名。 |
 | `SCHEDULER_MARKET_PERIODS` | 空 | 覆盖交易时段，例如 `09:30-11:30,13:00-15:00`。 |
 | `ACCOUNT_SYNC_ENABLED` / `ACCOUNT_SYNC_INTERVAL` | `true` / `60` | 账户后台同步开关和间隔秒数。 |
@@ -257,7 +258,9 @@ QMT_SERVER_SUB_ACCOUNT=demo@main
 | `QMT_SERVER_LOG_ACCOUNT` | `false` | 是否打印账户快照。 |
 | `QMT_SERVER_ACCESS_LOG` | `true` | 是否启用访问日志。 |
 | `QMT_SERVER_ORDER_RISK_ENABLED` | `false` | 是否启用 server 端订单/撤单风控。 |
-| `QMT_SERVER_IDEMPOTENCY_TTL_SECONDS` | `300` | 下单幂等缓存窗口秒数，避免重试导致重复下单。 |
+| `QMT_SERVER_IDEMPOTENCY_TTL_SECONDS` | `300` | 进程内幂等快速缓存窗口秒数；使用 SQLite 的 adapter 不会随该 TTL 自动删除持久记录。 |
+| `QMT_SERVER_IDEMPOTENCY_JOURNAL_PATH` | 无 | 要求持久幂等账本的 adapter 必填；未配置时其写请求 fail-closed。目录必须位于本机磁盘并由运行账户独占写入，不能放入临时目录、NFS/SMB/同步盘或使用符号链接。华鑫 adapter 明确不创建该 SQLite，但下单/撤单仍要求 `idempotency_key`。 |
+| `QMT_SERVER_IDEMPOTENCY_JOURNAL_MAX_ENTRIES` | `100000` | SQLite 账本最大记录数；达到上限拒绝新写请求，不能自动淘汰历史幂等键。 |
 | `QMT_SERVER_ACCOUNTS` | 空 | 多账户映射，例如 `main=123456,hedge=654321:future`。 |
 | `QMT_SERVER_SUB_ACCOUNTS` | 空 | 子账户映射，例如 `demo@main:limit=50000`。 |
 

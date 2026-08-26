@@ -25,21 +25,23 @@ class OrderStatus(Enum):
     - rejected: 废单/拒绝（最终态）
     - held: 挂起
     """
-    new = 'new'
-    open = 'open'
-    filling = 'filling'
-    partly_canceled = 'partly_canceled'
-    canceling = 'canceling'
-    filled = 'filled'
-    canceled = 'canceled'
-    rejected = 'rejected'
-    held = 'held'
+
+    new = "new"
+    open = "open"
+    filling = "filling"
+    partly_canceled = "partly_canceled"
+    canceling = "canceling"
+    filled = "filled"
+    canceled = "canceled"
+    rejected = "rejected"
+    held = "held"
 
 
 class OrderStyle(Enum):
     """下单方式枚举"""
-    market = 'market'  # 市价单
-    limit = 'limit'  # 限价单
+
+    market = "market"  # 市价单
+    limit = "limit"  # 限价单
 
 
 def security_code_aliases(security: Optional[str]) -> List[str]:
@@ -177,7 +179,7 @@ def ensure_security_position_map(value: Any) -> SecurityPositionMap:
 class Position:
     """
     持仓标的信息
-    
+
     Attributes:
         security: 标的代码
         total_amount: 总持仓
@@ -190,6 +192,7 @@ class Position:
         buy_time: 当前这轮持仓首次建仓时间
         last_buy_time: 最近一次买入/加仓时间
     """
+
     security: str
     total_amount: int = 0
     closeable_amount: int = 0
@@ -197,21 +200,21 @@ class Position:
     price: float = 0.0
     acc_avg_cost: float = 0.0
     value: float = 0.0
-    side: str = 'long'
+    side: str = "long"
     buy_time: Optional[datetime] = None
     last_buy_time: Optional[datetime] = None
     # 当日买入但受 T+1 限制的数量（次日释放为可卖）
     today_buy_t1: int = 0
-    
+
     def update_price(self, price: float):
         """更新当前价格和市值"""
         self.price = price
         self.value = self.total_amount * price
-        
+
     def update_position(self, amount: int, cost: float):
         """
         更新持仓
-        
+
         Args:
             amount: 交易数量（正数买入，负数卖出）
             cost: 成交价格
@@ -239,7 +242,7 @@ class Position:
 class SubPortfolio:
     """
     子账户信息
-    
+
     Attributes:
         type: 账户类型
         available_cash: 可用资金
@@ -248,7 +251,8 @@ class SubPortfolio:
         positions: 持仓字典
         positions_value: 持仓市值
     """
-    type: str = 'stock'  # stock/futures
+
+    type: str = "stock"  # stock/futures
     available_cash: float = 0.0
     transferable_cash: float = 0.0
     total_value: float = 0.0
@@ -257,7 +261,7 @@ class SubPortfolio:
 
     def __post_init__(self):
         self.positions = ensure_security_position_map(self.positions)
-    
+
     def update_value(self):
         """更新账户总价值"""
         self.positions_value = sum(pos.value for pos in self.positions.values())
@@ -268,7 +272,7 @@ class SubPortfolio:
 class Portfolio:
     """
     总账户信息
-    
+
     Attributes:
         total_value: 总资产
         available_cash: 可用资金
@@ -279,6 +283,7 @@ class Portfolio:
         positions_value: 持仓市值
         subportfolios: 子账户字典
     """
+
     total_value: float = 100000.0
     available_cash: float = 100000.0
     transferable_cash: float = 100000.0
@@ -287,20 +292,20 @@ class Portfolio:
     positions: Dict[str, Position] = field(default_factory=SecurityPositionMap)
     positions_value: float = 0.0
     subportfolios: Dict[str, SubPortfolio] = field(default_factory=dict)
-    
+
     # 风险指标
     returns: float = 0.0  # 当日收益
     daily_returns: float = 0.0  # 当日收益率
-    
+
     def __post_init__(self):
         """初始化子账户"""
         self.positions = ensure_security_position_map(self.positions)
         if not self.subportfolios:
-            self.subportfolios['stock'] = SubPortfolio(
-                type='stock',
+            self.subportfolios["stock"] = SubPortfolio(
+                type="stock",
                 available_cash=self.available_cash,
                 transferable_cash=self.transferable_cash,
-                total_value=self.total_value
+                total_value=self.total_value,
             )
         else:
             for subportfolio in self.subportfolios.values():
@@ -308,12 +313,12 @@ class Portfolio:
                     subportfolio.positions = ensure_security_position_map(subportfolio.positions)
                 except Exception:
                     pass
-    
+
     def update_value(self):
         """更新账户总价值"""
         self.positions_value = sum(pos.value for pos in self.positions.values())
         self.total_value = self.available_cash + self.positions_value + self.locked_cash
-        
+
         # 更新子账户
         for subportfolio in self.subportfolios.values():
             subportfolio.update_value()
@@ -323,7 +328,7 @@ class Portfolio:
 class Trade:
     """
     订单的一次交易记录
-    
+
     Attributes:
         order_id: 订单ID
         security: 标的代码
@@ -334,6 +339,7 @@ class Trade:
         tax: 印花税
         trade_id: 成交记录ID
     """
+
     order_id: str
     security: str
     amount: int
@@ -348,7 +354,7 @@ class Trade:
 class Order:
     """
     买卖订单信息
-    
+
     Attributes:
         order_id: 订单ID
         security: 标的代码
@@ -362,6 +368,7 @@ class Order:
         style: 下单方式
         extra: 扩展字段（券商特有信息，如备注/策略名）
     """
+
     order_id: str
     security: str
     amount: int
@@ -370,7 +377,7 @@ class Order:
     status: OrderStatus = OrderStatus.open
     add_time: Optional[datetime] = None
     is_buy: bool = True
-    action: str = 'open'
+    action: str = "open"
     style: object = OrderStyle.market
     wait_timeout: Optional[float] = None
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -380,7 +387,7 @@ class Order:
 class SecurityUnitData:
     """
     单个标的的行情数据
-    
+
     Attributes:
         security: 标的代码
         last_price: 最新价
@@ -388,11 +395,16 @@ class SecurityUnitData:
         low_limit: 跌停价
         paused: 是否停牌
         is_st: 是否ST
-        source_time: 行情源时间；上游无法证明时为 None
-        received_time: 行情接收时间；上游无法证明时为 None
-        age_seconds: 接收时相对行情源时间的秒数；上游无法证明时为 None
-        source: 行情来源稳定标识；上游未提供时为 None
+        source_time: 行情源时间；实时源无法证明时为 None
+        received_time: BulletTrade 接收快照的时间
+        age_seconds: 接收时相对行情源时间的秒数
+        source: 行情来源稳定标识
+        bid_price1: 买一价；行情源未提供时为 None
+        ask_price1: 卖一价；行情源未提供时为 None
+        bid_volume1: 买一量；行情源未提供时为 None
+        ask_volume1: 卖一量；行情源未提供时为 None
     """
+
     security: str
     last_price: float = 0.0
     high_limit: float = 0.0
@@ -403,13 +415,25 @@ class SecurityUnitData:
     received_time: Optional[datetime] = None
     age_seconds: Optional[float] = None
     source: Optional[str] = None
+    bid_price1: Optional[float] = None
+    ask_price1: Optional[float] = None
+    bid_volume1: Optional[float] = None
+    ask_volume1: Optional[float] = None
+    name: str = ""
+    display_name: str = ""
+    price_tick: float = 0.01
+    day_trading: bool = False
+
+    @property
+    def is_paused(self) -> bool:
+        return self.paused
 
 
 @dataclass
 class Context:
     """
     策略信息总览
-    
+
     Attributes:
         portfolio: 账户信息
         current_dt: 当前时间
@@ -418,12 +442,13 @@ class Context:
         run_params: 运行参数
         subportfolios: 子账户
     """
+
     portfolio: Portfolio
     current_dt: datetime
     previous_dt: Optional[datetime] = None
     previous_date: Optional[date] = None
     run_params: Dict[str, Any] = field(default_factory=dict)
-    
+
     @property
     def subportfolios(self):
         """获取子账户"""

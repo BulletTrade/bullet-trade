@@ -51,6 +51,7 @@ def _snapshot() -> dict:
                 "current_position": 20,
                 "available_position": 20,
                 "history_position": 20,
+                "onroad_position": 0,
                 "investor_id": "I2",
                 "business_unit_id": "B2",
                 "shareholder_id": "S2",
@@ -69,13 +70,13 @@ def test_digest_matches_frozen_writer_contract() -> None:
 
     snapshot = _snapshot()
 
-    assert HUAXIN_NODE16_READY_SCHEMA == "huaxin-node16-ready/v1"
+    assert HUAXIN_NODE16_READY_SCHEMA == "huaxin-node16-ready/v2"
     assert (
         build_huaxin_positions_snapshot_id(snapshot["trading_day"], snapshot["positions"])
-        == "c636c401d51c4d2f2bac8d836d2805a75079ff9ea10473e798dc18b390b6f35c"
+        == "b971310f8e17db221637da2b6b9a4d8a7a63fbbcdde1f21ebc18fb83eae1b4e1"
     )
     assert build_huaxin_node_asset_snapshot_digest(snapshot) == (
-        "b904b80a61f252ee92d6d04e54b63853a184f49d375c624b21402f82457b7b6c"
+        "0ff3e21c0e42ea5c70c4541c81f42a060c08bd0b1ae5ec74dac92a53616da82a"
     )
 
 
@@ -105,7 +106,7 @@ def test_digest_ignores_capture_time_and_row_order_but_detects_asset_drift() -> 
     ("field", "value", "error_code"),
     [
         ("trading_day", "2026-08-26", "node_asset_trading_day_invalid"),
-        ("node", {}, "node_asset_node_mismatch"),
+        ("node", {}, "node_asset_provenance_node_id_invalid"),
         ("positions", None, "node_asset_positions_invalid"),
     ],
 )
@@ -125,4 +126,53 @@ def test_invalid_complete_snapshot_fails_closed(field: str, value: object, error
     snapshot[field] = value
 
     with pytest.raises(HuaxinNodeAssetDigestError, match=error_code):
+        build_huaxin_node_asset_snapshot_digest(snapshot)
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "error_code"),
+    [
+        (("account", "transferable_cash"), None, "node_asset_transferable_cash_missing"),
+        (("account", "available_cash"), "NaN", "node_asset_available_cash_invalid"),
+        (("positions", 0, "available_position"), None, "node_asset_position_available_missing"),
+        (("positions", 0, "current_position"), float("inf"), "node_asset_position_current_invalid"),
+    ],
+)
+def test_missing_or_nonfinite_asset_values_never_default_to_zero(
+    path: tuple,
+    value: object,
+    error_code: str,
+) -> None:
+    """验证必填数值缺失、NaN 或无穷大不会被静默当成零。
+
+    Args:
+        path: 要破坏的嵌套字段路径。
+        value: 非法值。
+        error_code: 预期稳定错误码。
+
+    Returns:
+        None。
+    """
+
+    snapshot = _snapshot()
+    target = snapshot
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = value
+
+    with pytest.raises(HuaxinNodeAssetDigestError, match=error_code):
+        build_huaxin_node_asset_snapshot_digest(snapshot)
+
+
+def test_duplicate_position_identity_is_rejected() -> None:
+    """验证完整持仓集合不允许重复证券同行身份。
+
+    Returns:
+        None。
+    """
+
+    snapshot = _snapshot()
+    snapshot["positions"].append(deepcopy(snapshot["positions"][0]))
+
+    with pytest.raises(HuaxinNodeAssetDigestError, match="node_asset_position_duplicated"):
         build_huaxin_node_asset_snapshot_digest(snapshot)
