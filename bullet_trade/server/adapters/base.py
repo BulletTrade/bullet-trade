@@ -104,7 +104,21 @@ class AccountRouter:
         return self._lock
 
     def list_accounts(self) -> List[AccountContext]:
-        return list(self._accounts.values())
+        """枚举去重后的真实账户上下文。
+
+        Returns:
+            List[AccountContext]: 按配置顺序返回的唯一上下文；默认回退别名不会重复出现。
+        """
+
+        accounts: List[AccountContext] = []
+        seen = set()
+        for context in self._accounts.values():
+            identity = context.config.key or "default"
+            if identity in seen:
+                continue
+            seen.add(identity)
+            accounts.append(context)
+        return accounts
 
     def get(self, key: Optional[str]) -> AccountContext:
         if key and key in self._accounts:

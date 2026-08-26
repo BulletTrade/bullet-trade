@@ -1098,7 +1098,7 @@ class ServerApplication:
         self, method: str, ctx: AccountContext, payload: Optional[Dict]
     ) -> Tuple:
         payload = payload or {}
-        if method in ("get_account_info", "get_positions"):
+        if method in ("get_account_info", "get_positions", "positions"):
             return (ctx,)
         if method == "list_orders":
             filters = payload.get("filters")
