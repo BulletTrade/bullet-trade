@@ -546,7 +546,7 @@ def test_late_node14_transferable_cash_invalidates_existing_ready(tmp_path) -> N
         _source_snapshot(_NOW + timedelta(seconds=2), position=0),
         _source_snapshot(_NOW + timedelta(seconds=3), position=0, cash=0),
         _source_snapshot(_NOW + timedelta(seconds=4), position=0, cash=0),
-        _source_snapshot(_NOW + timedelta(seconds=5), position=0, cash=12.34),
+        _source_snapshot(_NOW + timedelta(seconds=5), position=0, cash=1326.76),
     ]
     coordinator = HuaxinAssetConsolidationCoordinator(
         _config(tmp_path),
