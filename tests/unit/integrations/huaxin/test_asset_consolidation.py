@@ -5,6 +5,8 @@ from datetime import datetime, timedelta, timezone
 import hashlib
 import json
 
+import pytest
+
 from bullet_trade.integrations.huaxin.asset_consolidation import (
     HUAXIN_NODE16_READY_SCHEMA,
     HuaxinAssetConsolidationConfig,
@@ -39,40 +41,44 @@ def _seal_source_snapshot(snapshot):
     return snapshot
 
 
-def _config(tmp_path, mode="full"):
+def _config(tmp_path, mode="full", authorized_snapshot=None):
     """构造不含生产身份的隔离归集配置。
 
     Args:
         tmp_path: pytest 临时目录。
         mode: dry_run/canary/full 模式。
+        authorized_snapshot: 写模式绑定的初始源快照；省略时使用标准测试快照。
 
     Returns:
         HuaxinAssetConsolidationConfig: 测试配置。
     """
 
-    return HuaxinAssetConsolidationConfig.from_mapping(
-        {
-            "mode": mode,
-            "source_mode": "external_snapshot",
-            "source_snapshot_path": tmp_path / "source.json",
-            "state_path": tmp_path / "state.json",
-            "source_node_id": 22,
-            "target_node_id": 11,
-            "source_role": "source-query",
-            "target_role": "target-writer",
-            "source_host": "source-host",
-            "target_host": "target-host",
-            "earliest_time": "09:00:00",
-            "snapshot_max_age_seconds": 120,
-            "stable_samples": 2,
-            "stable_interval_seconds": 1,
-            "poll_seconds": 0.01,
-            "wait_timeout": 0.01,
-            "max_position_actions": 10,
-            "max_position_volume": 10000,
-            "max_fund_amount": 10000,
-        }
-    )
+    values = {
+        "mode": mode,
+        "source_mode": "external_snapshot",
+        "source_snapshot_path": tmp_path / "source.json",
+        "state_path": tmp_path / "state.json",
+        "source_node_id": 22,
+        "target_node_id": 11,
+        "source_role": "source-query",
+        "target_role": "target-writer",
+        "source_host": "source-host",
+        "target_host": "target-host",
+        "earliest_time": "09:00:00",
+        "snapshot_max_age_seconds": 120,
+        "stable_samples": 2,
+        "stable_interval_seconds": 1,
+        "poll_seconds": 0.01,
+        "wait_timeout": 0.01,
+        "max_position_actions": 10,
+        "max_position_volume": 10000,
+        "max_fund_amount": 10000,
+    }
+    if mode in {"canary", "full"}:
+        snapshot = authorized_snapshot or _source_snapshot(_NOW)
+        values["authorized_trading_day"] = "20260825"
+        values["authorized_source_snapshot_id"] = snapshot["snapshot_id"]
+    return HuaxinAssetConsolidationConfig.from_mapping(values)
 
 
 def _source_snapshot(captured_at, position=100, cash=50.0):
@@ -346,6 +352,114 @@ def test_off_config_requires_no_private_paths_or_nodes() -> None:
     assert config.state_path is None
 
 
+def test_write_mode_requires_exact_day_and_source_snapshot_authorization(tmp_path) -> None:
+    """验证真实划转模式缺少单日、单快照授权时无法构造配置。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        None。
+    """
+
+    values = dict(_config(tmp_path).__dict__)
+    values.pop("authorized_trading_day")
+    values.pop("authorized_source_snapshot_id")
+
+    with pytest.raises(ValueError, match="authorized_trading_day"):
+        HuaxinAssetConsolidationConfig.from_mapping(values)
+
+    values["authorized_trading_day"] = "20260825"
+    with pytest.raises(ValueError, match="authorized_source_snapshot_id"):
+        HuaxinAssetConsolidationConfig.from_mapping(values)
+
+
+def test_write_authorization_rejects_changed_source_assets_before_plan(tmp_path) -> None:
+    """验证源资产偏离已确认快照时不建计划、不调用柜台划转。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        None。
+    """
+
+    changed = _source_snapshot(_NOW)
+    changed["account"]["available_cash"] = 51
+    changed["account"]["transferable_cash"] = 51
+    _seal_source_snapshot(changed)
+    broker = _TargetBroker()
+    coordinator = HuaxinAssetConsolidationCoordinator(
+        _config(tmp_path),
+        source_snapshot_provider=lambda: deepcopy(changed),
+        clock=lambda: _NOW,
+        hostname=lambda: "target-host",
+    )
+
+    result = coordinator.drive_once(broker)
+
+    assert result["state"] == "blocked"
+    assert result["reason"] == "write_authorization_source_snapshot_mismatch"
+    assert broker.position_submit_count == broker.fund_submit_count == 0
+    assert not (tmp_path / "state.json").exists()
+
+
+def test_write_authorization_rechecks_snapshot_after_planned_restart(tmp_path) -> None:
+    """验证计划落盘后、首次提交前重启仍重新核对已确认源快照。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        None。
+    """
+
+    initial = _source_snapshot(_NOW - timedelta(seconds=10))
+    stable = _source_snapshot(_NOW - timedelta(seconds=5))
+    first = HuaxinAssetConsolidationCoordinator(
+        _config(tmp_path, authorized_snapshot=initial),
+        source_snapshot_provider=_SequenceProvider([initial, stable]),
+        clock=lambda: _NOW,
+        hostname=lambda: "target-host",
+    )
+    broker = _TargetBroker()
+    assert first.drive_once(broker)["state"] == "observing"
+
+    def interrupt_before_submit(*_args, **_kwargs):
+        """模拟计划已保存但 native 提交尚未开始时进程退出。
+
+        Args:
+            _args: 被替换方法的位置参数。
+            _kwargs: 被替换方法的关键字参数。
+
+        Raises:
+            RuntimeError: 始终抛出以模拟进程中断。
+        """
+
+        raise RuntimeError("simulated_restart_before_submit")
+
+    first._submit_action_once = interrupt_before_submit
+    with pytest.raises(RuntimeError, match="simulated_restart_before_submit"):
+        first.drive_once(broker)
+
+    changed = _source_snapshot(_NOW + timedelta(seconds=1))
+    changed["account"]["available_cash"] = 60
+    changed["account"]["transferable_cash"] = 60
+    _seal_source_snapshot(changed)
+    restarted = HuaxinAssetConsolidationCoordinator(
+        _config(tmp_path, authorized_snapshot=initial),
+        source_snapshot_provider=lambda: deepcopy(changed),
+        clock=lambda: _NOW,
+        hostname=lambda: "target-host",
+    )
+
+    result = restarted.drive_once(broker)
+
+    assert result["state"] == "blocked"
+    assert result["reason"] == "write_authorization_source_snapshot_changed_before_first_submit"
+    assert broker.position_submit_count == broker.fund_submit_count == 0
+
+
 def test_direct_session_without_injected_provider_stays_explicitly_blocked(tmp_path) -> None:
     """验证尚未接入 direct provider 时不会退回外部文件或尝试划拨。
 
@@ -368,6 +482,8 @@ def test_direct_session_without_injected_provider_stays_explicitly_blocked(tmp_p
             "source_host": "target-host",
             "target_host": "target-host",
             "earliest_time": "09:00:00",
+            "authorized_trading_day": "20260825",
+            "authorized_source_snapshot_id": "0" * 64,
         }
     )
     broker = _TargetBroker()
@@ -433,6 +549,8 @@ def test_full_plan_submits_sequentially_and_only_completes_after_two_end_reconci
     assert (tmp_path / "state.json").stat().st_mode & 0o777 == 0o600
     state = HuaxinAssetConsolidationStateStore(tmp_path / "state.json").load_day("20260825")
     assert [row["state"] for row in state["actions"]] == ["succeeded", "succeeded"]
+    assert state["authorized_trading_day"] == config.authorized_trading_day
+    assert state["authorized_source_snapshot_id"] == config.authorized_source_snapshot_id
     ready = state["ready_evidence"]
     assert ready["schema"] == HUAXIN_NODE16_READY_SCHEMA
     assert ready["state"] == "ready"
@@ -726,7 +844,7 @@ def test_zero_action_source_never_creates_fake_ready(tmp_path) -> None:
         _source_snapshot(_NOW - timedelta(seconds=5), position=0, cash=0),
     ]
     coordinator = HuaxinAssetConsolidationCoordinator(
-        _config(tmp_path),
+        _config(tmp_path, authorized_snapshot=snapshots[0]),
         source_snapshot_provider=_SequenceProvider(snapshots),
         clock=lambda: _NOW,
         hostname=lambda: "target-host",
@@ -919,7 +1037,7 @@ def test_frozen_source_residual_requires_machine_verifiable_evidence(tmp_path) -
         snapshot["account"]["frozen_cash"] = 10
         _seal_source_snapshot(snapshot)
     coordinator = HuaxinAssetConsolidationCoordinator(
-        _config(tmp_path),
+        _config(tmp_path, authorized_snapshot=snapshots[0]),
         source_snapshot_provider=_SequenceProvider(snapshots),
         clock=lambda: _NOW,
         hostname=lambda: "target-host",

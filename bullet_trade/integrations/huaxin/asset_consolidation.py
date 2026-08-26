@@ -718,6 +718,8 @@ class HuaxinAssetConsolidationConfig:
     max_fund_amount: float = 1000000000.0
     canary_position_volume: int = 100
     canary_fund_amount: float = 100.0
+    authorized_trading_day: str = ""
+    authorized_source_snapshot_id: str = ""
 
     @property
     def enabled(self) -> bool:
@@ -773,6 +775,10 @@ class HuaxinAssetConsolidationConfig:
             "max_fund_amount": get_env("HUAXIN_ASSET_CONSOLIDATION_MAX_FUND_AMOUNT"),
             "canary_position_volume": get_env("HUAXIN_ASSET_CONSOLIDATION_CANARY_POSITION_VOLUME"),
             "canary_fund_amount": get_env("HUAXIN_ASSET_CONSOLIDATION_CANARY_FUND_AMOUNT"),
+            "authorized_trading_day": get_env("HUAXIN_ASSET_CONSOLIDATION_AUTHORIZED_TRADING_DAY"),
+            "authorized_source_snapshot_id": get_env(
+                "HUAXIN_ASSET_CONSOLIDATION_AUTHORIZED_SOURCE_SNAPSHOT_ID"
+            ),
         }
         return cls.from_mapping(values)
 
@@ -837,6 +843,17 @@ class HuaxinAssetConsolidationConfig:
         )
         if completion_cutoff_time <= earliest_time:
             raise ValueError("completion_cutoff_time 必须晚于 earliest_time")
+        authorized_trading_day = ""
+        authorized_source_snapshot_id = ""
+        if mode in {"canary", "full"}:
+            authorized_trading_day = required_text("authorized_trading_day")
+            if len(authorized_trading_day) != 8 or not authorized_trading_day.isdigit():
+                raise ValueError("authorized_trading_day 必须为 YYYYMMDD")
+            authorized_source_snapshot_id = required_text("authorized_source_snapshot_id").lower()
+            if len(authorized_source_snapshot_id) != 64 or any(
+                char not in "0123456789abcdef" for char in authorized_source_snapshot_id
+            ):
+                raise ValueError("authorized_source_snapshot_id 必须为 SHA-256")
         return cls(
             mode=mode,
             source_mode=source_mode,
@@ -879,6 +896,8 @@ class HuaxinAssetConsolidationConfig:
             canary_fund_amount=_parse_nonnegative_float(
                 values.get("canary_fund_amount"), "canary_fund_amount", 100.0
             ),
+            authorized_trading_day=authorized_trading_day,
+            authorized_source_snapshot_id=authorized_source_snapshot_id,
         )
 
 
@@ -1226,13 +1245,24 @@ class HuaxinAssetConsolidationCoordinator:
 
         source = dict(self._source_snapshot_provider())
         source_time = self._validate_source_snapshot(source, now)
-        target = self._capture_target_snapshot(broker, now)
         trading_day = str(source["trading_day"])
+        if (
+            self.config.mode in {"canary", "full"}
+            and trading_day != self.config.authorized_trading_day
+        ):
+            raise HuaxinAssetConsolidationError("write_authorization_trading_day_mismatch")
+        target = self._capture_target_snapshot(broker, now)
         if str(target.get("trading_day") or "") != trading_day:
             raise HuaxinAssetConsolidationError("source_target_trading_day_mismatch")
 
         plan = self._store.load_day(trading_day)
         if plan is None:
+            if (
+                self.config.mode in {"canary", "full"}
+                and str(source.get("snapshot_id") or "")
+                != self.config.authorized_source_snapshot_id
+            ):
+                raise HuaxinAssetConsolidationError("write_authorization_source_snapshot_mismatch")
             if wall_time > self.config.completion_cutoff_time:
                 raise HuaxinAssetConsolidationError("completion_cutoff_exceeded")
             if not self._observe_stability(source, target, source_time):
@@ -1778,6 +1808,8 @@ class HuaxinAssetConsolidationCoordinator:
                 source.get("snapshot_id"),
                 field_name="source_snapshot_id",
             ),
+            "authorized_trading_day": self.config.authorized_trading_day,
+            "authorized_source_snapshot_id": self.config.authorized_source_snapshot_id,
             "conservation_baseline": _asset_conservation_material(source, target),
             "actions": actions,
             "residuals": {
@@ -1867,6 +1899,17 @@ class HuaxinAssetConsolidationCoordinator:
             raise HuaxinAssetConsolidationError("existing_plan_schema_or_day_mismatch")
         if plan.get("mode") != self.config.mode:
             raise HuaxinAssetConsolidationError("existing_plan_mode_mismatch")
+        if self.config.mode in {"canary", "full"}:
+            if str(plan.get("authorized_trading_day") or "") != str(
+                self.config.authorized_trading_day
+            ):
+                raise HuaxinAssetConsolidationError("existing_plan_authorized_trading_day_mismatch")
+            if str(plan.get("authorized_source_snapshot_id") or "") != str(
+                self.config.authorized_source_snapshot_id
+            ):
+                raise HuaxinAssetConsolidationError(
+                    "existing_plan_authorized_source_snapshot_mismatch"
+                )
         if _as_int(plan.get("source_node_id"), -1) != self.config.source_node_id:
             raise HuaxinAssetConsolidationError("existing_plan_source_node_mismatch")
         if _as_int(plan.get("target_node_id"), -1) != self.config.target_node_id:
@@ -2058,6 +2101,27 @@ class HuaxinAssetConsolidationCoordinator:
         Side Effects:
             先持久化 submit_started，再至多调用一次 Broker NodeMoveIn 原语。
         """
+
+        prior_submission_states = {
+            "submit_started",
+            "unknown",
+            "reconciling",
+            "succeeded",
+            "rejected",
+        }
+        prior_submission_exists = any(
+            isinstance(row, Mapping)
+            and row is not action
+            and str(row.get("state") or "") in prior_submission_states
+            and bool(str(row.get("submit_started_at") or "").strip())
+            for row in plan.get("actions") or []
+        )
+        if not prior_submission_exists and str(source.get("snapshot_id") or "") != str(
+            plan.get("authorized_source_snapshot_id") or ""
+        ):
+            raise HuaxinAssetConsolidationError(
+                "write_authorization_source_snapshot_changed_before_first_submit"
+            )
 
         source_row = self._find_source_row(source, action)
         if source_row is None:

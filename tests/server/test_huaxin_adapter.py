@@ -1783,6 +1783,8 @@ async def test_asset_consolidation_runs_in_background_and_blocks_only_new_orders
             "target_role": "target-writer",
             "source_host": "source-host",
             "target_host": "target-host",
+            "authorized_trading_day": "20260825",
+            "authorized_source_snapshot_id": "0" * 64,
         }
     )
     adapter = HuaxinBrokerAdapter(
@@ -1856,6 +1858,8 @@ def test_asset_consolidation_write_modes_require_explicit_node_transfer(
             "target_role": "target-writer",
             "source_host": "source-host",
             "target_host": "target-host",
+            "authorized_trading_day": "20260825",
+            "authorized_source_snapshot_id": "0" * 64,
         }
     )
 
