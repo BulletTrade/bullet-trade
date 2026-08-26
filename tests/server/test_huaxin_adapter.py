@@ -1788,7 +1788,11 @@ async def test_asset_consolidation_runs_in_background_and_blocks_only_new_orders
     adapter = HuaxinBrokerAdapter(
         config,
         router,
-        broker_config={"enable_trading": True, "enable_cancel": True},
+        broker_config={
+            "enable_trading": True,
+            "enable_cancel": True,
+            "enable_node_transfer": True,
+        },
         broker_factory=_FakeBroker,
         consolidation_config=consolidation_config,
         consolidation_factory=_GateCoordinator,
@@ -1821,6 +1825,49 @@ async def test_asset_consolidation_runs_in_background_and_blocks_only_new_orders
     assert adapter._consolidation_task is not None
     await adapter.stop()
     assert adapter._consolidation_task is None
+
+
+@pytest.mark.parametrize("mode", ["canary", "full"])
+def test_asset_consolidation_write_modes_require_explicit_node_transfer(
+    tmp_path,
+    mode,
+) -> None:
+    """验证真实归集模式在创建后台任务前要求显式节点划转授权。
+
+    Args:
+        tmp_path: pytest 临时目录。
+        mode: 会产生柜台划转的归集模式。
+
+    Returns:
+        None。
+    """
+
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    consolidation_config = HuaxinAssetConsolidationConfig.from_mapping(
+        {
+            "mode": mode,
+            "source_mode": "external_snapshot",
+            "source_snapshot_path": tmp_path / "source.json",
+            "state_path": tmp_path / "state.json",
+            "source_node_id": 22,
+            "target_node_id": 11,
+            "source_role": "source-query",
+            "target_role": "target-writer",
+            "source_host": "source-host",
+            "target_host": "target-host",
+        }
+    )
+
+    with pytest.raises(ValueError, match="HUAXIN_ENABLE_NODE_TRANSFER=true"):
+        HuaxinBrokerAdapter(
+            config,
+            router,
+            broker_config={"enable_node_transfer": False},
+            broker_factory=_FakeBroker,
+            consolidation_config=consolidation_config,
+            consolidation_factory=_GateCoordinator,
+        )
 
 
 @pytest.mark.asyncio

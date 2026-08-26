@@ -258,6 +258,17 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
         self.config = config
         self.account_router = account_router
         self._broker_config = dict(broker_config or _load_huaxin_broker_config())
+        self._consolidation_config = (
+            consolidation_config or HuaxinAssetConsolidationConfig.from_env()
+        )
+        if (
+            self._consolidation_config.mode in {"canary", "full"}
+            and self._broker_config.get("enable_node_transfer") is not True
+        ):
+            raise ValueError(
+                "HUAXIN_ASSET_CONSOLIDATION_MODE=canary/full 必须显式配置 "
+                "HUAXIN_ENABLE_NODE_TRANSFER=true"
+            )
         self._broker_factory = broker_factory
         self._brokers: Dict[str, HuaxinBroker] = {}
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="huaxin-trader")
@@ -271,9 +282,6 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
         self._rebuild_required = False
         self._reconnect_count = 0
         self._consolidation_task: Optional[asyncio.Task] = None
-        self._consolidation_config = (
-            consolidation_config or HuaxinAssetConsolidationConfig.from_env()
-        )
         self._asset_consolidation: Optional[HuaxinAssetConsolidationCoordinator] = None
         if self._consolidation_config.enabled:
             self._asset_consolidation = consolidation_factory(
