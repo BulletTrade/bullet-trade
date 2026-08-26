@@ -8,7 +8,12 @@ import pandas as pd
 import pytest
 
 from bullet_trade.broker import RemoteQmtBroker
-from bullet_trade.remote import RemoteQmtConnection
+from bullet_trade.remote import (
+    RemoteQmtConnection,
+    RemoteServerError,
+    RemoteSubmissionUnknownError,
+    classify_remote_action,
+)
 from bullet_trade.server.adapters.base import AccountRouter
 from bullet_trade.server.adapters.stub import build_stub_bundle  # noqa: F401
 from bullet_trade.server.app import ServerApplication
@@ -155,6 +160,158 @@ def test_remote_connection_explicit_none_timeout_keeps_legacy_wait(monkeypatch):
     assert conn.request("broker.account", {}, timeout=None) == {"ok": True}
 
     assert recorded_future.timeouts == [60, None]
+
+
+def test_remote_connection_classifies_huaxin_snapshot_relay_actions() -> None:
+    """验证快照采集保持只读，安装按服务端幂等转换处理。
+
+    Returns:
+        None。
+    """
+
+    assert classify_remote_action("broker.node_asset_snapshot") == "none"
+    assert classify_remote_action("broker.install_source_snapshot") == "idempotent_transition"
+    assert classify_remote_action("broker.place_order") == "ambiguous_write"
+
+
+@pytest.mark.parametrize(
+    ("action", "payload", "result"),
+    [
+        (
+            "broker.node_asset_snapshot",
+            {"account_key": "default"},
+            {"generation": 8, "payload_digest_sha256": "b" * 64},
+        ),
+        (
+            "broker.install_source_snapshot",
+            {
+                "account_key": "default",
+                "snapshot": {"generation": 8, "payload_digest_sha256": "b" * 64},
+            },
+            {"installed": False, "noop": True, "generation": 8},
+        ),
+    ],
+)
+def test_remote_connection_retries_snapshot_relay_once_with_identical_payload(
+    action, payload, result
+) -> None:
+    """验证快照只读或幂等安装断连后只重试一次且载荷不变。
+
+    Args:
+        action: 待验证的快照 RPC action。
+        payload: 原始请求载荷。
+        result: 第二次请求返回结果。
+
+    Returns:
+        None。
+    """
+
+    conn = RemoteQmtConnection("127.0.0.1", 0, "token")
+    conn._connected.set()
+    sent = []
+
+    async def _send_disconnect_then_respond(message):
+        """首帧模拟响应丢失，第二帧返回确定结果。
+
+        Args:
+            message: Remote connection 发出的请求帧。
+
+        Returns:
+            None。
+        """
+
+        sent.append(message)
+        pending = conn._pending[message["id"]]
+        if len(sent) == 1:
+            pending.set_exception(RuntimeError("连接已断开"))
+        else:
+            pending.set_result(dict(result))
+
+    conn._send = _send_disconnect_then_respond  # type: ignore[method-assign]
+
+    actual = asyncio.run(conn._request_async(action, payload))
+
+    assert actual == result
+    assert len(sent) == 2
+    assert sent[0]["payload"] == sent[1]["payload"] == payload
+    assert [message["action"] for message in sent] == [action, action]
+
+
+def test_remote_connection_does_not_retry_snapshot_install_validation_error() -> None:
+    """验证服务端明确拒绝快照时不把业务错误当作断连重试。
+
+    Returns:
+        None。
+    """
+
+    conn = RemoteQmtConnection("127.0.0.1", 0, "token")
+    conn._connected.set()
+    sent = []
+
+    async def _send_rejected(message):
+        """返回一项确定的服务端合同错误。
+
+        Args:
+            message: Remote connection 发出的请求帧。
+
+        Returns:
+            None。
+        """
+
+        sent.append(message)
+        conn._pending[message["id"]].set_exception(
+            RemoteServerError("REQUEST_FAILED", "source_snapshot_generation_replayed")
+        )
+
+    conn._send = _send_rejected  # type: ignore[method-assign]
+
+    with pytest.raises(RemoteServerError, match="generation_replayed"):
+        asyncio.run(
+            conn._request_async(
+                "broker.install_source_snapshot",
+                {"snapshot": {"generation": 7, "payload_digest_sha256": "a" * 64}},
+            )
+        )
+
+    assert len(sent) == 1
+
+
+def test_remote_connection_does_not_retry_ambiguous_trade_write() -> None:
+    """验证交易写断连后直接进入 unknown，绝不重复发送。
+
+    Returns:
+        None。
+    """
+
+    conn = RemoteQmtConnection("127.0.0.1", 0, "token")
+    conn._connected.set()
+    sent = []
+
+    async def _send_disconnect(message):
+        """模拟写帧已发出但响应丢失。
+
+        Args:
+            message: Remote connection 发出的请求帧。
+
+        Returns:
+            None。
+        """
+
+        sent.append(message)
+        conn._pending[message["id"]].set_exception(RuntimeError("连接已断开"))
+
+    conn._send = _send_disconnect  # type: ignore[method-assign]
+
+    with pytest.raises(RemoteSubmissionUnknownError):
+        asyncio.run(
+            conn._request_async(
+                "broker.place_order",
+                {"security": "000001.XSHE", "side": "BUY", "amount": 100},
+            )
+        )
+
+    assert len(sent) == 1
+    assert sent[0]["payload"]["idempotency_key"].startswith("bt-place_order-")
 
 
 def test_server_session_extends_place_order_timeout_for_long_wait():
