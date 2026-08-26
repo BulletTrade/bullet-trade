@@ -26,6 +26,7 @@ from urllib.parse import urlsplit
 
 DEFAULT_QUEUE_CAPACITY = 1024
 STDIN_POLL_SECONDS = 0.10
+DEFAULT_SUBSCRIPTION_TIMEOUT_SECONDS = 5.0
 
 _COMMANDS = frozenset(("subscribe", "unsubscribe", "health", "stop"))
 _REQUEST_ID_PATTERN = re.compile(r"^[A-Za-z0-9_.:-]{1,128}$")
@@ -219,6 +220,27 @@ def _request_id(value: Any) -> str:
     if not _REQUEST_ID_PATTERN.match(text):
         raise XmdSidecarError("request_id_invalid", "request_id 格式非法")
     return text
+
+
+def _subscription_timeout(value: Any) -> float:
+    """校验父进程传入的单次订阅等待秒数。
+
+    参数:
+        value: 正有限秒数；缺省时使用兼容默认值。
+    返回:
+        可用于 ``time.monotonic`` deadline 的浮点秒数。
+    异常:
+        XmdSidecarError: 数值非法、非有限或不大于零时抛出。
+    """
+
+    candidate = DEFAULT_SUBSCRIPTION_TIMEOUT_SECONDS if value is None else value
+    try:
+        seconds = float(candidate)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise XmdSidecarError("subscription_timeout_invalid", "订阅等待秒数必须为正数") from exc
+    if not math.isfinite(seconds) or seconds <= 0:
+        raise XmdSidecarError("subscription_timeout_invalid", "订阅等待秒数必须为正数")
+    return seconds
 
 
 def _exchange_name(value: Any, xmdapi: Any) -> str:
@@ -615,13 +637,34 @@ class XmdJsonlSidecar:
         canonical = code + (".XSHG" if exchange == "SSE" else ".XSHE")
         return canonical, code, exchange
 
-    def _send_subscription(self, canonical: str, action: str, request_id: Optional[str]) -> None:
+    @staticmethod
+    def _clear_pending(item: Dict[str, Any]) -> None:
+        """清除单证券待处理请求，但保留 desired/active 业务状态。
+
+        参数:
+            item: ``self._subscriptions`` 中的单证券状态。
+        返回:
+            无。
+        """
+
+        item["pending"] = ""
+        item["pending_request_id"] = None
+        item["pending_deadline"] = None
+
+    def _send_subscription(
+        self,
+        canonical: str,
+        action: str,
+        request_id: Optional[str],
+        timeout_seconds: float,
+    ) -> None:
         """由主线程向 SDK 发送订阅或解除订阅请求。
 
         参数:
             canonical: 标准证券代码。
             action: subscribe 或 unsubscribe。
             request_id: 父进程请求号；停止清理时为 None。
+            timeout_seconds: 等待 callback 或首包的最大秒数。
         返回:
             无。
         """
@@ -632,14 +675,16 @@ class XmdJsonlSidecar:
         securities = [item["code"].encode("ascii")]
         item["pending"] = action
         item["pending_request_id"] = request_id
-        if action == "subscribe":
-            result = self._api.SubscribeMarketData(securities, exchange_constant)
-        else:
-            result = self._api.UnSubscribeMarketData(securities, exchange_constant)
-        accepted = _integer(result) == 0
-        if not accepted:
-            item["pending"] = ""
-            item["pending_request_id"] = None
+        item["pending_deadline"] = time.monotonic() + float(timeout_seconds)
+        try:
+            if action == "subscribe":
+                result = self._api.SubscribeMarketData(securities, exchange_constant)
+            else:
+                result = self._api.UnSubscribeMarketData(securities, exchange_constant)
+        except Exception:
+            self._clear_pending(item)
+            if action == "subscribe":
+                item["callback_ambiguous"] = True
             if request_id:
                 self._writer.emit(
                     {
@@ -650,6 +695,34 @@ class XmdJsonlSidecar:
                         "security": item["code"],
                         "exchange": item["exchange"],
                         "active": bool(item["active"]),
+                        "code": "subscription_request_exception",
+                        "confirmation": "sdk_exception",
+                    }
+                )
+            self._emit_error(
+                "subscription_request_exception",
+                "XMD SDK 订阅状态变更调用异常",
+                request_id,
+            )
+            return
+        sdk_return_code = _integer(result)
+        item["last_sdk_return_code"] = sdk_return_code
+        accepted = sdk_return_code == 0
+        if not accepted:
+            self._clear_pending(item)
+            if request_id:
+                self._writer.emit(
+                    {
+                        "type": "response",
+                        "request_id": request_id,
+                        "op": action,
+                        "ok": False,
+                        "security": item["code"],
+                        "exchange": item["exchange"],
+                        "active": bool(item["active"]),
+                        "code": "subscription_request_failed",
+                        "sdk_return_code": sdk_return_code,
+                        "confirmation": "sdk_return_code",
                     }
                 )
             self._emit_error(
@@ -660,8 +733,7 @@ class XmdJsonlSidecar:
             return
         if action == "unsubscribe":
             item["active"] = False
-            item["pending"] = ""
-            item["pending_request_id"] = None
+            self._clear_pending(item)
             if request_id:
                 self._writer.emit(
                     {
@@ -672,6 +744,8 @@ class XmdJsonlSidecar:
                         "security": item["code"],
                         "exchange": item["exchange"],
                         "active": False,
+                        "sdk_return_code": sdk_return_code,
+                        "confirmation": "sdk_return_code",
                     }
                 )
 
@@ -684,7 +758,56 @@ class XmdJsonlSidecar:
 
         for canonical, item in sorted(self._subscriptions.items()):
             if item["desired"] and not item["active"] and item["pending"] == "waiting_login":
-                self._send_subscription(canonical, "subscribe", item.get("pending_request_id"))
+                self._send_subscription(
+                    canonical,
+                    "subscribe",
+                    item.get("pending_request_id"),
+                    float(item["pending_timeout_seconds"]),
+                )
+
+    def _expire_pending_subscriptions(self, now: Optional[float] = None) -> int:
+        """使已超过 deadline 的订阅请求失败并释放下一次重试。
+
+        参数:
+            now: 可注入的 monotonic 秒数；缺省读取当前时钟。
+        返回:
+            本轮清理的 pending 数量。
+
+        说明:
+            厂商订阅 callback 不携带 request-id。一个已超时的 subscribe 可能仍有旧
+            callback 在途，因此设置 ``callback_ambiguous``，后续仅允许匹配首包确认。
+        """
+
+        current = time.monotonic() if now is None else float(now)
+        expired = 0
+        for item in self._subscriptions.values():
+            deadline = item.get("pending_deadline")
+            action = str(item.get("pending") or "")
+            if not action or deadline is None or current < float(deadline):
+                continue
+            request_id = item.get("pending_request_id")
+            public_action = "subscribe" if action == "waiting_login" else action
+            sdk_return_code = item.get("last_sdk_return_code")
+            if action == "subscribe":
+                item["callback_ambiguous"] = True
+            self._clear_pending(item)
+            if request_id:
+                response = {
+                    "type": "response",
+                    "request_id": request_id,
+                    "op": public_action,
+                    "ok": False,
+                    "security": item["code"],
+                    "exchange": item["exchange"],
+                    "active": bool(item["active"]),
+                    "code": "subscription_response_timeout",
+                    "confirmation": "timeout",
+                }
+                if sdk_return_code is not None:
+                    response["sdk_return_code"] = int(sdk_return_code)
+                self._writer.emit(response)
+            expired += 1
+        return expired
 
     def _fail_pending_subscriptions(self, code: str) -> None:
         """在登录或连接失败时结束所有待处理父进程请求。
@@ -712,8 +835,7 @@ class XmdJsonlSidecar:
                     }
                 )
             item["active"] = False
-            item["pending"] = ""
-            item["pending_request_id"] = None
+            self._clear_pending(item)
 
     def _handle_internal_event(self, event: Mapping[str, Any]) -> None:
         """在主线程消费一条回调标量并更新/输出状态。
@@ -771,12 +893,23 @@ class XmdJsonlSidecar:
         item = self._subscriptions.get(canonical)
         action = _text(event.get("action"))
         success = _integer(event.get("error_id")) == 0
+        callback_error_id = _integer(event.get("error_id"))
         request_id = item.get("pending_request_id") if item is not None else None
-        if item is not None:
-            item["pending"] = ""
-            item["pending_request_id"] = None
-            if success:
-                item["active"] = action == "subscribe"
+        if item is None or item.get("pending") != action:
+            self._emit_error(
+                "subscription_callback_stale",
+                "华鑫 XMD 收到无法关联当前请求的订阅回调",
+            )
+            return
+        if action == "subscribe" and bool(item.get("callback_ambiguous")):
+            self._emit_error(
+                "subscription_callback_ignored_after_timeout",
+                "华鑫 XMD 忽略超时后无法区分代次的订阅回调",
+            )
+            return
+        self._clear_pending(item)
+        if success:
+            item["active"] = action == "subscribe"
         if request_id:
             self._writer.emit(
                 {
@@ -787,6 +920,9 @@ class XmdJsonlSidecar:
                     "security": code,
                     "exchange": exchange,
                     "active": bool(item and item["active"]),
+                    "sdk_return_code": item.get("last_sdk_return_code"),
+                    "callback_error_id": callback_error_id,
+                    "confirmation": "sdk_callback",
                 }
             )
         if not success:
@@ -816,11 +952,13 @@ class XmdJsonlSidecar:
             self._emit_error("tick_exchange_unknown", "华鑫 XMD 行情交易所无法识别")
             return
         item = self._subscriptions.get(canonical)
+        if item is not None and item["desired"]:
+            item["active"] = True
+            item["callback_ambiguous"] = False
         if item is not None and item["desired"] and item["pending"] == "subscribe":
             request_id = item.get("pending_request_id")
-            item["active"] = True
-            item["pending"] = ""
-            item["pending_request_id"] = None
+            sdk_return_code = item.get("last_sdk_return_code")
+            self._clear_pending(item)
             if request_id:
                 self._writer.emit(
                     {
@@ -831,6 +969,8 @@ class XmdJsonlSidecar:
                         "security": code,
                         "exchange": exchange,
                         "active": True,
+                        "sdk_return_code": sdk_return_code,
+                        "confirmation": "first_tick",
                     }
                 )
         payload = {
@@ -874,6 +1014,7 @@ class XmdJsonlSidecar:
         if dropped > self._reported_drops:
             self._reported_drops = dropped
             self._emit_error("callback_queue_overflow", "华鑫 XMD 回调队列发生丢弃")
+        self._expire_pending_subscriptions()
         return processed
 
     def handle_command(self, command: Mapping[str, Any]) -> None:
@@ -903,7 +1044,11 @@ class XmdJsonlSidecar:
         allowed_fields = {"op", "request_id"}
         if name in ("subscribe", "unsubscribe"):
             allowed_fields.update(("security", "exchange"))
-        if set(command) != allowed_fields:
+        optional_fields = {"timeout_seconds"} if name in ("subscribe", "unsubscribe") else set()
+        if (
+            not allowed_fields.issubset(set(command))
+            or set(command) - allowed_fields - optional_fields
+        ):
             self._emit_error("command_fields_invalid", "JSON 命令字段与固定协议不一致", request_id)
             return
         if name == "health":
@@ -925,6 +1070,7 @@ class XmdJsonlSidecar:
             canonical, code, exchange = _normalise_security(
                 command.get("security"), command.get("exchange")
             )
+            timeout_seconds = _subscription_timeout(command.get("timeout_seconds"))
         except XmdSidecarError as exc:
             self._emit_error(exc.code, exc.message, request_id)
             return
@@ -937,6 +1083,10 @@ class XmdJsonlSidecar:
                 "active": False,
                 "pending": "",
                 "pending_request_id": None,
+                "pending_deadline": None,
+                "pending_timeout_seconds": DEFAULT_SUBSCRIPTION_TIMEOUT_SECONDS,
+                "last_sdk_return_code": None,
+                "callback_ambiguous": False,
             },
         )
         if item["pending"]:
@@ -955,6 +1105,7 @@ class XmdJsonlSidecar:
             return
         if name == "subscribe":
             item["desired"] = True
+            item["pending_timeout_seconds"] = timeout_seconds
             if item["active"]:
                 self._writer.emit(
                     {
@@ -968,14 +1119,15 @@ class XmdJsonlSidecar:
                     }
                 )
             elif self._logged_in:
-                self._send_subscription(canonical, "subscribe", request_id)
+                self._send_subscription(canonical, "subscribe", request_id, timeout_seconds)
             else:
                 item["pending"] = "waiting_login"
                 item["pending_request_id"] = request_id
+                item["pending_deadline"] = time.monotonic() + timeout_seconds
             return
         item["desired"] = False
         if (item["active"] or item["pending"] == "subscribe") and self._logged_in:
-            self._send_subscription(canonical, "unsubscribe", request_id)
+            self._send_subscription(canonical, "unsubscribe", request_id, timeout_seconds)
         else:
             self._writer.emit(
                 {
@@ -1023,7 +1175,12 @@ class XmdJsonlSidecar:
         if self._logged_in:
             for canonical, item in sorted(self._subscriptions.items()):
                 if item["active"] or item["pending"] == "subscribe":
-                    self._send_subscription(canonical, "unsubscribe", None)
+                    self._send_subscription(
+                        canonical,
+                        "unsubscribe",
+                        None,
+                        DEFAULT_SUBSCRIPTION_TIMEOUT_SECONDS,
+                    )
         self.drain_events()
         self._release_api()
         self._connected = False

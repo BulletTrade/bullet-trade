@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import os
 import subprocess
@@ -28,6 +29,8 @@ HUAXIN_XMD_SOURCE = "huaxin_xmd_l1"
 DEFAULT_MAX_AGE_SECONDS = 30.0
 _SHANGHAI_TZ = timezone(timedelta(hours=8))
 _ALLOWED_ENVIRONMENT = ("PATH", "LD_LIBRARY_PATH", "LANG", "LC_ALL", "TZ")
+
+log = logging.getLogger(__name__)
 
 
 class XmdBackendError(RuntimeError):
@@ -579,7 +582,10 @@ class Python37XmdBackend:
             exchange=exchange,
         )
         if not bool(response.get("ok")) or not bool(response.get("active")):
-            raise XmdBackendError("subscription_failed", "华鑫 XMD 订阅未得到成功确认")
+            raise XmdBackendError(
+                str(response.get("code") or "subscription_failed"),
+                "华鑫 XMD 订阅未得到成功确认",
+            )
         with self._condition:
             self._subscriptions.add(canonical)
         return response
@@ -712,10 +718,12 @@ class Python37XmdBackend:
         """
 
         request_id = uuid.uuid4().hex
+        wait_seconds = self.command_timeout if timeout is None else max(0.01, float(timeout))
         command: Dict[str, Any] = {"op": op, "request_id": request_id}
         if op in {"subscribe", "unsubscribe"}:
             command["security"] = security
             command["exchange"] = exchange
+            command["timeout_seconds"] = max(0.01, wait_seconds * 0.8)
         with self._condition:
             if not self._running or self._stdin is None:
                 raise XmdBackendError("backend_not_running", "华鑫 XMD backend 尚未运行")
@@ -731,7 +739,6 @@ class Python37XmdBackend:
                 self._pending.pop(request_id, None)
             raise XmdBackendError("sidecar_write_failed", "华鑫 XMD sidecar 命令写入失败") from exc
 
-        wait_seconds = self.command_timeout if timeout is None else max(0.01, float(timeout))
         deadline = time.monotonic() + wait_seconds
         with self._condition:
             while self._pending.get(request_id) is None and self._running:
@@ -816,6 +823,19 @@ class Python37XmdBackend:
             return
         if event_type == "response":
             request_id = str(payload.get("request_id") or "")
+            op = str(payload.get("op") or "")
+            if op in {"subscribe", "unsubscribe"}:
+                log.info(
+                    "华鑫 XMD 订阅响应 request_id=%s op=%s ok=%s sdk_return_code=%s "
+                    "callback_error_id=%s confirmation=%s code=%s",
+                    request_id,
+                    op,
+                    bool(payload.get("ok")),
+                    payload.get("sdk_return_code"),
+                    payload.get("callback_error_id"),
+                    str(payload.get("confirmation") or "unknown"),
+                    str(payload.get("code") or ""),
+                )
             with self._condition:
                 if request_id not in self._pending:
                     raise XmdBackendError(
@@ -836,6 +856,11 @@ class Python37XmdBackend:
             code = str(payload.get("code") or "sidecar_error")
             message = str(payload.get("message") or "华鑫 XMD sidecar 返回错误")
             request_id = str(payload.get("request_id") or "")
+            log.warning(
+                "华鑫 XMD sidecar 错误 code=%s request_id=%s",
+                code,
+                request_id,
+            )
             with self._condition:
                 self._last_error_code = code
                 self._last_error_message = message

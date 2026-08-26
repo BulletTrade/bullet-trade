@@ -34,17 +34,18 @@ from bullet_trade.integrations.huaxin.errors import (
     HuaxinNativeUnavailableError,
     HuaxinTradingDisabledError,
 )
+from bullet_trade.integrations.huaxin.snapshot_relay import (
+    HuaxinNodeSnapshotRelay,
+    HuaxinNodeSnapshotRelayConfig,
+)
 from bullet_trade.integrations.huaxin.xmd_backend import (
     DEFAULT_MAX_AGE_SECONDS,
     HUAXIN_XMD_SOURCE,
     Python37XmdBackend,
     XmdBackend,
     XmdBackendError,
+    _normalise_security,
     _validate_tcp_front,
-)
-from bullet_trade.integrations.huaxin.snapshot_relay import (
-    HuaxinNodeSnapshotRelay,
-    HuaxinNodeSnapshotRelayConfig,
 )
 from bullet_trade.utils.env_loader import (
     get_broker_config,
@@ -71,6 +72,11 @@ _RECOVERABLE_XMD_RUNTIME_CODES = frozenset(
         "login_failed",
         "sidecar_response_timeout",
         "sidecar_write_failed",
+        "subscription_failed",
+        "subscription_request_exception",
+        "subscription_request_failed",
+        "subscription_response_timeout",
+        "subscription_targets_missing",
     }
 )
 
@@ -1430,8 +1436,9 @@ class HuaxinDataAdapter:
         if not canonical:
             raise ValueError("缺少 security")
         try:
-            await self._run(self._backend.subscribe, canonical)
+            canonical, _, _ = _normalise_security(canonical)
             self._subscriptions.add(canonical)
+            await self._run(self._backend.subscribe, canonical)
             snapshot = await self._run(
                 self._backend.get_latest,
                 canonical,
@@ -1644,16 +1651,23 @@ class HuaxinDataAdapter:
             try:
                 transport_ready = bool(await self._run(self._backend_is_ready_sync))
                 if transport_ready:
-                    try:
-                        await self._run(self._verify_subscriptions_sync)
-                    except XmdBackendError as exc:
-                        self._state = "reconnecting"
-                        self._last_error_reason = exc.code
+                    if (
+                        self._last_error_reason in _RECOVERABLE_XMD_RUNTIME_CODES
+                        and not self._subscriptions
+                    ):
+                        self._state = "degraded"
+                        self._last_error_reason = "subscription_targets_missing"
                     else:
-                        if self._state != "ready":
-                            log.info("华鑫 XMD 会话、订阅与新鲜快照已恢复")
-                        self._state = "ready"
-                        self._last_error_reason = None
+                        try:
+                            await self._run(self._verify_subscriptions_sync)
+                        except XmdBackendError as exc:
+                            self._state = "reconnecting"
+                            self._last_error_reason = exc.code
+                        else:
+                            if self._state != "ready":
+                                log.info("华鑫 XMD 会话、订阅与新鲜快照已恢复")
+                            self._state = "ready"
+                            self._last_error_reason = None
                 else:
                     self._state = "reconnecting"
                     try:

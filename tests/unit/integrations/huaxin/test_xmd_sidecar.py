@@ -128,6 +128,7 @@ class _FakeApi:
         self.release_thread: Optional[int] = None
         self.emit_subscription_response = True
         self.emit_unsubscription_response = True
+        self.subscribe_exceptions_remaining = 0
 
     def RegisterSpi(self, spi: Any) -> None:
         """保存 sidecar 构造的 fake SPI。
@@ -185,6 +186,9 @@ class _FakeApi:
         """
 
         self.subscribe_calls.append((tuple(securities), exchange, threading.get_ident()))
+        if self.subscribe_exceptions_remaining > 0:
+            self.subscribe_exceptions_remaining -= 1
+            raise RuntimeError("fake SDK subscribe failure")
         if self.emit_subscription_response:
             self.spi.OnRspSubMarketData(_FakeSecurity(securities[0], exchange), _FakeResponse(0))
         return 0
@@ -473,6 +477,8 @@ def test_first_matching_tick_completes_pending_subscribe_without_vendor_response
         "security": "511880",
         "exchange": "SSE",
         "active": True,
+        "sdk_return_code": 0,
+        "confirmation": "first_tick",
     }
     assert response_index < tick_index
 
@@ -533,6 +539,8 @@ def test_unsubscribe_return_zero_completes_once_without_vendor_response() -> Non
             "security": "511880",
             "exchange": "SSE",
             "active": False,
+            "sdk_return_code": 0,
+            "confirmation": "sdk_return_code",
         }
     ]
 
@@ -544,6 +552,125 @@ def test_unsubscribe_return_zero_completes_once_without_vendor_response() -> Non
         if event.get("type") == "response" and event.get("request_id") == "unsub-without-callback"
     ]
     assert len(matching) == 1
+    sidecar.stop()
+
+
+@pytest.mark.unit
+def test_subscribe_timeout_allows_retry_and_old_callback_cannot_confirm_new_request() -> None:
+    """验证首次超时清理 pending，且旧 callback 不会误确认第二次请求。
+
+    返回:
+        无；第二次 SDK 调用可发出，只有匹配首包能完成新 request-id。
+    """
+
+    sidecar, module, output = _started_sidecar()
+    module.api.emit_subscription_response = False
+    sidecar.handle_command(
+        {
+            "op": "subscribe",
+            "request_id": "sub-timeout-one",
+            "security": "511880",
+            "exchange": "SSE",
+            "timeout_seconds": 60.0,
+        }
+    )
+    item = sidecar._subscriptions["511880.XSHG"]
+    assert sidecar._expire_pending_subscriptions(float(item["pending_deadline"]) + 1.0) == 1
+    first = [
+        event
+        for event in _json_lines(output)
+        if event.get("type") == "response" and event.get("request_id") == "sub-timeout-one"
+    ]
+    assert first[-1]["code"] == "subscription_response_timeout"
+    assert first[-1]["confirmation"] == "timeout"
+
+    sidecar.handle_command(
+        {
+            "op": "subscribe",
+            "request_id": "sub-retry-two",
+            "security": "511880",
+            "exchange": "SSE",
+            "timeout_seconds": 60.0,
+        }
+    )
+    assert len(module.api.subscribe_calls) == 2
+    assert not [
+        event
+        for event in _json_lines(output)
+        if event.get("type") == "response" and event.get("request_id") == "sub-retry-two"
+    ]
+
+    module.api.spi.OnRspSubMarketData(_FakeSecurity(b"511880", "1"), _FakeResponse(0))
+    sidecar.drain_events()
+    assert not [
+        event
+        for event in _json_lines(output)
+        if event.get("type") == "response" and event.get("request_id") == "sub-retry-two"
+    ]
+    ignored = [
+        event
+        for event in _json_lines(output)
+        if event.get("type") == "error"
+        and event.get("code") == "subscription_callback_ignored_after_timeout"
+    ]
+    assert set(ignored[-1]) == {"type", "code", "message"}
+
+    module.api.emit_tick(_FakeTick())
+    sidecar.drain_events()
+    retried = [
+        event
+        for event in _json_lines(output)
+        if event.get("type") == "response" and event.get("request_id") == "sub-retry-two"
+    ]
+    assert retried[-1]["ok"] is True
+    assert retried[-1]["confirmation"] == "first_tick"
+    sidecar.stop()
+
+
+@pytest.mark.unit
+def test_subscribe_sdk_exception_clears_pending_for_next_attempt() -> None:
+    """验证 SDK 调用异常也会清理 pending，下一次订阅不返回 busy。
+
+    返回:
+        无；第二次订阅必须再次进入 SDK，且可由首包完成确认。
+    """
+
+    sidecar, module, output = _started_sidecar()
+    module.api.subscribe_exceptions_remaining = 1
+    sidecar.handle_command(
+        {
+            "op": "subscribe",
+            "request_id": "sub-sdk-error",
+            "security": "511880",
+            "exchange": "SSE",
+        }
+    )
+    failed = [
+        event
+        for event in _json_lines(output)
+        if event.get("type") == "response" and event.get("request_id") == "sub-sdk-error"
+    ]
+    assert failed[-1]["code"] == "subscription_request_exception"
+
+    module.api.emit_subscription_response = False
+    sidecar.handle_command(
+        {
+            "op": "subscribe",
+            "request_id": "sub-after-sdk-error",
+            "security": "511880",
+            "exchange": "SSE",
+        }
+    )
+    assert len(module.api.subscribe_calls) == 2
+    module.api.emit_tick(_FakeTick())
+    sidecar.drain_events()
+    recovered = [
+        event
+        for event in _json_lines(output)
+        if event.get("type") == "response" and event.get("request_id") == "sub-after-sdk-error"
+    ]
+    assert recovered[-1]["ok"] is True
+    assert recovered[-1]["confirmation"] == "first_tick"
     sidecar.stop()
 
 

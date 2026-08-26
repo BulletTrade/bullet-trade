@@ -762,6 +762,31 @@ async def test_xmd_adapter_rebuilds_after_ready_disconnect_and_restores_subscrip
     assert adapter._watchdog_task is None
 
 
+@pytest.mark.asyncio
+async def test_xmd_watchdog_does_not_report_ready_with_empty_recovery_targets() -> None:
+    """验证运行期订阅失败后，空目标集合不能让 watchdog 假恢复。
+
+    Returns:
+        None；adapter 必须保持 degraded 并给出稳定缺目标原因。
+    """
+
+    adapter = HuaxinDataAdapter(
+        _xmd_server_config(),
+        backend_factory=_FakeXmdBackend,
+    )
+    adapter._watchdog_interval_seconds = 0.01
+    await adapter.start()
+    adapter._subscriptions.clear()
+    adapter._state = "degraded"
+    adapter._last_error_reason = "sidecar_response_timeout"
+
+    await _wait_for_condition(lambda: adapter._last_error_reason == "subscription_targets_missing")
+
+    assert adapter._state == "degraded"
+    assert adapter.backend_status()["ready"] is False
+    await adapter.stop()
+
+
 def test_xmd_tick_normalization_preserves_exchange_time_and_order_book() -> None:
     """验证 sidecar tick 归一后保留北京时间、盘口和唯一华鑫来源。"""
 
