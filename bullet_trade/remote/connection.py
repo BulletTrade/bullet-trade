@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import concurrent.futures
 import ssl
 import threading
@@ -13,6 +14,7 @@ from bullet_trade.server.protocol import ProtocolError, encode_message, read_mes
 
 
 _REQUEST_TIMEOUT_DEFAULT = object()
+_INSTALL_SOURCE_SNAPSHOT_ACTION = "broker.install_source_snapshot"
 
 
 class RemoteQmtConnection:
@@ -245,7 +247,26 @@ class RemoteQmtConnection:
             await asyncio.sleep(0.2)
 
     async def _request_async(self, action: str, payload: Dict) -> Dict:
+        """执行远程请求，并仅对快照安装施加一次重试上限。
+
+        Args:
+            action: 远程 RPC action 名称。
+            payload: 调用方提供的请求载荷。
+
+        Returns:
+            Dict: 服务端响应。
+
+        Raises:
+            Exception: 服务端明确错误、非瞬态错误，或快照安装第二次瞬态失败时抛出。
+
+        Side Effects:
+            普通 action 保留原有重试语义；快照安装始终复用同一份深拷贝载荷。
+        """
+
+        install_snapshot = action == _INSTALL_SOURCE_SNAPSHOT_ACTION
+        request_payload = copy.deepcopy(payload) if install_snapshot else payload
         last_error: Optional[Exception] = None
+        install_retry_count = 0
         while not self._stop.is_set():
             await self._wait_until_connected()
             req_id = str(uuid.uuid4())
@@ -253,7 +274,7 @@ class RemoteQmtConnection:
             future: asyncio.Future = loop.create_future()
             self._pending[req_id] = future
             try:
-                await self._send({"type": "request", "id": req_id, "action": action, "payload": payload})
+                await self._send({"type": "request", "id": req_id, "action": action, "payload": request_payload})
                 return await future
             except asyncio.CancelledError:
                 self._pending.pop(req_id, None)
@@ -263,6 +284,10 @@ class RemoteQmtConnection:
                 if not self._should_retry(exc):
                     raise
                 last_error = exc
+                if install_snapshot:
+                    install_retry_count += 1
+                    if install_retry_count > 1:
+                        raise
                 await asyncio.sleep(0.2)
         raise last_error or RuntimeError("连接已停止")
 

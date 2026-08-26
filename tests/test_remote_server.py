@@ -157,6 +157,163 @@ def test_remote_connection_explicit_none_timeout_keeps_legacy_wait(monkeypatch):
     assert recorded_future.timeouts == [60, None]
 
 
+def test_snapshot_install_retries_once_with_the_same_payload() -> None:
+    """验证快照安装断连后只重试一次且复用完全相同的载荷。
+
+    Returns:
+        None。
+    """
+
+    conn = RemoteQmtConnection("127.0.0.1", 0, "token")
+    conn._connected.set()
+    payload = {
+        "account_key": "default",
+        "snapshot": {"generation": 7, "payload_digest_sha256": "a" * 64},
+    }
+    sent = []
+
+    async def _send_disconnect_then_noop(message):
+        """首帧模拟瞬态断连，第二帧返回幂等 no-op。
+
+        Args:
+            message: Remote connection 发出的请求帧。
+
+        Returns:
+            None。
+        """
+
+        sent.append(message)
+        pending = conn._pending[message["id"]]
+        if len(sent) == 1:
+            payload["snapshot"]["generation"] = 99
+            pending.set_exception(RuntimeError("连接已断开"))
+        else:
+            pending.set_result({"installed": False, "noop": True, "generation": 7})
+
+    conn._send = _send_disconnect_then_noop  # type: ignore[method-assign]
+
+    result = asyncio.run(conn._request_async("broker.install_source_snapshot", payload))
+
+    assert result == {"installed": False, "noop": True, "generation": 7}
+    assert len(sent) == 2
+    assert payload["snapshot"]["generation"] == 99
+    assert sent[0]["payload"] == sent[1]["payload"]
+    assert sent[0]["payload"]["snapshot"]["generation"] == 7
+    assert sent[0]["payload"] is sent[1]["payload"]
+
+
+def test_snapshot_install_stops_after_two_transient_attempts() -> None:
+    """验证快照安装连续瞬态失败时总发送次数不超过两次。
+
+    Returns:
+        None。
+    """
+
+    conn = RemoteQmtConnection("127.0.0.1", 0, "token")
+    conn._connected.set()
+    sent = []
+
+    async def _send_disconnect(message):
+        """让每一次请求都以瞬态断连结束。
+
+        Args:
+            message: Remote connection 发出的请求帧。
+
+        Returns:
+            None。
+        """
+
+        sent.append(message)
+        conn._pending[message["id"]].set_exception(RuntimeError("连接已断开"))
+
+    conn._send = _send_disconnect  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="连接已断开"):
+        asyncio.run(
+            conn._request_async(
+                "broker.install_source_snapshot",
+                {"snapshot": {"generation": 8, "payload_digest_sha256": "b" * 64}},
+            )
+        )
+
+    assert len(sent) == 2
+
+
+def test_snapshot_install_does_not_retry_explicit_server_error() -> None:
+    """验证服务端明确拒绝安装时不进行第二次请求。
+
+    Returns:
+        None。
+    """
+
+    conn = RemoteQmtConnection("127.0.0.1", 0, "token")
+    conn._connected.set()
+    sent = []
+
+    async def _send_rejected(message):
+        """返回确定的服务端合同错误。
+
+        Args:
+            message: Remote connection 发出的请求帧。
+
+        Returns:
+            None。
+        """
+
+        sent.append(message)
+        conn._pending[message["id"]].set_exception(
+            RuntimeError("source_snapshot_generation_replayed")
+        )
+
+    conn._send = _send_rejected  # type: ignore[method-assign]
+
+    with pytest.raises(RuntimeError, match="generation_replayed"):
+        asyncio.run(
+            conn._request_async(
+                "broker.install_source_snapshot",
+                {"snapshot": {"generation": 7, "payload_digest_sha256": "a" * 64}},
+            )
+        )
+
+    assert len(sent) == 1
+
+
+def test_regular_read_keeps_retrying_beyond_snapshot_install_limit() -> None:
+    """验证普通只读请求仍保留基线的多次瞬态重试行为。
+
+    Returns:
+        None。
+    """
+
+    conn = RemoteQmtConnection("127.0.0.1", 0, "token")
+    conn._connected.set()
+    sent = []
+
+    async def _send_three_disconnects_then_respond(message):
+        """前三帧模拟瞬态断连，第四帧返回只读结果。
+
+        Args:
+            message: Remote connection 发出的请求帧。
+
+        Returns:
+            None。
+        """
+
+        sent.append(message)
+        pending = conn._pending[message["id"]]
+        if len(sent) <= 3:
+            pending.set_exception(RuntimeError("连接已断开"))
+        else:
+            pending.set_result({"value": {"available_cash": 1000.0}})
+
+    conn._send = _send_three_disconnects_then_respond  # type: ignore[method-assign]
+
+    result = asyncio.run(conn._request_async("broker.account", {"account_key": "default"}))
+
+    assert result == {"value": {"available_cash": 1000.0}}
+    assert len(sent) == 4
+
+
 def test_server_session_extends_place_order_timeout_for_long_wait():
     """broker.place_order 长等待窗口应同步扩展 session 外层请求超时。"""
 
