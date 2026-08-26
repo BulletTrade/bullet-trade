@@ -1896,6 +1896,10 @@ class LiveCurrentData:
                 high_limit=high_limit,
                 low_limit=low_limit,
                 paused=paused,
+                source_time=snap.get("source_time"),
+                received_time=snap.get("received_time"),
+                age_seconds=snap.get("age_seconds"),
+                source=snap.get("source"),
             )
         else:
             if requires_live:

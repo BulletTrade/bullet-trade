@@ -388,6 +388,10 @@ class SecurityUnitData:
         low_limit: 跌停价
         paused: 是否停牌
         is_st: 是否ST
+        source_time: 行情源时间；上游无法证明时为 None
+        received_time: 行情接收时间；上游无法证明时为 None
+        age_seconds: 接收时相对行情源时间的秒数；上游无法证明时为 None
+        source: 行情来源稳定标识；上游未提供时为 None
     """
     security: str
     last_price: float = 0.0
@@ -395,6 +399,10 @@ class SecurityUnitData:
     low_limit: float = 0.0
     paused: bool = False
     is_st: bool = False
+    source_time: Optional[datetime] = None
+    received_time: Optional[datetime] = None
+    age_seconds: Optional[float] = None
+    source: Optional[str] = None
 
 
 @dataclass

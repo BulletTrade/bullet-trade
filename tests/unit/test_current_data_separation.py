@@ -59,5 +59,69 @@ def test_live_current_data_prefers_provider_tick(monkeypatch):
     assert snap.last_price == 12.34
     assert snap.high_limit == 13.0
     assert snap.low_limit == 11.0
+    assert snap.source_time is None
+    assert snap.received_time is None
+    assert snap.age_seconds is None
+    assert snap.source is None
     set_current_context(None)
     g.live_trade = False
+
+
+def test_live_current_data_preserves_freshness_metadata(monkeypatch):
+    """验证实盘当前行情容器无损保留 provider 的时效审计字段。
+
+    Args:
+        monkeypatch: pytest 提供的属性替换工具。
+
+    Returns:
+        None: 断言源时间、接收时间、年龄和来源标识均原样进入 SecurityUnitData。
+
+    Side Effects:
+        临时切换全局实盘标志和当前上下文；测试结束后恢复为空上下文和非实盘。
+    """
+
+    reset_settings()
+    g.live_trade = True
+    source_time = datetime(2025, 1, 2, 10, 0, 1)
+    received_time = datetime(2025, 1, 2, 10, 0, 2)
+
+    class MetadataProvider:
+        """返回带完整时效审计字段的实盘行情替身。"""
+
+        requires_live_data = True
+
+        def get_live_current(self, security):
+            """返回固定实盘快照。
+
+            Args:
+                security: 待读取的证券代码。
+
+            Returns:
+                dict: 带价格和完整时效审计字段的快照。
+            """
+
+            return {
+                "last_price": 12.34,
+                "high_limit": 13.0,
+                "low_limit": 11.0,
+                "paused": False,
+                "source_time": source_time,
+                "received_time": received_time,
+                "age_seconds": 1.0,
+                "source": "test_live_feed",
+            }
+
+    ctx = SimpleNamespace(current_dt=datetime(2025, 1, 2, 10, 0, 2))
+    set_current_context(ctx)
+    monkeypatch.setattr(
+        "bullet_trade.data.api._provider", MetadataProvider(), raising=False
+    )
+    try:
+        snap = get_current_data()["000001.XSHE"]
+        assert snap.source_time == source_time
+        assert snap.received_time == received_time
+        assert snap.age_seconds == 1.0
+        assert snap.source == "test_live_feed"
+    finally:
+        set_current_context(None)
+        g.live_trade = False
