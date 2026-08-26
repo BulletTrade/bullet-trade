@@ -17,29 +17,37 @@ from decimal import Decimal
 from typing import Any, Dict, List, Mapping, Sequence
 
 
-HUAXIN_NODE_ASSET_DIGEST_VERSION = "huaxin-node-assets/v1"
-HUAXIN_NODE16_READY_SCHEMA = "huaxin-node16-ready/v1"
+HUAXIN_NODE_ASSET_DIGEST_VERSION = "huaxin-node-assets/v2"
+HUAXIN_NODE16_READY_SCHEMA = "huaxin-node16-ready/v2"
 
 
 class HuaxinNodeAssetDigestError(ValueError):
     """表示华鑫完整节点资产不满足确定性摘要合同。"""
 
 
-def _as_int(value: Any, default: int = 0) -> int:
-    """安全转换整数。
+def _required_int(value: Any, *, field_name: str) -> int:
+    """严格转换必填整数。
 
     Args:
         value: 原始字段值。
-        default: 转换失败时的默认值。
+        field_name: 用于错误定位的非敏感字段名。
 
     Returns:
-        int: 转换结果。
+        int: 已验证整数。
+
+    Raises:
+        HuaxinNodeAssetDigestError: 字段缺失、布尔或不是整数时抛出。
     """
 
+    if value in (None, "") or isinstance(value, bool):
+        raise HuaxinNodeAssetDigestError(f"{field_name}_invalid")
     try:
-        return int(value)
-    except (TypeError, ValueError, OverflowError):
-        return default
+        parsed = Decimal(str(value))
+    except Exception as exc:
+        raise HuaxinNodeAssetDigestError(f"{field_name}_invalid") from exc
+    if not parsed.is_finite() or parsed != parsed.to_integral_value():
+        raise HuaxinNodeAssetDigestError(f"{field_name}_invalid")
+    return int(parsed)
 
 
 def _row_fingerprint(row: Mapping[str, Any], kind: str) -> str:
@@ -65,8 +73,11 @@ def _row_fingerprint(row: Mapping[str, Any], kind: str) -> str:
             "market_id",
         )
     )
+    values = [str(row.get(field) or "").strip() for field in fields]
+    if any(not value for value in values):
+        raise HuaxinNodeAssetDigestError(f"node_asset_{kind}_identity_incomplete")
     material = json.dumps(
-        [str(row.get(field) or "") for field in fields],
+        values,
         ensure_ascii=False,
         separators=(",", ":"),
     ).encode("utf-8")
@@ -77,7 +88,7 @@ def _canonical_decimal_text(value: Any, *, field_name: str) -> str:
     """把资产数值收敛为无指数的确定性十进制文本。
 
     Args:
-        value: 原始数值；空值按零处理。
+        value: 原始必填数值。
         field_name: 用于非敏感错误定位的字段名。
 
     Returns:
@@ -87,9 +98,7 @@ def _canonical_decimal_text(value: Any, *, field_name: str) -> str:
         HuaxinNodeAssetDigestError: 数值非法、非有限或为布尔值时抛出。
     """
 
-    if value in (None, ""):
-        return "0"
-    if isinstance(value, bool):
+    if value in (None, "") or isinstance(value, bool):
         raise HuaxinNodeAssetDigestError(f"{field_name}_invalid")
     try:
         parsed = Decimal(str(value))
@@ -103,20 +112,24 @@ def _canonical_decimal_text(value: Any, *, field_name: str) -> str:
     return "0" if text in {"", "-0"} else text
 
 
-def _first_snapshot_value(*values: Any) -> Any:
-    """从多套兼容字段中选择第一个显式值。
+def _required_snapshot_value(*values: Any, field_name: str) -> Any:
+    """从兼容别名中选择第一个显式必填值。
 
     Args:
         *values: 按优先级排列的候选值。
+        field_name: 用于错误定位的非敏感字段名。
 
     Returns:
-        Any: 第一个非空候选；全部为空时返回零。
+        Any: 第一个非空候选。
+
+    Raises:
+        HuaxinNodeAssetDigestError: 所有别名均缺失时抛出。
     """
 
     for value in values:
         if value not in (None, ""):
             return value
-    return 0
+    raise HuaxinNodeAssetDigestError(f"{field_name}_missing")
 
 
 def _canonical_trading_day(value: Any) -> str:
@@ -195,28 +208,30 @@ def _canonical_node_position_material(row: Mapping[str, Any]) -> Dict[str, Any]:
     )
     combined = dict(native)
     combined.update(dict(row))
-    current = _first_snapshot_value(
+    current = _required_snapshot_value(
         combined.get("current_position"),
         combined.get("amount"),
         combined.get("volume"),
+        field_name="node_asset_position_current",
     )
-    available = _first_snapshot_value(
+    available = _required_snapshot_value(
         combined.get("available_position"),
         combined.get("closeable_amount"),
         combined.get("available_amount"),
         combined.get("available"),
-        current,
+        field_name="node_asset_position_available",
     )
-    history = _first_snapshot_value(
+    history = _required_snapshot_value(
         combined.get("history_position"),
         combined.get("yesterday_volume"),
-        current,
+        field_name="node_asset_position_history",
     )
-    onroad = _first_snapshot_value(
+    onroad = _required_snapshot_value(
         combined.get("onroad_position"),
         combined.get("on_road_position"),
+        combined.get("on_road_volume"),
         combined.get("in_transit_position"),
-        0,
+        field_name="node_asset_position_onroad",
     )
     return {
         "security": _canonical_security_for_digest(combined),
@@ -255,6 +270,9 @@ def _canonical_node_positions(snapshot: Mapping[str, Any]) -> List[Dict[str, Any
         raise HuaxinNodeAssetDigestError("node_asset_positions_invalid")
     material = [_canonical_node_position_material(row) for row in rows]
     material.sort(key=lambda row: (row["security"], row["identity_sha256"]))
+    identities = [(row["security"], row["identity_sha256"]) for row in material]
+    if len(identities) != len(set(identities)):
+        raise HuaxinNodeAssetDigestError("node_asset_position_duplicated")
     return material
 
 
@@ -303,8 +321,12 @@ def build_huaxin_node_asset_snapshot_digest(snapshot: Mapping[str, Any]) -> str:
         raise HuaxinNodeAssetDigestError("node_asset_account_missing")
     if not isinstance(node, Mapping):
         raise HuaxinNodeAssetDigestError("node_asset_provenance_missing")
-    node_id = _as_int(snapshot.get("node_id"), -1)
-    if node_id < 0 or _as_int(node.get("node_id"), -2) != node_id:
+    node_id = _required_int(snapshot.get("node_id"), field_name="node_asset_node_id")
+    node_proven_node_id = _required_int(
+        node.get("node_id"),
+        field_name="node_asset_provenance_node_id",
+    )
+    if node_id < 0 or node_proven_node_id != node_id:
         raise HuaxinNodeAssetDigestError("node_asset_node_mismatch")
     provenance = str(node.get("provenance") or "").strip()
     if not provenance:
@@ -318,23 +340,26 @@ def build_huaxin_node_asset_snapshot_digest(snapshot: Mapping[str, Any]) -> str:
         "account": {
             "identity_sha256": _row_fingerprint(account, "fund"),
             "available_cash": _canonical_decimal_text(
-                _first_snapshot_value(
+                _required_snapshot_value(
                     account.get("available_cash"),
                     account.get("cash"),
-                    account.get("transferable_cash"),
+                    field_name="node_asset_available_cash",
                 ),
                 field_name="node_asset_available_cash",
             ),
             "transferable_cash": _canonical_decimal_text(
-                _first_snapshot_value(
+                _required_snapshot_value(
                     account.get("transferable_cash"),
-                    account.get("available_cash"),
-                    account.get("cash"),
+                    field_name="node_asset_transferable_cash",
                 ),
                 field_name="node_asset_transferable_cash",
             ),
             "frozen_cash": _canonical_decimal_text(
-                _first_snapshot_value(account.get("frozen_cash"), account.get("locked_cash")),
+                _required_snapshot_value(
+                    account.get("frozen_cash"),
+                    account.get("locked_cash"),
+                    field_name="node_asset_frozen_cash",
+                ),
                 field_name="node_asset_frozen_cash",
             ),
         },

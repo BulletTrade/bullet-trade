@@ -71,6 +71,20 @@ def _server_config(**overrides):
     return ServerConfig(**values)
 
 
+def test_account_router_lists_non_default_account_once_with_default_fallback() -> None:
+    """验证非 default 主键可作默认回退，但枚举时不会重复连接同一账户。
+
+    Returns:
+        None。
+    """
+
+    account = AccountConfig(key="huaxin-node16-main", account_id="acct")
+    router = AccountRouter([account])
+
+    assert router.get(None).config is router.get("huaxin-node16-main").config
+    assert [ctx.config.key for ctx in router.list_accounts()] == ["huaxin-node16-main"]
+
+
 async def _wait_for_condition(predicate, timeout=1.0):
     """等待异步 watchdog 使给定条件成立。
 
@@ -1222,7 +1236,7 @@ class _FakeBroker:
         """
 
         self.baseline_queries.add("account")
-        return {"available_cash": 1000}
+        return {"available_cash": 1000, "account_id": "TEST-ACCOUNT"}
 
     def get_positions(self):
         """返回测试持仓。
@@ -1232,7 +1246,21 @@ class _FakeBroker:
         """
 
         self.baseline_queries.add("positions")
-        return [{"security": "511880.XSHG", "amount": 100}]
+        return [
+            {
+                "exchange": "SSE",
+                "security": "511880.XSHG",
+                "amount": 100,
+                "current_position": 100,
+                "available_position": 100,
+                "history_position": 100,
+                "onroad_position": 0,
+                "investor_id": "TEST-I",
+                "business_unit_id": "TEST-B",
+                "shareholder_id": "TEST-S",
+                "market_id": 49,
+            }
+        ]
 
     def get_orders(self, **kwargs):
         """返回测试委托并忽略过滤。
@@ -1450,8 +1478,19 @@ async def test_adapter_delegates_queries_and_preserves_cancel_payload() -> None:
 
     assert adapter.backend_status()["state"] == "ready"
     assert adapter.backend_status()["actions"]["broker.place_order"]["status"] == "ready"
-    assert (await adapter.get_account_info(ctx))["value"]["available_cash"] == 1000
+    account_envelope = await adapter.get_account_info(ctx)
+    assert account_envelope["value"]["available_cash"] == 1000
+    assert account_envelope["value"]["account_identity"] == {
+        "identity_verified": True,
+        "observed_balance_account_id": "TEST-ACCOUNT",
+    }
+    assert account_envelope["value"]["query_complete"] is True
     assert (await adapter.get_positions(ctx))[0]["amount"] == 100
+    positions_envelope = await adapter.positions(ctx)
+    assert positions_envelope["complete"] is True
+    assert positions_envelope["query_complete"] is True
+    assert len(positions_envelope["snapshot_id"]) == 64
+    assert positions_envelope["positions"][0]["security"] == "511880.XSHG"
     assert (await adapter.list_orders(ctx))[0]["order_id"] == "O1"
     assert (await adapter.list_trades(ctx))[0]["trade_id"] == "T1"
     assert await adapter.get_trading_day() == "20260824"
@@ -1499,6 +1538,39 @@ async def test_adapter_delegates_queries_and_preserves_cancel_payload() -> None:
     await adapter.cancel_order_request(ctx, cancel_payload)
     assert broker.cancel_payload[1] == cancel_payload
     assert adapter.backend_status()["actions"]["broker.place_order"]["status"] == "ready"
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
+async def test_server_dispatches_huaxin_positions_envelope_without_payload_argument() -> None:
+    """验证标准 broker.positions 只传账户上下文并返回完整性信封。"""
+
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    adapter = HuaxinBrokerAdapter(
+        config,
+        router,
+        broker_config={"enable_trading": False, "enable_cancel": False},
+        broker_factory=_FakeBroker,
+    )
+    await adapter.start()
+    app = ServerApplication(
+        config,
+        router,
+        AdapterBundle(
+            data_adapter=None,
+            broker_adapter=adapter,
+            broker_writes_require_persistent_idempotency=False,
+            broker_writes_require_idempotency_key=True,
+        ),
+    )
+    session = SimpleNamespace(account_key="default", sub_account_id=None)
+
+    positions_envelope = await app._dispatch_broker(session, "positions", {})
+
+    assert positions_envelope["complete"] is True
+    assert len(positions_envelope["snapshot_id"]) == 64
+    assert positions_envelope["positions"][0]["security"] == "511880.XSHG"
     await adapter.stop()
 
 

@@ -25,10 +25,21 @@ from decimal import Decimal, ROUND_DOWN
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, MutableMapping, Optional, Sequence, Set
 
+from bullet_trade.integrations.huaxin_node_assets import (
+    HUAXIN_NODE16_READY_SCHEMA as _STRICT_READY_SCHEMA,
+    HUAXIN_NODE_ASSET_DIGEST_VERSION as _STRICT_DIGEST_VERSION,
+    HuaxinNodeAssetDigestError,
+    build_huaxin_node_asset_snapshot_digest as _strict_node_asset_digest,
+    build_huaxin_positions_snapshot_id as _strict_positions_snapshot_id,
+)
 from bullet_trade.utils.env_loader import get_env
 
 
 HUAXIN_ASSET_CONSOLIDATION_ORDER_BLOCKED = "huaxin_asset_consolidation_pending"
+HUAXIN_NODE_ASSET_DIGEST_VERSION = _STRICT_DIGEST_VERSION
+HUAXIN_NODE16_READY_SCHEMA = _STRICT_READY_SCHEMA
+HUAXIN_NODE_SNAPSHOT_SCHEMA = "huaxin-node-snapshot/v2"
+HUAXIN_NODE_SNAPSHOT_PRODUCER_SCHEMA = "huaxin-node-snapshot-producer/v1"
 _ALLOWED_MODES = frozenset({"off", "dry_run", "canary", "full"})
 _SUCCESS_TRANSFER_STATES = frozenset({"success", "succeeded", "repeal_success"})
 _FAILED_TRANSFER_STATES = frozenset({"failed", "rejected", "repeal_failed"})
@@ -211,6 +222,439 @@ def _row_fingerprint(row: Mapping[str, Any], kind: str) -> str:
     return hashlib.sha256(material).hexdigest()
 
 
+def _canonical_trading_day(value: Any) -> str:
+    """验证并返回八位华鑫交易日。
+
+    Args:
+        value: 快照中的交易日。
+
+    Returns:
+        str: ``YYYYMMDD`` 文本。
+
+    Raises:
+        HuaxinAssetConsolidationError: 日期不是八位数字时抛出。
+    """
+
+    trading_day = str(value or "").strip()
+    if len(trading_day) != 8 or not trading_day.isdigit():
+        raise HuaxinAssetConsolidationError("node_asset_trading_day_invalid")
+    return trading_day
+
+
+def _canonical_security_for_digest(row: Mapping[str, Any]) -> str:
+    """把华鑫持仓代码收敛为跨公共/原生字段一致的证券标识。
+
+    Args:
+        row: 公共持仓行或华鑫原生持仓行。
+
+    Returns:
+        str: 规范化证券代码。
+
+    Raises:
+        HuaxinAssetConsolidationError: 证券代码缺失时抛出。
+    """
+
+    raw = str(row.get("security") or row.get("code") or "").strip().upper()
+    exchange = str(row.get("exchange") or row.get("market") or "").strip().upper()
+    if not raw:
+        raise HuaxinAssetConsolidationError("node_asset_security_missing")
+    base, dot, suffix = raw.partition(".")
+    if not base:
+        raise HuaxinAssetConsolidationError("node_asset_security_missing")
+    normalized_suffix = {
+        "SH": "XSHG",
+        "XSHG": "XSHG",
+        "SSE": "XSHG",
+        "SZ": "XSHE",
+        "XSHE": "XSHE",
+        "SZSE": "XSHE",
+    }.get(suffix if dot else "")
+    if normalized_suffix is None:
+        normalized_suffix = {
+            "SH": "XSHG",
+            "XSHG": "XSHG",
+            "SSE": "XSHG",
+            "SZ": "XSHE",
+            "XSHE": "XSHE",
+            "SZSE": "XSHE",
+        }.get(exchange)
+    return f"{base}.{normalized_suffix}" if normalized_suffix else raw
+
+
+def build_huaxin_positions_snapshot_id(
+    trading_day: Any,
+    positions: Sequence[Mapping[str, Any]],
+) -> str:
+    """使用共享 v2 合同生成完整持仓快照 ID。
+
+    Args:
+        trading_day: 八位交易日。
+        positions: 完整持仓序列。
+
+    Returns:
+        str: SHA-256 十六进制摘要。
+
+    Raises:
+        HuaxinAssetConsolidationError: 快照合同不完整时抛出。
+    """
+
+    try:
+        return _strict_positions_snapshot_id(trading_day, positions)
+    except HuaxinNodeAssetDigestError as exc:
+        raise HuaxinAssetConsolidationError(str(exc)) from exc
+
+
+def build_huaxin_node_asset_snapshot_digest(snapshot: Mapping[str, Any]) -> str:
+    """使用共享 v2 合同生成节点资产摘要。
+
+    Args:
+        snapshot: 完整节点资金和持仓快照。
+
+    Returns:
+        str: SHA-256 十六进制摘要。
+
+    Raises:
+        HuaxinAssetConsolidationError: 快照字段缺失或非法时抛出。
+    """
+
+    try:
+        return _strict_node_asset_digest(snapshot)
+    except HuaxinNodeAssetDigestError as exc:
+        raise HuaxinAssetConsolidationError(str(exc)) from exc
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    """计算 JSON 基础类型对象的确定性 SHA-256。
+
+    Args:
+        value: 可被标准 JSON 编码的基础类型对象。
+
+    Returns:
+        str: SHA-256 十六进制摘要。
+    """
+
+    encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _require_sha256(value: Any, *, field_name: str) -> str:
+    """验证必填字段是小写 SHA-256 文本。
+
+    Args:
+        value: 原始摘要值。
+        field_name: 用于错误定位的非敏感字段名。
+
+    Returns:
+        str: 已验证摘要。
+
+    Raises:
+        HuaxinAssetConsolidationError: 长度或字符集非法时抛出。
+    """
+
+    text = str(value or "").strip()
+    if len(text) != 64 or any(char not in "0123456789abcdef" for char in text):
+        raise HuaxinAssetConsolidationError(f"{field_name}_invalid")
+    return text
+
+
+def _snapshot_producer_sha256(snapshot: Mapping[str, Any]) -> str:
+    """验证并摘要外部快照生产者身份。
+
+    Args:
+        snapshot: 含 producer 字段的外部快照。
+
+    Returns:
+        str: 生产者合同的 SHA-256。
+
+    Raises:
+        HuaxinAssetConsolidationError: schema、实例或 Git 来源缺失时抛出。
+    """
+
+    producer = snapshot.get("producer")
+    if not isinstance(producer, Mapping):
+        raise HuaxinAssetConsolidationError("source_snapshot_producer_missing")
+    if str(producer.get("schema") or "") != HUAXIN_NODE_SNAPSHOT_PRODUCER_SCHEMA:
+        raise HuaxinAssetConsolidationError("source_snapshot_producer_schema_invalid")
+    instance_id = str(producer.get("instance_id") or "").strip()
+    git_commit = str(producer.get("git_commit") or "").strip().lower()
+    if not instance_id:
+        raise HuaxinAssetConsolidationError("source_snapshot_producer_instance_missing")
+    if len(git_commit) not in {40, 64} or any(
+        char not in "0123456789abcdef" for char in git_commit
+    ):
+        raise HuaxinAssetConsolidationError("source_snapshot_producer_git_invalid")
+    material = {
+        "schema": HUAXIN_NODE_SNAPSHOT_PRODUCER_SCHEMA,
+        "instance_id": instance_id,
+        "git_commit": git_commit,
+    }
+    digest = _canonical_json_sha256(material)
+    if (
+        _require_sha256(
+            snapshot.get("producer_sha256"),
+            field_name="source_snapshot_producer_sha256",
+        )
+        != digest
+    ):
+        raise HuaxinAssetConsolidationError("source_snapshot_producer_digest_mismatch")
+    return digest
+
+
+def _strict_nonnegative_decimal(value: Any, *, field_name: str) -> Decimal:
+    """解析有限非负资产数值，禁止缺失值默认为零。
+
+    Args:
+        value: 原始数值。
+        field_name: 非敏感字段名。
+
+    Returns:
+        Decimal: 已验证非负数。
+
+    Raises:
+        HuaxinAssetConsolidationError: 缺失、布尔、非有限或负数时抛出。
+    """
+
+    if value in (None, "") or isinstance(value, bool):
+        raise HuaxinAssetConsolidationError(f"{field_name}_invalid")
+    try:
+        parsed = Decimal(str(value))
+    except Exception as exc:
+        raise HuaxinAssetConsolidationError(f"{field_name}_invalid") from exc
+    if not parsed.is_finite() or parsed < 0:
+        raise HuaxinAssetConsolidationError(f"{field_name}_invalid")
+    return parsed
+
+
+def _strict_nonnegative_int(value: Any, *, field_name: str) -> int:
+    """解析有限非负资产整数。
+
+    Args:
+        value: 原始数值。
+        field_name: 非敏感字段名。
+
+    Returns:
+        int: 已验证非负整数。
+
+    Raises:
+        HuaxinAssetConsolidationError: 不是精确非负整数时抛出。
+    """
+
+    parsed = _strict_nonnegative_decimal(value, field_name=field_name)
+    if parsed != parsed.to_integral_value():
+        raise HuaxinAssetConsolidationError(f"{field_name}_invalid")
+    return int(parsed)
+
+
+def _validate_complete_asset_snapshot(snapshot: Mapping[str, Any], *, prefix: str) -> None:
+    """验证归集使用的资金与持仓必填字段。
+
+    Args:
+        snapshot: 单节点完整资产快照。
+        prefix: source/target 错误前缀。
+
+    Returns:
+        None。
+
+    Raises:
+        HuaxinAssetConsolidationError: 查询不完整、字段缺失或数值非法时抛出。
+    """
+
+    if snapshot.get("query_complete") is not True:
+        raise HuaxinAssetConsolidationError(f"{prefix}_snapshot_query_incomplete")
+    account = snapshot.get("account")
+    positions = snapshot.get("positions")
+    if not isinstance(account, Mapping):
+        raise HuaxinAssetConsolidationError(f"{prefix}_snapshot_account_missing")
+    if not isinstance(positions, list) or any(not isinstance(row, Mapping) for row in positions):
+        raise HuaxinAssetConsolidationError(f"{prefix}_snapshot_positions_invalid")
+    for field in ("available_cash", "transferable_cash", "frozen_cash"):
+        _strict_nonnegative_decimal(
+            account.get(field),
+            field_name=f"{prefix}_snapshot_account_{field}",
+        )
+    for index, row in enumerate(positions):
+        for field in (
+            "current_position",
+            "available_position",
+            "history_position",
+            "onroad_position",
+        ):
+            _strict_nonnegative_int(
+                row.get(field),
+                field_name=f"{prefix}_snapshot_position_{index}_{field}",
+            )
+    build_huaxin_node_asset_snapshot_digest(snapshot)
+
+
+def _asset_conservation_material(
+    source: Mapping[str, Any],
+    target: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """生成双端总资产守恒材料。
+
+    Args:
+        source: 源节点完整快照。
+        target: 目标节点完整快照。
+
+    Returns:
+        Dict[str, Any]: 总现金与按证券汇总的总持仓。
+    """
+
+    cash_total = Decimal("0")
+    positions: Dict[str, int] = {}
+    for prefix, snapshot in (("source", source), ("target", target)):
+        _validate_complete_asset_snapshot(snapshot, prefix=prefix)
+        account = snapshot["account"]
+        cash_total += _strict_nonnegative_decimal(
+            account.get("transferable_cash"),
+            field_name=f"{prefix}_snapshot_account_transferable_cash",
+        )
+        cash_total += _strict_nonnegative_decimal(
+            account.get("frozen_cash"),
+            field_name=f"{prefix}_snapshot_account_frozen_cash",
+        )
+        for row in snapshot["positions"]:
+            security = _canonical_security_for_digest(row)
+            positions[security] = positions.get(security, 0) + _strict_nonnegative_int(
+                row.get("current_position"),
+                field_name=f"{prefix}_snapshot_position_current",
+            )
+    return {
+        "cash_total": format(cash_total.quantize(Decimal("0.01")), "f"),
+        "positions": dict(sorted(positions.items())),
+    }
+
+
+def _snapshot_has_any_asset(snapshot: Mapping[str, Any], *, prefix: str) -> bool:
+    """判断完整快照是否至少含一项正资产。
+
+    Args:
+        snapshot: 已验证完整节点快照。
+        prefix: 错误字段前缀。
+
+    Returns:
+        bool: 现金、冻结资金或当前持仓任一为正时返回 True。
+    """
+
+    _validate_complete_asset_snapshot(snapshot, prefix=prefix)
+    account = snapshot["account"]
+    if (
+        _strict_nonnegative_decimal(
+            account.get("transferable_cash"),
+            field_name=f"{prefix}_snapshot_account_transferable_cash",
+        )
+        > 0
+        or _strict_nonnegative_decimal(
+            account.get("frozen_cash"),
+            field_name=f"{prefix}_snapshot_account_frozen_cash",
+        )
+        > 0
+    ):
+        return True
+    return any(
+        _strict_nonnegative_int(
+            row.get("current_position"),
+            field_name=f"{prefix}_snapshot_position_current",
+        )
+        > 0
+        for row in snapshot["positions"]
+    )
+
+
+def _source_nontransferable_residual_material(
+    source: Mapping[str, Any],
+) -> Dict[str, Any]:
+    """生成源端不可划残留的逐项、脱敏机器证明。
+
+    Args:
+        source: 已完成查询的源节点资产快照。
+
+    Returns:
+        Dict[str, Any]: 不含账户明文的资金与证券不可划原因材料。
+
+    Raises:
+        HuaxinAssetConsolidationError: 仍有可划资产、数量关系非法或残留无法解释时抛出。
+    """
+
+    _validate_complete_asset_snapshot(source, prefix="source")
+    account = source["account"]
+    available_cash = _strict_nonnegative_decimal(
+        account.get("available_cash"),
+        field_name="source_snapshot_account_available_cash",
+    )
+    transferable_cash = _strict_nonnegative_decimal(
+        account.get("transferable_cash"),
+        field_name="source_snapshot_account_transferable_cash",
+    )
+    frozen_cash = _strict_nonnegative_decimal(
+        account.get("frozen_cash"),
+        field_name="source_snapshot_account_frozen_cash",
+    )
+    if transferable_cash > Decimal("0.01"):
+        raise HuaxinAssetConsolidationError("source_transferable_cash_residual")
+    if transferable_cash > available_cash + Decimal("0.01"):
+        raise HuaxinAssetConsolidationError("source_cash_relation_invalid")
+
+    cash_items: List[Dict[str, str]] = []
+    unavailable_cash = max(Decimal("0"), available_cash - transferable_cash)
+    if unavailable_cash > Decimal("0.01"):
+        cash_items.append(
+            {
+                "reason": "available_but_not_transferable",
+                "amount": format(unavailable_cash.quantize(Decimal("0.01")), "f"),
+            }
+        )
+    if frozen_cash > Decimal("0.01"):
+        cash_items.append(
+            {
+                "reason": "frozen_cash",
+                "amount": format(frozen_cash.quantize(Decimal("0.01")), "f"),
+            }
+        )
+
+    position_items: List[Dict[str, Any]] = []
+    for index, row in enumerate(source["positions"]):
+        current = _strict_nonnegative_int(
+            row.get("current_position"),
+            field_name=f"source_snapshot_position_{index}_current_position",
+        )
+        available = _strict_nonnegative_int(
+            row.get("available_position"),
+            field_name=f"source_snapshot_position_{index}_available_position",
+        )
+        onroad = _strict_nonnegative_int(
+            row.get("onroad_position"),
+            field_name=f"source_snapshot_position_{index}_onroad_position",
+        )
+        if available > current:
+            raise HuaxinAssetConsolidationError("source_position_relation_invalid")
+        if available > 0:
+            raise HuaxinAssetConsolidationError("source_available_position_residual")
+        unavailable = current - available
+        reasons: List[Dict[str, Any]] = []
+        if unavailable > 0:
+            reasons.append({"reason": "current_but_not_available", "volume": unavailable})
+        if onroad > 0:
+            reasons.append({"reason": "onroad_position", "volume": onroad})
+        if (current > 0 or onroad > 0) and not reasons:
+            raise HuaxinAssetConsolidationError("source_position_residual_reason_missing")
+        if reasons:
+            position_items.append(
+                {
+                    "security": _canonical_security_for_digest(row),
+                    "row_fingerprint": _row_fingerprint(row, "position"),
+                    "reasons": reasons,
+                }
+            )
+
+    position_items.sort(key=lambda row: (row["security"], row["row_fingerprint"]))
+    return {
+        "schema": "huaxin-node14-nontransferable-residual/v1",
+        "cash": cash_items,
+        "positions": position_items,
+    }
+
+
 def _position_key(row: Mapping[str, Any]) -> str:
     """生成不含股东账号的证券资产匹配键。
 
@@ -263,6 +707,7 @@ class HuaxinAssetConsolidationConfig:
     source_host: str = ""
     target_host: str = ""
     earliest_time: clock_time = clock_time(9, 0)
+    completion_cutoff_time: clock_time = clock_time(9, 25)
     snapshot_max_age_seconds: float = 120.0
     stable_samples: int = 2
     stable_interval_seconds: float = 5.0
@@ -310,6 +755,10 @@ class HuaxinAssetConsolidationConfig:
             "source_host": get_env("HUAXIN_ASSET_CONSOLIDATION_SOURCE_HOST"),
             "target_host": get_env("HUAXIN_ASSET_CONSOLIDATION_TARGET_HOST"),
             "earliest_time": get_env("HUAXIN_ASSET_CONSOLIDATION_EARLIEST_TIME", "09:00:00"),
+            "completion_cutoff_time": get_env(
+                "HUAXIN_ASSET_CONSOLIDATION_COMPLETION_CUTOFF_TIME",
+                "09:25:00",
+            ),
             "snapshot_max_age_seconds": get_env(
                 "HUAXIN_ASSET_CONSOLIDATION_SNAPSHOT_MAX_AGE_SECONDS"
             ),
@@ -382,6 +831,12 @@ class HuaxinAssetConsolidationConfig:
         source_snapshot_path = values.get("source_snapshot_path")
         if source_mode == "external_snapshot":
             source_snapshot_path = required_text("source_snapshot_path")
+        earliest_time = _parse_clock(str(values.get("earliest_time") or "09:00:00"))
+        completion_cutoff_time = _parse_clock(
+            str(values.get("completion_cutoff_time") or "09:25:00")
+        )
+        if completion_cutoff_time <= earliest_time:
+            raise ValueError("completion_cutoff_time 必须晚于 earliest_time")
         return cls(
             mode=mode,
             source_mode=source_mode,
@@ -395,7 +850,8 @@ class HuaxinAssetConsolidationConfig:
             target_role=required_text("target_role"),
             source_host=source_host,
             target_host=target_host,
-            earliest_time=_parse_clock(str(values.get("earliest_time") or "09:00:00")),
+            earliest_time=earliest_time,
+            completion_cutoff_time=completion_cutoff_time,
             snapshot_max_age_seconds=_parse_nonnegative_float(
                 values.get("snapshot_max_age_seconds"), "snapshot_max_age_seconds", 120.0
             ),
@@ -640,6 +1096,8 @@ class HuaxinAssetConsolidationCoordinator:
         self._observed_fingerprint: Optional[str] = None
         self._observed_source_time: Optional[datetime] = None
         self._stable_count = 0
+        self._last_source_generation: Optional[int] = None
+        self._last_source_snapshot_id: Optional[str] = None
 
     def _unsupported_direct_snapshot(self) -> Mapping[str, Any]:
         """在 direct session provider 尚未注入时保持失败关闭。
@@ -762,7 +1220,8 @@ class HuaxinAssetConsolidationCoordinator:
         now = self._clock()
         if now.tzinfo is None:
             raise HuaxinAssetConsolidationError("协调器 clock 必须返回带时区时间")
-        if now.timetz().replace(tzinfo=None) < self.config.earliest_time:
+        wall_time = now.timetz().replace(tzinfo=None)
+        if wall_time < self.config.earliest_time:
             raise HuaxinAssetConsolidationWaiting("before_earliest_time")
 
         source = dict(self._source_snapshot_provider())
@@ -774,6 +1233,8 @@ class HuaxinAssetConsolidationCoordinator:
 
         plan = self._store.load_day(trading_day)
         if plan is None:
+            if wall_time > self.config.completion_cutoff_time:
+                raise HuaxinAssetConsolidationError("completion_cutoff_exceeded")
             if not self._observe_stability(source, target, source_time):
                 self._set_health("observing", "stable_samples_pending", trading_day=trading_day)
                 return
@@ -782,10 +1243,39 @@ class HuaxinAssetConsolidationCoordinator:
         else:
             self._validate_existing_plan(plan, trading_day)
 
+        if plan.get("state") != "complete" and wall_time > self.config.completion_cutoff_time:
+            raise HuaxinAssetConsolidationError("completion_cutoff_exceeded")
+        self._validate_source_replay_against_plan(plan, source)
+
         self._publish_plan_health(plan)
         if plan.get("state") == "complete":
-            if self._source_has_transferable_assets(source):
-                raise HuaxinAssetConsolidationError("complete_plan_has_new_source_residual")
+            try:
+                if self._source_has_transferable_assets(source):
+                    raise HuaxinAssetConsolidationError("complete_plan_has_new_source_residual")
+                self._assert_no_pending_transfers(broker, plan)
+                if self._validate_final_conservation(plan, source, target) != str(
+                    plan.get("conservation_sha256") or ""
+                ):
+                    raise HuaxinAssetConsolidationError("complete_plan_conservation_digest_drift")
+                residual_material = _source_nontransferable_residual_material(source)
+                if _canonical_json_sha256(residual_material) != str(
+                    plan.get("source_nontransferable_residual_sha256") or ""
+                ):
+                    raise HuaxinAssetConsolidationError("complete_plan_source_residual_drift")
+                ready = plan.get("ready_evidence")
+                if not isinstance(ready, Mapping) or (
+                    build_huaxin_node_asset_snapshot_digest(target)
+                    != str(ready.get("target_snapshot_sha256") or "")
+                ):
+                    raise HuaxinAssetConsolidationError("complete_plan_target_snapshot_drift")
+            except HuaxinAssetConsolidationError as exc:
+                plan["state"] = "blocked"
+                plan["reason"] = f"ready_invalidated:{exc}"
+                plan["updated_at"] = _now_iso(now)
+                plan.pop("ready_evidence", None)
+                self._store.save_day(plan)
+                self._publish_plan_health(plan)
+                raise
             return
         if plan.get("state") in {"canary_complete", "dry_run"}:
             return
@@ -794,7 +1284,7 @@ class HuaxinAssetConsolidationCoordinator:
             raise HuaxinAssetConsolidationError("计划 actions 元素必须为对象")
         current = next((row for row in actions if row.get("state") != "succeeded"), None)
         if current is None:
-            self._finish_plan(plan, source, target, now)
+            self._finish_plan(broker, plan, source, target, now)
             return
 
         action_state = str(current.get("state") or "")
@@ -832,7 +1322,11 @@ class HuaxinAssetConsolidationCoordinator:
             HuaxinAssetConsolidationWaiting: 快照过期时抛出。
         """
 
-        if snapshot.get("schema_version") != 1 or snapshot.get("state") != "captured":
+        if (
+            snapshot.get("schema_version") != 2
+            or snapshot.get("snapshot_schema") != HUAXIN_NODE_SNAPSHOT_SCHEMA
+            or snapshot.get("state") != "captured"
+        ):
             raise HuaxinAssetConsolidationError("source_snapshot_schema_invalid")
         if str(snapshot.get("role") or "") != self.config.source_role:
             raise HuaxinAssetConsolidationError("source_snapshot_role_mismatch")
@@ -850,10 +1344,39 @@ class HuaxinAssetConsolidationCoordinator:
         if age > self.config.snapshot_max_age_seconds:
             raise HuaxinAssetConsolidationWaiting("source_snapshot_stale")
         self._validate_snapshot_node_provenance(snapshot, self.config.source_node_id)
-        if not isinstance(snapshot.get("account"), Mapping):
-            raise HuaxinAssetConsolidationError("source_snapshot_account_missing")
-        if not isinstance(snapshot.get("positions"), list):
-            raise HuaxinAssetConsolidationError("source_snapshot_positions_invalid")
+        _validate_complete_asset_snapshot(snapshot, prefix="source")
+        snapshot_id = _require_sha256(
+            snapshot.get("snapshot_id"),
+            field_name="source_snapshot_id",
+        )
+        if snapshot_id != build_huaxin_node_asset_snapshot_digest(snapshot):
+            raise HuaxinAssetConsolidationError("source_snapshot_digest_mismatch")
+        if (
+            _require_sha256(
+                snapshot.get("snapshot_digest_sha256"),
+                field_name="source_snapshot_digest",
+            )
+            != snapshot_id
+        ):
+            raise HuaxinAssetConsolidationError("source_snapshot_digest_field_mismatch")
+        generation = _strict_nonnegative_int(
+            snapshot.get("snapshot_generation"),
+            field_name="source_snapshot_generation",
+        )
+        if generation <= 0:
+            raise HuaxinAssetConsolidationError("source_snapshot_generation_invalid")
+        producer_sha256 = _snapshot_producer_sha256(snapshot)
+        if self._last_source_generation is not None:
+            if generation < self._last_source_generation:
+                raise HuaxinAssetConsolidationError("source_snapshot_generation_replayed")
+            if (
+                generation == self._last_source_generation
+                and snapshot_id != self._last_source_snapshot_id
+            ):
+                raise HuaxinAssetConsolidationError("source_snapshot_generation_conflict")
+        self._last_source_generation = generation
+        self._last_source_snapshot_id = snapshot_id
+        snapshot["producer_sha256"] = producer_sha256
         if not isinstance(snapshot.get("shareholder_accounts"), list):
             raise HuaxinAssetConsolidationError("source_snapshot_shareholders_invalid")
         return captured_at
@@ -942,8 +1465,10 @@ class HuaxinAssetConsolidationCoordinator:
         if len(trading_day) != 8 or not trading_day.isdigit():
             raise HuaxinAssetConsolidationError("target_trading_day_invalid")
         snapshot = {
-            "schema_version": 1,
+            "schema_version": 2,
+            "snapshot_schema": HUAXIN_NODE_SNAPSHOT_SCHEMA,
             "state": "captured",
+            "query_complete": True,
             "role": self.config.target_role,
             "host": actual_host,
             "node_id": self.config.target_node_id,
@@ -956,7 +1481,65 @@ class HuaxinAssetConsolidationCoordinator:
             "shareholder_accounts": list(broker.get_shareholder_accounts(refresh=True) or []),
         }
         self._validate_snapshot_node_provenance(snapshot, self.config.target_node_id)
+        _validate_complete_asset_snapshot(snapshot, prefix="target")
+        snapshot["snapshot_id"] = build_huaxin_node_asset_snapshot_digest(snapshot)
+        snapshot["snapshot_digest_sha256"] = snapshot["snapshot_id"]
         return snapshot
+
+    def _validate_source_replay_against_plan(
+        self,
+        plan: MutableMapping[str, Any],
+        source: Mapping[str, Any],
+    ) -> None:
+        """把外部源快照与已持久化的生产者代次绑定。
+
+        Args:
+            plan: 当日持久归集计划。
+            source: 本轮已验证源快照。
+
+        Returns:
+            None。
+
+        Raises:
+            HuaxinAssetConsolidationError: 生产者变更、代次回退或同代摘要冲突时抛出。
+
+        Side Effects:
+            对未完成计划更新内存中最新源快照代次；后续状态写入时一并落盘。
+        """
+
+        current_generation = _strict_nonnegative_int(
+            source.get("snapshot_generation"),
+            field_name="source_snapshot_generation",
+        )
+        current_snapshot_id = _require_sha256(
+            source.get("snapshot_id"),
+            field_name="source_snapshot_id",
+        )
+        current_producer = _require_sha256(
+            source.get("producer_sha256"),
+            field_name="source_snapshot_producer_sha256",
+        )
+        stored_generation = _strict_nonnegative_int(
+            plan.get("last_source_snapshot_generation"),
+            field_name="plan_source_snapshot_generation",
+        )
+        stored_snapshot_id = _require_sha256(
+            plan.get("last_source_snapshot_id"),
+            field_name="plan_source_snapshot_id",
+        )
+        stored_producer = _require_sha256(
+            plan.get("source_producer_sha256"),
+            field_name="plan_source_producer_sha256",
+        )
+        if current_producer != stored_producer:
+            raise HuaxinAssetConsolidationError("source_snapshot_producer_changed")
+        if current_generation < stored_generation:
+            raise HuaxinAssetConsolidationError("source_snapshot_generation_replayed")
+        if current_generation == stored_generation and current_snapshot_id != stored_snapshot_id:
+            raise HuaxinAssetConsolidationError("source_snapshot_generation_conflict")
+        if plan.get("state") != "complete" and current_generation > stored_generation:
+            plan["last_source_snapshot_generation"] = current_generation
+            plan["last_source_snapshot_id"] = current_snapshot_id
 
     def _observe_stability(
         self,
@@ -1162,6 +1745,10 @@ class HuaxinAssetConsolidationCoordinator:
                         "state": "planned",
                     }
                 )
+        if not actions:
+            raise HuaxinAssetConsolidationError(
+                "zero_action_plan_cannot_prove_14_to_16_consolidation"
+            )
         frozen_cash = _as_float(source_account.get("frozen_cash"))
         frozen_positions = sum(
             max(0, _as_int(row.get("current_position")) - _as_int(row.get("available_position")))
@@ -1179,6 +1766,19 @@ class HuaxinAssetConsolidationCoordinator:
             "updated_at": _now_iso(now),
             "source_snapshot_at": source.get("captured_at"),
             "target_snapshot_at": target.get("captured_at"),
+            "source_producer_sha256": _require_sha256(
+                source.get("producer_sha256"),
+                field_name="source_snapshot_producer_sha256",
+            ),
+            "last_source_snapshot_generation": _strict_nonnegative_int(
+                source.get("snapshot_generation"),
+                field_name="source_snapshot_generation",
+            ),
+            "last_source_snapshot_id": _require_sha256(
+                source.get("snapshot_id"),
+                field_name="source_snapshot_id",
+            ),
+            "conservation_baseline": _asset_conservation_material(source, target),
             "actions": actions,
             "residuals": {
                 "source_frozen_cash": frozen_cash,
@@ -1281,6 +1881,127 @@ class HuaxinAssetConsolidationCoordinator:
             raise HuaxinAssetConsolidationError("existing_plan_apply_serial_invalid")
         if len(set(serials)) != len(serials):
             raise HuaxinAssetConsolidationError("existing_plan_apply_serial_duplicated")
+        state = str(plan.get("state") or "")
+        if state == "complete":
+            self._validate_existing_ready_evidence(plan)
+        elif plan.get("ready_evidence") is not None:
+            raise HuaxinAssetConsolidationError("non_complete_plan_carries_ready_evidence")
+
+    def _validate_existing_ready_evidence(self, plan: Mapping[str, Any]) -> None:
+        """验证重启加载的 complete 计划仍携带自洽 READY 证据。
+
+        Args:
+            plan: 已通过基础 schema、日期和节点校验的持久计划。
+
+        Returns:
+            None。
+
+        Raises:
+            HuaxinAssetConsolidationError: READY 缺失、字段漂移或摘要不自洽时抛出。
+        """
+
+        ready = plan.get("ready_evidence")
+        if not isinstance(ready, Mapping):
+            raise HuaxinAssetConsolidationError("existing_complete_plan_ready_evidence_missing")
+        required_sha_fields = (
+            "plan_id_sha256",
+            "source_snapshot_sha256",
+            "source_snapshot_id",
+            "source_producer_sha256",
+            "target_snapshot_sha256",
+            "target_snapshot_id",
+            "target_positions_snapshot_id",
+            "actions_sha256",
+            "conservation_sha256",
+            "source_nontransferable_residual_sha256",
+            "generation",
+            "fencing_token",
+        )
+        if any(len(str(ready.get(field) or "")) != 64 for field in required_sha_fields):
+            raise HuaxinAssetConsolidationError("existing_ready_evidence_digest_invalid")
+        if ready.get("schema") != HUAXIN_NODE16_READY_SCHEMA:
+            raise HuaxinAssetConsolidationError("existing_ready_evidence_schema_invalid")
+        if ready.get("state") != "ready" or ready.get("mode") != "full":
+            raise HuaxinAssetConsolidationError("existing_ready_evidence_state_invalid")
+        if ready.get("query_complete") is not True or ready.get("pending_transfer_count") != 0:
+            raise HuaxinAssetConsolidationError("existing_ready_evidence_query_incomplete")
+        if self.config.mode != "full":
+            raise HuaxinAssetConsolidationError("existing_ready_evidence_mode_mismatch")
+        if str(ready.get("trading_day") or "") != str(plan.get("trading_day") or ""):
+            raise HuaxinAssetConsolidationError("existing_ready_evidence_day_mismatch")
+        if _as_int(ready.get("source_node_id"), -1) != self.config.source_node_id:
+            raise HuaxinAssetConsolidationError("existing_ready_evidence_source_node_mismatch")
+        if _as_int(ready.get("target_node_id"), -1) != self.config.target_node_id:
+            raise HuaxinAssetConsolidationError("existing_ready_evidence_target_node_mismatch")
+        if str(ready.get("source_role") or "") != self.config.source_role:
+            raise HuaxinAssetConsolidationError("existing_ready_evidence_source_role_mismatch")
+        if str(ready.get("target_role") or "") != self.config.target_role:
+            raise HuaxinAssetConsolidationError("existing_ready_evidence_target_role_mismatch")
+        if not str(ready.get("source_node_provenance") or "").strip():
+            raise HuaxinAssetConsolidationError("existing_ready_evidence_source_provenance_missing")
+        if not str(ready.get("target_node_provenance") or "").strip():
+            raise HuaxinAssetConsolidationError("existing_ready_evidence_target_provenance_missing")
+        actions = [dict(row) for row in plan.get("actions") or []]
+        if not actions or int(ready.get("action_count") or 0) != len(actions):
+            raise HuaxinAssetConsolidationError("existing_ready_evidence_action_count_invalid")
+        if any(str(row.get("state") or "") != "succeeded" for row in actions):
+            raise HuaxinAssetConsolidationError("existing_ready_evidence_action_incomplete")
+        plan_id_sha256 = hashlib.sha256(str(plan.get("plan_id") or "").encode("utf-8")).hexdigest()
+        actions_sha256 = _canonical_json_sha256(actions)
+        if str(ready.get("plan_id_sha256")) != plan_id_sha256:
+            raise HuaxinAssetConsolidationError("existing_ready_evidence_plan_digest_mismatch")
+        if str(ready.get("actions_sha256")) != actions_sha256:
+            raise HuaxinAssetConsolidationError("existing_ready_evidence_actions_digest_mismatch")
+        residual_material = plan.get("source_nontransferable_residuals")
+        if not isinstance(residual_material, Mapping):
+            raise HuaxinAssetConsolidationError("existing_ready_source_residuals_missing")
+        residual_sha256 = _canonical_json_sha256(residual_material)
+        if str(ready.get("source_nontransferable_residual_sha256")) != residual_sha256:
+            raise HuaxinAssetConsolidationError("existing_ready_source_residual_digest_mismatch")
+        if str(plan.get("source_nontransferable_residual_sha256")) != residual_sha256:
+            raise HuaxinAssetConsolidationError("existing_plan_source_residual_digest_mismatch")
+        if str(ready.get("source_snapshot_sha256")) != str(ready.get("source_snapshot_id")):
+            raise HuaxinAssetConsolidationError("existing_ready_evidence_source_snapshot_mismatch")
+        if str(ready.get("target_snapshot_sha256")) != str(ready.get("target_snapshot_id")):
+            raise HuaxinAssetConsolidationError("existing_ready_evidence_target_snapshot_mismatch")
+        source_snapshot_generation = _strict_nonnegative_int(
+            ready.get("source_snapshot_generation"),
+            field_name="existing_ready_source_snapshot_generation",
+        )
+        if source_snapshot_generation <= 0:
+            raise HuaxinAssetConsolidationError("existing_ready_source_snapshot_generation_invalid")
+        cutoff = str(ready.get("completion_cutoff_time") or "")
+        if cutoff != self.config.completion_cutoff_time.isoformat():
+            raise HuaxinAssetConsolidationError("existing_ready_completion_cutoff_mismatch")
+        completed_at = _parse_datetime(ready.get("completed_at"))
+        if completed_at.timetz().replace(tzinfo=None) > self.config.completion_cutoff_time:
+            raise HuaxinAssetConsolidationError("existing_ready_completed_after_cutoff")
+        generation = _canonical_json_sha256(
+            {
+                "schema": HUAXIN_NODE16_READY_SCHEMA,
+                "trading_day": ready.get("trading_day"),
+                "source_node_id": ready.get("source_node_id"),
+                "target_node_id": ready.get("target_node_id"),
+                "plan_id_sha256": plan_id_sha256,
+                "source_snapshot_generation": source_snapshot_generation,
+                "source_snapshot_id": ready.get("source_snapshot_id"),
+                "source_producer_sha256": ready.get("source_producer_sha256"),
+                "target_snapshot_sha256": ready.get("target_snapshot_sha256"),
+                "conservation_sha256": ready.get("conservation_sha256"),
+                "source_nontransferable_residual_sha256": residual_sha256,
+            }
+        )
+        if str(ready.get("generation")) != generation:
+            raise HuaxinAssetConsolidationError("existing_ready_evidence_generation_mismatch")
+        fencing_token = _canonical_json_sha256(
+            {
+                "generation": generation,
+                "actions_sha256": actions_sha256,
+                "completed_at": ready.get("completed_at"),
+            }
+        )
+        if str(ready.get("fencing_token")) != fencing_token:
+            raise HuaxinAssetConsolidationError("existing_ready_evidence_fencing_mismatch")
 
     def _find_source_row(
         self, source: Mapping[str, Any], action: Mapping[str, Any]
@@ -1374,8 +2095,88 @@ class HuaxinAssetConsolidationCoordinator:
             for row in source.get("positions") or []
         )
 
+    def _assert_no_pending_transfers(
+        self,
+        broker: Any,
+        plan: Mapping[str, Any],
+    ) -> None:
+        """确认目标会话可见的资金和证券划拨均已终态。
+
+        Args:
+            broker: 目标节点唯一 writer 查询会话。
+            plan: 当日冻结计划，用于逐 ApplySerial 复查。
+
+        Returns:
+            None。
+
+        Raises:
+            HuaxinAssetConsolidationError: 查询结果非列表、行非对象或任一划拨未进入明确终态时抛出。
+
+        Side Effects:
+            各执行一次柜台资金和证券划拨明细只读查询。
+        """
+
+        for action in plan.get("actions") or []:
+            if not isinstance(action, Mapping):
+                raise HuaxinAssetConsolidationError("ready_transfer_action_invalid")
+            if self._query_action_fact(broker, action) != "succeeded":
+                raise HuaxinAssetConsolidationError(
+                    "ready_transfer_detail_missing_or_not_succeeded"
+                )
+        terminal_states = _SUCCESS_TRANSFER_STATES | _FAILED_TRANSFER_STATES
+        for kind, method in (
+            ("fund", broker.get_fund_transfer_details),
+            ("position", broker.get_position_transfer_details),
+        ):
+            rows = method({})
+            if not isinstance(rows, list) or any(not isinstance(row, Mapping) for row in rows):
+                raise HuaxinAssetConsolidationError(f"{kind}_transfer_detail_query_incomplete")
+            for row in rows:
+                state = str(row.get("transfer_status") or "").strip().lower()
+                if state not in terminal_states:
+                    raise HuaxinAssetConsolidationError(f"{kind}_transfer_pending_or_unknown")
+
+    def _validate_final_conservation(
+        self,
+        plan: Mapping[str, Any],
+        source: Mapping[str, Any],
+        target: Mapping[str, Any],
+    ) -> str:
+        """确认最终双端资金和持仓总量与计划基线守恒。
+
+        Args:
+            plan: 当日持久计划。
+            source: 最终源节点完整快照。
+            target: 最终目标节点完整快照。
+
+        Returns:
+            str: 守恒材料 SHA-256。
+
+        Raises:
+            HuaxinAssetConsolidationError: 基线缺失或现金/持仓总量漂移时抛出。
+        """
+
+        baseline = plan.get("conservation_baseline")
+        if not isinstance(baseline, Mapping):
+            raise HuaxinAssetConsolidationError("conservation_baseline_missing")
+        current = _asset_conservation_material(source, target)
+        try:
+            baseline_cash = Decimal(str(baseline.get("cash_total")))
+            current_cash = Decimal(str(current.get("cash_total")))
+        except Exception as exc:
+            raise HuaxinAssetConsolidationError("conservation_cash_invalid") from exc
+        if not baseline_cash.is_finite() or abs(baseline_cash - current_cash) > Decimal("0.01"):
+            raise HuaxinAssetConsolidationError("source_target_cash_conservation_mismatch")
+        baseline_positions = baseline.get("positions")
+        if not isinstance(baseline_positions, Mapping):
+            raise HuaxinAssetConsolidationError("conservation_positions_invalid")
+        if dict(baseline_positions) != dict(current["positions"]):
+            raise HuaxinAssetConsolidationError("source_target_position_conservation_mismatch")
+        return _canonical_json_sha256(current)
+
     def _finish_plan(
         self,
+        broker: Any,
         plan: MutableMapping[str, Any],
         source: Mapping[str, Any],
         target: Mapping[str, Any],
@@ -1384,6 +2185,7 @@ class HuaxinAssetConsolidationCoordinator:
         """在全部动作已逐项对账后执行最终源端残留复查。
 
         Args:
+            broker: 目标节点唯一 writer 查询会话。
             plan: 可变当日计划。
             source: 最新源端快照。
             target: 最新目标端快照。
@@ -1399,7 +2201,6 @@ class HuaxinAssetConsolidationCoordinator:
             原子持久化 complete 或 canary_complete 状态。
         """
 
-        del target
         if self.config.mode == "canary":
             plan["state"] = "canary_complete"
             plan["reason"] = "canary_reconciled_full_mode_not_authorized"
@@ -1408,10 +2209,181 @@ class HuaxinAssetConsolidationCoordinator:
         else:
             plan["state"] = "complete"
             plan.pop("reason", None)
+        if now.timetz().replace(tzinfo=None) > self.config.completion_cutoff_time:
+            raise HuaxinAssetConsolidationError("completion_cutoff_exceeded")
+        if plan["state"] == "complete":
+            self._assert_no_pending_transfers(broker, plan)
+            plan["conservation_sha256"] = self._validate_final_conservation(
+                plan,
+                source,
+                target,
+            )
+            residual_material = _source_nontransferable_residual_material(source)
+            plan["source_nontransferable_residuals"] = residual_material
+            plan["source_nontransferable_residual_sha256"] = _canonical_json_sha256(
+                residual_material
+            )
         plan["completed_at"] = _now_iso(now)
         plan["updated_at"] = _now_iso(now)
+        if plan["state"] == "complete":
+            plan["ready_evidence"] = self._build_ready_evidence(
+                plan=plan,
+                source=source,
+                target=target,
+            )
+        else:
+            plan.pop("ready_evidence", None)
         self._store.save_day(plan)
         self._publish_plan_health(plan)
+
+    def _build_ready_evidence(
+        self,
+        *,
+        plan: Mapping[str, Any],
+        source: Mapping[str, Any],
+        target: Mapping[str, Any],
+    ) -> Dict[str, Any]:
+        """从最终双端快照构造 full-complete READY 证据。
+
+        Args:
+            plan: 全部动作完成后的持久计划。
+            source: 最终源节点完整快照。
+            target: 最终目标节点完整快照。
+
+        Returns:
+            Dict[str, Any]: 不含身份明文的版本化 READY 证据。
+
+        Raises:
+            HuaxinAssetConsolidationError: 模式、方向、动作或快照不满足时抛出。
+        """
+
+        if self.config.mode != "full" or plan.get("state") != "complete":
+            raise HuaxinAssetConsolidationError("ready_evidence_requires_full_complete")
+        trading_day = _canonical_trading_day(plan.get("trading_day"))
+        if _canonical_trading_day(source.get("trading_day")) != trading_day:
+            raise HuaxinAssetConsolidationError("ready_evidence_source_day_mismatch")
+        if _canonical_trading_day(target.get("trading_day")) != trading_day:
+            raise HuaxinAssetConsolidationError("ready_evidence_target_day_mismatch")
+        if _as_int(source.get("node_id"), -1) != self.config.source_node_id:
+            raise HuaxinAssetConsolidationError("ready_evidence_source_node_mismatch")
+        if _as_int(target.get("node_id"), -1) != self.config.target_node_id:
+            raise HuaxinAssetConsolidationError("ready_evidence_target_node_mismatch")
+        if str(source.get("role") or "") != self.config.source_role:
+            raise HuaxinAssetConsolidationError("ready_evidence_source_role_mismatch")
+        if str(target.get("role") or "") != self.config.target_role:
+            raise HuaxinAssetConsolidationError("ready_evidence_target_role_mismatch")
+        actions = [dict(row) for row in plan.get("actions") or [] if isinstance(row, Mapping)]
+        if len(actions) != len(plan.get("actions") or []):
+            raise HuaxinAssetConsolidationError("ready_evidence_actions_invalid")
+        if not actions:
+            raise HuaxinAssetConsolidationError("ready_evidence_zero_actions_rejected")
+        if any(str(row.get("state") or "") != "succeeded" for row in actions):
+            raise HuaxinAssetConsolidationError("ready_evidence_action_incomplete")
+        if any(
+            row.get("reconciled_at") in (None, "")
+            or row.get("source_after") is None
+            or row.get("target_after") is None
+            for row in actions
+        ):
+            raise HuaxinAssetConsolidationError("ready_evidence_action_reconciliation_missing")
+        if self._source_has_transferable_assets(source):
+            raise HuaxinAssetConsolidationError("ready_evidence_source_residual")
+        if source.get("query_complete") is not True or target.get("query_complete") is not True:
+            raise HuaxinAssetConsolidationError("ready_evidence_query_incomplete")
+        if not _snapshot_has_any_asset(target, prefix="target"):
+            raise HuaxinAssetConsolidationError("ready_evidence_empty_target_rejected")
+        conservation_sha256 = _require_sha256(
+            plan.get("conservation_sha256"),
+            field_name="ready_evidence_conservation",
+        )
+        residual_material = plan.get("source_nontransferable_residuals")
+        if not isinstance(residual_material, Mapping):
+            raise HuaxinAssetConsolidationError("ready_evidence_source_residuals_missing")
+        source_nontransferable_residual_sha256 = _require_sha256(
+            plan.get("source_nontransferable_residual_sha256"),
+            field_name="ready_evidence_source_nontransferable_residual",
+        )
+        if source_nontransferable_residual_sha256 != _canonical_json_sha256(residual_material):
+            raise HuaxinAssetConsolidationError("ready_evidence_source_residual_digest_mismatch")
+
+        source_snapshot_sha256 = build_huaxin_node_asset_snapshot_digest(source)
+        target_snapshot_sha256 = build_huaxin_node_asset_snapshot_digest(target)
+        source_snapshot_id = _require_sha256(
+            source.get("snapshot_id"),
+            field_name="ready_evidence_source_snapshot_id",
+        )
+        if source_snapshot_id != source_snapshot_sha256:
+            raise HuaxinAssetConsolidationError("ready_evidence_source_snapshot_id_mismatch")
+        source_snapshot_generation = _strict_nonnegative_int(
+            source.get("snapshot_generation"),
+            field_name="ready_evidence_source_snapshot_generation",
+        )
+        source_producer_sha256 = _require_sha256(
+            source.get("producer_sha256"),
+            field_name="ready_evidence_source_producer",
+        )
+        target_positions_snapshot_id = build_huaxin_positions_snapshot_id(
+            trading_day,
+            [dict(row) for row in target.get("positions") or []],
+        )
+        plan_id_sha256 = hashlib.sha256(str(plan.get("plan_id") or "").encode("utf-8")).hexdigest()
+        actions_sha256 = _canonical_json_sha256(actions)
+        generation = _canonical_json_sha256(
+            {
+                "schema": HUAXIN_NODE16_READY_SCHEMA,
+                "trading_day": trading_day,
+                "source_node_id": self.config.source_node_id,
+                "target_node_id": self.config.target_node_id,
+                "plan_id_sha256": plan_id_sha256,
+                "source_snapshot_generation": source_snapshot_generation,
+                "source_snapshot_id": source_snapshot_id,
+                "source_producer_sha256": source_producer_sha256,
+                "target_snapshot_sha256": target_snapshot_sha256,
+                "conservation_sha256": conservation_sha256,
+                "source_nontransferable_residual_sha256": (source_nontransferable_residual_sha256),
+            }
+        )
+        completed_at = str(plan.get("completed_at") or "")
+        fencing_token = _canonical_json_sha256(
+            {
+                "generation": generation,
+                "actions_sha256": actions_sha256,
+                "completed_at": completed_at,
+            }
+        )
+        return {
+            "schema": HUAXIN_NODE16_READY_SCHEMA,
+            "state": "ready",
+            "mode": "full",
+            "trading_day": trading_day,
+            "source_node_id": self.config.source_node_id,
+            "target_node_id": self.config.target_node_id,
+            "source_role": self.config.source_role,
+            "target_role": self.config.target_role,
+            "source_node_provenance": str((source.get("node") or {}).get("provenance") or ""),
+            "target_node_provenance": str((target.get("node") or {}).get("provenance") or ""),
+            "completed_at": completed_at,
+            "completion_cutoff_time": self.config.completion_cutoff_time.isoformat(),
+            "query_complete": True,
+            "pending_transfer_count": 0,
+            "plan_id_sha256": plan_id_sha256,
+            "source_snapshot_sha256": source_snapshot_sha256,
+            "source_snapshot_id": source_snapshot_id,
+            "source_snapshot_generation": source_snapshot_generation,
+            "source_producer_sha256": source_producer_sha256,
+            "target_snapshot_sha256": target_snapshot_sha256,
+            "target_snapshot_id": _require_sha256(
+                target.get("snapshot_id"),
+                field_name="ready_evidence_target_snapshot_id",
+            ),
+            "target_positions_snapshot_id": target_positions_snapshot_id,
+            "actions_sha256": actions_sha256,
+            "action_count": len(actions),
+            "conservation_sha256": conservation_sha256,
+            "source_nontransferable_residual_sha256": (source_nontransferable_residual_sha256),
+            "generation": generation,
+            "fencing_token": fencing_token,
+        }
 
     def _publish_plan_health(self, plan: Mapping[str, Any]) -> None:
         """把持久计划投影为脱敏内存健康状态。
@@ -1766,9 +2738,13 @@ class HuaxinAssetConsolidationCoordinator:
 __all__ = [
     "ExternalHuaxinAssetSnapshotProvider",
     "HUAXIN_ASSET_CONSOLIDATION_ORDER_BLOCKED",
+    "HUAXIN_NODE16_READY_SCHEMA",
+    "HUAXIN_NODE_ASSET_DIGEST_VERSION",
     "HuaxinAssetConsolidationConfig",
     "HuaxinAssetConsolidationCoordinator",
     "HuaxinAssetConsolidationError",
     "HuaxinAssetConsolidationStateStore",
     "HuaxinAssetConsolidationWaiting",
+    "build_huaxin_node_asset_snapshot_digest",
+    "build_huaxin_positions_snapshot_id",
 ]
