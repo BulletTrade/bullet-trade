@@ -2605,18 +2605,42 @@ class HuaxinBroker(BrokerBase):
             row: NativeEvent.data 的 position 记录。
 
         Returns:
-            Dict[str, Any]: 含 amount/closeable_amount/avg_cost 的持仓。
+            Dict[str, Any]: 含当前、可用、昨仓、在途及公共成本字段的持仓；
+            厂商未直接给出在途字段时，用当前持仓减昨仓的正差做保守兼容值。
         """
 
         result = dict(row)
-        amount = _as_int(row.get("current_position"))
-        available = _as_int(row.get("available_position"))
+        amount = self._required_signed_int32_field(row, "current_position")
+        available = self._required_signed_int32_field(row, "available_position")
+        history = self._required_signed_int32_field(row, "history_position")
+        if min(amount, available, history) < 0 or available > amount:
+            raise ValueError("华鑫持仓当前、可用与昨仓数量关系非法")
+        onroad_aliases = (
+            "onroad_position",
+            "on_road_position",
+            "on_road_volume",
+            "in_transit_position",
+        )
+        explicit_onroad_field = next(
+            (field for field in onroad_aliases if row.get(field) not in (None, "")),
+            None,
+        )
+        if explicit_onroad_field is not None:
+            onroad = self._required_signed_int32_field(row, explicit_onroad_field)
+            if onroad < 0:
+                raise ValueError("华鑫持仓显式在途数量不能为负数")
+        else:
+            onroad = max(0, amount - history)
         total_cost = _as_float(row.get("total_cost"))
         result.update(
             {
                 "security": _canonical_security(
                     row.get("exchange") or row.get("market"), row.get("security")
                 ),
+                "current_position": amount,
+                "available_position": available,
+                "history_position": history,
+                "onroad_position": onroad,
                 "amount": amount,
                 "closeable_amount": available,
                 "available": available,

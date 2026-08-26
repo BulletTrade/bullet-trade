@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import bullet_trade.integrations.huaxin.native as native_module
 from bullet_trade.core.models import Order, OrderStatus
 from bullet_trade.core.orders import MarketOrderStyle
 from bullet_trade.core.orders import cancel_order as strategy_cancel_order
@@ -18,6 +19,7 @@ from bullet_trade.integrations.huaxin.errors import (
     HuaxinNativeUnavailableError,
     HuaxinTradingDisabledError,
 )
+from bullet_trade.integrations.huaxin_node_assets import build_huaxin_positions_snapshot_id
 
 
 class _FakeRuntime:
@@ -169,6 +171,10 @@ class _FakeRuntime:
                 "security": "511880",
                 "current_position": 100,
                 "available_position": 80,
+                "history_position": 80,
+                "today_bs": 20,
+                "today_pr": 0,
+                "today_sm": 0,
                 "total_cost": 10020,
                 "investor_id": "investor",
                 "business_unit_id": "unit",
@@ -747,8 +753,11 @@ def test_queries_wait_for_query_end_and_normalize() -> None:
     broker = _connected_broker(runtime)
 
     assert broker.get_account_info()["available_cash"] == 1000.0
-    assert broker.get_positions()[0]["security"] == "511880.XSHG"
-    assert broker.get_positions()[0]["closeable_amount"] == 80
+    position = broker.get_positions()[0]
+    assert position["security"] == "511880.XSHG"
+    assert position["closeable_amount"] == 80
+    assert position["history_position"] == 80
+    assert position["onroad_position"] == 20
     assert broker.get_orders() == []
     assert broker.get_trades()[0]["trade_id"] == "T1"
     assert broker.health_snapshot()["baseline_query_ready"] is True
@@ -758,6 +767,94 @@ def test_queries_wait_for_query_end_and_normalize() -> None:
         "positions",
         "trades",
     ]
+
+
+def test_position_normalization_derives_or_preserves_onroad_position() -> None:
+    """验证在途数量优先保留显式值，缺失时按当前减昨仓保守派生。"""
+
+    broker = _connected_broker(_FakeRuntime())
+    base = {
+        "exchange": "SSE",
+        "security": "511880",
+        "current_position": 100,
+        "available_position": 60,
+        "history_position": 70,
+        "total_cost": 10000,
+    }
+
+    derived = broker._normalize_position(base)
+    explicit = broker._normalize_position({**base, "onroad_position": 0})
+    after_buy = broker._normalize_position(
+        {**base, "current_position": 9900, "available_position": 9900, "history_position": 9800}
+    )
+    after_sell = broker._normalize_position({**base, "current_position": 60})
+
+    assert derived["onroad_position"] == 30
+    assert explicit["onroad_position"] == 0
+    assert after_buy["onroad_position"] == 100
+    assert after_sell["onroad_position"] == 0
+
+
+def test_position_normalization_rejects_missing_or_invalid_required_fields() -> None:
+    """验证必需字段缺失、可用量越界和负数显式在途均失败关闭。"""
+
+    broker = _connected_broker(_FakeRuntime())
+    base = {
+        "exchange": "SSE",
+        "security": "511880",
+        "current_position": 100,
+        "available_position": 60,
+        "history_position": 70,
+        "total_cost": 10000,
+    }
+
+    without_history = {key: value for key, value in base.items() if key != "history_position"}
+    with pytest.raises(ValueError, match="history_position"):
+        broker._normalize_position(without_history)
+    with pytest.raises(ValueError, match="数量关系非法"):
+        broker._normalize_position({**base, "available_position": 101})
+    with pytest.raises(ValueError, match="显式在途"):
+        broker._normalize_position({**base, "on_road_volume": -1})
+
+
+def test_native_position_normalizes_and_builds_snapshot_digest() -> None:
+    """验证原生独立权威字段可经过 Broker 标准化并生成持仓摘要。"""
+
+    raw = native_module._PositionEvent(
+        current_position=901,
+        available_position=407,
+        history_position=701,
+        today_bs=113,
+        today_pr=17,
+        today_sm=23,
+        total_cost=67890.5,
+    )
+    for field_name, text, capacity in (
+        ("exchange", "SZSE", native_module.EXCHANGE_CAPACITY),
+        ("investor_id", "investor", native_module.INVESTOR_CAPACITY),
+        ("shareholder_id", "shareholder", native_module.SHAREHOLDER_CAPACITY),
+        ("security", "000001", native_module.SECURITY_CAPACITY),
+        ("trading_day", "20260826", native_module.DATE_CAPACITY),
+        ("business_unit_id", "unit", native_module.BUSINESS_UNIT_CAPACITY),
+    ):
+        native_module._assign_text(raw, field_name, text, capacity)
+    raw.market_id = ord("1")
+    decoded = native_module._decode_event_data(
+        native_module.EVENT_POSITION,
+        native_module._structure_bytes(raw),
+    )
+
+    normalized = _connected_broker(_FakeRuntime())._normalize_position(decoded)
+    snapshot_id = build_huaxin_positions_snapshot_id("20260826", [normalized])
+
+    assert decoded["current_position"] != (
+        decoded["history_position"]
+        + decoded["today_bs"]
+        + decoded["today_pr"]
+        + decoded["today_sm"]
+    )
+    assert normalized["onroad_position"] == 200
+    assert len(snapshot_id) == 64
 
 
 def test_account_query_requires_exact_target_identity() -> None:
