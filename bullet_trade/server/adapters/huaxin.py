@@ -42,6 +42,10 @@ from bullet_trade.integrations.huaxin.xmd_backend import (
     XmdBackendError,
     _validate_tcp_front,
 )
+from bullet_trade.integrations.huaxin.snapshot_relay import (
+    HuaxinNodeSnapshotRelay,
+    HuaxinNodeSnapshotRelayConfig,
+)
 from bullet_trade.utils.env_loader import (
     get_broker_config,
     get_env,
@@ -228,6 +232,8 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
             HuaxinAssetConsolidationCoordinator
         ),
         source_snapshot_provider: Optional[Callable[[], Mapping[str, Any]]] = None,
+        snapshot_relay_config: Optional[HuaxinNodeSnapshotRelayConfig] = None,
+        snapshot_relay_factory: Callable[..., HuaxinNodeSnapshotRelay] = HuaxinNodeSnapshotRelay,
     ) -> None:
         """保存服务配置并创建华鑫专用 executor。
 
@@ -239,6 +245,8 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
             consolidation_config: 可注入节点资产归集配置；默认从环境读取。
             consolidation_factory: 测试可注入的归集协调器工厂。
             source_snapshot_provider: 可注入源节点权威快照函数。
+            snapshot_relay_config: 可注入节点快照生成与安装配置。
+            snapshot_relay_factory: 测试可注入的 snapshot relay 工厂。
 
         Returns:
             None。
@@ -272,6 +280,9 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
                 self._consolidation_config,
                 source_snapshot_provider=source_snapshot_provider,
             )
+        self._snapshot_relay = snapshot_relay_factory(
+            snapshot_relay_config or HuaxinNodeSnapshotRelayConfig.from_env()
+        )
 
     async def start(self) -> None:
         """依次创建并连接全部配置账户。
@@ -401,6 +412,62 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
             "snapshot_id": build_huaxin_positions_snapshot_id(trading_day, rows),
             "positions": rows,
         }
+
+    async def node_asset_snapshot(
+        self, account: AccountContext, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """生成当前华鑫节点的完整只读资产快照。
+
+        Args:
+            account: 已路由父账户上下文。
+            payload: 保留给远程协议的空对象；不接受身份或路径覆盖。
+
+        Returns:
+            Dict[str, Any]: 带持久递增 generation 的 schema v2 快照。
+
+        Raises:
+            RuntimeError: relay 未启用、Trader 未 ready 或任一查询不完整时抛出。
+
+        Side Effects:
+            只更新本机 generation 状态文件，不调用券商写接口。
+        """
+
+        if payload:
+            unsupported = sorted(key for key in payload if key not in {"account_key"})
+            if unsupported:
+                raise ValueError("node_asset_snapshot 不接受远程配置覆盖")
+        broker = self._broker_for(account)
+        return dict(await self._run_ready(self._snapshot_relay.capture, broker) or {})
+
+    async def install_source_snapshot(
+        self, account: AccountContext, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """校验并幂等安装一份外部源节点完整快照。
+
+        Args:
+            account: 已路由 consumer 父账户上下文。
+            payload: 含 ``snapshot`` 的完整远程载荷。
+
+        Returns:
+            Dict[str, Any]: installed/noop、generation 和摘要等脱敏结果。
+
+        Raises:
+            RuntimeError: 显式开关未启用、Trader 未 ready、回放或合同冲突时抛出。
+
+        Side Effects:
+            仅把合格新快照以 0600 原子文件安装，不调用任何券商写接口。
+        """
+
+        broker = self._broker_for(account)
+        trading_day = await self._run_ready(broker.get_trading_day)
+        return dict(
+            await self._run_ready(
+                self._snapshot_relay.install,
+                payload,
+                trading_day=str(trading_day or ""),
+            )
+            or {}
+        )
 
     async def get_trading_day(self) -> Optional[str]:
         """返回默认华鑫父账户登录回报中的权威交易日。
@@ -674,6 +741,7 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
                 if native_query_ready
                 else "native_query_not_ready"
             )
+        relay_config = self._snapshot_relay.config
         return {
             "backend_type": "huaxin",
             "component": "trader",
@@ -688,6 +756,22 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
                 "broker.positions": {"status": query_action_status},
                 "broker.orders": {"status": query_action_status},
                 "broker.trades": {"status": query_action_status},
+                "broker.node_asset_snapshot": {
+                    "status": (
+                        query_action_status if relay_config.capture_enabled else "unavailable"
+                    ),
+                    "reason": (
+                        None if relay_config.capture_enabled else "node_asset_snapshot_disabled"
+                    ),
+                },
+                "broker.install_source_snapshot": {
+                    "status": (
+                        query_action_status if relay_config.install_enabled else "unavailable"
+                    ),
+                    "reason": (
+                        None if relay_config.install_enabled else "source_snapshot_install_disabled"
+                    ),
+                },
                 "broker.place_order": {
                     "status": "ready" if order_ready else "unavailable",
                     "reason": (

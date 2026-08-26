@@ -1575,6 +1575,112 @@ async def test_server_dispatches_huaxin_positions_envelope_without_payload_argum
 
 
 @pytest.mark.asyncio
+async def test_server_dispatches_private_snapshot_relay_actions() -> None:
+    """验证私有快照动作仅经 Huaxin adapter 调度且安装取得柜台交易日。
+
+    Returns:
+        None。
+    """
+
+    class _RecordingRelay:
+        """记录 capture/install 调用的最小 relay 替身。"""
+
+        def __init__(self):
+            """初始化调用记录和启用状态。
+
+            Returns:
+                None。
+            """
+
+            self.config = SimpleNamespace(capture_enabled=True, install_enabled=True)
+            self.capture_broker = None
+            self.install_payload = None
+            self.install_trading_day = None
+
+        def capture(self, broker):
+            """记录只读 Broker 并返回脱敏测试结果。
+
+            Args:
+                broker: Adapter 已路由 Broker。
+
+            Returns:
+                dict: 测试 capture 结果。
+            """
+
+            self.capture_broker = broker
+            return {"generation": 1}
+
+        def install(self, payload, *, trading_day):
+            """记录安装载荷和 consumer 柜台交易日。
+
+            Args:
+                payload: 原始远程安装载荷。
+                trading_day: Adapter 从 Broker 读取的交易日。
+
+            Returns:
+                dict: 测试安装结果。
+            """
+
+            self.install_payload = payload
+            self.install_trading_day = trading_day
+            return {"installed": True, "generation": 1}
+
+    relay = _RecordingRelay()
+
+    def _relay_factory(_config):
+        """返回预先创建的 relay 替身。
+
+        Args:
+            _config: Adapter 传入的默认 relay 配置。
+
+        Returns:
+            _RecordingRelay: 共享测试替身。
+        """
+
+        return relay
+
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    adapter = HuaxinBrokerAdapter(
+        config,
+        router,
+        broker_config={"enable_trading": False, "enable_cancel": False},
+        broker_factory=_FakeBroker,
+        snapshot_relay_factory=_relay_factory,
+    )
+    await adapter.start()
+    app = ServerApplication(
+        config,
+        router,
+        AdapterBundle(
+            data_adapter=None,
+            broker_adapter=adapter,
+            broker_writes_require_persistent_idempotency=False,
+            broker_writes_require_idempotency_key=True,
+        ),
+    )
+    session = SimpleNamespace(account_key="default", sub_account_id=None)
+
+    captured = await app._dispatch_broker(session, "node_asset_snapshot", {})
+    installed = await app._dispatch_broker(
+        session,
+        "install_source_snapshot",
+        {"snapshot": {"schema_version": 2}},
+    )
+
+    assert captured == {"generation": 1}
+    assert installed == {"installed": True, "generation": 1}
+    assert relay.capture_broker is adapter._brokers["default"]
+    assert relay.install_payload == {"snapshot": {"schema_version": 2}}
+    assert relay.install_trading_day == "20260824"
+    assert adapter.backend_status()["actions"]["broker.node_asset_snapshot"]["status"] == "ready"
+    assert (
+        adapter.backend_status()["actions"]["broker.install_source_snapshot"]["status"] == "ready"
+    )
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
 async def test_asset_consolidation_runs_in_background_and_blocks_only_new_orders(tmp_path) -> None:
     """验证归集后台任务不阻塞启动，查询和精确撤单保留而新下单被拒绝。
 

@@ -23,7 +23,12 @@ from bullet_trade.server.protocol import ProtocolError, encode_message, read_mes
 _REQUEST_TIMEOUT_DEFAULT = object()
 _AMBIGUOUS_WRITE_ACTIONS = frozenset({"broker.place_order", "broker.cancel_order"})
 _IDEMPOTENT_TRANSITION_ACTIONS = frozenset(
-    {"data.subscribe", "data.unsubscribe", "data.unsubscribe_all"}
+    {
+        "broker.install_source_snapshot",
+        "data.subscribe",
+        "data.unsubscribe",
+        "data.unsubscribe_all",
+    }
 )
 _AMBIGUOUS_SERVER_ERROR_CODES = frozenset({"REQUEST_FAILED", "REQUEST_TIMEOUT"})
 

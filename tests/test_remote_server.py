@@ -169,6 +169,7 @@ def test_remote_connection_classifies_concrete_write_actions():
     assert classify_remote_action("broker.cancel_order") == "ambiguous_write"
     assert classify_remote_action("broker.resolve_submission") == "none"
     assert classify_remote_action("broker.orders") == "none"
+    assert classify_remote_action("broker.install_source_snapshot") == "idempotent_transition"
     assert classify_remote_action("data.subscribe") == "idempotent_transition"
 
 
@@ -339,6 +340,45 @@ def test_remote_connection_retries_read_once_after_disconnect():
 
     assert result == {"value": {"available_cash": 1000.0}}
     assert [message["action"] for message in sent] == ["broker.account", "broker.account"]
+
+
+def test_remote_connection_retries_idempotent_snapshot_install_once_after_disconnect():
+    """快照安装断连后可按同一 generation/digest 载荷重试一次。
+
+    Returns:
+        None。
+    """
+
+    conn = RemoteQmtConnection("127.0.0.1", 0, "token")
+    conn._connected.set()
+    sent = []
+
+    async def _send_disconnect_then_noop(message):
+        """首帧模拟响应丢失，第二帧返回服务端幂等 no-op。
+
+        Args:
+            message: Remote connection 发出的请求帧。
+
+        Returns:
+            None。
+        """
+
+        sent.append(message)
+        pending = conn._pending[message["id"]]
+        if len(sent) == 1:
+            pending.set_exception(RuntimeError("连接已断开"))
+        else:
+            pending.set_result({"installed": False, "noop": True, "generation": 7})
+
+    conn._send = _send_disconnect_then_noop  # type: ignore[method-assign]
+    payload = {"snapshot": {"generation": 7, "payload_digest_sha256": "a" * 64}}
+
+    result = asyncio.run(conn._request_async("broker.install_source_snapshot", payload))
+
+    assert result == {"installed": False, "noop": True, "generation": 7}
+    assert len(sent) == 2
+    assert sent[0]["payload"] == sent[1]["payload"] == payload
+    assert all(message["action"] == "broker.install_source_snapshot" for message in sent)
 
 
 def test_remote_server_direct_idempotency_and_resolution_contract():
