@@ -730,10 +730,15 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
             and bool(item.get("order_identity_ready"))
             for item in accounts.values()
         )
-        state = "ready" if query_ready else self._state
-        if state not in {"ready", "starting", "degraded", "reconnecting", "stopped", "unavailable"}:
+        if query_ready:
+            state = "ready"
+        elif self._state in {"stopped", "unavailable"}:
+            state = self._state
+        else:
             state = "degraded" if native_query_ready else "unavailable"
-        query_action_status = "ready" if query_ready else state
+        query_action_status = (
+            "ready" if query_ready else ("degraded" if state == "degraded" else "unavailable")
+        )
         reason = self._last_error_reason
         if not query_ready:
             reason = reason or (
@@ -761,7 +766,9 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
                         query_action_status if relay_config.capture_enabled else "unavailable"
                     ),
                     "reason": (
-                        None if relay_config.capture_enabled else "node_asset_snapshot_disabled"
+                        (None if query_ready else reason)
+                        if relay_config.capture_enabled
+                        else "node_asset_snapshot_disabled"
                     ),
                 },
                 "broker.install_source_snapshot": {
@@ -769,7 +776,9 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
                         query_action_status if relay_config.install_enabled else "unavailable"
                     ),
                     "reason": (
-                        None if relay_config.install_enabled else "source_snapshot_install_disabled"
+                        (None if query_ready else reason)
+                        if relay_config.install_enabled
+                        else "source_snapshot_install_disabled"
                     ),
                 },
                 "broker.place_order": {

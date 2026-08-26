@@ -1542,6 +1542,84 @@ async def test_adapter_delegates_queries_and_preserves_cancel_payload() -> None:
 
 
 @pytest.mark.asyncio
+async def test_broker_snapshot_health_requires_query_ready_but_ignores_xmd_degradation() -> None:
+    """验证快照动作不误报 ready，也不受独立 XMD 降级连坐。
+
+    Returns:
+        None。
+    """
+
+    relay = SimpleNamespace(config=SimpleNamespace(capture_enabled=True, install_enabled=True))
+
+    def _relay_factory(_config):
+        """返回启用两项快照动作的最小 relay 替身。
+
+        Args:
+            _config: Adapter 传入的默认 relay 配置。
+
+        Returns:
+            SimpleNamespace: 仅提供配置状态的 relay 替身。
+        """
+
+        return relay
+
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    adapter = HuaxinBrokerAdapter(
+        config,
+        router,
+        broker_config={"enable_trading": False, "enable_cancel": False},
+        broker_factory=_FakeBroker,
+        snapshot_relay_factory=_relay_factory,
+    )
+    await adapter.start()
+    broker = adapter._brokers["default"]
+
+    broker.baseline_queries.clear()
+    not_ready = adapter.backend_status()
+
+    assert not_ready["ready"] is False
+    assert not_ready["state"] == "degraded"
+    assert not_ready["reason"] == "four_baseline_queries_not_completed"
+    for action in (
+        "broker.account",
+        "broker.positions",
+        "broker.orders",
+        "broker.trades",
+        "broker.node_asset_snapshot",
+        "broker.install_source_snapshot",
+    ):
+        assert not_ready["actions"][action]["status"] != "ready"
+    assert (
+        not_ready["actions"]["broker.node_asset_snapshot"]["reason"]
+        == "four_baseline_queries_not_completed"
+    )
+
+    broker.baseline_queries.update({"account", "positions", "orders", "trades"})
+    broker_ready = adapter.backend_status()
+    merged = ServerApplication._merge_huaxin_backend_statuses(
+        [
+            broker_ready,
+            {
+                "backend_type": "huaxin",
+                "component": "xmd_l1",
+                "ready": False,
+                "state": "degraded",
+                "reason": "xmd_front_disconnected",
+                "actions": {"data.live_current": {"status": "unavailable"}},
+            },
+        ]
+    )
+
+    assert merged["ready"] is False
+    assert merged["state"] == "degraded"
+    assert merged["actions"]["broker.node_asset_snapshot"]["status"] == "ready"
+    assert merged["actions"]["broker.install_source_snapshot"]["status"] == "ready"
+    assert merged["actions"]["data.live_current"]["status"] == "unavailable"
+    await adapter.stop()
+
+
+@pytest.mark.asyncio
 async def test_server_dispatches_huaxin_positions_envelope_without_payload_argument() -> None:
     """验证标准 broker.positions 只传账户上下文并返回完整性信封。"""
 
