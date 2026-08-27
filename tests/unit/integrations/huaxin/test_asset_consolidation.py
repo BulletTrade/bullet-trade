@@ -4,9 +4,11 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
 from bullet_trade.integrations.huaxin.asset_consolidation import (
+    HUAXIN_NODE16_READY_SCHEMA,
     HuaxinAssetConsolidationConfig,
     HuaxinAssetConsolidationCoordinator,
     HuaxinAssetConsolidationStateStore,
+    build_huaxin_node_asset_snapshot_digest,
 )
 
 
@@ -378,8 +380,41 @@ def test_full_plan_submits_sequentially_and_only_completes_after_two_end_reconci
     assert (tmp_path / "state.json").stat().st_mode & 0o777 == 0o600
     state = HuaxinAssetConsolidationStateStore(tmp_path / "state.json").load_day("20260825")
     assert [row["state"] for row in state["actions"]] == ["succeeded", "succeeded"]
+    ready = state["ready_evidence"]
+    assert ready["schema"] == HUAXIN_NODE16_READY_SCHEMA
+    assert ready["state"] == "ready"
+    assert ready["mode"] == "full"
+    assert ready["trading_day"] == "20260825"
+    assert ready["source_node_id"] == 22
+    assert ready["target_node_id"] == 11
+    assert ready["source_role"] == "source-query"
+    assert ready["target_role"] == "target-writer"
+    assert ready["action_count"] == 2
+    assert all(
+        len(ready[field]) == 64
+        for field in (
+            "plan_id_sha256",
+            "source_snapshot_sha256",
+            "target_snapshot_sha256",
+            "target_positions_snapshot_id",
+            "actions_sha256",
+            "generation",
+            "fencing_token",
+        )
+    )
     assert "account_id" not in (tmp_path / "state.json").read_text(encoding="utf-8")
     assert "shareholder_id" not in (tmp_path / "state.json").read_text(encoding="utf-8")
+
+    before_restart = deepcopy(state["ready_evidence"])
+    restarted = HuaxinAssetConsolidationCoordinator(
+        config,
+        source_snapshot_provider=provider,
+        clock=lambda: _NOW,
+        hostname=lambda: "target-host",
+    )
+    assert restarted.drive_once(broker)["state"] == "complete"
+    reloaded = HuaxinAssetConsolidationStateStore(tmp_path / "state.json").load_day("20260825")
+    assert reloaded["ready_evidence"] == before_restart
 
 
 def test_unknown_restart_only_queries_original_serial_and_never_resubmits(tmp_path) -> None:
@@ -423,6 +458,8 @@ def test_unknown_restart_only_queries_original_serial_and_never_resubmits(tmp_pa
     assert result["reason"] == "transfer_fact_unknown_query_only"
     assert broker.position_submit_count == 1
     assert broker.fund_submit_count == 0
+    state = HuaxinAssetConsolidationStateStore(tmp_path / "state.json").load_day("20260825")
+    assert "ready_evidence" not in state
 
 
 def test_dry_run_persists_plan_without_any_transfer_call(tmp_path) -> None:
@@ -455,3 +492,78 @@ def test_dry_run_persists_plan_without_any_transfer_call(tmp_path) -> None:
     assert result["state"] == "dry_run"
     assert coordinator.order_allowed() is False
     assert broker.position_submit_count == broker.fund_submit_count == 0
+    state = HuaxinAssetConsolidationStateStore(tmp_path / "state.json").load_day("20260825")
+    assert "ready_evidence" not in state
+
+
+def test_node_asset_digest_is_stable_and_changes_with_business_assets() -> None:
+    """验证采样时间和行顺序不影响摘要，而资金或持仓漂移会改变摘要。
+
+    Returns:
+        None。
+    """
+
+    first = _source_snapshot(_NOW, position=100, cash=50.0)
+    first["positions"].append(
+        {
+            "exchange": "SZSE",
+            "security": "159001.SZ",
+            "current_position": 20,
+            "available_position": 20,
+            "history_position": 20,
+            "investor_id": "I2",
+            "business_unit_id": "B2",
+            "shareholder_id": "S2",
+            "market_id": 1,
+        }
+    )
+    reordered = deepcopy(first)
+    reordered["captured_at"] = (_NOW + timedelta(seconds=30)).isoformat()
+    reordered["positions"] = list(reversed(reordered["positions"]))
+
+    stable_digest = build_huaxin_node_asset_snapshot_digest(first)
+    assert build_huaxin_node_asset_snapshot_digest(reordered) == stable_digest
+
+    cash_changed = deepcopy(first)
+    cash_changed["account"]["transferable_cash"] = 49.99
+    assert build_huaxin_node_asset_snapshot_digest(cash_changed) != stable_digest
+
+    position_changed = deepcopy(first)
+    position_changed["positions"][0]["current_position"] = 99
+    assert build_huaxin_node_asset_snapshot_digest(position_changed) != stable_digest
+
+
+def test_canary_complete_never_carries_ready_evidence(tmp_path) -> None:
+    """验证 canary 即使双端完成也不会伪装为 full READY。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        None。
+    """
+
+    snapshots = [
+        _source_snapshot(_NOW - timedelta(seconds=10)),
+        _source_snapshot(_NOW - timedelta(seconds=5)),
+        _source_snapshot(_NOW + timedelta(seconds=1), position=0),
+        _source_snapshot(_NOW + timedelta(seconds=2), position=0),
+        _source_snapshot(_NOW + timedelta(seconds=3), position=0, cash=0),
+        _source_snapshot(_NOW + timedelta(seconds=4), position=0, cash=0),
+    ]
+    broker = _TargetBroker()
+    coordinator = HuaxinAssetConsolidationCoordinator(
+        _config(tmp_path, mode="canary"),
+        source_snapshot_provider=_SequenceProvider(snapshots),
+        clock=lambda: _NOW,
+        hostname=lambda: "target-host",
+    )
+
+    result = {}
+    for _ in range(6):
+        result = coordinator.drive_once(broker)
+
+    assert result["state"] == "canary_complete"
+    assert coordinator.order_allowed() is False
+    state = HuaxinAssetConsolidationStateStore(tmp_path / "state.json").load_day("20260825")
+    assert "ready_evidence" not in state

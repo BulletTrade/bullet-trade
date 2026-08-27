@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Set
 from bullet_trade.integrations.huaxin.asset_consolidation import (
     HuaxinAssetConsolidationConfig,
     HuaxinAssetConsolidationCoordinator,
+    build_huaxin_positions_snapshot_id,
 )
 from bullet_trade.integrations.huaxin.broker import HuaxinBroker
 from bullet_trade.integrations.huaxin.errors import (
@@ -355,8 +356,15 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
             Dict[str, Any]: ``{"dtype":"dict","value":...}``。
         """
 
-        info = await self._run_ready(self._broker_for(account).get_account_info)
-        return {"dtype": "dict", "value": info or {}}
+        info = dict(await self._run_ready(self._broker_for(account).get_account_info) or {})
+        observed_balance_account_id = str(info.get("account_id") or "").strip()
+        if not observed_balance_account_id:
+            raise RuntimeError("华鑫资金查询缺少物理资金账号，拒绝返回弱身份快照")
+        info["account_identity"] = {
+            "identity_verified": True,
+            "observed_balance_account_id": observed_balance_account_id,
+        }
+        return {"dtype": "dict", "value": info}
 
     async def get_positions(self, account: AccountContext) -> List[Dict[str, Any]]:
         """查询账户持仓。
@@ -369,6 +377,28 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
         """
 
         return list(await self._run_ready(self._broker_for(account).get_positions) or [])
+
+    async def positions(self, account: AccountContext) -> Dict[str, Any]:
+        """返回带完整性证明的既有 ``broker.positions`` 响应信封。
+
+        Args:
+            account: 已路由父账户上下文。
+
+        Returns:
+            Dict[str, Any]: 含 ``complete=true``、稳定 snapshot_id 和完整持仓列表。
+
+        Notes:
+            本方法只复用 server 已支持的扩展信封形态；内部风控继续调用
+            ``get_positions`` 并获得列表，不增加 Remote action 或写入能力。
+        """
+
+        rows = await self.get_positions(account)
+        trading_day = await self._run_ready(self._broker_for(account).get_trading_day)
+        return {
+            "complete": True,
+            "snapshot_id": build_huaxin_positions_snapshot_id(trading_day, rows),
+            "positions": rows,
+        }
 
     async def get_trading_day(self) -> Optional[str]:
         """返回默认华鑫父账户登录回报中的权威交易日。

@@ -1222,7 +1222,7 @@ class _FakeBroker:
         """
 
         self.baseline_queries.add("account")
-        return {"available_cash": 1000}
+        return {"available_cash": 1000, "account_id": "TEST-ACCOUNT"}
 
     def get_positions(self):
         """返回测试持仓。
@@ -1450,8 +1450,17 @@ async def test_adapter_delegates_queries_and_preserves_cancel_payload() -> None:
 
     assert adapter.backend_status()["state"] == "ready"
     assert adapter.backend_status()["actions"]["broker.place_order"]["status"] == "ready"
-    assert (await adapter.get_account_info(ctx))["value"]["available_cash"] == 1000
+    account_envelope = await adapter.get_account_info(ctx)
+    assert account_envelope["value"]["available_cash"] == 1000
+    assert account_envelope["value"]["account_identity"] == {
+        "identity_verified": True,
+        "observed_balance_account_id": "TEST-ACCOUNT",
+    }
     assert (await adapter.get_positions(ctx))[0]["amount"] == 100
+    positions_envelope = await adapter.positions(ctx)
+    assert positions_envelope["complete"] is True
+    assert len(positions_envelope["snapshot_id"]) == 64
+    assert positions_envelope["positions"][0]["security"] == "511880.XSHG"
     assert (await adapter.list_orders(ctx))[0]["order_id"] == "O1"
     assert (await adapter.list_trades(ctx))[0]["trade_id"] == "T1"
     assert await adapter.get_trading_day() == "20260824"
