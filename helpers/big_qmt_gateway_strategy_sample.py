@@ -1,4 +1,4 @@
-#encoding:gbk
+# -*- coding: utf-8 -*-
 # Author: BruceLee
 # Date: 2026-07-10
 # Version: 20260710_daily_log_rotation_5d
@@ -494,7 +494,24 @@ def _tick_float(tick: Dict[str, Any], *keys: str) -> Optional[float]:
     return None
 
 
-def _enrich_tick(context_info: Any, qmt_security: str, tick: Any) -> Dict[str, Any]:
+def _enrich_tick(
+    context_info: Any,
+    qmt_security: str,
+    tick: Any,
+    query_completed_time: Optional[str] = None,
+) -> Dict[str, Any]:
+    """补齐单证券快照的身份、时间、盘口和交易状态证据。
+
+    Args:
+        context_info: Big QMT 策略上下文。
+        qmt_security: QMT 格式证券代码。
+        tick: get_full_tick 返回的原始证券快照。
+        query_completed_time: 本次 get_full_tick 完成的北京时间。
+
+    Returns:
+        Dict[str, Any]: 保留原始字段并增加可选观察元数据的快照。
+    """
+
     item = _basic_value(tick)
     if not isinstance(item, dict):
         item = {"raw": item}
@@ -507,6 +524,25 @@ def _enrich_tick(context_info: Any, qmt_security: str, tick: Any) -> Dict[str, A
     timetag = item.get("timetag") or item.get("time") or item.get("datetime")
     if timetag not in (None, ""):
         item.setdefault("dt", timetag)
+        item.setdefault("source_time", timetag)
+    item.setdefault("source", "big_qmt_full_tick")
+    if query_completed_time:
+        item.setdefault("received_time", query_completed_time)
+        item.setdefault("query_completed_time", query_completed_time)
+    item.setdefault(
+        "feed_health",
+        {
+            "status": "healthy",
+            "query_succeeded": True,
+            "transport": "ContextInfo.get_full_tick",
+        },
+    )
+    bid_prices = item.get("bidPrice")
+    ask_prices = item.get("askPrice")
+    if item.get("bid_price1") in (None, "") and isinstance(bid_prices, (list, tuple)) and bid_prices:
+        item["bid_price1"] = _tick_float({"value": bid_prices[0]}, "value")
+    if item.get("ask_price1") in (None, "") and isinstance(ask_prices, (list, tuple)) and ask_prices:
+        item["ask_price1"] = _tick_float({"value": ask_prices[0]}, "value")
     getter = getattr(context_info, "get_instrument_detail", None)
     if getter is None:
         getter = getattr(context_info, "get_instrumentdetail", None)
@@ -539,12 +575,32 @@ def _enrich_tick(context_info: Any, qmt_security: str, tick: Any) -> Dict[str, A
     return item
 
 
-def _normalize_tick_keys(ticks: Any, context_info: Any = None) -> Dict[str, Any]:
+def _normalize_tick_keys(
+    ticks: Any,
+    context_info: Any = None,
+    query_completed_time: Optional[str] = None,
+) -> Dict[str, Any]:
+    """规范证券键并把同一次查询完成时间写入每条快照。
+
+    Args:
+        ticks: get_full_tick 返回的证券映射。
+        context_info: Big QMT 策略上下文。
+        query_completed_time: 本次查询完成的北京时间。
+
+    Returns:
+        Dict[str, Any]: 聚宽格式证券键到完整快照的映射。
+    """
+
     if not isinstance(ticks, dict):
         return {}
     normalized = {}
     for key, value in ticks.items():
-        normalized[_from_qmt_security(key)] = _enrich_tick(context_info, str(key), value)
+        normalized[_from_qmt_security(key)] = _enrich_tick(
+            context_info,
+            str(key),
+            value,
+            query_completed_time,
+        )
     return normalized
 
 
@@ -1335,6 +1391,16 @@ def _query_trades(account_id: str, account_type: str, payload: Optional[Dict[str
 
 
 def _get_full_tick(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """查询实时快照并在 helper 边界记录独立的查询完成时间。
+
+    Args:
+        context_info: Big QMT 策略上下文。
+        payload: 含单证券或证券列表的 HTTP 请求载荷。
+
+    Returns:
+        Dict[str, Any]: 带完整 observation metadata 的 ticks 响应。
+    """
+
     securities = payload.get("securities") or payload.get("symbols")
     if not securities:
         securities = payload.get("stocks") or payload.get("codes")
@@ -1346,7 +1412,13 @@ def _get_full_tick(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]
         return _context_not_ready(payload)
     ticks = context_info.get_full_tick(stock_code=qmt_codes) or {}
     source = "ContextInfo.get_full_tick"
-    return {"ticks": _normalize_tick_keys(ticks, context_info), "qmt_codes": qmt_codes, "source": source}
+    query_completed_time = time.strftime("%Y-%m-%dT%H:%M:%S+08:00", time.localtime())
+    return {
+        "ticks": _normalize_tick_keys(ticks, context_info, query_completed_time),
+        "qmt_codes": qmt_codes,
+        "source": source,
+        "query_completed_time": query_completed_time,
+    }
 
 
 def _call_download_history_data(qmt_security: str, period: str, start: Any, end: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -2578,13 +2650,13 @@ class _GatewayRuntime:
         except Exception:
             log_file_size_bytes = 0
         return {
-            "ready": context_ready or qmt_api_ready,
+            "ready": context_ready,
             "http_alive": self.ioloop is not None,
             "init_called": self.init_called,
             "context_ready": context_ready,
             "qmt_api_ready": qmt_api_ready,
             "data_context_ready": context_ready,
-            "trading_context_ready": context_ready,
+            "trading_context_ready": context_ready and account_configured and ENABLE_TRADING,
             "qmt_apis": {
                 "get_trade_detail_data": _qmt_global_available("get_trade_detail_data"),
                 "download_history_data": _qmt_global_available("download_history_data"),

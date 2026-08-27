@@ -2017,7 +2017,7 @@ class MiniQMTProvider(DataProvider):
             Dict[str, Any]: 已通过价格、时间与新鲜度校验的原始快照摘要。
 
         Raises:
-            RuntimeError: 行情缺失、价格非法、时间非法、未来或过期时抛出稳定错误码。
+            RuntimeError: 行情缺失、价格非法、时间非法或未来时抛出稳定错误码。
 
         Side Effects:
             通过本机 xtdata 读取一次实时行情，不写文件、不做历史数据回退。
@@ -2053,8 +2053,6 @@ class MiniQMTProvider(DataProvider):
         age_seconds = (received_time - source_time).total_seconds()
         if age_seconds < -2.0:
             raise RuntimeError("MINIQMT_LIVE_TIMESTAMP_FUTURE")
-        if age_seconds > self.max_live_age_seconds:
-            raise RuntimeError("MINIQMT_LIVE_STALE")
 
         return {
             "code": code,
@@ -2063,6 +2061,12 @@ class MiniQMTProvider(DataProvider):
             "source_time": source_time,
             "received_time": received_time,
             "age_seconds": max(age_seconds, 0.0),
+            "event_stale": age_seconds > self.max_live_age_seconds,
+            "feed_health": {
+                "status": "healthy",
+                "query_succeeded": True,
+                "transport": "xtdata.get_full_tick",
+            },
             "source": "windows_miniqmt_xtdata",
         }
 
@@ -2076,7 +2080,7 @@ class MiniQMTProvider(DataProvider):
             Dict[str, Any]: 最新价、涨跌停、停牌状态和源时间审计字段。
 
         Raises:
-            RuntimeError: 实时快照缺失、非法或超过新鲜度阈值时抛出。
+            RuntimeError: 实时快照缺失、非法或源时间明显未来时抛出。
 
         Side Effects:
             读取一次本机 xtdata 快照及证券详情，不回退到分钟线或本机伪时间。
@@ -2127,15 +2131,46 @@ class MiniQMTProvider(DataProvider):
         except Exception:
             pass
         return {
+            "security": self._to_jq_code(code),
             "last_price": snapshot["last_price"],
             "high_limit": high_limit,
             "low_limit": low_limit,
             "paused": paused,
             "source_time": snapshot["source_time"],
             "received_time": snapshot["received_time"],
+            "query_completed_time": snapshot["received_time"],
             "age_seconds": snapshot["age_seconds"],
+            "event_stale": snapshot["event_stale"],
+            "feed_health": snapshot["feed_health"],
+            "bid_price1": self._first_level_price(tick, "bidPrice", "bid_price1"),
+            "ask_price1": self._first_level_price(tick, "askPrice", "ask_price1"),
             "source": snapshot["source"],
         }
+
+    @staticmethod
+    def _first_level_price(
+        tick: Dict[str, Any], array_name: str, scalar_name: str
+    ) -> Optional[float]:
+        """读取一档盘口价格并把缺失或非法值保留为 None。
+
+        Args:
+            tick: MiniQMT 原始 tick 字典。
+            array_name: QMT 档位数组字段名。
+            scalar_name: 兼容的一档标量字段名。
+
+        Returns:
+            Optional[float]: 正有限的一档价格；不可用时返回 None。
+        """
+
+        raw = tick.get(scalar_name)
+        levels = tick.get(array_name)
+        if raw in (None, "") and isinstance(levels, (list, tuple)) and levels:
+            raw = levels[0]
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return None
+        return value if math.isfinite(value) and value > 0 else None
 
     def _get_xt_split_dividend(
         self,

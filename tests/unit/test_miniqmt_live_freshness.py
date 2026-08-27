@@ -1,7 +1,7 @@
 """MiniQMT 实时快照新鲜度合同测试。
 
 作者: BruceLee
-职责: 验证实时价格必须携带 QMT 源时间，并对缺失、未来及过期快照关闭交易入口。
+职责: 验证实时价格分离 QMT 查询健康与单证券事件年龄，并对缺失、未来快照关闭入口。
 输入: 可控 xtdata 替身和固定北京时间。
 输出: 稳定快照字段或稳定错误码断言。
 上游: MiniQMTProvider.get_live_current。
@@ -92,6 +92,30 @@ def test_live_current_exposes_fresh_source_time(monkeypatch):
     assert snap["source"] == "windows_miniqmt_xtdata"
     assert 0 <= snap["age_seconds"] <= 5
     assert snap["source_time"].tzinfo is not None
+    assert snap["query_completed_time"] == snap["received_time"]
+    assert snap["feed_health"]["status"] == "healthy"
+    assert snap["security"] == "511880.XSHG"
+
+
+def test_live_current_keeps_quiet_security_when_query_is_healthy(monkeypatch):
+    """验证证券五分钟无新事件时仍返回行情，并显式保留事件年龄。"""
+
+    quiet_time = pd.Timestamp.now(tz="Asia/Shanghai") - pd.Timedelta(minutes=5)
+    tick = {
+        "lastPrice": 100.708,
+        "time": int(quiet_time.timestamp() * 1000),
+        "openInt": 13,
+        "bidPrice": [100.707],
+        "askPrice": [100.708],
+    }
+
+    snap = _provider(monkeypatch, tick, max_age=5.0).get_live_current("511880.XSHG")
+
+    assert snap["age_seconds"] >= 299.0
+    assert snap["event_stale"] is True
+    assert snap["feed_health"]["status"] == "healthy"
+    assert snap["bid_price1"] == pytest.approx(100.707)
+    assert snap["ask_price1"] == pytest.approx(100.708)
 
 
 @pytest.mark.parametrize(
@@ -99,17 +123,10 @@ def test_live_current_exposes_fresh_source_time(monkeypatch):
     [
         ({"lastPrice": 100.0}, "MINIQMT_LIVE_TIMESTAMP_MISSING"),
         ({"lastPrice": 0.0, "time": 1}, "MINIQMT_LIVE_PRICE_INVALID"),
-        (
-            {
-                "lastPrice": 100.0,
-                "time": _epoch_ms("2000-01-01T09:30:00+08:00"),
-            },
-            "MINIQMT_LIVE_STALE",
-        ),
     ],
 )
 def test_live_current_rejects_unproved_snapshot(monkeypatch, tick, code):
-    """验证缺时间、非法价格和过期快照均按稳定码失败。"""
+    """验证缺时间和非法价格均按稳定码失败。"""
     provider = _provider(monkeypatch, tick)
     with pytest.raises(RuntimeError, match=code):
         provider.get_live_current("511880.XSHG")

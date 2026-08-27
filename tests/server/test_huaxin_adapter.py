@@ -591,6 +591,9 @@ async def test_huaxin_data_adapter_returns_only_fresh_xmd_snapshot() -> None:
     assert snapshot["source"] == HUAXIN_XMD_SOURCE
     assert snapshot["bid_price1"] == 100.704
     assert live_current["ask_price1"] == 100.705
+    assert live_current["max_age_seconds"] == DEFAULT_MAX_AGE_SECONDS
+    assert live_current["feed_health"]["status"] == "healthy"
+    assert live_current["query_completed_time"]
     assert current_tick["security"] == "511880.XSHG"
     assert adapter.backend_status()["actions"]["data.history"]["status"] == "unsupported"
     assert not hasattr(adapter, "get_history")

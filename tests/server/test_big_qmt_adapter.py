@@ -102,6 +102,30 @@ def test_big_qmt_adapter_is_registered_and_health_reports_backend(monkeypatch):
     assert health["idempotency_journal"]["ready"] is False
 
 
+def test_big_qmt_health_cache_expires_instead_of_staying_green(monkeypatch):
+    """验证 sidecar health 缓存过期后状态变为 unknown，而不是继续假绿。
+
+    Args:
+        monkeypatch: pytest 时间替换工具。
+
+    Returns:
+        None。
+    """
+
+    from bullet_trade.server.adapters.big_qmt import BigQmtGatewayClient
+
+    client = BigQmtGatewayClient(BigQmtGatewayConfig(health_ttl_seconds=15.0))
+    client._last_health = {"ready": True}
+    client._last_health_at = 100.0
+    monkeypatch.setattr(time, "time", lambda: 116.0)
+
+    status = client.qmt_status()
+
+    assert status["ready"] is None
+    assert status["state"] == "unknown"
+    assert status["health_cache_expired"] is True
+
+
 @pytest.mark.asyncio
 async def test_big_qmt_data_adapter_normalizes_gateway_payloads():
     client = _FakeGatewayClient(
@@ -120,6 +144,12 @@ async def test_big_qmt_data_adapter_normalizes_gateway_payloads():
                         "low_limit": 11.25,
                         "openInt": 13,
                         "bidPrice": [12.4],
+                        "askPrice": [12.6],
+                        "source": "big_qmt_full_tick",
+                        "source_time": "2026-07-03T09:30:00+08:00",
+                        "received_time": "2026-07-03T09:30:01+08:00",
+                        "query_completed_time": "2026-07-03T09:30:01+08:00",
+                        "feed_health": {"status": "healthy", "query_succeeded": True},
                     }
                 }
             },
@@ -142,15 +172,22 @@ async def test_big_qmt_data_adapter_normalizes_gateway_payloads():
     assert history["records"] == [[1.0, 2.0]]
 
     snapshot = await adapter.get_snapshot({"security": "000001.XSHE"})
-    assert snapshot == {"sid": "000001.XSHE", "last_price": 12.3, "dt": 1783043331000}
+    assert snapshot["sid"] == "000001.XSHE"
+    assert snapshot["last_price"] == 12.3
+    assert snapshot["dt"] == 1783043331000
 
     live_current = await adapter.get_live_current({"security": "000001.XSHE"})
-    assert live_current == {
-        "last_price": 12.5,
-        "high_limit": 13.75,
-        "low_limit": 11.25,
-        "paused": False,
-    }
+    assert live_current["last_price"] == 12.5
+    assert live_current["high_limit"] == 13.75
+    assert live_current["low_limit"] == 11.25
+    assert live_current["paused"] is False
+    assert live_current["security"] == "000001.XSHE"
+    assert live_current["source"] == "big_qmt_full_tick"
+    assert live_current["source_time"] == "2026-07-03T09:30:00+08:00"
+    assert live_current["query_completed_time"] == "2026-07-03T09:30:01+08:00"
+    assert live_current["feed_health"]["status"] == "healthy"
+    assert live_current["bid_price1"] == pytest.approx(12.4)
+    assert live_current["ask_price1"] == pytest.approx(12.6)
 
     current_tick = await adapter.get_current_tick("000001.XSHE")
     assert current_tick == {
