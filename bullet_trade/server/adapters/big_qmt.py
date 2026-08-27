@@ -81,6 +81,7 @@ class BigQmtGatewayConfig:
     password: Optional[str] = None
     secret: Optional[str] = None
     timeout_seconds: float = 10.0
+    health_ttl_seconds: float = 15.0
     action_status: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
 
@@ -101,6 +102,10 @@ def load_big_qmt_gateway_config(server_config: ServerConfig) -> BigQmtGatewayCon
         password=get_env("BIG_QMT_GATEWAY_PASSWORD", get_env("BIG_QMT_GATEWAY_TOKEN")),
         secret=get_env("BIG_QMT_GATEWAY_SECRET"),
         timeout_seconds=max(0.1, float(timeout or 10.0)),
+        health_ttl_seconds=max(
+            1.0,
+            float(get_env_float("BIG_QMT_GATEWAY_HEALTH_TTL_SECONDS", 15.0) or 15.0),
+        ),
     )
     cfg.action_status = _build_action_status(server_config)
     return cfg
@@ -111,6 +116,7 @@ class BigQmtGatewayClient:
         self.config = config
         self._base_url = config.base_url.rstrip("/")
         self._last_health: Optional[Dict[str, Any]] = None
+        self._last_health_at: Optional[float] = None
         self._last_error: Optional[str] = None
         self._last_success_at: Optional[float] = None
         self._last_failure_at: Optional[float] = None
@@ -140,6 +146,7 @@ class BigQmtGatewayClient:
         value = await self.get("/health")
         if isinstance(value, dict):
             self._last_health = value
+            self._last_health_at = time.time()
             return value
         return {"raw": value}
 
@@ -200,12 +207,23 @@ class BigQmtGatewayClient:
 
     def qmt_status(self) -> Dict[str, Any]:
         health = self._last_health or {}
+        health_cache_age = (
+            max(0.0, time.time() - self._last_health_at)
+            if self._last_health_at is not None
+            else None
+        )
+        health_cache_expired = (
+            health_cache_age is None or health_cache_age > self.config.health_ttl_seconds
+        )
         health_ready = health.get("ready")
         if health_ready is None:
             health_ready = health.get("process_alive")
         if self._last_error:
             ready = False
             state = "unavailable"
+        elif health_cache_expired:
+            ready = None
+            state = "unknown"
         elif health_ready is None:
             ready = None
             state = "unknown"
@@ -222,6 +240,9 @@ class BigQmtGatewayClient:
             "last_error": self._last_error,
             "last_success_at": self._last_success_at,
             "last_failure_at": self._last_failure_at,
+            "health_cache_age_seconds": health_cache_age,
+            "health_cache_ttl_seconds": self.config.health_ttl_seconds,
+            "health_cache_expired": health_cache_expired,
             "actions": self.config.action_status,
             "big_qmt_gateway": health,
         }
@@ -294,7 +315,7 @@ class BigQmtDataAdapter(RemoteDataAdapter):
         data = await self.client.post_first(
             ("/data/live_current", "/data/current_tick", "/data/snapshot"), payload
         )
-        return _normalize_live_current_tick(_select_tick(data, security))
+        return _normalize_live_current_tick(_select_tick(data, security), security)
 
     async def get_trade_days(self, payload: Dict) -> Dict:
         data = await self.client.post("/data/trade_days", payload)
@@ -802,10 +823,12 @@ def _normalize_snapshot_tick(tick: Dict[str, Any], security: Optional[str]) -> D
         or ""
     )
     dt = _first_present(tick, "dt", "timetag", "datetime", "time")
-    return {"sid": sid, "last_price": last_price, "dt": dt}
+    value = {"sid": sid, "last_price": last_price, "dt": dt}
+    _preserve_live_observation_fields(value, tick)
+    return value
 
 
-def _normalize_live_current_tick(tick: Dict[str, Any]) -> Dict:
+def _normalize_live_current_tick(tick: Dict[str, Any], security: Optional[str] = None) -> Dict:
     if not tick:
         return {}
     last_price = _as_float_or_none(_first_present(tick, "last_price", "lastPrice", "price", "last"))
@@ -818,16 +841,56 @@ def _normalize_live_current_tick(tick: Dict[str, Any]) -> Dict:
             paused = int(open_int) in (1, 17, 20)
         except (TypeError, ValueError):
             paused = False
-    return {
-        "last_price": last_price,
-        "high_limit": _as_float(
-            _first_present(tick, "high_limit", "highLimit", "UpStopPrice", "up_stop_price")
-        ),
-        "low_limit": _as_float(
-            _first_present(tick, "low_limit", "lowLimit", "DownStopPrice", "down_stop_price")
-        ),
-        "paused": bool(paused),
-    }
+    value = dict(tick)
+    value.update(
+        {
+            "security": security or tick.get("security") or tick.get("sid") or tick.get("code"),
+            "last_price": last_price,
+            "high_limit": _as_float(
+                _first_present(tick, "high_limit", "highLimit", "UpStopPrice", "up_stop_price")
+            ),
+            "low_limit": _as_float(
+                _first_present(tick, "low_limit", "lowLimit", "DownStopPrice", "down_stop_price")
+            ),
+            "paused": bool(paused),
+        }
+    )
+    _preserve_live_observation_fields(value, tick)
+    return value
+
+
+def _preserve_live_observation_fields(target: Dict[str, Any], source: Dict[str, Any]) -> None:
+    """把 helper 的来源、双时间、健康和一档盘口证据无损写入规范快照。
+
+    Args:
+        target: adapter 正在构造的规范快照。
+        source: helper 返回的原始证券快照。
+
+    Returns:
+        None: 直接修改 target，不伪造缺失的源时间。
+    """
+
+    for name in (
+        "source",
+        "source_time",
+        "received_time",
+        "query_completed_time",
+        "age_seconds",
+        "event_stale",
+        "feed_health",
+        "bid_volume1",
+        "ask_volume1",
+    ):
+        if name in source:
+            target[name] = source[name]
+    for scalar, array in (("bid_price1", "bidPrice"), ("ask_price1", "askPrice")):
+        raw = source.get(scalar)
+        levels = source.get(array)
+        if raw in (None, "") and isinstance(levels, (list, tuple)) and levels:
+            raw = levels[0]
+        value = _as_float_or_none(raw)
+        if value is not None and value > 0:
+            target[scalar] = value
 
 
 def _virtual_account_id(payload: Dict[str, Any]) -> str:

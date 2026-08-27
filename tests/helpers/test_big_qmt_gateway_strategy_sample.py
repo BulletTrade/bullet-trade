@@ -11,7 +11,9 @@ TEST_ACCOUNT_ID = "test_account_id"
 
 def _load_helper():
     path = Path(__file__).resolve().parents[2] / "helpers" / "big_qmt_gateway_strategy_sample.py"
-    spec = importlib.util.spec_from_file_location("bt_big_qmt_gateway_strategy_sample_for_test", str(path))
+    spec = importlib.util.spec_from_file_location(
+        "bt_big_qmt_gateway_strategy_sample_for_test", str(path)
+    )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -174,10 +176,42 @@ def test_big_qmt_helper_keeps_current_tick_as_snapshot_capability():
     assert context.full_tick_codes == ["000001.SZ"]
 
 
+def test_big_qmt_helper_preserves_live_observation_metadata():
+    """验证 helper 保留源时间、查询完成时间和一档盘口。
+
+    Returns:
+        None。
+    """
+
+    helper = _load_helper()
+    context = _FakeContext()
+    context.get_full_tick = lambda stock_code=None: {
+        "000001.SZ": {
+            "lastPrice": 12.3,
+            "timetag": "20260827 09:31:00",
+            "bidPrice": [12.29],
+            "askPrice": [12.31],
+            "openInt": 13,
+        }
+    }
+
+    result = helper._get_full_tick(context, {"security": "000001.XSHE"})
+    tick = result["ticks"]["000001.XSHE"]
+
+    assert tick["source"] == "big_qmt_full_tick"
+    assert tick["source_time"] == "20260827 09:31:00"
+    assert tick["query_completed_time"] == result["query_completed_time"]
+    assert tick["feed_health"]["status"] == "healthy"
+    assert tick["bid_price1"] == 12.29
+    assert tick["ask_price1"] == 12.31
+
+
 def test_big_qmt_gateway_handler_reads_request_headers():
     helper = _load_helper()
     handler = object.__new__(helper._GatewayHandler)
-    handler.request = SimpleNamespace(headers=HTTPHeaders({"X-BulletTrade-Request-Id": "r-headers"}))
+    handler.request = SimpleNamespace(
+        headers=HTTPHeaders({"X-BulletTrade-Request-Id": "r-headers"})
+    )
 
     assert handler._request_id() == "r-headers"
 
@@ -219,7 +253,9 @@ def test_runtime_reports_context_missing_for_current_tick_without_context():
     runtime = helper._GatewayRuntime()
     runtime.direct_dispatch = True
 
-    response = runtime.submit("current_tick", {"security": "000001.XSHE", "request_id": "r-no-context"})
+    response = runtime.submit(
+        "current_tick", {"security": "000001.XSHE", "request_id": "r-no-context"}
+    )
 
     assert response["ok"] is False
     assert response["code"] == "QMT_CONTEXT_NOT_READY"
@@ -240,7 +276,9 @@ def test_runtime_dispatches_account_actions_without_context(monkeypatch):
     monkeypatch.setattr(
         helper,
         "get_trade_detail_data",
-        lambda account_id, account_type, detail_type, *args: [_FakeAccount()] if detail_type == "account" else [],
+        lambda account_id, account_type, detail_type, *args: [_FakeAccount()]
+        if detail_type == "account"
+        else [],
         raising=False,
     )
 
@@ -267,7 +305,9 @@ def test_runtime_bypasses_queue_for_account_actions_even_with_context(monkeypatc
     monkeypatch.setattr(
         helper,
         "get_trade_detail_data",
-        lambda account_id, account_type, detail_type, *args: [_FakeAccount()] if detail_type == "account" else [],
+        lambda account_id, account_type, detail_type, *args: [_FakeAccount()]
+        if detail_type == "account"
+        else [],
         raising=False,
     )
 
@@ -314,12 +354,16 @@ def test_big_qmt_helper_dispatches_non_tick_data_apis(monkeypatch):
     assert context.history_call[2]["period"] == "1d"
     assert download_calls[0][0] == ("000001.SZ", "1d", "", "")
 
-    trade_days = helper._dispatch_qmt_action(context, "trade_days", {"security": "000001.XSHE", "count": 1})
+    trade_days = helper._dispatch_qmt_action(
+        context, "trade_days", {"security": "000001.XSHE", "count": 1}
+    )
     assert trade_days["ok"] is True
     assert trade_days["value"]["values"] == ["20260701"]
     assert context.trade_days_call[0] == "000001.SZ"
 
-    security_info = helper._dispatch_qmt_action(context, "security_info", {"security": "000001.XSHE"})
+    security_info = helper._dispatch_qmt_action(
+        context, "security_info", {"security": "000001.XSHE"}
+    )
     assert security_info["ok"] is True
     assert security_info["value"]["display_name"] == "Ping An Bank"
     assert security_info["value"]["qmt_security"] == "000001.SZ"
@@ -358,7 +402,9 @@ def test_big_qmt_helper_dispatches_non_tick_data_apis(monkeypatch):
     assert context.sector_calls[-1] == "\u6caa\u6df1ETF"
     assert etf_securities["value"]["records"][0][5] == "etf"
 
-    index_stocks = helper._dispatch_qmt_action(context, "index_stocks", {"index_symbol": "000300.XSHG"})
+    index_stocks = helper._dispatch_qmt_action(
+        context, "index_stocks", {"index_symbol": "000300.XSHG"}
+    )
     assert index_stocks["ok"] is True
     assert index_stocks["value"]["stocks"] == ["000001.XSHE", "000002.XSHE"]
     assert index_stocks["value"]["source"] == "sector_fallback"
@@ -384,7 +430,9 @@ def test_big_qmt_helper_dispatches_non_tick_data_apis(monkeypatch):
 def test_big_qmt_helper_history_drops_unrequested_stime_column(monkeypatch):
     helper = _load_helper()
     context = _FakeContextHistoryWithStime()
-    monkeypatch.setattr(helper, "download_history_data", lambda *args, **kwargs: None, raising=False)
+    monkeypatch.setattr(
+        helper, "download_history_data", lambda *args, **kwargs: None, raising=False
+    )
 
     history = helper._dispatch_qmt_action(
         context,
@@ -400,7 +448,9 @@ def test_big_qmt_helper_history_drops_unrequested_stime_column(monkeypatch):
 def test_big_qmt_helper_history_uses_miniqmt_ratio_dividend_types(monkeypatch):
     helper = _load_helper()
     context = _FakeContext()
-    monkeypatch.setattr(helper, "download_history_data", lambda *args, **kwargs: None, raising=False)
+    monkeypatch.setattr(
+        helper, "download_history_data", lambda *args, **kwargs: None, raising=False
+    )
 
     helper._dispatch_qmt_action(
         context,
@@ -458,7 +508,12 @@ def test_big_qmt_helper_index_stocks_prefers_index_weight(monkeypatch):
     helper = _load_helper()
     context = _FakeContextWithIndexWeight()
     download_calls = []
-    monkeypatch.setattr(helper, "download_index_weight", lambda *args, **kwargs: download_calls.append(args), raising=False)
+    monkeypatch.setattr(
+        helper,
+        "download_index_weight",
+        lambda *args, **kwargs: download_calls.append(args),
+        raising=False,
+    )
 
     response = helper._dispatch_qmt_action(context, "index_stocks", {"index_symbol": "000300.XSHG"})
 
@@ -859,7 +914,9 @@ def test_big_qmt_helper_filters_orders_and_trades_by_virtual_account(monkeypatch
     assert trades["value"]["trades"][0]["sub_account_id"] == "sub-a"
 
 
-def test_big_qmt_helper_matches_pending_virtual_order_tag_when_qmt_remark_is_short_id(monkeypatch, tmp_path):
+def test_big_qmt_helper_matches_pending_virtual_order_tag_when_qmt_remark_is_short_id(
+    monkeypatch, tmp_path
+):
     helper = _load_helper()
     order = _FakeOrder("order-new", volume=100, traded=0, remark="BTSHORTID")
     order.m_dLimitPrice = 1.0
@@ -962,6 +1019,8 @@ def test_big_qmt_helper_split_dividend_filters_epoch_millisecond_keys(monkeypatc
     )
 
     assert result["ok"] is True
-    assert [item["date"] for item in result["value"]["events"]] == [helper._date_iso("1278000000000")]
+    assert [item["date"] for item in result["value"]["events"]] == [
+        helper._date_iso("1278000000000")
+    ]
     assert result["value"]["events"][0]["bonus_pre_tax"] == 40.0
     assert result["value"]["events"][0]["per_base"] == 10

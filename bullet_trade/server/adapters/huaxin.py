@@ -1393,6 +1393,13 @@ class HuaxinDataAdapter:
         if bid_price1 > ask_price1:
             raise XmdBackendError("snapshot_spread_invalid", "实时快照买一价不能高于卖一价")
         value["age_seconds"] = age_seconds
+        value["max_age_seconds"] = self._max_age_seconds
+        value["query_completed_time"] = datetime.now(source_time.tzinfo).isoformat()
+        value["feed_health"] = {
+            "status": "healthy",
+            "session_ready": True,
+            "source": HUAXIN_XMD_SOURCE,
+        }
         return value
 
     @staticmethod
