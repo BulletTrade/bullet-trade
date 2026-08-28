@@ -738,12 +738,16 @@ class LiveEngine:
         schedule_results: Dict[str, Any] = {}
         schedule_batch: Optional[_OrderBatchContext] = None
         schedule_failed = False
+        guard_schedule_orders = bool(
+            self.config.fail_on_schedule_error
+            and self.config.checkpoint_persistence_enabled
+        )
         schedule_scope = (
-            _order_batch_scope() if self.config.fail_on_schedule_error else nullcontext(None)
+            _order_batch_scope() if guard_schedule_orders else nullcontext(None)
         )
         try:
             with schedule_scope as schedule_batch:
-                self._schedule_batch_active = self.config.fail_on_schedule_error
+                self._schedule_batch_active = guard_schedule_orders
                 try:
                     if self.async_scheduler:
                         schedule_results = await self.async_scheduler.trigger(
@@ -755,10 +759,11 @@ class LiveEngine:
                     log.error(f"异步调度执行失败: {exc}", exc_info=True)
                     if self.config.fail_on_schedule_error:
                         schedule_failed = True
-                        self._reject_schedule_batch_orders(
-                            schedule_batch,
-                            "scheduler_trigger_failed",
-                        )
+                        if schedule_batch is not None:
+                            self._reject_schedule_batch_orders(
+                                schedule_batch,
+                                "scheduler_trigger_failed",
+                            )
                         raise RuntimeError("异步调度器触发失败，拒绝推进调度游标") from exc
 
                 if self.config.fail_on_schedule_error:
@@ -769,10 +774,11 @@ class LiveEngine:
                     }
                     if schedule_errors:
                         schedule_failed = True
-                        self._reject_schedule_batch_orders(
-                            schedule_batch,
-                            "scheduler_task_failed",
-                        )
+                        if schedule_batch is not None:
+                            self._reject_schedule_batch_orders(
+                                schedule_batch,
+                                "scheduler_task_failed",
+                            )
                         raise RuntimeError("调度任务执行失败，拒绝推进调度游标: " f"{schedule_errors}")
         finally:
             self._schedule_batch_active = False

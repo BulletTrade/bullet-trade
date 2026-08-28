@@ -1678,6 +1678,7 @@ async def test_live_engine_schedule_error_guard_preserves_cursor(tmp_path, monke
         live_config={
             "runtime_dir": str(tmp_path / "runtime"),
             "fail_on_schedule_error": True,
+            "checkpoint_persistence_enabled": True,
         },
     )
     engine.async_scheduler = AsyncMock()
@@ -1715,6 +1716,7 @@ async def test_schedule_error_guard_rejects_only_new_batch_orders(tmp_path):
         live_config={
             "runtime_dir": str(tmp_path / "runtime"),
             "fail_on_schedule_error": True,
+            "checkpoint_persistence_enabled": True,
         },
     )
     engine._loop = asyncio.get_running_loop()
@@ -1788,6 +1790,7 @@ async def test_schedule_error_guard_processes_batch_after_success(tmp_path):
         live_config={
             "runtime_dir": str(tmp_path / "runtime"),
             "fail_on_schedule_error": True,
+            "checkpoint_persistence_enabled": True,
         },
     )
     engine._loop = asyncio.get_running_loop()
@@ -1815,6 +1818,75 @@ async def test_schedule_error_guard_processes_batch_after_success(tmp_path):
         await asyncio.sleep(0)
         assert engine.broker.orders == []
         return {"daily__success": {"result": None}}
+
+    engine.async_scheduler.trigger.side_effect = _trigger
+    set_current_engine(engine)
+    try:
+        await engine._handle_minute_tick(datetime(2025, 1, 2, 9, 31))
+
+        assert engine.broker.orders == [("000001.XSHE", 100, 10.0, "buy", False)]
+        assert get_order_queue() == []
+    finally:
+        clear_order_queue()
+        set_current_engine(None)
+
+
+@pytest.mark.asyncio
+async def test_schedule_fail_fast_can_keep_executor_order_submission_synchronous(tmp_path):
+    """验证执行器可在保留调度异常退出时同步取得券商订单号。
+
+    Args:
+        tmp_path: pytest 提供的临时策略和运行目录。
+
+    Returns:
+        None: 回调内取得券商订单号且 Broker 只收到一次委托时通过。
+
+    Side Effects:
+        临时注册 LiveEngine，并向内存 DummyBroker 提交一笔合成限价单。
+    """
+
+    strategy = _write_strategy(tmp_path)
+    engine = LiveEngine(
+        strategy_file=strategy,
+        broker_factory=DummyBroker,
+        live_config={
+            "runtime_dir": str(tmp_path / "runtime"),
+            "fail_on_schedule_error": True,
+        },
+    )
+    engine._loop = asyncio.get_running_loop()
+    engine._startup_phase = "ready"
+    engine.broker = DummyBroker()
+    engine.async_scheduler = AsyncMock()
+    engine._maybe_emit_market_events = AsyncMock()
+    engine._maybe_handle_data = AsyncMock()
+    clear_order_queue()
+    submitted_order: Optional[Order] = None
+
+    async def _trigger(*_args, **_kwargs):
+        """在线程回调中提交订单并验证同步 broker identity。
+
+        Args:
+            *_args: 兼容 AsyncScheduler.trigger 的位置参数。
+            **_kwargs: 兼容 AsyncScheduler.trigger 的关键字参数。
+
+        Returns:
+            Dict[str, Dict[str, None]]: 成功调度回执。
+
+        Side Effects:
+            创建一笔订单并写入 ``submitted_order``。
+        """
+
+        nonlocal submitted_order
+        submitted_order = await asyncio.to_thread(
+            order,
+            "000001.XSHE",
+            100,
+            price=10.0,
+        )
+        assert submitted_order is not None
+        assert getattr(submitted_order, "_broker_order_id", None) == "buy-1"
+        return {"daily__executor": {"result": None}}
 
     engine.async_scheduler.trigger.side_effect = _trigger
     set_current_engine(engine)
@@ -1884,6 +1956,7 @@ async def test_schedule_trigger_exception_rejects_new_batch_order(tmp_path):
         live_config={
             "runtime_dir": str(tmp_path / "runtime"),
             "fail_on_schedule_error": True,
+            "checkpoint_persistence_enabled": True,
         },
     )
     engine._loop = asyncio.get_running_loop()
@@ -2180,6 +2253,7 @@ async def test_failed_batch_rejects_late_context_order_before_enqueue(
         live_config={
             "runtime_dir": str(tmp_path / "runtime"),
             "fail_on_schedule_error": True,
+            "checkpoint_persistence_enabled": True,
         },
     )
     engine._loop = asyncio.get_running_loop()
