@@ -5,6 +5,15 @@
 
 ## [未发布]
 
+### 修复
+- **大 QMT 实时行情时间语义**：helper 和 server adapter 保留行情源时间、独立查询完成时间、通道健康状态及一档盘口，使上层可以区分安静证券与行情通道故障；正式 helper build 标识更新为 `20260828_observation_metadata_v1`。
+
+### 文档
+- **大 QMT observation metadata**：补充实时快照新增字段、通道健康与证券事件年龄的判定边界。
+
+### 测试
+- **大 QMT helper 构建标识回归**：显式锁定 observation metadata build，并覆盖源时间、查询完成时间、通道健康和一档盘口。
+
 ## [0.9.2] - 2026-07-06
 
 ### 修复

@@ -253,7 +253,7 @@ bullet-trade live strategies/demo_strategy.py --broker qmt-remote
 大 QMT helper 和 `--server-type big_qmt` 的目标是对上层继续提供 MiniQMT 兼容的 `qmt-remote` 协议。关键数据接口按下面口径处理：
 
 - `data.history`：每次都先调用大 QMT 内置 `download_history_data`，再调用 `get_market_data_ex` 读取本地行情。请求参数不能跳过下载；下载失败直接返回受控错误，避免把缺失数据当成成功结果。
-- `data.current_tick`：保留当前价接口，返回结构与快照保持一致，至少包含 `sid`、`last_price`、`dt`。
+- `data.current_tick` / 快照：保留当前价接口并返回 `sid`、`last_price`、`dt`；build `20260828_observation_metadata_v1` 起还保留 `source_time`、独立的 `query_completed_time`、`source`、`feed_health` 以及可用的一档买卖价。上层可以分别判断“行情通道是否健康”和“当前证券最近事件是否较旧”，避免把安静证券误判为整条行情链路失效。
 - `data.security_info`：返回聚宽风格 `code` 和 QMT 风格 `qmt_code`，同时补齐 `display_name`、`name`、`start_date`、`end_date`、`type`、`subtype`、`parent`。
 - `data.get_index_stocks`：优先使用 `download_index_weight` / `get_index_weight` 获取指数权重成分；如果当前大 QMT 环境不支持，再回退到板块列表。
 - `data.trade_days`：输出日期保持 MiniQMT 兼容格式，避免不同后端返回纯数字日期导致上层对比失败。
