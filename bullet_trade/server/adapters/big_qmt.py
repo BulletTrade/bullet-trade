@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import time
 import urllib.error
 import urllib.request
@@ -400,8 +401,8 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
     async def list_orders(
         self, account: AccountContext, filters: Optional[Dict] = None
     ) -> List[Dict]:
-        payload = self._account_payload(account)
-        payload.update(_gateway_order_filters(filters or {}))
+        payload = _gateway_order_filters(filters or {})
+        payload.update(self._account_payload(account))
         data = await self.client.post("/orders", payload)
         orders = [
             self._apply_local_order_tag(_normalize_order(item))
@@ -413,8 +414,8 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
     async def list_trades(
         self, account: AccountContext, filters: Optional[Dict] = None
     ) -> List[Dict]:
-        payload = self._account_payload(account)
-        payload.update(_gateway_order_filters(filters or {}))
+        payload = _gateway_order_filters(filters or {})
+        payload.update(self._account_payload(account))
         data = await self.client.post("/trades", payload)
         trades = [
             self._apply_local_order_tag(_normalize_trade(item))
@@ -430,8 +431,8 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
         return self._apply_local_order_tag(_normalize_order(_extract_dict(data)))
 
     async def place_order(self, account: AccountContext, payload: Dict) -> Dict:
-        request = self._account_payload(account)
-        request.update(payload or {})
+        request = dict(payload or {})
+        request.update(self._account_payload(account))
         _ensure_virtual_account_remark(request)
         _ensure_gateway_submission_identity(request)
         submitted_at = time.time()
@@ -1216,7 +1217,17 @@ def _submission_unknown_order(order: Dict[str, Any], warning: str) -> Dict[str, 
 
 
 def _normalize_position(row: Dict[str, Any]) -> Dict[str, Any]:
+    """规范化大 QMT 持仓字段并过滤非法行情与成本数值。
+
+    Args:
+        row: helper 返回的持仓字典，可包含嵌套 raw 原始字段。
+
+    Returns:
+        Dict[str, Any]: 证券身份、数量、平均成本、现价和市值口径统一的持仓。
+    """
+
     item = dict(row)
+    raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
     security = item.get("security") or _security_from_qmt_fields(item)
     if security:
         item["security"] = security
@@ -1224,8 +1235,44 @@ def _normalize_position(row: Dict[str, Any]) -> Dict[str, Any]:
         item["closeable_amount"] = item.get("available") or item.get("m_nCanUseVolume")
     if "amount" not in item:
         item["amount"] = item.get("volume") or item.get("m_nVolume")
-    if "cost_basis" not in item:
-        item["cost_basis"] = item.get("avg_cost") or item.get("m_dOpenPrice")
+    avg_cost = None
+    zero_cost = None
+    for key in ("m_dAvgOpenPrice", "avg_cost", "cost_basis", "open_price", "m_dOpenPrice"):
+        for source in (item, raw):
+            value = _as_float_or_none(source.get(key))
+            if value is not None and math.isfinite(value) and value >= 0.0:
+                if value > 0.0:
+                    avg_cost = value
+                    break
+                zero_cost = value
+        if avg_cost is not None:
+            break
+    if avg_cost is None:
+        avg_cost = zero_cost
+    item["avg_cost"] = float(avg_cost or 0.0)
+    item["cost_basis"] = float(avg_cost or 0.0)
+    current_price = None
+    for key in ("current_price", "price", "last_price", "m_dLastPrice"):
+        for source in (item, raw):
+            value = _as_float_or_none(source.get(key))
+            if value is not None and math.isfinite(value) and value >= 0.0:
+                current_price = value
+                break
+        if current_price is not None:
+            break
+    if current_price is not None:
+        item["current_price"] = current_price
+    market_value = None
+    for key in ("market_value", "m_dMarketValue"):
+        for source in (item, raw):
+            value = _as_float_or_none(source.get(key))
+            if value is not None and math.isfinite(value) and value >= 0.0:
+                market_value = value
+                break
+        if market_value is not None:
+            break
+    if market_value is not None:
+        item["market_value"] = market_value
     return item
 
 

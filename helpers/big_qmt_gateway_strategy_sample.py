@@ -1,7 +1,7 @@
 #encoding:gbk
 # Author: BruceLee
 # Date: 2026-08-28
-# Version: 20260828_observation_metadata_v1
+# Version: 20260828_freshness_cost_v2
 # File: Big QMT embedded gateway strategy sample.
 # Description: Run inside a dedicated Big QMT strategy and expose a
 # BulletTrade-compatible local HTTP/JSON data and trading gateway.
@@ -10,9 +10,11 @@
 # bridge. Validate scheduling, thread boundaries and QMT API availability in a
 # simulation environment before production use.
 
+import calendar
 import json
 import logging
 from logging.handlers import TimedRotatingFileHandler
+import math
 import os
 import queue
 import sys
@@ -42,7 +44,7 @@ LISTEN_PORT = 9000
 
 # Build marker shown in startup logs and /health. Update this when copying a new
 # helper build into QMT so tests can prove the running file version.
-GATEWAY_BUILD_ID = "20260828_observation_metadata_v1"
+GATEWAY_BUILD_ID = "20260828_freshness_cost_v2"
 
 # Shared password required by non-health HTTP APIs. Change this to a private
 # local value outside simulation; clients send it as X-BulletTrade-Password or
@@ -494,6 +496,90 @@ def _tick_float(tick: Dict[str, Any], *keys: str) -> Optional[float]:
     return None
 
 
+def _timestamp_epoch(value: Any) -> Optional[float]:
+    """把大 QMT 行情时间转换为可比较的 Unix 秒。
+
+    Args:
+        value: QMT timetag、epoch 秒/毫秒或带可选时区的时间文本。
+
+    Returns:
+        Optional[float]: 可验证的 Unix 秒；格式不受支持时返回 None。
+    """
+
+    if value in (None, "") or isinstance(value, bool):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    digits = text.replace(".", "", 1)
+    if text.isdigit() and len(text) in (14, 17):
+        try:
+            year = int(text[:4])
+        except Exception:
+            year = 0
+        if 2000 <= year <= 2100:
+            try:
+                return time.mktime(time.strptime(text[:14], "%Y%m%d%H%M%S"))
+            except Exception:
+                return None
+    if digits.isdigit():
+        try:
+            number = float(text)
+        except Exception:
+            number = 0.0
+        if number > 100000000000.0:
+            number /= 1000.0
+        if 946684800.0 <= number <= 4102444800.0:
+            return number
+
+    timezone_offset = None
+    if text.endswith("Z"):
+        timezone_offset = 0
+        text = text[:-1]
+    elif len(text) >= 6 and text[-6] in ("+", "-") and text[-3] == ":":
+        try:
+            sign = 1 if text[-6] == "+" else -1
+            timezone_offset = sign * (int(text[-5:-3]) * 3600 + int(text[-2:]) * 60)
+            text = text[:-6]
+        except Exception:
+            return None
+    for fmt in (
+        "%Y%m%d %H:%M:%S",
+        "%Y%m%d%H%M%S",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%d %H:%M:%S",
+    ):
+        try:
+            parsed = time.strptime(text, fmt)
+        except Exception:
+            continue
+        if timezone_offset is None:
+            return time.mktime(parsed)
+        return calendar.timegm(parsed) - timezone_offset
+    return None
+
+
+def _tick_age_seconds(source_time: Any, received_time: Any) -> Optional[float]:
+    """计算同一次行情查询中证券事件到接收完成的年龄。
+
+    Args:
+        source_time: QMT 快照携带的证券事件时间。
+        received_time: 本次 get_full_tick 查询完成时间。
+
+    Returns:
+        Optional[float]: 非负事件年龄秒数；任一时间不可解析时返回 None。
+    """
+
+    source_epoch = _timestamp_epoch(source_time)
+    received_epoch = _timestamp_epoch(received_time)
+    if source_epoch is None or received_epoch is None:
+        return None
+    age_seconds = received_epoch - source_epoch
+    if not math.isfinite(age_seconds) or age_seconds < 0.0:
+        return None
+    return age_seconds
+
+
 def _enrich_tick(
     context_info: Any,
     qmt_security: str,
@@ -521,22 +607,35 @@ def _enrich_tick(
     last_price = _tick_float(item, "last_price", "lastPrice", "price")
     if last_price is not None:
         item.setdefault("last_price", last_price)
-    timetag = item.get("timetag") or item.get("time") or item.get("datetime")
-    if timetag not in (None, ""):
-        item.setdefault("dt", timetag)
-        item.setdefault("source_time", timetag)
-    item.setdefault("source", "big_qmt_full_tick")
-    if query_completed_time:
-        item.setdefault("received_time", query_completed_time)
-        item.setdefault("query_completed_time", query_completed_time)
-    item.setdefault(
-        "feed_health",
-        {
-            "status": "healthy",
-            "query_succeeded": True,
-            "transport": "ContextInfo.get_full_tick",
-        },
+    timetag = (
+        item.get("timetag")
+        or item.get("time")
+        or item.get("datetime")
+        or item.get("source_time")
     )
+    if timetag not in (None, ""):
+        item["dt"] = timetag
+        item["source_time"] = timetag
+    else:
+        item.pop("source_time", None)
+    item["source"] = "big_qmt_full_tick"
+    if query_completed_time:
+        item["received_time"] = query_completed_time
+        item["query_completed_time"] = query_completed_time
+        age_seconds = _tick_age_seconds(timetag, query_completed_time)
+        if age_seconds is not None:
+            item["age_seconds"] = age_seconds
+        else:
+            item.pop("age_seconds", None)
+    else:
+        item.pop("received_time", None)
+        item.pop("query_completed_time", None)
+        item.pop("age_seconds", None)
+    item["feed_health"] = {
+        "status": "healthy",
+        "query_succeeded": True,
+        "transport": "ContextInfo.get_full_tick",
+    }
     bid_prices = item.get("bidPrice")
     ask_prices = item.get("askPrice")
     if item.get("bid_price1") in (None, "") and isinstance(bid_prices, (list, tuple)) and bid_prices:
@@ -1178,7 +1277,49 @@ def _account_to_dict(account: Any, account_id: str, account_type: str) -> Dict[s
     }
 
 
+def _finite_nonnegative_float(value: Any) -> Optional[float]:
+    """把字段转换为有限非负浮点数。
+
+    Args:
+        value: QMT 对象上的候选数值字段。
+
+    Returns:
+        Optional[float]: 有限非负值；负数、NaN、无穷或非法值返回 None。
+    """
+
+    try:
+        parsed = float(value)
+    except Exception:
+        return None
+    if not math.isfinite(parsed) or parsed < 0.0:
+        return None
+    return parsed
+
+
+def _position_average_cost(position: Any) -> float:
+    """选择大 QMT 持仓对象中语义可靠的平均建仓成本。
+
+    Args:
+        position: get_trade_detail_data 返回的持仓对象。
+
+    Returns:
+        float: 优先使用正数平均开仓价；在其为零、缺失或非法时回退有效开仓价，
+        均无效则为零。
+    """
+
+    zero_candidate = None
+    for field_name in ("m_dAvgOpenPrice", "m_dOpenPrice"):
+        parsed = _finite_nonnegative_float(getattr(position, field_name, None))
+        if parsed is None:
+            continue
+        if parsed > 0.0:
+            return parsed
+        zero_candidate = parsed
+    return float(zero_candidate or 0.0)
+
+
 def _position_to_dict(position: Any) -> Dict[str, Any]:
+    avg_cost = _position_average_cost(position)
     return {
         "security": _security(
             getattr(position, "m_strInstrumentID", ""),
@@ -1187,8 +1328,8 @@ def _position_to_dict(position: Any) -> Dict[str, Any]:
         "name": getattr(position, "m_strInstrumentName", ""),
         "amount": int(getattr(position, "m_nVolume", 0) or 0),
         "closeable_amount": int(getattr(position, "m_nCanUseVolume", 0) or 0),
-        "avg_cost": float(getattr(position, "m_dOpenPrice", 0.0) or 0.0),
-        "cost_basis": float(getattr(position, "m_dOpenPrice", 0.0) or 0.0),
+        "avg_cost": avg_cost,
+        "cost_basis": avg_cost,
         "market_value": float(getattr(position, "m_dMarketValue", 0.0) or 0.0),
         "last_price": float(getattr(position, "m_dLastPrice", 0.0) or 0.0),
         "frozen": int(getattr(position, "m_nFrozenVolume", 0) or 0),
