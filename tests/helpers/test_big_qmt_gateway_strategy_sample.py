@@ -3,6 +3,7 @@ from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
 from tornado.httputil import HTTPHeaders
 
 
@@ -17,6 +18,22 @@ def _load_helper():
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
+
+
+def test_big_qmt_helper_source_keeps_gbk_encoding():
+    """验证嵌入大 QMT 的策略源码保持 GBK 声明和真实字节编码。
+
+    Returns:
+        None。
+    """
+
+    path = Path(__file__).parents[2] / "helpers" / "big_qmt_gateway_strategy_sample.py"
+    raw = path.read_bytes()
+
+    assert raw.startswith(b"#encoding:gbk\n")
+    assert "补齐单证券快照" in raw.decode("gbk")
+    with pytest.raises(UnicodeDecodeError):
+        raw.decode("utf-8")
 
 
 class _FakeValues:

@@ -305,6 +305,10 @@ build `20260710_daily_log_rotation_5d` 起，helper 使用 Python 3.6 标准库 
 
 升级前已经很大的活动日志不会在启动时直接删除。它会在下一个午夜进入轮转，再按保留数量逐日淘汰。如果需要立即释放空间，应先停止 helper，人工归档或删除旧日志，再启动新版 helper；不要在 helper 正写入时强制删除或改名。
 
+### 为什么 helper 文件必须保持 GBK
+
+`helpers/big_qmt_gateway_strategy_sample.py` 是复制到大 QMT 内置策略编辑器运行的嵌入式源码，不是普通外部 Python 脚本。正式文件第一行和真实文件字节均保持 GBK；不要使用编辑器或格式化工具自动转成 UTF-8，否则部分大 QMT 版本会在加载策略或返回服务端响应时发生编码错误。
+
 ### 为什么密码不匹配
 
 `GATEWAY_PASSWORD` 和 `BIG_QMT_GATEWAY_PASSWORD` 是一对，必须一致。`QMT_SERVER_TOKEN` 是另一层 token，给 `qmt-remote` 客户端连接 `58620` 使用。
