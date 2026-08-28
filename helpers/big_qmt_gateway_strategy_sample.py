@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 # Author: BruceLee
-# Date: 2026-07-10
-# Version: 20260710_daily_log_rotation_5d
+# Date: 2026-08-28
+# Version: 20260828_observation_metadata_v1
 # File: Big QMT embedded gateway strategy sample.
 # Description: Run inside a dedicated Big QMT strategy and expose a
 # BulletTrade-compatible local HTTP/JSON data and trading gateway.
@@ -42,7 +42,7 @@ LISTEN_PORT = 9000
 
 # Build marker shown in startup logs and /health. Update this when copying a new
 # helper build into QMT so tests can prove the running file version.
-GATEWAY_BUILD_ID = "20260710_daily_log_rotation_5d"
+GATEWAY_BUILD_ID = "20260828_observation_metadata_v1"
 
 # Shared password required by non-health HTTP APIs. Change this to a private
 # local value outside simulation; clients send it as X-BulletTrade-Password or
