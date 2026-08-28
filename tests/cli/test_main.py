@@ -6,8 +6,35 @@ from types import SimpleNamespace
 
 import pytest
 
-from bullet_trade.cli.main import apply_cli_overrides
+from bullet_trade.cli.main import apply_cli_overrides, create_parser
 from bullet_trade.core.globals import Logger
+from bullet_trade.server.config import build_server_config
+
+
+def test_server_type_defaults_to_env_and_explicit_cli_still_overrides(monkeypatch):
+    """验证 server 类型遵循“显式 CLI、环境变量、qmt 默认”的优先级。
+
+    Args:
+        monkeypatch: pytest 环境替换夹具。
+
+    Returns:
+        None。
+    """
+
+    monkeypatch.setenv("QMT_SERVER_TYPE", "big_qmt")
+    monkeypatch.setenv("QMT_SERVER_TOKEN", "server-type-test")
+    parser = create_parser()
+
+    env_config = build_server_config(parser.parse_args(["server"]))
+    cli_config = build_server_config(
+        parser.parse_args(["server", "--server-type", "qmt"])
+    )
+    monkeypatch.delenv("QMT_SERVER_TYPE")
+    default_config = build_server_config(parser.parse_args(["server"]))
+
+    assert env_config.server_type == "big_qmt"
+    assert cli_config.server_type == "qmt"
+    assert default_config.server_type == "qmt"
 
 
 def test_main_env_file_triggers_refresh(monkeypatch):

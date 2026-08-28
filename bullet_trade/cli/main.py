@@ -245,7 +245,7 @@ def create_parser():
     server_parser.add_argument(
         "--server-type",
         dest="server_type",
-        default="qmt",
+        default=None,
         help="服务类型（qmt、big_qmt/big-qmt 或 huaxin）",
     )
     server_parser.add_argument(
