@@ -218,9 +218,154 @@ def test_big_qmt_helper_preserves_live_observation_metadata():
     assert tick["source"] == "big_qmt_full_tick"
     assert tick["source_time"] == "20260827 09:31:00"
     assert tick["query_completed_time"] == result["query_completed_time"]
+    assert tick["age_seconds"] >= 0.0
     assert tick["feed_health"]["status"] == "healthy"
     assert tick["bid_price1"] == 12.29
     assert tick["ask_price1"] == 12.31
+
+
+def test_big_qmt_helper_computes_tick_age_in_same_clock_domain():
+    """验证 helper 用源时间与查询完成时间计算事件年龄，不读取当前时间伪造。
+
+    Returns:
+        None。
+    """
+
+    helper = _load_helper()
+
+    tick = helper._enrich_tick(
+        None,
+        "000001.SZ",
+        {"lastPrice": 12.3, "timetag": "20260827 09:31:00"},
+        "2026-08-27T09:31:08+08:00",
+    )
+
+    assert tick["source_time"] == "20260827 09:31:00"
+    assert tick["received_time"] == "2026-08-27T09:31:08+08:00"
+    assert tick["age_seconds"] == pytest.approx(8.0)
+
+
+def test_big_qmt_helper_does_not_invent_age_for_unparseable_source_time():
+    """验证源时间不可解析时保持缺失，使上游按合同失败关闭。
+
+    Returns:
+        None。
+    """
+
+    helper = _load_helper()
+
+    tick = helper._enrich_tick(
+        None,
+        "000001.SZ",
+        {
+            "lastPrice": 12.3,
+            "timetag": "unknown",
+            "age_seconds": 0.0,
+            "received_time": "old-received-time",
+        },
+        "2026-08-27T09:31:08+08:00",
+    )
+
+    assert "age_seconds" not in tick
+    assert tick["received_time"] == "2026-08-27T09:31:08+08:00"
+
+
+def test_big_qmt_helper_overwrites_raw_observation_metadata():
+    """验证原始 tick 中的旧观察字段不能覆盖本次查询证据。
+
+    Returns:
+        None。
+    """
+
+    helper = _load_helper()
+
+    tick = helper._enrich_tick(
+        None,
+        "000001.SZ",
+        {
+            "lastPrice": 12.3,
+            "timetag": "20260827 09:31:00",
+            "age_seconds": 0.0,
+            "received_time": "old-received-time",
+            "query_completed_time": "old-query-time",
+            "source": "old-source",
+            "feed_health": {"status": "stale"},
+        },
+        "2026-08-27T09:31:08+08:00",
+    )
+
+    assert tick["age_seconds"] == pytest.approx(8.0)
+    assert tick["received_time"] == "2026-08-27T09:31:08+08:00"
+    assert tick["query_completed_time"] == "2026-08-27T09:31:08+08:00"
+    assert tick["source"] == "big_qmt_full_tick"
+    assert tick["feed_health"]["status"] == "healthy"
+
+
+def test_big_qmt_helper_does_not_clamp_future_event_time_to_zero():
+    """验证事件时间晚于接收时间时不伪造零年龄。
+
+    Returns:
+        None。
+    """
+
+    helper = _load_helper()
+
+    tick = helper._enrich_tick(
+        None,
+        "000001.SZ",
+        {"lastPrice": 12.3, "timetag": "20260827 09:31:09"},
+        "2026-08-27T09:31:08+08:00",
+    )
+
+    assert "age_seconds" not in tick
+
+
+def test_big_qmt_helper_prefers_average_open_price_over_negative_diluted_cost():
+    """验证持仓平均成本优先采用 QMT 平均开仓价并拒绝负摊薄字段。
+
+    Returns:
+        None。
+    """
+
+    helper = _load_helper()
+    position = SimpleNamespace(
+        m_strInstrumentID="159967",
+        m_strExchangeID="SZ",
+        m_nVolume=300,
+        m_nCanUseVolume=300,
+        m_dAvgOpenPrice=0.81,
+        m_dOpenPrice=-58.64929996666666,
+        m_dMarketValue=240.0,
+        m_dLastPrice=0.80,
+    )
+
+    result = helper._position_to_dict(position)
+
+    assert result["avg_cost"] == pytest.approx(0.81)
+    assert result["cost_basis"] == pytest.approx(0.81)
+
+
+def test_big_qmt_helper_replaces_all_invalid_cost_fields_with_zero():
+    """验证所有成本候选均为负数时不把非法成本送入父账户同步。
+
+    Returns:
+        None。
+    """
+
+    helper = _load_helper()
+    position = SimpleNamespace(
+        m_strInstrumentID="159967",
+        m_strExchangeID="SZ",
+        m_nVolume=300,
+        m_nCanUseVolume=300,
+        m_dAvgOpenPrice=-1.0,
+        m_dOpenPrice=-58.0,
+    )
+
+    result = helper._position_to_dict(position)
+
+    assert result["avg_cost"] == 0.0
+    assert result["cost_basis"] == 0.0
 
 
 def test_big_qmt_gateway_handler_reads_request_headers():
@@ -239,7 +384,7 @@ def test_runtime_health_reports_gateway_build_id():
 
     health = runtime.health()
 
-    assert helper.GATEWAY_BUILD_ID == "20260828_observation_metadata_v1"
+    assert helper.GATEWAY_BUILD_ID == "20260828_freshness_cost_v2"
     assert health["gateway_build_id"] == helper.GATEWAY_BUILD_ID
 
 

@@ -11,6 +11,7 @@ from bullet_trade.server.adapters.big_qmt import (
     BigQmtDataAdapter,
     BigQmtGatewayConfig,
     BigQmtGatewayError,
+    _normalize_position,
     build_big_qmt_bundle,
 )
 from bullet_trade.server.app import ServerApplication
@@ -282,7 +283,10 @@ async def test_big_qmt_broker_adapter_normalizes_account_positions_orders_trades
                         "m_strExchangeID": "SH",
                         "m_nVolume": 1000,
                         "m_nCanUseVolume": 800,
-                        "m_dOpenPrice": 2.5,
+                        "m_dAvgOpenPrice": 2.5,
+                        "m_dOpenPrice": -10.0,
+                        "m_dLastPrice": 2.6,
+                        "m_dMarketValue": 2600.0,
                     }
                 ]
             },
@@ -333,6 +337,10 @@ async def test_big_qmt_broker_adapter_normalizes_account_positions_orders_trades
     assert positions[0]["security"] == "510050.XSHG"
     assert positions[0]["amount"] == 1000
     assert positions[0]["closeable_amount"] == 800
+    assert positions[0]["avg_cost"] == 2.5
+    assert positions[0]["cost_basis"] == 2.5
+    assert positions[0]["current_price"] == 2.6
+    assert positions[0]["market_value"] == 2600.0
 
     orders = await adapter.list_orders(ctx, {"order_id": "O1"})
     assert orders[0]["status"] == "filled"
@@ -408,6 +416,75 @@ async def test_big_qmt_trading_and_cancel_forward_account_payload_when_enabled()
     assert client.calls[0][2]["order_remark"] == "sub:sub-a|bt:alpha:abcd1234"
     assert client.calls[1][1] == "/cancel_order"
     assert client.calls[1][2]["order_id"] == "O2"
+
+
+@pytest.mark.asyncio
+async def test_big_qmt_server_account_identity_cannot_be_overridden_by_client_payload():
+    """验证客户端 payload 不能覆盖 sidecar 已解析的实体账号身份。
+
+    Returns:
+        None。
+    """
+
+    client = _FakeGatewayClient(
+        {
+            "/place_order": {"order_id": "O-authoritative", "m_nOrderStatus": 50},
+            "/orders": {"orders": []},
+            "/trades": {"trades": []},
+        },
+    )
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    ctx = router.get("default")
+    adapter = BigQmtBrokerAdapter(config, router, client)
+
+    await adapter.place_order(
+        ctx,
+        {
+            "security": "000001.XSHE",
+            "amount": 100,
+            "side": "BUY",
+            "account_key": "spoofed",
+            "account_id": "spoofed-account",
+            "account_type": "spoofed-type",
+        },
+    )
+
+    submitted = client.calls[0][2]
+    assert submitted["account_key"] == "default"
+    assert submitted["account_id"] == "demo"
+    assert submitted["account_type"] == "stock"
+
+    spoofed_filters = {
+        "account_key": "spoofed",
+        "account_id": "spoofed-account",
+        "account_type": "spoofed-type",
+    }
+    await adapter.list_orders(ctx, spoofed_filters)
+    await adapter.list_trades(ctx, spoofed_filters)
+    for _, _, query in client.calls[1:]:
+        assert query["account_key"] == "default"
+        assert query["account_id"] == "demo"
+        assert query["account_type"] == "stock"
+
+
+def test_big_qmt_position_zero_average_cost_falls_back_to_positive_open_price():
+    """验证零平均成本不遮蔽后续有效的正开仓价。
+
+    Returns:
+        None。
+    """
+
+    result = _normalize_position(
+        {
+            "security": "510050.XSHG",
+            "avg_cost": 0.0,
+            "m_dOpenPrice": 2.5,
+        }
+    )
+
+    assert result["avg_cost"] == 2.5
+    assert result["cost_basis"] == 2.5
 
 
 @pytest.mark.asyncio
