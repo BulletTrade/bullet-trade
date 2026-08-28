@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+#encoding:gbk
 # Author: BruceLee
 # Date: 2026-08-28
 # Version: 20260828_observation_metadata_v1
@@ -500,16 +500,16 @@ def _enrich_tick(
     tick: Any,
     query_completed_time: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """è¡¥é½å•è¯åˆ¸å¿«ç…§çš„èº«ä»½ã€æ—¶é—´ã€ç›˜å£å’Œäº¤æ˜“çŠ¶æ€è¯æ®ã€‚
+    """²¹Æëµ¥Ö¤È¯¿ìÕÕµÄÉí·İ¡¢Ê±¼ä¡¢ÅÌ¿ÚºÍ½»Ò××´Ì¬Ö¤¾İ¡£
 
     Args:
-        context_info: Big QMT ç­–ç•¥ä¸Šä¸‹æ–‡ã€‚
-        qmt_security: QMT æ ¼å¼è¯åˆ¸ä»£ç ã€‚
-        tick: get_full_tick è¿”å›çš„åŸå§‹è¯åˆ¸å¿«ç…§ã€‚
-        query_completed_time: æœ¬æ¬¡ get_full_tick å®Œæˆçš„åŒ—äº¬æ—¶é—´ã€‚
+        context_info: Big QMT ²ßÂÔÉÏÏÂÎÄ¡£
+        qmt_security: QMT ¸ñÊ½Ö¤È¯´úÂë¡£
+        tick: get_full_tick ·µ»ØµÄÔ­Ê¼Ö¤È¯¿ìÕÕ¡£
+        query_completed_time: ±¾´Î get_full_tick Íê³ÉµÄ±±¾©Ê±¼ä¡£
 
     Returns:
-        Dict[str, Any]: ä¿ç•™åŸå§‹å­—æ®µå¹¶å¢åŠ å¯é€‰è§‚å¯Ÿå…ƒæ•°æ®çš„å¿«ç…§ã€‚
+        Dict[str, Any]: ±£ÁôÔ­Ê¼×Ö¶Î²¢Ôö¼Ó¿ÉÑ¡¹Û²ìÔªÊı¾İµÄ¿ìÕÕ¡£
     """
 
     item = _basic_value(tick)
@@ -580,15 +580,15 @@ def _normalize_tick_keys(
     context_info: Any = None,
     query_completed_time: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """è§„èŒƒè¯åˆ¸é”®å¹¶æŠŠåŒä¸€æ¬¡æŸ¥è¯¢å®Œæˆæ—¶é—´å†™å…¥æ¯æ¡å¿«ç…§ã€‚
+    """¹æ·¶Ö¤È¯¼ü²¢°ÑÍ¬Ò»´Î²éÑ¯Íê³ÉÊ±¼äĞ´ÈëÃ¿Ìõ¿ìÕÕ¡£
 
     Args:
-        ticks: get_full_tick è¿”å›çš„è¯åˆ¸æ˜ å°„ã€‚
-        context_info: Big QMT ç­–ç•¥ä¸Šä¸‹æ–‡ã€‚
-        query_completed_time: æœ¬æ¬¡æŸ¥è¯¢å®Œæˆçš„åŒ—äº¬æ—¶é—´ã€‚
+        ticks: get_full_tick ·µ»ØµÄÖ¤È¯Ó³Éä¡£
+        context_info: Big QMT ²ßÂÔÉÏÏÂÎÄ¡£
+        query_completed_time: ±¾´Î²éÑ¯Íê³ÉµÄ±±¾©Ê±¼ä¡£
 
     Returns:
-        Dict[str, Any]: èšå®½æ ¼å¼è¯åˆ¸é”®åˆ°å®Œæ•´å¿«ç…§çš„æ˜ å°„ã€‚
+        Dict[str, Any]: ¾Û¿í¸ñÊ½Ö¤È¯¼üµ½ÍêÕû¿ìÕÕµÄÓ³Éä¡£
     """
 
     if not isinstance(ticks, dict):
@@ -1391,14 +1391,14 @@ def _query_trades(account_id: str, account_type: str, payload: Optional[Dict[str
 
 
 def _get_full_tick(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
-    """æŸ¥è¯¢å®æ—¶å¿«ç…§å¹¶åœ¨ helper è¾¹ç•Œè®°å½•ç‹¬ç«‹çš„æŸ¥è¯¢å®Œæˆæ—¶é—´ã€‚
+    """²éÑ¯ÊµÊ±¿ìÕÕ²¢ÔÚ helper ±ß½ç¼ÇÂ¼¶ÀÁ¢µÄ²éÑ¯Íê³ÉÊ±¼ä¡£
 
     Args:
-        context_info: Big QMT ç­–ç•¥ä¸Šä¸‹æ–‡ã€‚
-        payload: å«å•è¯åˆ¸æˆ–è¯åˆ¸åˆ—è¡¨çš„ HTTP è¯·æ±‚è½½è·ã€‚
+        context_info: Big QMT ²ßÂÔÉÏÏÂÎÄ¡£
+        payload: º¬µ¥Ö¤È¯»òÖ¤È¯ÁĞ±íµÄ HTTP ÇëÇóÔØºÉ¡£
 
     Returns:
-        Dict[str, Any]: å¸¦å®Œæ•´ observation metadata çš„ ticks å“åº”ã€‚
+        Dict[str, Any]: ´øÍêÕû observation metadata µÄ ticks ÏìÓ¦¡£
     """
 
     securities = payload.get("securities") or payload.get("symbols")
