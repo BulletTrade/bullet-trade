@@ -128,6 +128,7 @@ class RemoteQmtConnection:
         tls_cert: Optional[str] = None,
         tls_enabled: bool = False,
         request_timeout: float = 60.0,
+        connect_timeout: float = 10.0,
     ) -> None:
         """创建尚未联网的远程连接。
 
@@ -138,6 +139,7 @@ class RemoteQmtConnection:
             tls_cert: 用于验证服务端的 CA/证书路径。
             tls_enabled: 是否强制使用 TLS。
             request_timeout: 默认 RPC 等待秒数。
+            connect_timeout: 后台连接完成握手的等待秒数，默认保持 10 秒兼容值。
 
         Returns:
             None。
@@ -157,6 +159,7 @@ class RemoteQmtConnection:
         self.tls_cert = tls_cert
         self.tls_enabled = bool(tls_enabled)
         self.request_timeout = max(5.0, float(request_timeout))
+        self.connect_timeout = float(connect_timeout)
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._thread: Optional[threading.Thread] = None
         self._reader: Optional[asyncio.StreamReader] = None
@@ -176,7 +179,7 @@ class RemoteQmtConnection:
             return
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
-        if not self._connected.wait(timeout=10):
+        if not self._connected.wait(timeout=self.connect_timeout):
             raise RuntimeError("连接 qmt server 超时")
 
     def close(self) -> None:

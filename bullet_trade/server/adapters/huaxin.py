@@ -483,6 +483,42 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
             or {}
         )
 
+    async def asset_consolidation_state(
+        self, account: AccountContext, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """导出 node16 当日已经完成的资产归集 READY 文档。
+
+        Args:
+            account: 已路由 node16 父账户上下文。
+            payload: 仅允许 account_key 和可选 trading_day；交易日必须与柜台一致。
+
+        Returns:
+            Dict[str, Any]: 单日完整 READY 状态文档。
+
+        Raises:
+            RuntimeError: 归集未启用或当日尚未完成时抛出。
+            ValueError: 载荷覆盖、日期或柜台交易日不一致时抛出。
+
+        Side Effects:
+            仅读取归集状态文件，不查询资产、不执行划拨或订单。
+        """
+
+        del account
+        unsupported = sorted(
+            key for key in payload if key not in {"account_key", "trading_day"}
+        )
+        if unsupported:
+            raise ValueError("asset_consolidation_state 不接受远程配置覆盖")
+        consolidation = self._asset_consolidation
+        if consolidation is None:
+            raise RuntimeError("华鑫资产归集未启用")
+        broker = self._default_broker()
+        broker_day = str(await self._run_ready(broker.get_trading_day) or "")
+        requested_day = str(payload.get("trading_day") or broker_day)
+        if requested_day != broker_day:
+            raise ValueError("asset_consolidation_state 交易日与柜台不一致")
+        return await self._run(consolidation.export_daily_clearance, requested_day)
+
     async def get_trading_day(self) -> Optional[str]:
         """返回默认华鑫父账户登录回报中的权威交易日。
 
@@ -793,6 +829,20 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
                         (None if query_ready else reason)
                         if relay_config.install_enabled
                         else "source_snapshot_install_disabled"
+                    ),
+                },
+                "broker.asset_consolidation_state": {
+                    "status": (
+                        "ready"
+                        if consolidation is not None
+                        and consolidation_health.get("state") == "complete"
+                        else "unavailable"
+                    ),
+                    "reason": (
+                        None
+                        if consolidation is not None
+                        and consolidation_health.get("state") == "complete"
+                        else "asset_consolidation_not_complete"
                     ),
                 },
                 "broker.place_order": {

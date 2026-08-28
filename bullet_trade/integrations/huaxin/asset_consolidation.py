@@ -718,8 +718,6 @@ class HuaxinAssetConsolidationConfig:
     max_fund_amount: float = 1000000000.0
     canary_position_volume: int = 100
     canary_fund_amount: float = 100.0
-    authorized_trading_day: str = ""
-    authorized_source_snapshot_id: str = ""
 
     @property
     def enabled(self) -> bool:
@@ -775,10 +773,6 @@ class HuaxinAssetConsolidationConfig:
             "max_fund_amount": get_env("HUAXIN_ASSET_CONSOLIDATION_MAX_FUND_AMOUNT"),
             "canary_position_volume": get_env("HUAXIN_ASSET_CONSOLIDATION_CANARY_POSITION_VOLUME"),
             "canary_fund_amount": get_env("HUAXIN_ASSET_CONSOLIDATION_CANARY_FUND_AMOUNT"),
-            "authorized_trading_day": get_env("HUAXIN_ASSET_CONSOLIDATION_AUTHORIZED_TRADING_DAY"),
-            "authorized_source_snapshot_id": get_env(
-                "HUAXIN_ASSET_CONSOLIDATION_AUTHORIZED_SOURCE_SNAPSHOT_ID"
-            ),
         }
         return cls.from_mapping(values)
 
@@ -843,17 +837,6 @@ class HuaxinAssetConsolidationConfig:
         )
         if completion_cutoff_time <= earliest_time:
             raise ValueError("completion_cutoff_time 必须晚于 earliest_time")
-        authorized_trading_day = ""
-        authorized_source_snapshot_id = ""
-        if mode in {"canary", "full"}:
-            authorized_trading_day = required_text("authorized_trading_day")
-            if len(authorized_trading_day) != 8 or not authorized_trading_day.isdigit():
-                raise ValueError("authorized_trading_day 必须为 YYYYMMDD")
-            authorized_source_snapshot_id = required_text("authorized_source_snapshot_id").lower()
-            if len(authorized_source_snapshot_id) != 64 or any(
-                char not in "0123456789abcdef" for char in authorized_source_snapshot_id
-            ):
-                raise ValueError("authorized_source_snapshot_id 必须为 SHA-256")
         return cls(
             mode=mode,
             source_mode=source_mode,
@@ -896,8 +879,6 @@ class HuaxinAssetConsolidationConfig:
             canary_fund_amount=_parse_nonnegative_float(
                 values.get("canary_fund_amount"), "canary_fund_amount", 100.0
             ),
-            authorized_trading_day=authorized_trading_day,
-            authorized_source_snapshot_id=authorized_source_snapshot_id,
         )
 
 
@@ -962,6 +943,38 @@ class HuaxinAssetConsolidationStateStore:
         plans[trading_day] = json.loads(json.dumps(plan, ensure_ascii=False))
         document["updated_at"] = plan.get("updated_at")
         self._atomic_write(document)
+
+    def export_complete_day(self, trading_day: str) -> Dict[str, Any]:
+        """导出一个已完成交易日的独立 READY 状态文档。
+
+        Args:
+            trading_day: 八位柜台交易日。
+
+        Returns:
+            Dict[str, Any]: 仅含指定交易日 complete plan 的版本化状态文档。
+
+        Raises:
+            HuaxinAssetConsolidationWaiting: 当日计划尚未完成时抛出。
+            HuaxinAssetConsolidationError: 日期或 READY 结构非法时抛出。
+
+        Side Effects:
+            仅读取原子状态文件，不修改计划或快照。
+        """
+
+        if len(str(trading_day or "")) != 8 or not str(trading_day).isdigit():
+            raise HuaxinAssetConsolidationError("clearance_export_trading_day_invalid")
+        plan = self.load_day(str(trading_day))
+        if plan is None:
+            raise HuaxinAssetConsolidationWaiting("clearance_plan_missing")
+        if plan.get("state") != "complete" or not isinstance(
+            plan.get("ready_evidence"), Mapping
+        ):
+            raise HuaxinAssetConsolidationWaiting("clearance_not_complete")
+        return {
+            "schema_version": 1,
+            "plans": {str(trading_day): plan},
+            "updated_at": plan.get("updated_at"),
+        }
 
     def _load_document(self) -> Optional[Dict[str, Any]]:
         """读取并验证完整状态文档。
@@ -1160,6 +1173,29 @@ class HuaxinAssetConsolidationCoordinator:
         with self._lock:
             return json.loads(json.dumps(self._health, ensure_ascii=False))
 
+    def export_daily_clearance(self, trading_day: str) -> Dict[str, Any]:
+        """导出指定交易日已经完成的归集 READY 文档。
+
+        Args:
+            trading_day: 八位柜台交易日。
+
+        Returns:
+            Dict[str, Any]: 可交付给 AIStocks 的单日完整 READY 文档。
+
+        Raises:
+            HuaxinAssetConsolidationWaiting: 当日归集仍在进行时抛出。
+            HuaxinAssetConsolidationError: 已保存文档与当前配置冲突时抛出。
+
+        Side Effects:
+            仅读取状态文件；不查询柜台、不执行划拨。
+        """
+
+        with self._lock:
+            document = self._store.export_complete_day(str(trading_day))
+            plan = document["plans"][str(trading_day)]
+            self._validate_existing_plan(plan, str(trading_day))
+            return json.loads(json.dumps(document, ensure_ascii=False))
+
     def blocked_order_result(self) -> Dict[str, Any]:
         """生成归集期间稳定的新下单拒绝响应。
 
@@ -1246,25 +1282,12 @@ class HuaxinAssetConsolidationCoordinator:
         source = dict(self._source_snapshot_provider())
         source_time = self._validate_source_snapshot(source, now)
         trading_day = str(source["trading_day"])
-        if (
-            self.config.mode in {"canary", "full"}
-            and trading_day != self.config.authorized_trading_day
-        ):
-            raise HuaxinAssetConsolidationError("write_authorization_trading_day_mismatch")
         target = self._capture_target_snapshot(broker, now)
         if str(target.get("trading_day") or "") != trading_day:
             raise HuaxinAssetConsolidationError("source_target_trading_day_mismatch")
 
         plan = self._store.load_day(trading_day)
         if plan is None:
-            if (
-                self.config.mode in {"canary", "full"}
-                and str(source.get("snapshot_id") or "")
-                != self.config.authorized_source_snapshot_id
-            ):
-                raise HuaxinAssetConsolidationError("write_authorization_source_snapshot_mismatch")
-            if wall_time > self.config.completion_cutoff_time:
-                raise HuaxinAssetConsolidationError("completion_cutoff_exceeded")
             if not self._observe_stability(source, target, source_time):
                 self._set_health("observing", "stable_samples_pending", trading_day=trading_day)
                 return
@@ -1273,8 +1296,6 @@ class HuaxinAssetConsolidationCoordinator:
         else:
             self._validate_existing_plan(plan, trading_day)
 
-        if plan.get("state") != "complete" and wall_time > self.config.completion_cutoff_time:
-            raise HuaxinAssetConsolidationError("completion_cutoff_exceeded")
         self._validate_source_replay_against_plan(plan, source)
 
         self._publish_plan_health(plan)
@@ -1727,7 +1748,16 @@ class HuaxinAssetConsolidationCoordinator:
                 for item in target_positions
                 if _position_key(item) == key
             )
-            action_key = f"{plan_id}|position|{key}|{fingerprint}"
+            action_key = "|".join(
+                (
+                    "position",
+                    str(self.config.source_node_id),
+                    str(self.config.target_node_id),
+                    key,
+                    fingerprint,
+                    str(planned_volume),
+                )
+            )
             actions.append(
                 {
                     "kind": "position",
@@ -1770,15 +1800,21 @@ class HuaxinAssetConsolidationCoordinator:
                             (target.get("account") or {}).get("transferable_cash")
                         ),
                         "apply_serial": _apply_serial(
-                            trading_day, f"{plan_id}|fund|{fingerprint}", used
+                            trading_day,
+                            "|".join(
+                                (
+                                    "fund",
+                                    str(self.config.source_node_id),
+                                    str(self.config.target_node_id),
+                                    fingerprint,
+                                    format(planned_amount, "f"),
+                                )
+                            ),
+                            used,
                         ),
                         "state": "planned",
                     }
                 )
-        if not actions:
-            raise HuaxinAssetConsolidationError(
-                "zero_action_plan_cannot_prove_14_to_16_consolidation"
-            )
         frozen_cash = _as_float(source_account.get("frozen_cash"))
         frozen_positions = sum(
             max(0, _as_int(row.get("current_position")) - _as_int(row.get("available_position")))
@@ -1808,8 +1844,13 @@ class HuaxinAssetConsolidationCoordinator:
                 source.get("snapshot_id"),
                 field_name="source_snapshot_id",
             ),
-            "authorized_trading_day": self.config.authorized_trading_day,
-            "authorized_source_snapshot_id": self.config.authorized_source_snapshot_id,
+            "planned_source_snapshot_id": _require_sha256(
+                source.get("snapshot_id"),
+                field_name="planned_source_snapshot_id",
+            ),
+            "clearance_mode": (
+                "transfer_required" if actions else "no_transfer_required"
+            ),
             "conservation_baseline": _asset_conservation_material(source, target),
             "actions": actions,
             "residuals": {
@@ -1899,17 +1940,6 @@ class HuaxinAssetConsolidationCoordinator:
             raise HuaxinAssetConsolidationError("existing_plan_schema_or_day_mismatch")
         if plan.get("mode") != self.config.mode:
             raise HuaxinAssetConsolidationError("existing_plan_mode_mismatch")
-        if self.config.mode in {"canary", "full"}:
-            if str(plan.get("authorized_trading_day") or "") != str(
-                self.config.authorized_trading_day
-            ):
-                raise HuaxinAssetConsolidationError("existing_plan_authorized_trading_day_mismatch")
-            if str(plan.get("authorized_source_snapshot_id") or "") != str(
-                self.config.authorized_source_snapshot_id
-            ):
-                raise HuaxinAssetConsolidationError(
-                    "existing_plan_authorized_source_snapshot_mismatch"
-                )
         if _as_int(plan.get("source_node_id"), -1) != self.config.source_node_id:
             raise HuaxinAssetConsolidationError("existing_plan_source_node_mismatch")
         if _as_int(plan.get("target_node_id"), -1) != self.config.target_node_id:
@@ -1924,6 +1954,13 @@ class HuaxinAssetConsolidationCoordinator:
             raise HuaxinAssetConsolidationError("existing_plan_apply_serial_invalid")
         if len(set(serials)) != len(serials):
             raise HuaxinAssetConsolidationError("existing_plan_apply_serial_duplicated")
+        expected_clearance_mode = "transfer_required" if actions else "no_transfer_required"
+        actual_clearance_mode = str(plan.get("clearance_mode") or "")
+        if actual_clearance_mode not in {
+            expected_clearance_mode,
+            "transfer_completed" if actions else "no_transfer_required",
+        }:
+            raise HuaxinAssetConsolidationError("existing_plan_clearance_mode_invalid")
         state = str(plan.get("state") or "")
         if state == "complete":
             self._validate_existing_ready_evidence(plan)
@@ -1985,7 +2022,13 @@ class HuaxinAssetConsolidationCoordinator:
         if not str(ready.get("target_node_provenance") or "").strip():
             raise HuaxinAssetConsolidationError("existing_ready_evidence_target_provenance_missing")
         actions = [dict(row) for row in plan.get("actions") or []]
-        if not actions or int(ready.get("action_count") or 0) != len(actions):
+        clearance_mode = str(ready.get("clearance_mode") or "")
+        expected_clearance_mode = (
+            "transfer_completed" if actions else "no_transfer_required"
+        )
+        if clearance_mode != expected_clearance_mode:
+            raise HuaxinAssetConsolidationError("existing_ready_evidence_clearance_mode_invalid")
+        if int(ready.get("action_count") or 0) != len(actions):
             raise HuaxinAssetConsolidationError("existing_ready_evidence_action_count_invalid")
         if any(str(row.get("state") or "") != "succeeded" for row in actions):
             raise HuaxinAssetConsolidationError("existing_ready_evidence_action_incomplete")
@@ -2016,13 +2059,12 @@ class HuaxinAssetConsolidationCoordinator:
         cutoff = str(ready.get("completion_cutoff_time") or "")
         if cutoff != self.config.completion_cutoff_time.isoformat():
             raise HuaxinAssetConsolidationError("existing_ready_completion_cutoff_mismatch")
-        completed_at = _parse_datetime(ready.get("completed_at"))
-        if completed_at.timetz().replace(tzinfo=None) > self.config.completion_cutoff_time:
-            raise HuaxinAssetConsolidationError("existing_ready_completed_after_cutoff")
+        _parse_datetime(ready.get("completed_at"))
         generation = _canonical_json_sha256(
             {
                 "schema": HUAXIN_NODE16_READY_SCHEMA,
                 "trading_day": ready.get("trading_day"),
+                "clearance_mode": clearance_mode,
                 "source_node_id": ready.get("source_node_id"),
                 "target_node_id": ready.get("target_node_id"),
                 "plan_id_sha256": plan_id_sha256,
@@ -2101,27 +2143,6 @@ class HuaxinAssetConsolidationCoordinator:
         Side Effects:
             先持久化 submit_started，再至多调用一次 Broker NodeMoveIn 原语。
         """
-
-        prior_submission_states = {
-            "submit_started",
-            "unknown",
-            "reconciling",
-            "succeeded",
-            "rejected",
-        }
-        prior_submission_exists = any(
-            isinstance(row, Mapping)
-            and row is not action
-            and str(row.get("state") or "") in prior_submission_states
-            and bool(str(row.get("submit_started_at") or "").strip())
-            for row in plan.get("actions") or []
-        )
-        if not prior_submission_exists and str(source.get("snapshot_id") or "") != str(
-            plan.get("authorized_source_snapshot_id") or ""
-        ):
-            raise HuaxinAssetConsolidationError(
-                "write_authorization_source_snapshot_changed_before_first_submit"
-            )
 
         source_row = self._find_source_row(source, action)
         if source_row is None:
@@ -2272,9 +2293,10 @@ class HuaxinAssetConsolidationCoordinator:
             raise HuaxinAssetConsolidationError("source_transferable_residual_after_full_plan")
         else:
             plan["state"] = "complete"
+            plan["clearance_mode"] = (
+                "transfer_completed" if plan.get("actions") else "no_transfer_required"
+            )
             plan.pop("reason", None)
-        if now.timetz().replace(tzinfo=None) > self.config.completion_cutoff_time:
-            raise HuaxinAssetConsolidationError("completion_cutoff_exceeded")
         if plan["state"] == "complete":
             self._assert_no_pending_transfers(broker, plan)
             plan["conservation_sha256"] = self._validate_final_conservation(
@@ -2339,8 +2361,6 @@ class HuaxinAssetConsolidationCoordinator:
         actions = [dict(row) for row in plan.get("actions") or [] if isinstance(row, Mapping)]
         if len(actions) != len(plan.get("actions") or []):
             raise HuaxinAssetConsolidationError("ready_evidence_actions_invalid")
-        if not actions:
-            raise HuaxinAssetConsolidationError("ready_evidence_zero_actions_rejected")
         if any(str(row.get("state") or "") != "succeeded" for row in actions):
             raise HuaxinAssetConsolidationError("ready_evidence_action_incomplete")
         if any(
@@ -2392,10 +2412,14 @@ class HuaxinAssetConsolidationCoordinator:
         )
         plan_id_sha256 = hashlib.sha256(str(plan.get("plan_id") or "").encode("utf-8")).hexdigest()
         actions_sha256 = _canonical_json_sha256(actions)
+        clearance_mode = "transfer_completed" if actions else "no_transfer_required"
+        if str(plan.get("clearance_mode") or "") != clearance_mode:
+            raise HuaxinAssetConsolidationError("ready_evidence_clearance_mode_mismatch")
         generation = _canonical_json_sha256(
             {
                 "schema": HUAXIN_NODE16_READY_SCHEMA,
                 "trading_day": trading_day,
+                "clearance_mode": clearance_mode,
                 "source_node_id": self.config.source_node_id,
                 "target_node_id": self.config.target_node_id,
                 "plan_id_sha256": plan_id_sha256,
@@ -2419,6 +2443,7 @@ class HuaxinAssetConsolidationCoordinator:
             "schema": HUAXIN_NODE16_READY_SCHEMA,
             "state": "ready",
             "mode": "full",
+            "clearance_mode": clearance_mode,
             "trading_day": trading_day,
             "source_node_id": self.config.source_node_id,
             "target_node_id": self.config.target_node_id,

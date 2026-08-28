@@ -47,7 +47,7 @@ def _config(tmp_path, mode="full", authorized_snapshot=None):
     Args:
         tmp_path: pytest 临时目录。
         mode: dry_run/canary/full 模式。
-        authorized_snapshot: 写模式绑定的初始源快照；省略时使用标准测试快照。
+        authorized_snapshot: 旧测试兼容占位；standing full 不再绑定单日快照。
 
     Returns:
         HuaxinAssetConsolidationConfig: 测试配置。
@@ -74,10 +74,7 @@ def _config(tmp_path, mode="full", authorized_snapshot=None):
         "max_position_volume": 10000,
         "max_fund_amount": 10000,
     }
-    if mode in {"canary", "full"}:
-        snapshot = authorized_snapshot or _source_snapshot(_NOW)
-        values["authorized_trading_day"] = "20260825"
-        values["authorized_source_snapshot_id"] = snapshot["snapshot_id"]
+    del authorized_snapshot
     return HuaxinAssetConsolidationConfig.from_mapping(values)
 
 
@@ -352,8 +349,8 @@ def test_off_config_requires_no_private_paths_or_nodes() -> None:
     assert config.state_path is None
 
 
-def test_write_mode_requires_exact_day_and_source_snapshot_authorization(tmp_path) -> None:
-    """验证真实划转模式缺少单日、单快照授权时无法构造配置。
+def test_write_mode_uses_standing_direction_without_daily_tokens(tmp_path) -> None:
+    """验证 full 生产模式不再要求每天手填交易日和快照口令。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -362,20 +359,15 @@ def test_write_mode_requires_exact_day_and_source_snapshot_authorization(tmp_pat
         None。
     """
 
-    values = dict(_config(tmp_path).__dict__)
-    values.pop("authorized_trading_day")
-    values.pop("authorized_source_snapshot_id")
+    config = _config(tmp_path)
 
-    with pytest.raises(ValueError, match="authorized_trading_day"):
-        HuaxinAssetConsolidationConfig.from_mapping(values)
-
-    values["authorized_trading_day"] = "20260825"
-    with pytest.raises(ValueError, match="authorized_source_snapshot_id"):
-        HuaxinAssetConsolidationConfig.from_mapping(values)
+    assert config.mode == "full"
+    assert not hasattr(config, "authorized_trading_day")
+    assert not hasattr(config, "authorized_source_snapshot_id")
 
 
-def test_write_authorization_rejects_changed_source_assets_before_plan(tmp_path) -> None:
-    """验证源资产偏离已确认快照时不建计划、不调用柜台划转。
+def test_standing_mode_builds_plan_from_current_stable_snapshot(tmp_path) -> None:
+    """验证 standing full 从当日稳定快照建计划，不依赖昨日人工快照号。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -385,27 +377,33 @@ def test_write_authorization_rejects_changed_source_assets_before_plan(tmp_path)
     """
 
     changed = _source_snapshot(_NOW)
+    changed["captured_at"] = (_NOW - timedelta(seconds=2)).isoformat()
     changed["account"]["available_cash"] = 51
     changed["account"]["transferable_cash"] = 51
     _seal_source_snapshot(changed)
+    stable = deepcopy(changed)
+    stable["captured_at"] = _NOW.isoformat()
+    stable["snapshot_generation"] += 1
+    _seal_source_snapshot(stable)
     broker = _TargetBroker()
     coordinator = HuaxinAssetConsolidationCoordinator(
         _config(tmp_path),
-        source_snapshot_provider=lambda: deepcopy(changed),
+        source_snapshot_provider=_SequenceProvider([changed, stable]),
         clock=lambda: _NOW,
         hostname=lambda: "target-host",
     )
 
+    assert coordinator.drive_once(broker)["state"] == "observing"
     result = coordinator.drive_once(broker)
 
-    assert result["state"] == "blocked"
-    assert result["reason"] == "write_authorization_source_snapshot_mismatch"
-    assert broker.position_submit_count == broker.fund_submit_count == 0
-    assert not (tmp_path / "state.json").exists()
+    assert result["state"] == "reconciling"
+    assert broker.position_submit_count == 1
+    assert broker.fund_submit_count == 0
+    assert (tmp_path / "state.json").exists()
 
 
-def test_write_authorization_rechecks_snapshot_after_planned_restart(tmp_path) -> None:
-    """验证计划落盘后、首次提交前重启仍重新核对已确认源快照。
+def test_planned_restart_revalidates_frozen_rows_without_daily_snapshot_token(tmp_path) -> None:
+    """验证重启后按冻结资产行继续，不要求人工更新快照号。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -455,9 +453,9 @@ def test_write_authorization_rechecks_snapshot_after_planned_restart(tmp_path) -
 
     result = restarted.drive_once(broker)
 
-    assert result["state"] == "blocked"
-    assert result["reason"] == "write_authorization_source_snapshot_changed_before_first_submit"
-    assert broker.position_submit_count == broker.fund_submit_count == 0
+    assert result["state"] == "reconciling"
+    assert broker.position_submit_count == 1
+    assert broker.fund_submit_count == 0
 
 
 def test_direct_session_without_injected_provider_stays_explicitly_blocked(tmp_path) -> None:
@@ -549,12 +547,13 @@ def test_full_plan_submits_sequentially_and_only_completes_after_two_end_reconci
     assert (tmp_path / "state.json").stat().st_mode & 0o777 == 0o600
     state = HuaxinAssetConsolidationStateStore(tmp_path / "state.json").load_day("20260825")
     assert [row["state"] for row in state["actions"]] == ["succeeded", "succeeded"]
-    assert state["authorized_trading_day"] == config.authorized_trading_day
-    assert state["authorized_source_snapshot_id"] == config.authorized_source_snapshot_id
+    assert len(state["planned_source_snapshot_id"]) == 64
+    assert state["clearance_mode"] == "transfer_completed"
     ready = state["ready_evidence"]
     assert ready["schema"] == HUAXIN_NODE16_READY_SCHEMA
     assert ready["state"] == "ready"
     assert ready["mode"] == "full"
+    assert ready["clearance_mode"] == "transfer_completed"
     assert ready["trading_day"] == "20260825"
     assert ready["source_node_id"] == 22
     assert ready["target_node_id"] == 11
@@ -829,8 +828,8 @@ def test_incomplete_or_tampered_source_snapshot_blocks_before_plan(tmp_path) -> 
     assert not (tmp_path / "state.json").exists()
 
 
-def test_zero_action_source_never_creates_fake_ready(tmp_path) -> None:
-    """验证初始源端报零不会绕过真实 14→16 动作证据。
+def test_zero_action_source_creates_no_transfer_required_ready(tmp_path) -> None:
+    """验证完整双端快照证明源端无资产时自动形成 no-transfer READY。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -853,9 +852,47 @@ def test_zero_action_source_never_creates_fake_ready(tmp_path) -> None:
     assert coordinator.drive_once(_TargetBroker())["state"] == "observing"
     result = coordinator.drive_once(_TargetBroker())
 
-    assert result["state"] == "blocked"
-    assert result["reason"] == "zero_action_plan_cannot_prove_14_to_16_consolidation"
-    assert not (tmp_path / "state.json").exists()
+    assert result["state"] == "complete"
+    state = HuaxinAssetConsolidationStateStore(tmp_path / "state.json").load_day(
+        "20260825"
+    )
+    assert state["actions"] == []
+    assert state["clearance_mode"] == "no_transfer_required"
+    assert state["ready_evidence"]["clearance_mode"] == "no_transfer_required"
+    assert state["ready_evidence"]["action_count"] == 0
+
+
+def test_apply_serial_survives_state_file_loss_for_same_daily_actions(tmp_path) -> None:
+    """验证状态文件意外丢失时同日同动作仍生成相同柜台幂等流水。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        None。
+    """
+
+    source = _source_snapshot(_NOW)
+    first = HuaxinAssetConsolidationCoordinator(
+        _config(tmp_path),
+        source_snapshot_provider=lambda: deepcopy(source),
+        clock=lambda: _NOW,
+        hostname=lambda: "target-host",
+    )
+    target = first._capture_target_snapshot(_TargetBroker(), _NOW)
+    first_plan = first._build_plan(deepcopy(source), deepcopy(target), _NOW)
+    second = HuaxinAssetConsolidationCoordinator(
+        _config(tmp_path),
+        source_snapshot_provider=lambda: deepcopy(source),
+        clock=lambda: _NOW,
+        hostname=lambda: "target-host",
+    )
+    second_plan = second._build_plan(deepcopy(source), deepcopy(target), _NOW)
+
+    assert first_plan["plan_id"] != second_plan["plan_id"]
+    assert [row["apply_serial"] for row in first_plan["actions"]] == [
+        row["apply_serial"] for row in second_plan["actions"]
+    ]
 
 
 def test_source_generation_replay_and_conflict_fail_closed(tmp_path) -> None:
@@ -896,8 +933,8 @@ def test_source_generation_replay_and_conflict_fail_closed(tmp_path) -> None:
     )
 
 
-def test_completion_cutoff_blocks_without_persisting_plan(tmp_path) -> None:
-    """验证超过盘前截止时间后不会新建计划或 READY。
+def test_completion_cutoff_is_sla_and_late_recovery_still_completes(tmp_path) -> None:
+    """验证盘前截止只用于观测，晚启动仍能形成当日 no-transfer READY。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -913,18 +950,25 @@ def test_completion_cutoff_blocks_without_persisting_plan(tmp_path) -> None:
             "completion_cutoff_time": "09:05:00",
         }
     )
+    snapshots = [
+        _source_snapshot(_NOW - timedelta(seconds=10), position=0, cash=0),
+        _source_snapshot(_NOW - timedelta(seconds=5), position=0, cash=0),
+    ]
     coordinator = HuaxinAssetConsolidationCoordinator(
         config,
-        source_snapshot_provider=lambda: _source_snapshot(_NOW),
+        source_snapshot_provider=_SequenceProvider(snapshots),
         clock=lambda: _NOW,
         hostname=lambda: "target-host",
     )
 
+    assert coordinator.drive_once(_TargetBroker())["state"] == "observing"
     result = coordinator.drive_once(_TargetBroker())
 
-    assert result["state"] == "blocked"
-    assert result["reason"] == "completion_cutoff_exceeded"
-    assert not (tmp_path / "state.json").exists()
+    assert result["state"] == "complete"
+    state = HuaxinAssetConsolidationStateStore(tmp_path / "state.json").load_day(
+        "20260825"
+    )
+    assert state["ready_evidence"]["completion_cutoff_time"] == "09:05:00"
 
 
 def test_pending_transfer_or_combined_asset_drift_prevents_ready(tmp_path) -> None:

@@ -86,6 +86,69 @@ def _make_connection(cfg: ServerConfig) -> RemoteQmtConnection:
     return conn
 
 
+@pytest.mark.parametrize(
+    ("connection_kwargs", "expected_timeout"),
+    [({}, 10.0), ({"connect_timeout": 30.0}, 30.0)],
+)
+def test_remote_connection_start_uses_configured_connect_timeout(
+    monkeypatch,
+    connection_kwargs,
+    expected_timeout,
+):
+    """连接启动应兼容默认 10 秒，并允许调用方显式延长握手等待。
+
+    Args:
+        monkeypatch: pytest 属性替换工具。
+        connection_kwargs: 当前用例传给连接构造器的额外参数。
+        expected_timeout: 期望传给连接完成事件的等待秒数。
+
+    Returns:
+        None。
+    """
+
+    class _NoopThread:
+        """替代后台连接线程，确保单测不访问网络。"""
+
+        def __init__(self, *args, **kwargs):
+            """接收 Thread 兼容参数但不保存连接目标。
+
+            Args:
+                args: Thread 位置参数。
+                kwargs: Thread 关键字参数。
+
+            Returns:
+                None。
+            """
+
+            self.started = False
+
+        def start(self):
+            """只记录启动，不运行目标函数。
+
+            Returns:
+                None。
+            """
+
+            self.started = True
+
+    monkeypatch.setattr(
+        "bullet_trade.remote.connection.threading.Thread",
+        _NoopThread,
+    )
+    connection = RemoteQmtConnection(
+        "127.0.0.1",
+        0,
+        "token",
+        **connection_kwargs,
+    )
+    connection._connected.wait = Mock(return_value=False)
+
+    with pytest.raises(RuntimeError, match="连接 qmt server 超时"):
+        connection.start()
+
+    connection._connected.wait.assert_called_once_with(timeout=expected_timeout)
+
+
 def test_remote_connection_request_cancels_pending_future_on_timeout(monkeypatch):
     """同步 request 超时时应取消后台协程，避免长连接 pending 状态残留。"""
 
