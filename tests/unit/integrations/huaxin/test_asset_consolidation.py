@@ -687,6 +687,91 @@ def test_late_node14_transferable_cash_invalidates_existing_ready(tmp_path) -> N
     assert coordinator.order_allowed() is False
 
 
+def test_complete_ready_survives_normal_target_trading_asset_changes(tmp_path) -> None:
+    """验证 READY 是归集完成时点证据，不被目标账户后续正常交易撤销。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        None。
+    """
+
+    snapshots = [
+        _source_snapshot(_NOW - timedelta(seconds=10)),
+        _source_snapshot(_NOW - timedelta(seconds=5)),
+        _source_snapshot(_NOW + timedelta(seconds=1), position=0),
+        _source_snapshot(_NOW + timedelta(seconds=2), position=0),
+        _source_snapshot(_NOW + timedelta(seconds=3), position=0, cash=0),
+        _source_snapshot(_NOW + timedelta(seconds=4), position=0, cash=0),
+    ]
+    provider = _SequenceProvider(snapshots)
+    broker = _TargetBroker()
+    config = _config(tmp_path)
+    coordinator = HuaxinAssetConsolidationCoordinator(
+        config,
+        source_snapshot_provider=provider,
+        clock=lambda: _NOW,
+        hostname=lambda: "target-host",
+    )
+    for _ in range(6):
+        result = coordinator.drive_once(broker)
+    assert result["state"] == "complete"
+    state_store = HuaxinAssetConsolidationStateStore(tmp_path / "state.json")
+    ready_before_trade = deepcopy(state_store.load_day("20260825")["ready_evidence"])
+
+    broker.account.update(
+        {
+            "available_cash": 820.0,
+            "transferable_cash": 800.0,
+            "frozen_cash": 30.0,
+        }
+    )
+    broker.positions = [
+        {
+            "exchange": "SSE",
+            "security": "511880.XSHG",
+            "current_position": 60,
+            "available_position": 50,
+            "history_position": 60,
+            "onroad_position": 0,
+            "investor_id": "TI",
+            "business_unit_id": "TB",
+            "shareholder_id": "TS",
+            "market_id": 49,
+        },
+        {
+            "exchange": "SSE",
+            "security": "512100.XSHG",
+            "current_position": 40,
+            "available_position": 0,
+            "history_position": 0,
+            "onroad_position": 40,
+            "investor_id": "TI",
+            "business_unit_id": "TB",
+            "shareholder_id": "TS",
+            "market_id": 49,
+        },
+    ]
+
+    assert coordinator.drive_once(broker)["state"] == "complete"
+    assert coordinator.order_allowed() is True
+    after_trade = state_store.load_day("20260825")
+    assert after_trade["ready_evidence"] == ready_before_trade
+    assert broker.position_submit_count == 1
+    assert broker.fund_submit_count == 1
+
+    restarted = HuaxinAssetConsolidationCoordinator(
+        config,
+        source_snapshot_provider=provider,
+        clock=lambda: _NOW,
+        hostname=lambda: "target-host",
+    )
+    assert restarted.drive_once(broker)["state"] == "complete"
+    assert restarted.order_allowed() is True
+    assert state_store.load_day("20260825")["ready_evidence"] == ready_before_trade
+
+
 def test_dry_run_persists_plan_without_any_transfer_call(tmp_path) -> None:
     """验证 dry-run 只生成脱敏计划，资金和证券写调用均为零。
 

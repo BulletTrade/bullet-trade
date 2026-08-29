@@ -1301,24 +1301,15 @@ class HuaxinAssetConsolidationCoordinator:
         self._publish_plan_health(plan)
         if plan.get("state") == "complete":
             try:
+                # READY 是归集完成时点证据；目标账户后续正常交易不得反向改写该事实。
                 if self._source_has_transferable_assets(source):
                     raise HuaxinAssetConsolidationError("complete_plan_has_new_source_residual")
                 self._assert_no_pending_transfers(broker, plan)
-                if self._validate_final_conservation(plan, source, target) != str(
-                    plan.get("conservation_sha256") or ""
-                ):
-                    raise HuaxinAssetConsolidationError("complete_plan_conservation_digest_drift")
                 residual_material = _source_nontransferable_residual_material(source)
                 if _canonical_json_sha256(residual_material) != str(
                     plan.get("source_nontransferable_residual_sha256") or ""
                 ):
                     raise HuaxinAssetConsolidationError("complete_plan_source_residual_drift")
-                ready = plan.get("ready_evidence")
-                if not isinstance(ready, Mapping) or (
-                    build_huaxin_node_asset_snapshot_digest(target)
-                    != str(ready.get("target_snapshot_sha256") or "")
-                ):
-                    raise HuaxinAssetConsolidationError("complete_plan_target_snapshot_drift")
             except HuaxinAssetConsolidationError as exc:
                 plan["state"] = "blocked"
                 plan["reason"] = f"ready_invalidated:{exc}"
