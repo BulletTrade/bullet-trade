@@ -98,9 +98,10 @@ def test_big_qmt_adapter_is_registered_and_health_reports_backend(monkeypatch):
     assert health["qmt"]["actions"]["data.snapshot"]["status"] == "ready"
     assert health["qmt"]["actions"]["data.current_tick"]["status"] == "ready"
     assert health["qmt"]["actions"]["data.subscribe"]["status"] == "degraded"
-    assert health["qmt"]["actions"]["broker.place_order"]["status"] == "unavailable"
-    assert health["qmt"]["actions"]["broker.cancel_order"]["status"] == "unavailable"
-    assert health["idempotency_journal"]["ready"] is False
+    assert health["qmt"]["actions"]["broker.place_order"]["status"] == "ready"
+    assert health["qmt"]["actions"]["broker.cancel_order"]["status"] == "ready"
+    assert health["idempotency"]["mode"] == "process_memory"
+    assert health["idempotency"]["cross_restart_exactly_once"] is False
 
 
 def test_big_qmt_health_cache_expires_instead_of_staying_green(monkeypatch):

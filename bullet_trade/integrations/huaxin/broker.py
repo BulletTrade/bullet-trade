@@ -161,7 +161,7 @@ def _stable_local_order_id(idempotency_key: str) -> str:
     """从幂等键派生不回显原键的稳定本地订单号。
 
     Args:
-        idempotency_key: 服务端持久幂等键。
+        idempotency_key: 服务端稳定幂等键。
 
     Returns:
         str: 带 ``huaxin:`` 前缀的稳定本地订单号。
@@ -1143,7 +1143,7 @@ class HuaxinBroker(BrokerBase):
         extra: Optional[Mapping[str, Any]] = None,
         wait_timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
-        """同步提交一笔带显式类型和持久幂等键的华鑫现货委托。
+        """同步提交一笔带显式类型和稳定幂等键的华鑫现货委托。
 
         Args:
             direction: ``buy`` 或 ``sell``。

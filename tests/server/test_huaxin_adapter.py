@@ -162,10 +162,10 @@ def test_allowlist_rejects_invalid_entries_and_preserves_ipv6_host_prefix() -> N
         )
 
 
-def test_huaxin_bundle_requires_key_but_not_sqlite_journal(
+def test_huaxin_bundle_requires_key_and_uses_process_memory(
     monkeypatch,
 ) -> None:
-    """验证华鑫写保留幂等键要求，但不会创建或要求 SQLite。
+    """验证华鑫写保留幂等键要求，并统一使用 Server 进程内状态。
 
     Args:
         monkeypatch: pytest monkeypatch fixture。
@@ -188,7 +188,6 @@ def test_huaxin_bundle_requires_key_but_not_sqlite_journal(
 
     assert bundle.data_adapter is None
     assert isinstance(bundle.broker_adapter, HuaxinBrokerAdapter)
-    assert bundle.broker_writes_require_persistent_idempotency is False
     assert bundle.broker_writes_require_idempotency_key is True
 
     _validate_huaxin_server_config(
@@ -196,9 +195,9 @@ def test_huaxin_bundle_requires_key_but_not_sqlite_journal(
         {**login_metadata, "enable_trading": True},
     )
     health = ServerApplication(config, router, bundle)._health_snapshot()["value"]
-    assert health["idempotency_journal"]["required"] is False
-    assert health["idempotency_journal"]["ready"] is False
-    assert health["idempotency_journal"]["state"] == "ready"
+    assert health["idempotency"]["mode"] == "process_memory"
+    assert health["idempotency"]["key_required"] is True
+    assert health["idempotency"]["unknown_auto_resend"] is False
     assert health["huaxin"]["actions"]["broker.place_order"]["status"] == "unavailable"
 
 
@@ -1666,7 +1665,6 @@ async def test_server_dispatches_huaxin_positions_envelope_without_payload_argum
         AdapterBundle(
             data_adapter=None,
             broker_adapter=adapter,
-            broker_writes_require_persistent_idempotency=False,
             broker_writes_require_idempotency_key=True,
         ),
     )
@@ -1761,7 +1759,6 @@ async def test_server_dispatches_private_snapshot_relay_actions() -> None:
         AdapterBundle(
             data_adapter=None,
             broker_adapter=adapter,
-            broker_writes_require_persistent_idempotency=False,
             broker_writes_require_idempotency_key=True,
         ),
     )
@@ -2045,7 +2042,6 @@ async def test_huaxin_server_memory_idempotency_requires_key_without_sqlite() ->
         AdapterBundle(
             data_adapter=None,
             broker_adapter=adapter,
-            broker_writes_require_persistent_idempotency=False,
             broker_writes_require_idempotency_key=True,
         ),
     )
@@ -2063,7 +2059,7 @@ async def test_huaxin_server_memory_idempotency_requires_key_without_sqlite() ->
 
     assert first["status"] == repeated["status"] == "submit_unknown"
     assert adapter._brokers["default"].place_call_count == 1
-    assert app._idempotency_journal is None
+    assert app._health_snapshot()["value"]["idempotency"]["mode"] == "process_memory"
     missing_key = dict(payload)
     missing_key.pop("idempotency_key")
     with pytest.raises(ValueError, match="idempotency_key"):

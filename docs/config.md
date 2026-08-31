@@ -258,11 +258,12 @@ QMT_SERVER_SUB_ACCOUNT=demo@main
 | `QMT_SERVER_LOG_ACCOUNT` | `false` | 是否打印账户快照。 |
 | `QMT_SERVER_ACCESS_LOG` | `true` | 是否启用访问日志。 |
 | `QMT_SERVER_ORDER_RISK_ENABLED` | `false` | 是否启用 server 端订单/撤单风控。 |
-| `QMT_SERVER_IDEMPOTENCY_TTL_SECONDS` | `300` | 进程内幂等快速缓存窗口秒数；使用 SQLite 的 adapter 不会随该 TTL 自动删除持久记录。 |
-| `QMT_SERVER_IDEMPOTENCY_JOURNAL_PATH` | 无 | 要求持久幂等账本的 adapter 必填；未配置时其写请求 fail-closed。目录必须位于本机磁盘并由运行账户独占写入，不能放入临时目录、NFS/SMB/同步盘或使用符号链接。华鑫 adapter 明确不创建该 SQLite，但下单/撤单仍要求 `idempotency_key`。 |
-| `QMT_SERVER_IDEMPOTENCY_JOURNAL_MAX_ENTRIES` | `100000` | SQLite 账本最大记录数；达到上限拒绝新写请求，不能自动淘汰历史幂等键。 |
 | `QMT_SERVER_ACCOUNTS` | 空 | 多账户映射，例如 `main=123456,hedge=654321:future`。 |
 | `QMT_SERVER_SUB_ACCOUNTS` | 空 | 子账户映射，例如 `demo@main:limit=50000`。 |
+
+交易写必须携带稳定 `idempotency_key`。Server 在当前进程内原子占位并保留到进程结束；
+不需要数据库、文件路径或额外启用开关。进程重启后不承诺跨重启 exactly-once，提交结果未知时
+只允许用柜台订单/成交事实对账，禁止自动重发。
 
 ## 12. qmt-remote 客户端
 

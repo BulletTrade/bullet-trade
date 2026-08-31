@@ -186,9 +186,7 @@ async def test_qmt_server_clamps_explicit_market_buy_protect_price_to_cage(monke
 
 
 @pytest.mark.asyncio
-async def test_remote_market_sell_without_price_uses_default_sell_protect_price(
-    monkeypatch, tmp_path
-):
+async def test_remote_market_sell_without_price_uses_default_sell_protect_price(monkeypatch):
     from bullet_trade.core import pricing
 
     async def _qmt_snapshot(_security):
@@ -207,7 +205,6 @@ async def test_remote_market_sell_without_price_uses_default_sell_protect_price(
         enable_data=True,
         enable_broker=True,
         accounts=[AccountConfig(key="default", account_id="demo")],
-        idempotency_journal_path=str(tmp_path / "sell-idempotency.sqlite3"),
     )
     router = AccountRouter(config.accounts)
     adapter = QmtBrokerAdapter(config, router)
@@ -249,7 +246,7 @@ async def test_remote_market_sell_without_price_uses_default_sell_protect_price(
 
 @pytest.mark.asyncio
 async def test_remote_market_buy_without_price_ignores_prefill_and_uses_default_buy_protect_price(
-    monkeypatch, tmp_path
+    monkeypatch,
 ):
     from bullet_trade.core import pricing
 
@@ -269,7 +266,6 @@ async def test_remote_market_buy_without_price_ignores_prefill_and_uses_default_
         enable_data=True,
         enable_broker=True,
         accounts=[AccountConfig(key="default", account_id="demo")],
-        idempotency_journal_path=str(tmp_path / "buy-idempotency.sqlite3"),
     )
     router = AccountRouter(config.accounts)
     adapter = QmtBrokerAdapter(config, router)

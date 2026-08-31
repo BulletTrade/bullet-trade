@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
 from functools import partial
 from typing import Any, Dict, List, Optional, Set
 
@@ -21,7 +20,8 @@ from bullet_trade.server.qmt_guard import (
 )
 from bullet_trade.utils.env_loader import get_data_provider_config
 
-from ..config import AccountConfig, ServerConfig
+from ..config import ServerConfig
+from . import register_adapter
 from .base import (
     AccountContext,
     AccountRouter,
@@ -29,7 +29,6 @@ from .base import (
     RemoteBrokerAdapter,
     RemoteDataAdapter,
 )
-from . import register_adapter
 
 # 专用线程池：用于执行 xtquant 的同步调用
 # max_workers 设置较大，避免长时间阻塞的调用占满线程池
@@ -269,8 +268,8 @@ class QmtDataAdapter(RemoteDataAdapter):
         :param payload: 包含 security, count, start, end, frequency, fq, fields 等参数
         :return: DataFrame 转换后的 payload 字典
         """
-        import traceback
         import logging
+        import traceback
 
         logger = logging.getLogger(__name__)
 
@@ -334,8 +333,8 @@ class QmtDataAdapter(RemoteDataAdapter):
         :param payload: 包含 security 参数
         :return: tick 数据字典
         """
-        import traceback
         import logging
+        import traceback
 
         logger = logging.getLogger(__name__)
 
@@ -697,7 +696,54 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
             else:
                 connected = bool(is_connected)
             accounts[key] = {"connected": connected}
-        snapshot["accounts"] = accounts
+        all_accounts_connected = bool(accounts) and all(
+            item["connected"] for item in accounts.values()
+        )
+        broker_ready = bool(self.guard.ready and all_accounts_connected)
+        reason = None
+        if not self.guard.ready:
+            reason = self.guard.last_error or f"qmt_guard_{self.guard.state}"
+        elif not all_accounts_connected:
+            reason = "one_or_more_qmt_accounts_disconnected"
+        broker_status = {"status": "ready" if broker_ready else "unavailable"}
+        if reason:
+            broker_status["reason"] = reason
+        actions = {
+            action: dict(broker_status)
+            for action in (
+                "broker.account",
+                "broker.positions",
+                "broker.orders",
+                "broker.trades",
+                "broker.order_status",
+                "broker.place_order",
+                "broker.cancel_order",
+            )
+        }
+        if self.config.enable_data:
+            data_status = {
+                "status": "ready" if self.guard.ready else "unavailable",
+            }
+            if not self.guard.ready:
+                data_status["reason"] = reason
+            for action in (
+                "data.history",
+                "data.snapshot",
+                "data.current_tick",
+                "data.trade_days",
+                "data.security_info",
+            ):
+                actions[action] = dict(data_status)
+        snapshot.update(
+            {
+                "backend_type": "qmt",
+                "ready": broker_ready,
+                "state": "ready" if broker_ready else "unavailable",
+                "reason": reason,
+                "accounts": accounts,
+                "actions": actions,
+            }
+        )
         return snapshot
 
     def _broker_for(self, ctx: AccountContext) -> QmtBroker:
@@ -814,6 +860,7 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
         5. 卖出时可卖数量检查
         """
         import logging
+
         from bullet_trade.core import pricing
         from bullet_trade.utils.env_loader import get_live_trade_config
 
@@ -1149,7 +1196,8 @@ def dataframe_to_payload(df):
         except Exception:
             pass
         try:
-            from datetime import datetime, date as Date
+            from datetime import date as Date
+            from datetime import datetime
 
             if isinstance(value, (datetime, Date)):
                 return value.isoformat()

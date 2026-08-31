@@ -74,13 +74,12 @@ class RemoteDataAdapter(Protocol):
 class AdapterBundle:
     """聚合行情与券商 adapter，并声明交易写入安全能力。
 
-    幂等键与持久账本是两个独立能力：真实 broker 默认两者都要求；明确由上游持有
-    持久账本的 adapter 可以只关闭持久要求，但仍保留每个写请求必须带幂等键。
+    真实 broker 默认要求每个写请求携带稳定幂等键。Server 在单进程内原子占位，
+    持久订单与成交事实由上游账本和柜台各自的权威 owner 管理。
     """
 
     data_adapter: Optional[RemoteDataAdapter]
     broker_adapter: Optional[RemoteBrokerAdapter]
-    broker_writes_require_persistent_idempotency: bool = True
     broker_writes_require_idempotency_key: bool = True
 
 

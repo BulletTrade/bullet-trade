@@ -132,8 +132,8 @@ bullet-trade --env-file <PRIVATE_CLIENT_ENV> live <STRATEGY_FILE> --broker qmt-r
 
 - XMD 快照默认最大年龄是 30 秒，配置只能收紧，不能超过 30 秒；过期快照直接报错，不用历史
   数据或其他行情源静默补齐。
-- 每次远程下单和撤单都必须携带有效 `idempotency_key`。华鑫 adapter 使用进程内结果缓存与
-  柜台订单事实，不创建或要求 `QMT_SERVER_IDEMPOTENCY_JOURNAL_PATH` 指向 SQLite。
+- 每次远程下单和撤单都必须携带有效 `idempotency_key`。Server 使用进程内结果缓存与
+  柜台订单事实，不创建或要求任何幂等数据库、文件路径或第二启用开关。
 - Trader 登录后以柜台 `MaxOrderRef` 为基线，运行中只在内存中单调递增；server 重启不会复制
   一份柜台订单账本。
 - Trader 或 XMD 断线时，现有 adapter watchdog 在同一 server 进程内重建会话。重连期间查询和

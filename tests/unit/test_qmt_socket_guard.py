@@ -539,6 +539,8 @@ async def test_qmt_broker_adapter_recovers_after_cooldown(monkeypatch):
         """第一次连接失败、第二次连接成功的 fake broker。"""
 
         connect_calls = 0
+        place_calls = 0
+        cancel_calls = 0
 
         def __init__(self, **kwargs):
             """接收真实 broker 初始化参数。
@@ -609,6 +611,36 @@ async def test_qmt_broker_adapter_recovers_after_cooldown(monkeypatch):
 
             return {"account_id": "demo"}
 
+        def buy(self, *args, **kwargs):
+            """记录不应由重连任务触发的下单调用。
+
+            Args:
+                *args: 模拟下单位置参数。
+                **kwargs: 模拟下单关键字参数。
+
+            Returns:
+                str: 假订单号。
+            """
+
+            _ = args, kwargs
+            type(self).place_calls += 1
+            return "unexpected-order"
+
+        def cancel_order(self, *args, **kwargs):
+            """记录不应由重连任务触发的撤单调用。
+
+            Args:
+                *args: 模拟撤单位置参数。
+                **kwargs: 模拟撤单关键字参数。
+
+            Returns:
+                bool: 固定 True。
+            """
+
+            _ = args, kwargs
+            type(self).cancel_calls += 1
+            return True
+
     async def _run_now(func, *args, **kwargs):
         """立即执行同步函数。
 
@@ -646,6 +678,8 @@ async def test_qmt_broker_adapter_recovers_after_cooldown(monkeypatch):
         await _wait_until(lambda: guard.ready and _RecoveringBroker.connect_calls >= 2)
         resp = await adapter.get_account_info(ctx)
         assert resp["value"]["account_id"] == "demo"
+        assert _RecoveringBroker.place_calls == 0
+        assert _RecoveringBroker.cancel_calls == 0
     finally:
         await adapter.stop()
 
@@ -965,6 +999,66 @@ def test_qmt_health_reports_unavailable_without_hiding_features():
     assert health["features"] == ["data"]
     assert health["qmt"]["ready"] is False
     assert health["qmt"]["last_error"] == "QMT down"
+
+
+@pytest.mark.unit
+def test_qmt_broker_health_exposes_real_action_readiness():
+    """验证 QMT broker health 由 guard 与账户连接共同决定写能力。
+
+    Args:
+        None。
+
+    Returns:
+        None。
+    """
+
+    class _ConnectedBroker:
+        """提供可切换连接状态的最小 Broker。"""
+
+        def __init__(self) -> None:
+            """初始化为已连接状态。
+
+            Returns:
+                None。
+            """
+
+            self.is_connected = True
+
+    config = ServerConfig(
+        server_type="qmt",
+        listen="127.0.0.1",
+        port=0,
+        token="t",
+        enable_data=False,
+        enable_broker=True,
+        accounts=[AccountConfig(key="default", account_id="demo")],
+    )
+    router = AccountRouter(config.accounts)
+    guard = QmtAvailabilityGuard(config=_guard_config(), name="test")
+    adapter = QmtBrokerAdapter(config, router, guard=guard)
+    broker = _ConnectedBroker()
+    adapter._brokers["default"] = broker
+    app = ServerApplication(
+        config,
+        router,
+        AdapterBundle(data_adapter=None, broker_adapter=adapter),
+    )
+
+    ready = app._health_snapshot()["value"]
+
+    assert ready["backend_type"] == "qmt"
+    assert ready["qmt"]["ready"] is True
+    assert ready["qmt"]["actions"]["broker.orders"]["status"] == "ready"
+    assert ready["qmt"]["actions"]["broker.place_order"]["status"] == "ready"
+    assert ready["idempotency"]["mode"] == "process_memory"
+
+    broker.is_connected = False
+    unavailable = app._health_snapshot()["value"]
+
+    assert unavailable["process_alive"] is True
+    assert unavailable["qmt"]["ready"] is False
+    assert unavailable["qmt"]["reason"] == "one_or_more_qmt_accounts_disconnected"
+    assert unavailable["qmt"]["actions"]["broker.place_order"]["status"] == "unavailable"
 
 
 @pytest.mark.unit

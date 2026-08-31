@@ -758,7 +758,7 @@ class StubBrokerAdapter(RemoteBrokerAdapter):
 
 
 def build_stub_bundle(config: ServerConfig, router: AccountRouter) -> AdapterBundle:
-    """构造显式豁免持久幂等要求的内存测试 bundle。
+    """构造不强制客户端幂等键的内存测试 bundle。
 
     Args:
         config: server 配置；stub 不读取真实交易凭据。
@@ -776,7 +776,6 @@ def build_stub_bundle(config: ServerConfig, router: AccountRouter) -> AdapterBun
     return AdapterBundle(
         data_adapter=StubDataAdapter(),
         broker_adapter=StubBrokerAdapter(router),
-        broker_writes_require_persistent_idempotency=False,
         broker_writes_require_idempotency_key=False,
     )
 
