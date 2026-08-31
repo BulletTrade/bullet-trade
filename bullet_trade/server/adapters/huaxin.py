@@ -504,9 +504,7 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
         """
 
         del account
-        unsupported = sorted(
-            key for key in payload if key not in {"account_key", "trading_day"}
-        )
+        unsupported = sorted(key for key in payload if key not in {"account_key", "trading_day"})
         if unsupported:
             raise ValueError("asset_consolidation_state 不接受远程配置覆盖")
         consolidation = self._asset_consolidation
@@ -613,7 +611,7 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
         return rows[0] if rows else {}
 
     async def place_order(self, account: AccountContext, payload: Dict[str, Any]) -> Dict[str, Any]:
-        """透传显式限价或沪深白名单原生市价及持久幂等元数据。
+        """透传显式限价或沪深白名单原生市价及稳定幂等元数据。
 
         Args:
             account: 已路由父账户上下文。
@@ -1799,7 +1797,6 @@ def build_huaxin_bundle(config: ServerConfig, router: AccountRouter) -> AdapterB
     return AdapterBundle(
         data_adapter=data_adapter,
         broker_adapter=broker_adapter,
-        broker_writes_require_persistent_idempotency=False,
         broker_writes_require_idempotency_key=True,
     )
 

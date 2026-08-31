@@ -31,23 +31,17 @@ from .adapters.base import (
     VirtualAccountManager,
 )
 from .config import ServerConfig
-from .idempotency_journal import (
-    IdempotencyJournalConflictError,
-    IdempotencyJournalError,
-    PersistentIdempotencyJournal,
-)
 from .session import ClientSession
 from .tick import TickSubscriptionManager
 
 
 @dataclass
 class _IdempotencyEntry:
-    """记录一个已占用的写请求幂等键。"""
+    """记录一个在当前 Server 进程内已占用的写请求幂等键。"""
 
     action: str
     fingerprint: str
     result: Dict[str, Any]
-    expires_at: float
     finalized: bool = False
 
 
@@ -118,26 +112,9 @@ class ServerApplication:
         self._started: Optional[asyncio.Event] = None
         self._idempotency_cache: Dict[Tuple[str, str, str], _IdempotencyEntry] = {}
         self._idempotency_lock: Optional[asyncio.Lock] = None
-        self._idempotency_journal: Optional[PersistentIdempotencyJournal] = None
-        self._idempotency_journal_error: Optional[str] = None
-        self._idempotency_journal_required = bool(
-            adapters.broker_adapter
-            and adapters.broker_writes_require_persistent_idempotency is not False
-        )
         self._idempotency_key_required = bool(
             adapters.broker_adapter and adapters.broker_writes_require_idempotency_key is not False
         )
-        if self._idempotency_journal_required and self.config.idempotency_journal_path:
-            try:
-                self._idempotency_journal = PersistentIdempotencyJournal(
-                    self.config.idempotency_journal_path,
-                    self.config.idempotency_journal_max_entries,
-                )
-            except IdempotencyJournalError as exc:
-                self._idempotency_journal_error = str(exc)
-                log.error("幂等持久日志不可用，交易写将 fail-closed: %s", exc)
-        elif self._idempotency_journal_required:
-            self._idempotency_journal_error = "生产交易 server 未配置 QMT_SERVER_IDEMPOTENCY_JOURNAL_PATH"
         self._risk_by_account: Dict[str, RiskController] = {}
         self._risk_locks: Dict[str, asyncio.Lock] = {}
         if self.config.order_risk_enabled:
@@ -520,6 +497,11 @@ class ServerApplication:
             except Exception:
                 pass
         if write_action is not None:
+            if isinstance(result, dict):
+                result.setdefault(
+                    "idempotency_key",
+                    str(payload.get("idempotency_key") or "").strip(),
+                )
             await self._finalize_idempotent_write(
                 resolved_key,
                 sub_cfg,
@@ -649,14 +631,11 @@ class ServerApplication:
             新 key 会在进程内幂等缓存中占位，防止并发双写。
         """
 
-        if self._idempotency_journal_required and self._idempotency_journal is None:
-            raise RuntimeError("拒绝交易写：持久幂等日志不可用（%s）" % (self._idempotency_journal_error or "未配置"))
         key = str(payload.get("idempotency_key") or "").strip()
         if not key:
             return None
         cache_key = self._idempotency_cache_key(resolved_key, sub_cfg, key)
         normalized = fingerprint or _build_write_fingerprint(action, payload)
-        now = time.monotonic()
         async with self._idempotency_lock_guard:
             pending_result = _unknown_submission_result(
                 action,
@@ -665,18 +644,6 @@ class ServerApplication:
                     str(payload.get("order_id") or "") if action == "broker.cancel_order" else None
                 ),
             )
-            if self._idempotency_journal is not None:
-                try:
-                    journal_result = self._idempotency_journal.claim(
-                        cache_key, action, normalized, pending_result
-                    )
-                except IdempotencyJournalConflictError as exc:
-                    raise IdempotencyConflictError(f"idempotency_key 冲突: {key}") from exc
-                except IdempotencyJournalError as exc:
-                    raise RuntimeError(f"拒绝交易写：幂等持久日志失败: {exc}") from exc
-                if journal_result is not None:
-                    return journal_result
-            self._purge_expired_idempotency_entries(now)
             entry = self._idempotency_cache.get(cache_key)
             if entry is not None:
                 self._ensure_idempotency_match(entry, action, normalized, key)
@@ -685,7 +652,6 @@ class ServerApplication:
                 action=action,
                 fingerprint=normalized,
                 result=pending_result,
-                expires_at=now + max(1, int(self.config.idempotency_ttl_seconds or 300)),
                 finalized=False,
             )
         return None
@@ -728,20 +694,7 @@ class ServerApplication:
         normalized_result = dict(result) if isinstance(result, dict) else {"value": result}
         normalized_result.setdefault("idempotency_key", key)
         finalized = _is_final_idempotency_result(normalized_result)
-        now = time.monotonic()
         async with self._idempotency_lock_guard:
-            if self._idempotency_journal is not None:
-                try:
-                    self._idempotency_journal.finalize(
-                        cache_key,
-                        action,
-                        normalized,
-                        normalized_result,
-                        finalized=finalized,
-                    )
-                except IdempotencyJournalError as exc:
-                    raise RuntimeError("交易写已返回但无法持久收口，保持 submit_unknown 并停止重试: %s" % exc) from exc
-            self._purge_expired_idempotency_entries(now)
             entry = self._idempotency_cache.get(cache_key)
             if entry is not None:
                 self._ensure_idempotency_match(entry, action, normalized, key)
@@ -749,7 +702,6 @@ class ServerApplication:
                 action=action,
                 fingerprint=normalized,
                 result=normalized_result,
-                expires_at=now + max(1, int(self.config.idempotency_ttl_seconds or 300)),
                 finalized=finalized,
             )
 
@@ -791,23 +743,6 @@ class ServerApplication:
         cache_key = self._idempotency_cache_key(resolved_key, sub_cfg, key)
         pending_result: Optional[Dict[str, Any]] = None
         async with self._idempotency_lock_guard:
-            if self._idempotency_journal is not None:
-                try:
-                    journal_entry = self._idempotency_journal.get(
-                        cache_key, action, requested_fingerprint
-                    )
-                except IdempotencyJournalConflictError as exc:
-                    raise IdempotencyConflictError(f"idempotency_key 冲突: {key}") from exc
-                except IdempotencyJournalError as exc:
-                    raise IdempotencyConflictError(f"幂等持久日志冲突: {key}") from exc
-                if journal_entry is not None:
-                    journal_result = dict(journal_entry["result"])
-                    if journal_entry.get("finalized"):
-                        return _format_resolved_submission(
-                            action, key, journal_result, source="idempotency_journal"
-                        )
-                    pending_result = journal_result
-            self._purge_expired_idempotency_entries(time.monotonic())
             entry = self._idempotency_cache.get(cache_key)
             if entry is not None:
                 if requested_fingerprint is not None:
@@ -974,11 +909,6 @@ class ServerApplication:
         """
 
         return (resolved_key, sub_cfg.sub_account_id if sub_cfg else "", key)
-
-    def _purge_expired_idempotency_entries(self, now: float) -> None:
-        expired = [key for key, value in self._idempotency_cache.items() if value.expires_at <= now]
-        for key in expired:
-            self._idempotency_cache.pop(key, None)
 
     async def _maybe_fill_price(self, payload: Dict) -> None:
         """
@@ -1169,33 +1099,22 @@ class ServerApplication:
             await self.tick_manager.start()
 
     def _health_snapshot(self) -> Dict:
-        journal_ready = self._idempotency_journal is not None
         value = {
             "process_alive": True,
             "uptime_seconds": max(0.0, time.time() - self._created_at),
             "sessions": len(self._sessions),
             "accounts": [ctx.config.key for ctx in self.router.list_accounts()],
             "features": self.active_features(),
-            "idempotency_journal": {
-                "required": self._idempotency_journal_required,
-                "ready": journal_ready,
-                "state": "ready"
-                if journal_ready or not self._idempotency_journal_required
-                else "unavailable",
-                "reason": self._idempotency_journal_error,
+            "idempotency": {
+                "mode": "process_memory",
+                "key_required": self._idempotency_key_required,
+                "entries": len(self._idempotency_cache),
+                "cross_restart_exactly_once": False,
+                "unknown_auto_resend": False,
             },
         }
         backend_status = self._backend_status_snapshot()
         if backend_status is not None:
-            if self._idempotency_journal_required and not journal_ready:
-                backend_status = dict(backend_status)
-                actions = dict(backend_status.get("actions") or {})
-                for action in ("broker.place_order", "broker.cancel_order"):
-                    actions[action] = {
-                        "status": "unavailable",
-                        "reason": self._idempotency_journal_error or "持久幂等日志不可用",
-                    }
-                backend_status["actions"] = actions
             backend_type = (
                 backend_status.get("backend_type") if isinstance(backend_status, dict) else None
             )
