@@ -16,13 +16,19 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
 import pytest
 
-from bullet_trade.server.adapters.base import AccountContext, AccountRouter, AdapterBundle
+from bullet_trade.server.adapters.base import (
+    AccountContext,
+    AccountRouter,
+    AdapterBundle,
+    mark_broker_call_started,
+)
 from bullet_trade.server.app import IdempotencyConflictError, ServerApplication
 from bullet_trade.server.config import (
     AccountConfig,
@@ -30,6 +36,7 @@ from bullet_trade.server.config import (
     SubAccountConfig,
     build_server_config,
 )
+from bullet_trade.server.session import ClientSession
 
 
 class _Session:
@@ -133,6 +140,48 @@ class _MemoryBroker:
 
         _ = account, filters
         return [dict(row) for row in self.orders]
+
+
+class _PreciseBoundaryMemoryBroker(_MemoryBroker):
+    """模拟能在 native writer 前精确触发边界标记的内建 Broker。"""
+
+    tracks_broker_call_boundary = True
+
+    def __init__(self) -> None:
+        """初始化精确边界 Broker 与本地拒绝控制。
+
+        Returns:
+            None。
+        """
+
+        super().__init__()
+        self.reject_before_native = False
+
+    async def place_order(
+        self,
+        account: AccountContext,
+        payload: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """在本地校验通过后才标记 native writer 已开始。
+
+        Args:
+            account: Server 已解析的父账户上下文。
+            payload: 原始下单请求及 Server 内部边界回调。
+
+        Returns:
+            Dict[str, Any]: 父类构造的确定性订单结果。
+
+        Raises:
+            ValueError: 测试配置为 native writer 前拒绝时抛出。
+            Exception: native writer 开始后的测试异常原样抛出。
+        """
+
+        copied_payload = copy.deepcopy(payload)
+        assert copied_payload is not payload
+        if self.reject_before_native:
+            raise ValueError("local validation rejected")
+        mark_broker_call_started(payload)
+        return await super().place_order(account, payload)
 
 
 def _build_app(
@@ -380,6 +429,161 @@ async def test_unknown_result_is_never_auto_retried() -> None:
     assert repeated["status"] == "submit_unknown"
     assert repeated["submission_state"] == "submit_unknown"
     assert len(broker.place_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_pre_adapter_rejection_keeps_broker_called_false() -> None:
+    """Server 在 adapter 前拒绝下单时必须保留未调用券商事实。
+
+    Returns:
+        None: 断言缺少幂等键的请求没有进入 broker adapter。
+    """
+
+    app, broker = _build_app()
+    session = _Session()
+    session._current_broker_called = False
+    payload = _place_payload("pre-adapter-reject")
+    payload.pop("idempotency_key")
+
+    with pytest.raises(ValueError, match="idempotency_key"):
+        await app._dispatch_broker(session, "place_order", payload)
+
+    assert session._current_broker_called is False
+    assert broker.place_calls == []
+
+
+@pytest.mark.asyncio
+async def test_adapter_exception_marks_broker_called_true() -> None:
+    """进入 broker adapter 后发生异常时必须标记券商调用边界已跨过。
+
+    Returns:
+        None: 断言异常前已记录调用事实，禁止被误判为安全未发送。
+    """
+
+    broker = _MemoryBroker()
+    broker.raise_after_claim = RuntimeError("adapter response lost")
+    app, broker = _build_app(broker=broker)
+    session = _Session()
+    session._current_broker_called = False
+
+    with pytest.raises(RuntimeError, match="adapter response lost"):
+        await app._dispatch_broker(
+            session,
+            "place_order",
+            _place_payload("adapter-error"),
+        )
+
+    assert session._current_broker_called is True
+    assert len(broker.place_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_precise_adapter_local_rejection_keeps_broker_called_false() -> None:
+    """内建 adapter 在 native writer 前拒绝时不得谎报已进券商。
+
+    Returns:
+        None: 断言本地校验异常保留 ``broker_called=false``。
+    """
+
+    broker = _PreciseBoundaryMemoryBroker()
+    broker.reject_before_native = True
+    app, _ = _build_app(broker=broker)
+    session = _Session()
+    session._current_broker_called = False
+
+    with pytest.raises(ValueError, match="local validation rejected"):
+        await app._dispatch_broker(
+            session,
+            "place_order",
+            _place_payload("precise-pre-native-error"),
+        )
+
+    assert session._current_broker_called is False
+    assert broker.place_calls == []
+
+
+@pytest.mark.asyncio
+async def test_precise_adapter_native_exception_marks_broker_called_true() -> None:
+    """native writer 已开始后发生异常时必须保留冻结等待对账。
+
+    Returns:
+        None: 断言 native writer 后异常记录 ``broker_called=true``。
+    """
+
+    broker = _PreciseBoundaryMemoryBroker()
+    broker.raise_after_claim = RuntimeError("native response lost")
+    app, _ = _build_app(broker=broker)
+    session = _Session()
+    session._current_broker_called = False
+
+    with pytest.raises(RuntimeError, match="native response lost"):
+        await app._dispatch_broker(
+            session,
+            "place_order",
+            _place_payload("precise-post-native-error"),
+        )
+
+    assert session._current_broker_called is True
+    assert len(broker.place_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_session_error_protocol_exposes_broker_called_fact() -> None:
+    """交易错误帧必须原样携带布尔型券商调用事实。
+
+    Returns:
+        None: 断言客户端可区分 adapter 前拒绝与提交后未知。
+    """
+
+    session = ClientSession(SimpleNamespace(), object(), object(), "unit-peer")
+    sent: list[dict[str, Any]] = []
+
+    async def _capture(message: Dict[str, Any]) -> None:
+        """捕获待发送协议帧。
+
+        Args:
+            message: ClientSession 构造的错误消息。
+
+        Returns:
+            None: 把消息副本追加到测试列表。
+        """
+
+        sent.append(dict(message))
+
+    session._safe_send = _capture  # type: ignore[method-assign]
+
+    await session._send_error(
+        "request-1",
+        "REQUEST_FAILED",
+        "local validation rejected",
+        broker_called=False,
+    )
+
+    assert sent == [
+        {
+            "type": "error",
+            "id": "request-1",
+            "code": "REQUEST_FAILED",
+            "message": "local validation rejected",
+            "broker_called": False,
+        }
+    ]
+
+    sent.clear()
+    await session._send_error(
+        "request-2",
+        "REQUEST_TIMEOUT",
+        "remote result unknown",
+        broker_called=None,
+    )
+    assert sent == [
+        {
+            "type": "error",
+            "id": "request-2",
+            "code": "REQUEST_TIMEOUT",
+            "message": "remote result unknown",
+        }
+    ]
 
 
 @pytest.mark.asyncio

@@ -28,6 +28,7 @@ from .base import (
     AdapterBundle,
     RemoteBrokerAdapter,
     RemoteDataAdapter,
+    mark_broker_call_started,
 )
 
 # 专用线程池：用于执行 xtquant 的同步调用
@@ -454,6 +455,8 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
     - 市价单价格笼子计算
     - 卖出时可卖数量检查
     """
+
+    tracks_broker_call_boundary = True
 
     def __init__(
         self,
@@ -981,6 +984,7 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
             f"执行下单: {security} {'买入' if is_buy else '卖出'} {amount} 股，价格={price:.4f}，市价单={is_market}"
         )
 
+        mark_broker_call_started(payload)
         if is_buy:
             order = await broker.buy(
                 security,

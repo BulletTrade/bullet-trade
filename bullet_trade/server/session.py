@@ -42,6 +42,7 @@ class ClientSession:
         self._send_lock = asyncio.Lock()
         self._last_ping = time.time()
         self._current_request: Optional[str] = None  # 当前正在处理的请求 action
+        self._current_broker_called: Optional[bool] = None
 
     async def run(self) -> None:
         try:
@@ -120,6 +121,11 @@ class ClientSession:
             action = message.get("action")
             payload = message.get("payload") or {}
             self._current_request = action
+            self._current_broker_called = (
+                False
+                if str(action or "") in {"broker.place_order", "broker.cancel_order"}
+                else None
+            )
             start = time.time()
             try:
                 request_timeout = self._request_timeout_for(action, payload)
@@ -133,28 +139,84 @@ class ClientSession:
                 error_msg = f"请求超时（>{request_timeout}s）"
                 log.warning(f"[SESSION] {self.session_id} 请求 {action} 超时, 耗时={elapsed:.1f}s")
                 self.app.log_access(self, action, payload, "timeout", elapsed, error_msg, request_id=request_id)
-                await self._send_error(request_id, "REQUEST_TIMEOUT", error_msg)
+                await self._send_error(
+                    request_id,
+                    "REQUEST_TIMEOUT",
+                    error_msg,
+                    # 同步券商调用可能已进入 executor 队列且无法由 asyncio
+                    # 取消；超时发生时，尚未观察到 marker 不能证明未来不会
+                    # 进入 native writer。只有已经观察到 True 才回传事实，
+                    # 否则保持未知并交给订单对账，禁止误释放后产生双单。
+                    broker_called=(
+                        True if self._current_broker_called is True else None
+                    ),
+                )
             except Exception as exc:
                 elapsed = time.time() - start
                 self.app.log_access(self, action, payload, "error", elapsed, str(exc), request_id=request_id)
-                await self._send_error(request_id, getattr(exc, "code", "REQUEST_FAILED"), str(exc))
+                broker_called = getattr(exc, "broker_called", None)
+                if broker_called is None:
+                    broker_called = self._current_broker_called
+                await self._send_error(
+                    request_id,
+                    getattr(exc, "code", "REQUEST_FAILED"),
+                    str(exc),
+                    broker_called=broker_called,
+                )
             else:
                 elapsed = time.time() - start
                 self.app.log_access(self, action, payload, "ok", elapsed, request_id=request_id)
                 await self._send_response(request_id, result)
             finally:
                 self._current_request = None
+                self._current_broker_called = None
 
     async def _send_response(self, request_id: Optional[str], payload: Any) -> None:
         if request_id is None:
             return
         await self._safe_send({"type": "response", "id": request_id, "payload": payload})
 
-    async def _send_error(self, request_id: Optional[str], code: str, message: str) -> None:
+    async def _send_error(
+        self,
+        request_id: Optional[str],
+        code: str,
+        message: str,
+        *,
+        broker_called: Optional[bool] = None,
+    ) -> None:
+        """发送结构化错误，并携带本次写请求是否进入券商调用的事实。
+
+        Args:
+            request_id: 客户端请求 ID；握手错误时可以为空。
+            code: 稳定错误码。
+            message: 面向调用方的错误说明。
+            broker_called: 写请求是否已经进入 native 券商写接口；非交易请求为空。
+
+        Returns:
+            None: 错误帧写入当前 TCP 会话。
+
+        Side Effects:
+            向客户端发送一条协议错误消息。
+        """
+
         body = {"type": "error", "code": code, "message": message}
+        if broker_called is not None:
+            body["broker_called"] = bool(broker_called)
         if request_id:
             body["id"] = request_id
         await self._safe_send(body)
+
+    def mark_broker_called(self) -> None:
+        """记录当前交易写请求已经进入 native 券商写接口。
+
+        Returns:
+            None: 仅更新当前顺序处理请求的会话内事实。
+
+        Side Effects:
+            后续错误响应会携带 ``broker_called=true``。
+        """
+
+        self._current_broker_called = True
 
     async def _send_pong(self, ping: Dict[str, Any]) -> None:
         self._last_ping = time.time()
