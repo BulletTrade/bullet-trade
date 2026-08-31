@@ -22,6 +22,7 @@ from .base import (
     AdapterBundle,
     RemoteBrokerAdapter,
     RemoteDataAdapter,
+    mark_broker_call_started,
 )
 from .qmt import dataframe_to_payload, dict_payload
 
@@ -57,6 +58,21 @@ _BROKER_READ_ACTIONS = (
 
 _ADMIN_ACTIONS = ("admin.health", "admin.print_account")
 
+_BIG_QMT_PRE_BROKER_ERROR_CODES = frozenset(
+    {
+        "TRADING_DISABLED",
+        "QMT_NOT_READY",
+        "ACCOUNT_NOT_CONFIGURED",
+        "BAD_REQUEST",
+        "CANCEL_ORDER_DISABLED",
+        "MISSING_ORDER_ID",
+        "VIRTUAL_ACCOUNT_MISMATCH",
+        "ORDER_NOT_CANCELABLE",
+        "DANGEROUS_OPERATION_DISABLED",
+        "GATEWAY_BUSY",
+    }
+)
+
 _ORDER_STATUS_MAP = {
     0: "unknown",
     48: "open",
@@ -87,9 +103,48 @@ class BigQmtGatewayConfig:
 
 
 class BigQmtGatewayError(RuntimeError):
-    def __init__(self, message: str, *, code: str = "BIG_QMT_GATEWAY_ERROR") -> None:
+    """保存大 QMT Gateway 错误及其券商调用边界事实。"""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str = "BIG_QMT_GATEWAY_ERROR",
+        broker_called: Optional[bool] = None,
+    ) -> None:
+        """创建可向上传递的结构化 Gateway 错误。
+
+        Args:
+            message: 可读错误说明。
+            code: 稳定错误码。
+            broker_called: Gateway 是否已经调用 QMT ``passorder``；未知时为空。
+
+        Returns:
+            None: 初始化异常实例。
+        """
+
         super().__init__(message)
         self.code = code
+        self.broker_called = broker_called
+
+
+def _resolve_gateway_broker_called(payload: Dict[str, Any], code: str) -> Optional[bool]:
+    """从 Gateway 结构化错误解析是否已经调用 QMT 写接口。
+
+    Args:
+        payload: Gateway 返回的错误对象。
+        code: 已解析的稳定错误码。
+
+    Returns:
+        Optional[bool]: 显式布尔值优先；仅稳定的调用前错误码推导 False，
+        其余错误保持未知。
+    """
+
+    if isinstance(payload.get("broker_called"), bool):
+        return bool(payload["broker_called"])
+    if str(code or "") in _BIG_QMT_PRE_BROKER_ERROR_CODES:
+        return False
+    return None
 
 
 def load_big_qmt_gateway_config(server_config: ServerConfig) -> BigQmtGatewayConfig:
@@ -260,15 +315,17 @@ class BigQmtGatewayClient:
     def _http_error(self, exc: urllib.error.HTTPError) -> BigQmtGatewayError:
         message = str(exc)
         code = f"HTTP_{exc.code}"
+        broker_called: Optional[bool] = None
         try:
             raw = exc.read()
             payload = json.loads(raw.decode("utf-8")) if raw else {}
             if isinstance(payload, dict):
                 message = str(payload.get("message") or payload.get("error") or message)
                 code = str(payload.get("code") or code)
+                broker_called = _resolve_gateway_broker_called(payload, code)
         except Exception:
             pass
-        return BigQmtGatewayError(message, code=code)
+        return BigQmtGatewayError(message, code=code, broker_called=broker_called)
 
     def _unwrap_response(self, payload: Any) -> Any:
         if not isinstance(payload, dict):
@@ -277,7 +334,12 @@ class BigQmtGatewayClient:
         if ok is False:
             message = str(payload.get("message") or payload.get("error") or "big QMT gateway 请求失败")
             code = str(payload.get("code") or payload.get("error_code") or "BIG_QMT_GATEWAY_ERROR")
-            raise BigQmtGatewayError(message, code=code)
+            broker_called = _resolve_gateway_broker_called(payload, code)
+            raise BigQmtGatewayError(
+                message,
+                code=code,
+                broker_called=broker_called,
+            )
         if "data" in payload:
             return payload["data"]
         if "result" in payload:
@@ -363,6 +425,10 @@ class BigQmtDataAdapter(RemoteDataAdapter):
 
 
 class BigQmtBrokerAdapter(RemoteBrokerAdapter):
+    """通过大 QMT HTTP Gateway 提供账户查询、下单、撤单和订单对账。"""
+
+    tracks_broker_call_boundary = True
+
     def __init__(
         self,
         config: ServerConfig,
@@ -440,6 +506,7 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
         known_order_ids = set()
         if wait_timeout > 0:
             known_order_ids = await self._snapshot_order_ids(account, request)
+        mark_broker_call_started(request)
         data = await self.client.post("/place_order", request)
         order = _normalize_order(_extract_dict(data))
         if wait_timeout <= 0:

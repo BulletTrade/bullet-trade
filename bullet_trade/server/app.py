@@ -27,6 +27,8 @@ from .adapters.base import (
     AccountContext,
     AccountRouter,
     AdapterBundle,
+    BROKER_CALL_MARKER_KEY,
+    BrokerCallBoundaryMarker,
     SubAccountConfig,
     VirtualAccountManager,
 )
@@ -469,6 +471,45 @@ class ServerApplication:
                         sub_cfg.sub_account_id,
                     )
                 return cached_result
+            broker_fn = fn
+
+            async def _tracked_broker_write(*call_args):
+                """为内建 adapter 注入精确券商调用标记并兼容旧 adapter。
+
+                Args:
+                    call_args: 已由 Server 组装完成的 broker adapter 参数。
+
+                Returns:
+                    Any: broker adapter 的原始返回值。
+
+                Raises:
+                    Exception: broker adapter 的异常原样向上传递。
+
+                Side Effects:
+                    内建 place adapter 在真正 native writer 前触发标记；未知旧
+                    adapter 与 cancel 路径仍在入口保守标记为已调用。
+                """
+
+                marker = getattr(session, "mark_broker_called", None)
+                if not callable(marker):
+                    marker = lambda: setattr(session, "_current_broker_called", True)
+                precise_place_boundary = method == "place_order" and bool(
+                    getattr(
+                        self.adapters.broker_adapter,
+                        "tracks_broker_call_boundary",
+                        False,
+                    )
+                )
+                if precise_place_boundary:
+                    payload[BROKER_CALL_MARKER_KEY] = BrokerCallBoundaryMarker(marker)
+                else:
+                    marker()
+                try:
+                    return await broker_fn(*call_args)
+                finally:
+                    payload.pop(BROKER_CALL_MARKER_KEY, None)
+
+            fn = _tracked_broker_write
         if method == "place_order" and resolved_key in self._risk_by_account:
             result = await self._place_order_with_server_risk(
                 resolved_key=resolved_key,

@@ -8,6 +8,7 @@ from bullet_trade.server.adapters import get_adapter
 from bullet_trade.server.adapters.base import AccountRouter, AdapterBundle
 from bullet_trade.server.adapters.big_qmt import (
     BigQmtBrokerAdapter,
+    BigQmtGatewayClient,
     BigQmtDataAdapter,
     BigQmtGatewayConfig,
     BigQmtGatewayError,
@@ -33,6 +34,50 @@ def test_big_qmt_server_env_example_contains_account_route_and_timeout_order():
     assert int(values["QMT_SERVER_REQUEST_TIMEOUT_SECONDS"]) > int(
         values["BIG_QMT_GATEWAY_TIMEOUT_SECONDS"]
     )
+
+
+def test_big_qmt_gateway_error_preserves_broker_called_false() -> None:
+    """Gateway 明确未调用 passorder 时必须把该事实保留在异常中。
+
+    Returns:
+        None: 断言 Server 会话可继续把未提交事实传给 V2 客户端。
+    """
+
+    client = BigQmtGatewayClient(BigQmtGatewayConfig())
+
+    with pytest.raises(BigQmtGatewayError) as raised:
+        client._unwrap_response(
+            {
+                "ok": False,
+                "code": "LOCAL_REJECTED",
+                "message": "rejected before passorder",
+                "broker_called": False,
+            }
+        )
+
+    assert raised.value.code == "LOCAL_REJECTED"
+    assert raised.value.broker_called is False
+
+
+def test_big_qmt_gateway_stable_pre_passorder_error_implies_not_called() -> None:
+    """旧 helper 未回传边界字段时，稳定调用前错误码仍必须安全释放。
+
+    Returns:
+        None: 断言 QMT_NOT_READY 被解释为尚未调用 passorder。
+    """
+
+    client = BigQmtGatewayClient(BigQmtGatewayConfig())
+
+    with pytest.raises(BigQmtGatewayError) as raised:
+        client._unwrap_response(
+            {
+                "ok": False,
+                "code": "QMT_NOT_READY",
+                "message": "ContextInfo is required before trading",
+            }
+        )
+
+    assert raised.value.broker_called is False
 
 
 class _FakeGatewayClient:

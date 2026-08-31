@@ -11,6 +11,7 @@ from .base import (
     AdapterBundle,
     RemoteBrokerAdapter,
     RemoteDataAdapter,
+    mark_broker_call_started,
 )
 
 
@@ -319,6 +320,10 @@ class StubDataAdapter(RemoteDataAdapter):
 
 
 class StubBrokerAdapter(RemoteBrokerAdapter):
+    """以内存账户和订单事实模拟完整 broker 行为，供本地端到端验证。"""
+
+    tracks_broker_call_boundary = True
+
     def __init__(self, router: AccountRouter):
         self.account_router = router
         self._orders: Dict[str, List[Dict]] = {}
@@ -680,6 +685,7 @@ class StubBrokerAdapter(RemoteBrokerAdapter):
             "order_sysid": str(_as_int(scenario.get("order_sysid"), 70000 + order_idx)),
             "raw_status": _raw_status_for(status),
         }
+        mark_broker_call_started(payload)
         self._orders_for(account).append(order)
         if status in {"filled", "partly_canceled", "partly_filled", "rejected"}:
             filled_default = amount if status == "filled" else 0

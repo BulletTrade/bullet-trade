@@ -57,7 +57,14 @@ from bullet_trade.utils.env_loader import (
 
 from ..config import ServerConfig
 from . import register_adapter
-from .base import AccountContext, AccountRouter, AdapterBundle, RemoteBrokerAdapter
+from .base import (
+    AccountContext,
+    AccountRouter,
+    AdapterBundle,
+    BROKER_CALL_MARKER_KEY,
+    RemoteBrokerAdapter,
+    mark_broker_call_started,
+)
 
 log = logging.getLogger(__name__)
 
@@ -224,6 +231,7 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
     交错；每个账户仍由独立 HuaxinBroker/NativeRuntime 管理实际 SDK 会话。
     """
 
+    tracks_broker_call_boundary = True
     requires_explicit_execution_price = True
 
     def __init__(
@@ -675,6 +683,7 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
         direction = str(payload.get("side") or "BUY").strip().lower()
         broker = self._broker_for(account)
         extra = dict(payload)
+        extra.pop(BROKER_CALL_MARKER_KEY, None)
         if market_type:
             extra["market_type"] = market_type
         return dict(
@@ -688,6 +697,7 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
                 market=market,
                 extra=extra,
                 wait_timeout=payload.get("wait_timeout"),
+                broker_call_payload=payload,
             )
             or {}
         )
@@ -917,6 +927,9 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
         consolidation = self._asset_consolidation
         if consolidation is not None and not consolidation.order_allowed():
             return consolidation.blocked_order_result()
+        broker_call_payload = kwargs.pop("broker_call_payload", None)
+        if isinstance(broker_call_payload, dict):
+            mark_broker_call_started(broker_call_payload)
         return dict(broker.submit_order(direction, security, amount, price, **kwargs) or {})
 
     async def _connect_all(self) -> None:

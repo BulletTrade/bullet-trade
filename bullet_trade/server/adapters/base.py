@@ -2,9 +2,79 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Protocol, Tuple
+from typing import Any, Callable, Dict, List, Optional, Protocol, Tuple
 
 from ..config import AccountConfig, ServerConfig, SubAccountConfig
+
+BROKER_CALL_MARKER_KEY = "_bullet_trade_broker_call_marker"
+
+
+class BrokerCallBoundaryMarker:
+    """封装当前会话的券商调用边界，并允许 adapter 安全深拷贝请求。"""
+
+    def __init__(self, callback: Callable[[], None]) -> None:
+        """保存只在本进程内调用的边界回调。
+
+        Args:
+            callback: native 券商写接口开始前执行的无参回调。
+
+        Returns:
+            None。
+        """
+
+        self._callback = callback
+
+    def __call__(self) -> None:
+        """触发一次当前会话的券商调用事实。
+
+        Returns:
+            None。
+
+        Side Effects:
+            调用 Server 会话提供的边界记录函数。
+        """
+
+        self._callback()
+
+    def __copy__(self) -> "BrokerCallBoundaryMarker":
+        """浅拷贝时复用同一进程内边界标记。
+
+        Returns:
+            BrokerCallBoundaryMarker: 当前实例。
+        """
+
+        return self
+
+    def __deepcopy__(self, memo: Dict[int, Any]) -> "BrokerCallBoundaryMarker":
+        """深拷贝请求时避免递归复制会话和 asyncio Task。
+
+        Args:
+            memo: ``copy.deepcopy`` 使用的对象缓存。
+
+        Returns:
+            BrokerCallBoundaryMarker: 当前实例，确保副本仍标记同一请求。
+        """
+
+        memo[id(self)] = self
+        return self
+
+
+def mark_broker_call_started(payload: Dict[str, Any]) -> None:
+    """在真正调用券商写接口前消费并触发会话边界标记。
+
+    Args:
+        payload: Server 传给 broker adapter 的当前写请求；可含内部回调。
+
+    Returns:
+        None: 内部回调存在时已执行并从载荷删除，否则不做任何事。
+
+    Side Effects:
+        更新当前 Server 会话的 ``broker_called`` 事实；内部键不会传给券商。
+    """
+
+    marker = payload.pop(BROKER_CALL_MARKER_KEY, None)
+    if callable(marker):
+        marker()
 
 
 @dataclass
