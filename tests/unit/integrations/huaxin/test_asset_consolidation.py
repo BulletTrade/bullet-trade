@@ -808,6 +808,88 @@ def test_complete_ready_survives_normal_target_trading_asset_changes(tmp_path) -
     assert state_store.load_day("20260825")["ready_evidence"] == ready_before_trade
 
 
+def test_complete_ready_survives_expired_source_snapshot(tmp_path) -> None:
+    """验证当日 READY 不会仅因已安装源快照过期而重新阻断下单。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        None。
+    """
+
+    snapshots = [
+        _source_snapshot(_NOW - timedelta(seconds=10)),
+        _source_snapshot(_NOW - timedelta(seconds=5)),
+        _source_snapshot(_NOW + timedelta(seconds=1), position=0),
+        _source_snapshot(_NOW + timedelta(seconds=2), position=0),
+        _source_snapshot(_NOW + timedelta(seconds=3), position=0, cash=0),
+        _source_snapshot(_NOW + timedelta(seconds=4), position=0, cash=0),
+    ]
+    broker = _TargetBroker()
+    config = _config(tmp_path)
+    coordinator = HuaxinAssetConsolidationCoordinator(
+        config,
+        source_snapshot_provider=_SequenceProvider(snapshots),
+        clock=lambda: _NOW,
+        hostname=lambda: "target-host",
+    )
+    for _ in range(6):
+        assert coordinator.drive_once(broker)["state"] in {
+            "observing",
+            "planned",
+            "reconciling",
+            "complete",
+        }
+    assert coordinator.order_allowed() is True
+
+    restarted = HuaxinAssetConsolidationCoordinator(
+        config,
+        source_snapshot_provider=_SequenceProvider(
+            [_source_snapshot(_NOW - timedelta(minutes=10), position=0, cash=0)]
+        ),
+        clock=lambda: _NOW,
+        hostname=lambda: "target-host",
+    )
+
+    result = restarted.drive_once(broker)
+
+    assert result["state"] == "complete"
+    assert result["reason"] is None
+    assert restarted.order_allowed() is True
+    assert broker.position_submit_count == 1
+    assert broker.fund_submit_count == 1
+
+
+def test_expired_source_snapshot_still_blocks_without_complete_plan(tmp_path) -> None:
+    """验证没有当日 READY 时，过期源快照仍保持阻断且不生成计划。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        None。
+    """
+
+    broker = _TargetBroker()
+    coordinator = HuaxinAssetConsolidationCoordinator(
+        _config(tmp_path),
+        source_snapshot_provider=_SequenceProvider(
+            [_source_snapshot(_NOW - timedelta(minutes=10), position=0, cash=0)]
+        ),
+        clock=lambda: _NOW,
+        hostname=lambda: "target-host",
+    )
+
+    result = coordinator.drive_once(broker)
+
+    assert result["state"] == "observing"
+    assert result["reason"] == "source_snapshot_stale"
+    assert coordinator.order_allowed() is False
+    assert broker.position_submit_count == broker.fund_submit_count == 0
+    assert not (tmp_path / "state.json").exists()
+
+
 def test_dry_run_persists_plan_without_any_transfer_call(tmp_path) -> None:
     """验证 dry-run 只生成脱敏计划，资金和证券写调用均为零。
 

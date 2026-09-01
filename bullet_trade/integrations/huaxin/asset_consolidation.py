@@ -1279,14 +1279,32 @@ class HuaxinAssetConsolidationCoordinator:
         if wall_time < self.config.earliest_time:
             raise HuaxinAssetConsolidationWaiting("before_earliest_time")
 
-        source = dict(self._source_snapshot_provider())
-        source_time = self._validate_source_snapshot(source, now)
+        broker_trading_day = str(broker.get_trading_day() or "").strip()
+        if len(broker_trading_day) != 8 or not broker_trading_day.isdigit():
+            raise HuaxinAssetConsolidationError("target_trading_day_invalid")
+        plan = self._store.load_day(broker_trading_day)
+        try:
+            source = dict(self._source_snapshot_provider())
+            source_time = self._validate_source_snapshot(source, now)
+        except HuaxinAssetConsolidationWaiting as exc:
+            if (
+                plan is None
+                or plan.get("state") != "complete"
+                or str(exc)
+                not in {
+                    "source_snapshot_missing",
+                    "source_snapshot_stale",
+                }
+            ):
+                raise
+            self._validate_existing_plan(plan, broker_trading_day)
+            self._publish_plan_health(plan)
+            return
         trading_day = str(source["trading_day"])
         target = self._capture_target_snapshot(broker, now)
         if str(target.get("trading_day") or "") != trading_day:
             raise HuaxinAssetConsolidationError("source_target_trading_day_mismatch")
 
-        plan = self._store.load_day(trading_day)
         if plan is None:
             if not self._observe_stability(source, target, source_time):
                 self._set_health("observing", "stable_samples_pending", trading_day=trading_day)
