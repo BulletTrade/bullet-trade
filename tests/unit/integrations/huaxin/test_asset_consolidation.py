@@ -349,6 +349,42 @@ def test_off_config_requires_no_private_paths_or_nodes() -> None:
     assert config.state_path is None
 
 
+def test_from_env_derives_full_external_snapshot_without_mode_switches(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """验证生产归集由固定路径自动启用且忽略旧模式开关。
+
+    Args:
+        monkeypatch: pytest 环境变量隔离器。
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        None。
+    """
+
+    values = {
+        "HUAXIN_ASSET_CONSOLIDATION_MODE": "off",
+        "HUAXIN_ASSET_CONSOLIDATION_SOURCE_MODE": "direct_session",
+        "HUAXIN_ASSET_CONSOLIDATION_SOURCE_SNAPSHOT": str(tmp_path / "source.json"),
+        "HUAXIN_ASSET_CONSOLIDATION_STATE_FILE": str(tmp_path / "state.json"),
+        "HUAXIN_ASSET_CONSOLIDATION_SOURCE_NODE_ID": "14",
+        "HUAXIN_ASSET_CONSOLIDATION_TARGET_NODE_ID": "16",
+        "HUAXIN_ASSET_CONSOLIDATION_SOURCE_ROLE": "source-node14",
+        "HUAXIN_ASSET_CONSOLIDATION_TARGET_ROLE": "target-node16",
+        "HUAXIN_ASSET_CONSOLIDATION_SOURCE_HOST": "huaxin",
+        "HUAXIN_ASSET_CONSOLIDATION_TARGET_HOST": "hx_jq",
+    }
+    for name, value in values.items():
+        monkeypatch.setenv(name, value)
+
+    config = HuaxinAssetConsolidationConfig.from_env()
+
+    assert config.mode == "full"
+    assert config.source_mode == "external_snapshot"
+    assert config.enabled is True
+
+
 def test_write_mode_uses_standing_direction_without_daily_tokens(tmp_path) -> None:
     """验证 full 生产模式不再要求每天手填交易日和快照口令。
 
@@ -938,9 +974,7 @@ def test_zero_action_source_creates_no_transfer_required_ready(tmp_path) -> None
     result = coordinator.drive_once(_TargetBroker())
 
     assert result["state"] == "complete"
-    state = HuaxinAssetConsolidationStateStore(tmp_path / "state.json").load_day(
-        "20260825"
-    )
+    state = HuaxinAssetConsolidationStateStore(tmp_path / "state.json").load_day("20260825")
     assert state["actions"] == []
     assert state["clearance_mode"] == "no_transfer_required"
     assert state["ready_evidence"]["clearance_mode"] == "no_transfer_required"
@@ -1050,9 +1084,7 @@ def test_completion_cutoff_is_sla_and_late_recovery_still_completes(tmp_path) ->
     result = coordinator.drive_once(_TargetBroker())
 
     assert result["state"] == "complete"
-    state = HuaxinAssetConsolidationStateStore(tmp_path / "state.json").load_day(
-        "20260825"
-    )
+    state = HuaxinAssetConsolidationStateStore(tmp_path / "state.json").load_day("20260825")
     assert state["ready_evidence"]["completion_cutoff_time"] == "09:05:00"
 
 

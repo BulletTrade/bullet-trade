@@ -239,7 +239,6 @@ def get_broker_config() -> dict:
             "runtime_mode": get_env("HUAXIN_RUNTIME_MODE", "server"),
             "enable_trading": get_env_bool("HUAXIN_ENABLE_TRADING", False),
             "enable_cancel": get_env_bool("HUAXIN_ENABLE_CANCEL", False),
-            "enable_node_transfer": get_env_bool("HUAXIN_ENABLE_NODE_TRANSFER", False),
         },
     }
 

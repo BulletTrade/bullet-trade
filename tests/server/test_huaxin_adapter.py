@@ -18,6 +18,7 @@ from bullet_trade.integrations.huaxin.errors import (
     HuaxinNativeUnavailableError,
     HuaxinTradingDisabledError,
 )
+from bullet_trade.integrations.huaxin.snapshot_relay import HuaxinNodeSnapshotRelayConfig
 from bullet_trade.integrations.huaxin.xmd_backend import (
     DEFAULT_MAX_AGE_SECONDS,
     HUAXIN_XMD_SOURCE,
@@ -1818,7 +1819,6 @@ async def test_asset_consolidation_runs_in_background_and_blocks_only_new_orders
         broker_config={
             "enable_trading": True,
             "enable_cancel": True,
-            "enable_node_transfer": True,
         },
         broker_factory=_FakeBroker,
         consolidation_config=consolidation_config,
@@ -1855,11 +1855,11 @@ async def test_asset_consolidation_runs_in_background_and_blocks_only_new_orders
 
 
 @pytest.mark.parametrize("mode", ["canary", "full"])
-def test_asset_consolidation_write_modes_require_explicit_node_transfer(
+def test_asset_consolidation_write_modes_enable_node_transfer_from_role(
     tmp_path,
     mode,
 ) -> None:
-    """验证真实归集模式在创建后台任务前要求显式节点划转授权。
+    """验证真实归集模式自动赋予目标 writer 节点划转能力。
 
     Args:
         tmp_path: pytest 临时目录。
@@ -1888,15 +1888,64 @@ def test_asset_consolidation_write_modes_require_explicit_node_transfer(
         }
     )
 
-    with pytest.raises(ValueError, match="HUAXIN_ENABLE_NODE_TRANSFER=true"):
-        HuaxinBrokerAdapter(
-            config,
-            router,
-            broker_config={"enable_node_transfer": False},
-            broker_factory=_FakeBroker,
-            consolidation_config=consolidation_config,
-            consolidation_factory=_GateCoordinator,
-        )
+    adapter = HuaxinBrokerAdapter(
+        config,
+        router,
+        broker_config={
+            "enable_trading": False,
+            "enable_cancel": False,
+            "enable_node_transfer": False,
+        },
+        broker_factory=_FakeBroker,
+        consolidation_config=consolidation_config,
+        consolidation_factory=_GateCoordinator,
+        snapshot_relay_config=HuaxinNodeSnapshotRelayConfig.from_mapping(
+            {
+                "install_path": tmp_path / "source.json",
+                "expected_source_node_id": 22,
+                "expected_source_role": "source-query",
+                "expected_source_host": "source-host",
+            }
+        ),
+    )
+
+    assert adapter._broker_config["enable_node_transfer"] is True
+    assert adapter._broker_config["enable_trading"] is True
+    assert adapter._broker_config["enable_cancel"] is True
+
+
+def test_snapshot_source_role_forces_query_only_broker(tmp_path) -> None:
+    """验证快照源机自动保持只读，不受旧交易开关影响。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        None。
+    """
+
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    adapter = HuaxinBrokerAdapter(
+        config,
+        router,
+        broker_config={"enable_trading": True, "enable_cancel": True},
+        broker_factory=_FakeBroker,
+        snapshot_relay_config=HuaxinNodeSnapshotRelayConfig.from_mapping(
+            {
+                "generation_state_path": tmp_path / "generation.json",
+                "node_id": 14,
+                "role": "source-node14",
+                "host": "source-host",
+                "producer_instance": "source-v2",
+                "producer_git_commit": "a" * 40,
+            }
+        ),
+    )
+
+    assert adapter._broker_config["enable_node_transfer"] is False
+    assert adapter._broker_config["enable_trading"] is False
+    assert adapter._broker_config["enable_cancel"] is False
 
 
 @pytest.mark.asyncio

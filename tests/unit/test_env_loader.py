@@ -79,7 +79,7 @@ class TestEnvLoader:
 
         assert config["default"] == "qmt"
         assert config["qmt"]["account_id"] == "12345"
-        assert config["huaxin"]["enable_node_transfer"] is True
+        assert "enable_node_transfer" not in config["huaxin"]
 
     def test_get_system_config(self, monkeypatch):
         """测试获取系统配置"""

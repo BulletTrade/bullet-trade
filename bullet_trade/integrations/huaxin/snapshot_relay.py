@@ -34,7 +34,7 @@ from bullet_trade.integrations.huaxin.asset_consolidation import (
     HUAXIN_NODE_SNAPSHOT_SCHEMA,
     build_huaxin_node_asset_snapshot_digest,
 )
-from bullet_trade.utils.env_loader import get_env, get_env_bool, parse_bool
+from bullet_trade.utils.env_loader import get_env
 
 
 _GENERATION_STATE_SCHEMA = "huaxin-node-snapshot-generation/v1"
@@ -345,45 +345,61 @@ def _exclusive_file_lock(path: Path) -> Iterator[None]:
 
 @dataclass(frozen=True)
 class HuaxinNodeSnapshotRelayConfig:
-    """保存节点快照生成与安装的显式安全配置。"""
+    """保存节点快照生成与安装配置，并由路径自动确定本机职责。"""
 
-    capture_enabled: bool = False
     generation_state_path: Optional[Path] = None
     node_id: Optional[int] = None
     role: str = ""
     host: str = ""
     producer_instance: str = ""
     producer_git_commit: str = ""
-    install_enabled: bool = False
     install_path: Optional[Path] = None
     expected_source_node_id: Optional[int] = None
     expected_source_role: str = ""
     expected_source_host: str = ""
     install_max_age_seconds: float = 120.0
 
+    @property
+    def capture_enabled(self) -> bool:
+        """返回本机是否承担快照生成职责。
+
+        Returns:
+            bool: 配置 generation 状态文件时为 True。
+        """
+
+        return self.generation_state_path is not None
+
+    @property
+    def install_enabled(self) -> bool:
+        """返回本机是否承担快照安装职责。
+
+        Returns:
+            bool: 配置来源快照文件时为 True。
+        """
+
+        return self.install_path is not None
+
     @classmethod
     def from_env(cls) -> "HuaxinNodeSnapshotRelayConfig":
-        """从环境构造默认关闭的 relay 配置。
+        """从环境构造按固定路径自动分工的 relay 配置。
 
         Returns:
             HuaxinNodeSnapshotRelayConfig: 已严格校验的配置。
 
         Raises:
-            HuaxinNodeSnapshotRelayError: 任一启用分支缺少显式配置时抛出。
+            HuaxinNodeSnapshotRelayError: 任一已配置职责缺少身份时抛出。
 
         Side Effects:
             仅读取环境，不访问文件或柜台。
         """
 
         values = {
-            "capture_enabled": get_env_bool("HUAXIN_NODE_ASSET_SNAPSHOT_ENABLED", False),
             "generation_state_path": get_env("HUAXIN_NODE_ASSET_SNAPSHOT_STATE_FILE"),
             "node_id": get_env("HUAXIN_NODE_ASSET_SNAPSHOT_NODE_ID"),
             "role": get_env("HUAXIN_NODE_ASSET_SNAPSHOT_ROLE"),
             "host": get_env("HUAXIN_NODE_ASSET_SNAPSHOT_HOST"),
             "producer_instance": get_env("HUAXIN_NODE_ASSET_SNAPSHOT_PRODUCER_INSTANCE"),
             "producer_git_commit": get_env("HUAXIN_NODE_ASSET_SNAPSHOT_GIT_COMMIT"),
-            "install_enabled": get_env_bool("HUAXIN_SOURCE_SNAPSHOT_INSTALL_ENABLED", False),
             "install_path": get_env("HUAXIN_ASSET_CONSOLIDATION_SOURCE_SNAPSHOT"),
             "expected_source_node_id": get_env("HUAXIN_ASSET_CONSOLIDATION_SOURCE_NODE_ID"),
             "expected_source_role": get_env("HUAXIN_ASSET_CONSOLIDATION_SOURCE_ROLE"),
@@ -408,12 +424,9 @@ class HuaxinNodeSnapshotRelayConfig:
             HuaxinNodeSnapshotRelayError: 启用功能缺少路径或身份时抛出。
         """
 
-        capture_enabled = parse_bool(values.get("capture_enabled"), default=False)
-        install_enabled = parse_bool(values.get("install_enabled"), default=False)
-        kwargs: Dict[str, Any] = {
-            "capture_enabled": capture_enabled,
-            "install_enabled": install_enabled,
-        }
+        capture_enabled = values.get("generation_state_path") not in (None, "")
+        install_enabled = values.get("install_path") not in (None, "")
+        kwargs: Dict[str, Any] = {}
         if capture_enabled:
             kwargs.update(
                 generation_state_path=Path(

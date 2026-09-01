@@ -6,7 +6,7 @@
 主要输出: 0600 原子 JSON 状态、脱敏健康摘要以及新下单放行门禁。
 上游关系: HuaxinBrokerAdapter 在独立 Trader executor 中周期调用本模块。
 下游关系: HuaxinBroker 的节点查询、划拨流水查询和一次性 NodeMoveIn 原语。
-关键配置: 功能默认 off；公开代码不内置生产节点编号、账号、前置或主机身份。
+关键配置: 是否归集由固定来源快照和状态路径自动确定；公开代码不内置生产身份。
 """
 
 from __future__ import annotations
@@ -731,10 +731,10 @@ class HuaxinAssetConsolidationConfig:
 
     @classmethod
     def from_env(cls) -> "HuaxinAssetConsolidationConfig":
-        """从 ``HUAXIN_ASSET_CONSOLIDATION_*`` 环境变量构造配置。
+        """从固定路径和身份环境变量构造生产归集配置。
 
         Returns:
-            HuaxinAssetConsolidationConfig: 已校验配置；off 不要求任何路径和节点。
+            HuaxinAssetConsolidationConfig: 有完整固定路径时自动 full，否则 off。
 
         Raises:
             ValueError: 启用后缺少身份、路径或数值边界时抛出。
@@ -743,11 +743,13 @@ class HuaxinAssetConsolidationConfig:
             仅读取进程环境，不访问快照或状态文件。
         """
 
+        source_snapshot_path = get_env("HUAXIN_ASSET_CONSOLIDATION_SOURCE_SNAPSHOT")
+        state_path = get_env("HUAXIN_ASSET_CONSOLIDATION_STATE_FILE")
         values: Dict[str, Any] = {
-            "mode": get_env("HUAXIN_ASSET_CONSOLIDATION_MODE", "off"),
-            "source_mode": get_env("HUAXIN_ASSET_CONSOLIDATION_SOURCE_MODE"),
-            "source_snapshot_path": get_env("HUAXIN_ASSET_CONSOLIDATION_SOURCE_SNAPSHOT"),
-            "state_path": get_env("HUAXIN_ASSET_CONSOLIDATION_STATE_FILE"),
+            "mode": "full" if source_snapshot_path and state_path else "off",
+            "source_mode": "external_snapshot",
+            "source_snapshot_path": source_snapshot_path,
+            "state_path": state_path,
             "source_node_id": get_env("HUAXIN_ASSET_CONSOLIDATION_SOURCE_NODE_ID"),
             "target_node_id": get_env("HUAXIN_ASSET_CONSOLIDATION_TARGET_NODE_ID"),
             "source_role": get_env("HUAXIN_ASSET_CONSOLIDATION_SOURCE_ROLE"),
@@ -792,7 +794,7 @@ class HuaxinAssetConsolidationConfig:
 
         mode = str(values.get("mode") or "off").strip().lower()
         if mode not in _ALLOWED_MODES:
-            raise ValueError("HUAXIN_ASSET_CONSOLIDATION_MODE 必须为 off/dry_run/canary/full")
+            raise ValueError("mode 必须为 off/dry_run/canary/full")
         if mode == "off":
             return cls()
 
@@ -966,9 +968,7 @@ class HuaxinAssetConsolidationStateStore:
         plan = self.load_day(str(trading_day))
         if plan is None:
             raise HuaxinAssetConsolidationWaiting("clearance_plan_missing")
-        if plan.get("state") != "complete" or not isinstance(
-            plan.get("ready_evidence"), Mapping
-        ):
+        if plan.get("state") != "complete" or not isinstance(plan.get("ready_evidence"), Mapping):
             raise HuaxinAssetConsolidationWaiting("clearance_not_complete")
         return {
             "schema_version": 1,
@@ -1839,9 +1839,7 @@ class HuaxinAssetConsolidationCoordinator:
                 source.get("snapshot_id"),
                 field_name="planned_source_snapshot_id",
             ),
-            "clearance_mode": (
-                "transfer_required" if actions else "no_transfer_required"
-            ),
+            "clearance_mode": ("transfer_required" if actions else "no_transfer_required"),
             "conservation_baseline": _asset_conservation_material(source, target),
             "actions": actions,
             "residuals": {
@@ -2014,9 +2012,7 @@ class HuaxinAssetConsolidationCoordinator:
             raise HuaxinAssetConsolidationError("existing_ready_evidence_target_provenance_missing")
         actions = [dict(row) for row in plan.get("actions") or []]
         clearance_mode = str(ready.get("clearance_mode") or "")
-        expected_clearance_mode = (
-            "transfer_completed" if actions else "no_transfer_required"
-        )
+        expected_clearance_mode = "transfer_completed" if actions else "no_transfer_required"
         if clearance_mode != expected_clearance_mode:
             raise HuaxinAssetConsolidationError("existing_ready_evidence_clearance_mode_invalid")
         if int(ready.get("action_count") or 0) != len(actions):

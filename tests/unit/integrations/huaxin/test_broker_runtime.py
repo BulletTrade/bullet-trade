@@ -1687,7 +1687,7 @@ def test_query_only_broker_rejects_transfer_before_native_call() -> None:
     runtime = _FakeRuntime()
     broker = _connected_broker(runtime, enable_node_transfer=False)
 
-    with pytest.raises(HuaxinTradingDisabledError, match="节点资产划拨未启用"):
+    with pytest.raises(HuaxinTradingDisabledError, match="不是资产归集 writer"):
         broker.submit_fund_transfer(
             broker.get_account_info(),
             amount=100.0,

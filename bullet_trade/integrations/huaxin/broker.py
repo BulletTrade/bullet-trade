@@ -808,8 +808,8 @@ class HuaxinBroker(BrokerBase):
         if not self._enable_node_transfer:
             raise HuaxinTradingDisabledError(
                 HUAXIN_TRADING_DISABLED,
-                "华鑫节点资产划拨未启用",
-                {"required_config": "enable_node_transfer"},
+                "当前华鑫会话不是资产归集 writer",
+                {"required_role": "asset_consolidation_writer"},
             )
         frozen_amount = _as_float(amount, float("nan"))
         transferable_cash = _as_float(source_account.get("transferable_cash"), float("nan"))
@@ -865,8 +865,8 @@ class HuaxinBroker(BrokerBase):
         if not self._enable_node_transfer:
             raise HuaxinTradingDisabledError(
                 HUAXIN_TRADING_DISABLED,
-                "华鑫节点资产划拨未启用",
-                {"required_config": "enable_node_transfer"},
+                "当前华鑫会话不是资产归集 writer",
+                {"required_role": "asset_consolidation_writer"},
             )
         frozen_volume = _as_int(volume, -1)
         available_position = _as_int(source_position.get("available_position"), -1)

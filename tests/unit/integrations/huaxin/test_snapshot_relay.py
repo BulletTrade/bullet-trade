@@ -167,7 +167,6 @@ def _capture_config(tmp_path) -> HuaxinNodeSnapshotRelayConfig:
 
     return HuaxinNodeSnapshotRelayConfig.from_mapping(
         {
-            "capture_enabled": True,
             "generation_state_path": tmp_path / "generation.json",
             "node_id": 16,
             "role": "JQ16_SOURCE",
@@ -208,13 +207,49 @@ def _install_config(tmp_path) -> HuaxinNodeSnapshotRelayConfig:
 
     return HuaxinNodeSnapshotRelayConfig.from_mapping(
         {
-            "install_enabled": True,
             "install_path": tmp_path / "installed-source.json",
             "expected_source_node_id": 16,
             "expected_source_role": "JQ16_SOURCE",
             "expected_source_host": "source-host",
         }
     )
+
+
+def test_from_env_derives_capture_and_install_roles_from_paths(monkeypatch, tmp_path) -> None:
+    """验证旧布尔开关不再影响由固定路径确定的快照职责。
+
+    Args:
+        monkeypatch: pytest 环境变量隔离器。
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        None。
+    """
+
+    monkeypatch.setenv("HUAXIN_NODE_ASSET_SNAPSHOT_ENABLED", "false")
+    monkeypatch.setenv("HUAXIN_NODE_ASSET_SNAPSHOT_STATE_FILE", str(tmp_path / "generation.json"))
+    monkeypatch.setenv("HUAXIN_NODE_ASSET_SNAPSHOT_NODE_ID", "16")
+    monkeypatch.setenv("HUAXIN_NODE_ASSET_SNAPSHOT_ROLE", "JQ16_SOURCE")
+    monkeypatch.setenv("HUAXIN_NODE_ASSET_SNAPSHOT_HOST", "source-host")
+    monkeypatch.setenv("HUAXIN_NODE_ASSET_SNAPSHOT_PRODUCER_INSTANCE", "producer-v2")
+    monkeypatch.setenv("HUAXIN_NODE_ASSET_SNAPSHOT_GIT_COMMIT", "a" * 40)
+
+    capture = HuaxinNodeSnapshotRelayConfig.from_env()
+
+    assert capture.capture_enabled is True
+    assert capture.install_enabled is False
+
+    monkeypatch.delenv("HUAXIN_NODE_ASSET_SNAPSHOT_STATE_FILE")
+    monkeypatch.setenv("HUAXIN_SOURCE_SNAPSHOT_INSTALL_ENABLED", "false")
+    monkeypatch.setenv("HUAXIN_ASSET_CONSOLIDATION_SOURCE_SNAPSHOT", str(tmp_path / "source.json"))
+    monkeypatch.setenv("HUAXIN_ASSET_CONSOLIDATION_SOURCE_NODE_ID", "16")
+    monkeypatch.setenv("HUAXIN_ASSET_CONSOLIDATION_SOURCE_ROLE", "JQ16_SOURCE")
+    monkeypatch.setenv("HUAXIN_ASSET_CONSOLIDATION_SOURCE_HOST", "source-host")
+
+    install = HuaxinNodeSnapshotRelayConfig.from_env()
+
+    assert install.capture_enabled is False
+    assert install.install_enabled is True
 
 
 def test_capture_is_complete_and_generation_persists_across_instances(tmp_path) -> None:

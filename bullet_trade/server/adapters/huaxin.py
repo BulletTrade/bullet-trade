@@ -275,14 +275,19 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
         self._consolidation_config = (
             consolidation_config or HuaxinAssetConsolidationConfig.from_env()
         )
-        if (
-            self._consolidation_config.mode in {"canary", "full"}
-            and self._broker_config.get("enable_node_transfer") is not True
-        ):
-            raise ValueError(
-                "HUAXIN_ASSET_CONSOLIDATION_MODE=canary/full 必须显式配置 "
-                "HUAXIN_ENABLE_NODE_TRANSFER=true"
-            )
+        self._snapshot_relay_config = (
+            snapshot_relay_config or HuaxinNodeSnapshotRelayConfig.from_env()
+        )
+        self._broker_config["enable_node_transfer"] = self._consolidation_config.mode in {
+            "canary",
+            "full",
+        }
+        if self._snapshot_relay_config.capture_enabled:
+            self._broker_config["enable_trading"] = False
+            self._broker_config["enable_cancel"] = False
+        elif self._snapshot_relay_config.install_enabled:
+            self._broker_config["enable_trading"] = True
+            self._broker_config["enable_cancel"] = True
         self._broker_factory = broker_factory
         self._brokers: Dict[str, HuaxinBroker] = {}
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="huaxin-trader")
@@ -302,9 +307,7 @@ class HuaxinBrokerAdapter(RemoteBrokerAdapter):
                 self._consolidation_config,
                 source_snapshot_provider=source_snapshot_provider,
             )
-        self._snapshot_relay = snapshot_relay_factory(
-            snapshot_relay_config or HuaxinNodeSnapshotRelayConfig.from_env()
-        )
+        self._snapshot_relay = snapshot_relay_factory(self._snapshot_relay_config)
 
     async def start(self) -> None:
         """依次创建并连接全部配置账户。
