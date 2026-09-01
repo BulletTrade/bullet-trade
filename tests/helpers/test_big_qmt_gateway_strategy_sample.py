@@ -3,8 +3,11 @@ from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 from tornado.httputil import HTTPHeaders
+
+from bullet_trade.data.providers.remote_qmt import _dataframe_from_payload
 
 
 TEST_ACCOUNT_ID = "test_account_id"
@@ -384,7 +387,7 @@ def test_runtime_health_reports_gateway_build_id():
 
     health = runtime.health()
 
-    assert helper.GATEWAY_BUILD_ID == "20260828_freshness_cost_v2"
+    assert helper.GATEWAY_BUILD_ID == "20260901_history_contract_v1"
     assert health["gateway_build_id"] == helper.GATEWAY_BUILD_ID
 
 
@@ -511,7 +514,10 @@ def test_big_qmt_helper_dispatches_non_tick_data_apis(monkeypatch):
     )
     assert history["ok"] is True
     assert history["value"]["dtype"] == "dataframe"
-    assert history["value"]["records"] == [[1.0, 2.0]]
+    assert history["value"]["columns"] == ["index", "open", "close"]
+    assert history["value"]["records"] == [["20260701", 1.0, 2.0]]
+    assert history["value"]["index_columns"] == ["index"]
+    assert history["value"]["index_names"] == [None]
     assert context.history_call[0] == ["open", "close"]
     assert context.history_call[1] == ["000001.SZ"]
     assert context.history_call[2]["period"] == "1d"
@@ -590,7 +596,7 @@ def test_big_qmt_helper_dispatches_non_tick_data_apis(monkeypatch):
     ]
 
 
-def test_big_qmt_helper_history_drops_unrequested_stime_column(monkeypatch):
+def test_big_qmt_helper_history_preserves_stime_index(monkeypatch):
     helper = _load_helper()
     context = _FakeContextHistoryWithStime()
     monkeypatch.setattr(
@@ -604,8 +610,127 @@ def test_big_qmt_helper_history_drops_unrequested_stime_column(monkeypatch):
     )
 
     assert history["ok"] is True
-    assert history["value"]["columns"] == ["open", "close"]
-    assert history["value"]["records"] == [[1.0, 2.0]]
+    assert history["value"]["columns"] == ["stime", "open", "close"]
+    assert history["value"]["records"] == [["20260701093000", 1.0, 2.0]]
+    assert history["value"]["index_columns"] == ["stime"]
+    assert history["value"]["index_names"] == ["stime"]
+
+
+def test_big_qmt_helper_history_normalizes_standard_dates_without_losing_minute_time(
+    monkeypatch,
+):
+    """验证标准日期可供 QMT 使用，分钟时间不会被截成当天零点。
+
+    Args:
+        monkeypatch: pytest 提供的运行时替换工具。
+
+    Returns:
+        None。
+    """
+
+    helper = _load_helper()
+    context = _FakeContext()
+    download_calls = []
+    monkeypatch.setattr(
+        helper,
+        "download_history_data",
+        lambda *args, **kwargs: download_calls.append((args, kwargs)),
+        raising=False,
+    )
+
+    daily = helper._dispatch_qmt_action(
+        context,
+        "history",
+        {
+            "security": "000001.XSHE",
+            "fields": ["open"],
+            "frequency": "daily",
+            "start": "2026-07-01",
+            "end": "2026-07-02",
+        },
+    )
+
+    assert daily["ok"] is True
+    assert download_calls[0][0] == ("000001.SZ", "1d", "20260701", "20260702")
+    assert context.history_call[2]["start_time"] == "20260701"
+    assert context.history_call[2]["end_time"] == "20260702"
+
+    minute = helper._dispatch_qmt_action(
+        context,
+        "history",
+        {
+            "security": "000001.XSHE",
+            "fields": ["open"],
+            "frequency": "minute",
+            "start": "2026-07-01 09:31:00",
+            "end": "2026-07-01 09:32:00",
+        },
+    )
+
+    assert minute["ok"] is True
+    assert download_calls[1][0] == (
+        "000001.SZ",
+        "1m",
+        "20260701093100",
+        "20260701093200",
+    )
+    assert context.history_call[2]["start_time"] == "20260701093100"
+    assert context.history_call[2]["end_time"] == "20260701093200"
+
+
+def test_big_qmt_helper_history_maps_money_to_amount_and_restores_time_index(monkeypatch):
+    """验证 public money 映射到 QMT amount，并在客户端恢复时间索引。
+
+    Args:
+        monkeypatch: pytest 提供的运行时替换工具。
+
+    Returns:
+        None。
+    """
+
+    helper = _load_helper()
+    context = _FakeContext()
+
+    def _get_market_data_ex(fields, stock_code, **kwargs):
+        """返回带未命名时间索引和 QMT amount 字段的模拟历史行情。
+
+        Args:
+            fields: QMT 原生字段列表。
+            stock_code: QMT 证券代码列表。
+            **kwargs: QMT 历史行情查询参数。
+
+        Returns:
+            dict: 按 QMT 证券代码组织的 DataFrame。
+        """
+
+        context.history_call = (fields, stock_code, kwargs)
+        frame = pd.DataFrame(
+            {"open": [10.0], "amount": [123456.0]},
+            index=pd.DatetimeIndex(["2026-07-01"]),
+        )
+        return {stock_code[0]: frame}
+
+    context.get_market_data_ex = _get_market_data_ex
+    monkeypatch.setattr(
+        helper, "download_history_data", lambda *args, **kwargs: None, raising=False
+    )
+
+    history = helper._dispatch_qmt_action(
+        context,
+        "history",
+        {"security": "000001.XSHE", "fields": ["open", "money"], "count": 1},
+    )
+
+    assert history["ok"] is True
+    assert context.history_call[0] == ["open", "amount"]
+    assert history["value"]["columns"] == ["index", "open", "money"]
+    assert history["value"]["records"] == [["2026-07-01T00:00:00", 10.0, 123456.0]]
+
+    restored = _dataframe_from_payload(history["value"])
+    assert isinstance(restored.index, pd.DatetimeIndex)
+    assert restored.index.tolist() == [pd.Timestamp("2026-07-01")]
+    assert restored.columns.tolist() == ["open", "money"]
+    assert restored.iloc[0]["money"] == 123456.0
 
 
 def test_big_qmt_helper_history_uses_miniqmt_ratio_dividend_types(monkeypatch):

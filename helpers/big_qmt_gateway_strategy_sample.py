@@ -1,7 +1,7 @@
 #encoding:gbk
 # Author: BruceLee
 # Date: 2026-08-28
-# Version: 20260828_freshness_cost_v2
+# Version: 20260901_history_contract_v1
 # File: Big QMT embedded gateway strategy sample.
 # Description: Run inside a dedicated Big QMT strategy and expose a
 # BulletTrade-compatible local HTTP/JSON data and trading gateway.
@@ -44,7 +44,7 @@ LISTEN_PORT = 9000
 
 # Build marker shown in startup logs and /health. Update this when copying a new
 # helper build into QMT so tests can prove the running file version.
-GATEWAY_BUILD_ID = "20260828_freshness_cost_v2"
+GATEWAY_BUILD_ID = "20260901_history_contract_v1"
 
 # Shared password required by non-health HTTP APIs. Change this to a private
 # local value outside simulation; clients send it as X-BulletTrade-Password or
@@ -1046,9 +1046,10 @@ def _qmt_dividend_type(value: Any) -> str:
     return mapping.get(text, text)
 
 
-def _date_digits(value: Any) -> str:
+def _date_digits(value: Any, max_length: int = 8) -> str:
     text = str(value or "")
     digits = "".join(ch for ch in text if ch.isdigit())
+    length = 14 if _to_int(max_length, 8) > 8 else 8
     if len(digits) >= 10 and not digits.startswith(("19", "20", "21")):
         try:
             timestamp = int(digits[:13] if len(digits) >= 13 else digits[:10])
@@ -1057,10 +1058,11 @@ def _date_digits(value: Any) -> str:
             elif len(digits) > 10:
                 timestamp = int(digits)
                 timestamp = timestamp // 1000
-            return time.strftime("%Y%m%d", time.localtime(timestamp))
+            pattern = "%Y%m%d%H%M%S" if length > 8 else "%Y%m%d"
+            return time.strftime(pattern, time.localtime(timestamp))
         except Exception:
             pass
-    return digits[:8]
+    return digits[:length]
 
 
 def _date_in_range(value: Any, start: Any, end: Any) -> bool:
@@ -1169,15 +1171,42 @@ def _dataframe_to_payload(df: Any, include_index: bool = True) -> Dict[str, Any]
         return {"dtype": "dataframe", "columns": [], "records": []}
     try:
         columns = [str(col) for col in list(df.columns)]
-        has_named_index = bool(getattr(getattr(df, "index", None), "name", None))
-        raw = df.reset_index().values.tolist() if include_index and has_named_index else df.values.tolist()
-        if include_index and has_named_index:
-            columns = [str(df.index.name)] + columns
-        return {
+        data_rows = df.values.tolist()
+        index = getattr(df, "index", None)
+        index_name = getattr(index, "name", None)
+        index_type = type(index).__name__ if index is not None else ""
+        is_default_range = (
+            index_type == "RangeIndex"
+            and index_name is None
+            and getattr(index, "start", None) == 0
+            and getattr(index, "stop", None) == len(data_rows)
+            and getattr(index, "step", None) == 1
+        )
+        include_wire_index = bool(include_index and index is not None and not is_default_range)
+        index_values = list(index.tolist()) if include_wire_index else []
+        include_wire_index = include_wire_index and len(index_values) >= len(data_rows)
+        raw = data_rows
+        payload = {
             "dtype": "dataframe",
             "columns": columns,
-            "records": [[_basic_value(item) for item in row] for row in raw],
+            "records": [],
         }
+        if include_wire_index:
+            wire_name = str(index_name or "index")
+            if wire_name in columns:
+                wire_name = "__bt_index_0_1__"
+            payload["columns"] = [wire_name] + columns
+            raw = [[index_values[row_index]] + list(row) for row_index, row in enumerate(data_rows)]
+            payload.update(
+                {
+                    "index_columns": [wire_name],
+                    "index_names": [_basic_value(index_name)],
+                    "index_type": index_type or "Index",
+                    "index_dtypes": [str(getattr(index, "dtype", "object"))],
+                }
+            )
+        payload["records"] = [[_basic_value(item) for item in row] for row in raw]
+        return payload
     except Exception:
         return {"dtype": "dataframe", "columns": [], "records": []}
 
@@ -1188,6 +1217,10 @@ def _select_dataframe_columns(df: Any, fields: List[str]) -> Any:
         return df
     try:
         available = list(getattr(df, "columns", []))
+        if "money" in fields and "money" not in available and "amount" in available:
+            df = df.copy()
+            df["money"] = df["amount"]
+            available = list(getattr(df, "columns", []))
         selected = [field for field in fields if field in available]
         if selected:
             return df[selected]
@@ -1565,8 +1598,9 @@ def _get_full_tick(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]
 def _call_download_history_data(qmt_security: str, period: str, start: Any, end: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
     downloader = _qmt_global("download_history_data")
     incrementally = payload.get("incrementally")
-    start_text = str(start or "")
-    end_text = str(end or "")
+    date_length = 8 if period in ("1d", "1w", "1mon") else 14
+    start_text = _date_digits(start, date_length)
+    end_text = _date_digits(end, date_length)
     if incrementally is None:
         downloader(qmt_security, period, start_text, end_text)
     else:
@@ -1614,6 +1648,14 @@ def _query_history(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]
     period = _qmt_period(payload.get("frequency") or payload.get("period") or "1d")
     start = payload.get("start") or payload.get("start_date") or payload.get("start_time") or ""
     end = payload.get("end") or payload.get("end_date") or payload.get("end_time") or ""
+    date_length = 8 if period in ("1d", "1w", "1mon") else 14
+    qmt_start = _date_digits(start, date_length)
+    qmt_end = _date_digits(end, date_length)
+    qmt_fields = []
+    for field in fields:
+        qmt_field = "amount" if field == "money" else field
+        if qmt_field not in qmt_fields:
+            qmt_fields.append(qmt_field)
     count = _to_int(payload.get("count"), -1)
     dividend_type = _qmt_dividend_type(payload.get("fq") or payload.get("dividend_type"))
     fill_data = _to_bool(payload.get("fill_data"), _to_bool(payload.get("fill_paused"), True))
@@ -1622,7 +1664,7 @@ def _query_history(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]
         if context_info is None:
             return _context_not_ready(payload)
         try:
-            _auto_ensure_history_cache(qmt_security, period, start, end, payload)
+            _auto_ensure_history_cache(qmt_security, period, qmt_start, qmt_end, payload)
         except QmtApiUnavailable as exc:
             LOGGER.exception("history auto ensure_cache unavailable: %s", exc)
             return _error("QMT_API_NOT_READY", str(exc), payload.get("request_id"))
@@ -1630,11 +1672,11 @@ def _query_history(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]
             LOGGER.exception("history auto ensure_cache failed: %s", exc)
             return _error("ENSURE_CACHE_FAILED", str(exc), payload.get("request_id"))
         data = context_info.get_market_data_ex(
-            fields,
+            qmt_fields,
             [qmt_security],
             period=period,
-            start_time=str(start),
-            end_time=str(end),
+            start_time=qmt_start,
+            end_time=qmt_end,
             count=count,
             dividend_type=dividend_type,
             fill_data=fill_data,
@@ -1645,10 +1687,10 @@ def _query_history(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]
             if df is None and data:
                 df = list(data.values())[0]
             df = _select_dataframe_columns(df, fields)
-            value = _normalize_history_payload(_dataframe_to_payload(df, include_index=False), security, period)
+            value = _normalize_history_payload(_dataframe_to_payload(df, include_index=True), security, period)
             return _ok(value, payload.get("request_id"))
         data = _select_dataframe_columns(data, fields)
-        value = _normalize_history_payload(_dataframe_to_payload(data, include_index=False), security, period)
+        value = _normalize_history_payload(_dataframe_to_payload(data, include_index=True), security, period)
         return _ok(value, payload.get("request_id"))
     except QmtApiUnavailable as exc:
         LOGGER.exception("get_market_data_ex unavailable: %s", exc)
