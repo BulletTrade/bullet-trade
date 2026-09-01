@@ -23,6 +23,7 @@ from bullet_trade.integrations.huaxin.snapshot_relay import (
     HuaxinNodeSnapshotRelayConfig,
     HuaxinNodeSnapshotRelayError,
     _payload_sha256,
+    _producer_sha256,
     validate_huaxin_relay_snapshot,
 )
 
@@ -195,12 +196,11 @@ def _capture(tmp_path):
     return relay.capture(_QueryOnlyBroker())
 
 
-def _install_config(tmp_path, snapshot) -> HuaxinNodeSnapshotRelayConfig:
+def _install_config(tmp_path) -> HuaxinNodeSnapshotRelayConfig:
     """构造 consumer 幂等安装配置。
 
     Args:
         tmp_path: pytest 临时目录。
-        snapshot: 用于绑定允许生产者摘要的源快照。
 
     Returns:
         HuaxinNodeSnapshotRelayConfig: 启用 install 的隔离配置。
@@ -213,7 +213,6 @@ def _install_config(tmp_path, snapshot) -> HuaxinNodeSnapshotRelayConfig:
             "expected_source_node_id": 16,
             "expected_source_role": "JQ16_SOURCE",
             "expected_source_host": "source-host",
-            "expected_producer_sha256": snapshot["producer_sha256"],
         }
     )
 
@@ -285,7 +284,7 @@ def test_install_is_atomic_idempotent_and_rejects_replay_or_conflict(tmp_path) -
 
     snapshot = _capture(tmp_path / "source")
     relay = HuaxinNodeSnapshotRelay(
-        _install_config(tmp_path, snapshot),
+        _install_config(tmp_path),
         clock=lambda: _NOW,
     )
 
@@ -298,7 +297,7 @@ def test_install_is_atomic_idempotent_and_rejects_replay_or_conflict(tmp_path) -
     assert stat.S_IMODE(installed_path.stat().st_mode) == 0o600
     assert json.loads(installed_path.read_text(encoding="utf-8")) == snapshot
     delayed_retry = HuaxinNodeSnapshotRelay(
-        _install_config(tmp_path, snapshot),
+        _install_config(tmp_path),
         clock=lambda: _NOW + timedelta(minutes=10),
     )
     assert delayed_retry.install(snapshot, trading_day="20260827")["noop"] is True
@@ -337,7 +336,7 @@ def test_install_rejects_disabled_incomplete_and_wrong_identity(tmp_path) -> Non
         disabled.install(snapshot, trading_day="20260826")
 
     relay = HuaxinNodeSnapshotRelay(
-        _install_config(tmp_path, snapshot),
+        _install_config(tmp_path),
         clock=lambda: _NOW,
     )
     incomplete = deepcopy(snapshot)
@@ -360,9 +359,36 @@ def test_install_rejects_disabled_incomplete_and_wrong_identity(tmp_path) -> Non
         relay.install(forbidden, trading_day="20260826")
 
     stale = HuaxinNodeSnapshotRelay(
-        _install_config(tmp_path, snapshot),
+        _install_config(tmp_path),
         clock=lambda: _NOW + timedelta(seconds=121),
     )
     with pytest.raises(HuaxinNodeSnapshotRelayError, match="stale"):
         stale.install(snapshot, trading_day="20260826")
     assert not (tmp_path / "installed-source.json").exists()
+
+
+def test_install_accepts_new_producer_version_without_consumer_allowlist(tmp_path) -> None:
+    """验证同一固定来源升级 producer 后无需修改 consumer 配置。
+
+    Args:
+        tmp_path: pytest 临时目录。
+
+    Returns:
+        None。
+    """
+
+    snapshot = _capture(tmp_path / "source")
+    snapshot["producer"] = {
+        "schema": snapshot["producer"]["schema"],
+        "instance_id": "query-only-upgraded",
+        "git_commit": "b" * 40,
+    }
+    snapshot["producer_sha256"] = _producer_sha256(snapshot["producer"])
+    snapshot["payload_digest_sha256"] = _payload_sha256(snapshot)
+
+    result = HuaxinNodeSnapshotRelay(
+        _install_config(tmp_path),
+        clock=lambda: _NOW,
+    ).install(snapshot, trading_day="20260826")
+
+    assert result["installed"] is True

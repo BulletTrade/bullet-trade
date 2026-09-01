@@ -359,7 +359,6 @@ class HuaxinNodeSnapshotRelayConfig:
     expected_source_node_id: Optional[int] = None
     expected_source_role: str = ""
     expected_source_host: str = ""
-    expected_producer_sha256: str = ""
     install_max_age_seconds: float = 120.0
 
     @classmethod
@@ -389,7 +388,6 @@ class HuaxinNodeSnapshotRelayConfig:
             "expected_source_node_id": get_env("HUAXIN_ASSET_CONSOLIDATION_SOURCE_NODE_ID"),
             "expected_source_role": get_env("HUAXIN_ASSET_CONSOLIDATION_SOURCE_ROLE"),
             "expected_source_host": get_env("HUAXIN_ASSET_CONSOLIDATION_SOURCE_HOST"),
-            "expected_producer_sha256": get_env("HUAXIN_SOURCE_SNAPSHOT_EXPECTED_PRODUCER_SHA256"),
             "install_max_age_seconds": get_env(
                 "HUAXIN_ASSET_CONSOLIDATION_SNAPSHOT_MAX_AGE_SECONDS"
             ),
@@ -468,10 +466,6 @@ class HuaxinNodeSnapshotRelayConfig:
                 expected_source_host=_required_text(
                     values.get("expected_source_host"),
                     field_name="snapshot_expected_source_host",
-                ),
-                expected_producer_sha256=_required_sha256(
-                    values.get("expected_producer_sha256"),
-                    field_name="snapshot_expected_producer_sha256",
                 ),
                 install_max_age_seconds=max_age,
             )
@@ -729,7 +723,7 @@ class HuaxinNodeSnapshotRelay:
         )
 
     def _validate_install_identity(self, snapshot: Mapping[str, Any]) -> None:
-        """校验 consumer 私密允许的源节点和生产者身份。
+        """校验 consumer 固定的源节点、角色和主机身份。
 
         Args:
             snapshot: 已通过通用 schema 校验的快照。
@@ -738,18 +732,13 @@ class HuaxinNodeSnapshotRelay:
             None。
 
         Raises:
-            HuaxinNodeSnapshotRelayError: 节点、主机、角色或生产者不符时抛出。
+            HuaxinNodeSnapshotRelayError: 节点、主机或角色不符时抛出。
         """
 
         checks = (
             (int(snapshot["node_id"]), self.config.expected_source_node_id, "node"),
             (str(snapshot["role"]), self.config.expected_source_role, "role"),
             (str(snapshot["host"]), self.config.expected_source_host, "host"),
-            (
-                str(snapshot["producer_sha256"]),
-                self.config.expected_producer_sha256,
-                "producer",
-            ),
         )
         for actual, expected, name in checks:
             if actual != expected:
