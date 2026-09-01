@@ -376,6 +376,7 @@ class ServerApplication:
                 return {"count": 0}
             return await self.tick_manager.unsubscribe(session, None)
         if action == "admin.health":
+            await self._refresh_backend_status()
             return self._health_snapshot()
         if action == "admin.print_account":
             return await self._admin_print_account(session, payload)
@@ -384,6 +385,30 @@ class ServerApplication:
         if action.startswith("broker."):
             return await self._dispatch_broker(session, action.split(".", 1)[1], payload)
         raise ValueError(f"未知 action: {action}")
+
+    async def _refresh_backend_status(self) -> None:
+        """在生成管理健康快照前刷新当前后端状态。
+
+        Args:
+            None。
+
+        Returns:
+            None。
+
+        Side Effects:
+            当 adapter 提供刷新接口时，发起一次后端健康查询；查询失败由 adapter
+            记录为受控不可用状态，不改变交易、行情或进程生命周期。
+        """
+
+        seen: Set[int] = set()
+        for adapter in (self.adapters.broker_adapter, self.adapters.data_adapter):
+            if adapter is None or id(adapter) in seen:
+                continue
+            seen.add(id(adapter))
+            refresh_fn = getattr(adapter, "refresh_backend_status", None)
+            if callable(refresh_fn):
+                await refresh_fn()
+                return
 
     async def _dispatch_data(self, method: str, payload: Dict) -> Dict:
         if not self.adapters.data_adapter:

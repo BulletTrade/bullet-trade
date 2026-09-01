@@ -364,6 +364,24 @@ class BigQmtDataAdapter(RemoteDataAdapter):
     def qmt_status(self) -> Dict[str, Any]:
         return self.client.qmt_status()
 
+    async def refresh_backend_status(self) -> None:
+        """刷新大 QMT helper 当前健康状态并保留受控失败信息。
+
+        Args:
+            None。
+
+        Returns:
+            None。
+
+        Side Effects:
+            向 helper 的 ``/health`` 发起一次只读请求，更新 sidecar 内存中的健康快照。
+        """
+
+        try:
+            await self.client.health()
+        except BigQmtGatewayError:
+            pass
+
     async def get_history(self, payload: Dict) -> Dict:
         data = await self.client.post("/data/history", payload)
         return _as_dataframe_payload(data)
@@ -441,16 +459,31 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
         self._order_tag_overrides: Dict[str, Dict[str, Any]] = {}
 
     async def start(self) -> None:
-        try:
-            await self.client.health()
-        except BigQmtGatewayError:
-            pass
+        await self.refresh_backend_status()
 
     async def stop(self) -> None:
         return None
 
     def qmt_status(self) -> Dict[str, Any]:
         return self.client.qmt_status()
+
+    async def refresh_backend_status(self) -> None:
+        """刷新大 QMT helper 当前健康状态并保留受控失败信息。
+
+        Args:
+            None。
+
+        Returns:
+            None。
+
+        Side Effects:
+            向 helper 的 ``/health`` 发起一次只读请求，更新 sidecar 内存中的健康快照。
+        """
+
+        try:
+            await self.client.health()
+        except BigQmtGatewayError:
+            pass
 
     async def get_account_info(self, account: AccountContext) -> Dict:
         data = await self.client.post("/account", self._account_payload(account))

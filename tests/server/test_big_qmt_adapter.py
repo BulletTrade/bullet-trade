@@ -85,6 +85,7 @@ class _FakeGatewayClient:
         self.responses = responses
         self.calls = []
         self.config = config or BigQmtGatewayConfig()
+        self.last_health = None
 
     async def post(self, path, payload=None):
         self.calls.append(("POST", path, payload or {}))
@@ -102,13 +103,21 @@ class _FakeGatewayClient:
         raise BigQmtGatewayError("missing", code="NOT_IMPLEMENTED")
 
     async def health(self):
-        return self.responses.get("/health", {"ready": True})
+        self.calls.append(("GET", "/health", {}))
+        value = self.responses.get("/health", {"ready": True})
+        if isinstance(value, Exception):
+            raise value
+        self.last_health = value
+        return value
 
     def qmt_status(self):
+        health = self.last_health or {}
+        ready = health.get("ready")
         return {
             "backend_type": "big_qmt",
-            "ready": True,
-            "big_qmt_gateway": {"ready": True},
+            "ready": ready,
+            "state": "ready" if ready else "unknown",
+            "big_qmt_gateway": health,
             "actions": self.config.action_status,
         }
 
@@ -171,6 +180,42 @@ def test_big_qmt_health_cache_expires_instead_of_staying_green(monkeypatch):
     assert status["ready"] is None
     assert status["state"] == "unknown"
     assert status["health_cache_expired"] is True
+
+
+@pytest.mark.asyncio
+async def test_admin_health_refreshes_big_qmt_gateway_before_snapshot():
+    """验证 admin.health 返回前主动刷新 helper，而不是永久读取启动缓存。
+
+    Returns:
+        None: 断言实时 health 已进入 sidecar 快照，且只发起一次只读刷新。
+    """
+
+    client = _FakeGatewayClient(
+        {
+            "/health": {
+                "ready": True,
+                "http_alive": True,
+                "qmt_api_ready": True,
+                "direct_dispatch": True,
+            }
+        }
+    )
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    broker = BigQmtBrokerAdapter(config, router, client)
+    data = BigQmtDataAdapter(client)
+    app = ServerApplication(
+        config,
+        router,
+        AdapterBundle(data_adapter=data, broker_adapter=broker),
+    )
+
+    health = await app.handle_request(None, "admin.health", {})
+
+    assert client.calls == [("GET", "/health", {})]
+    assert health["value"]["qmt"]["ready"] is True
+    assert health["value"]["qmt"]["state"] == "ready"
+    assert health["value"]["big_qmt_gateway"]["qmt_api_ready"] is True
 
 
 @pytest.mark.asyncio
