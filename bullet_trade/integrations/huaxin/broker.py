@@ -377,13 +377,7 @@ class HuaxinBroker(BrokerBase):
             self._order_ref_allocator_ready = True
             self._security_order_constraints_ready = True
             self._security_constraints.clear()
-            term_info = str(self._config.get("terminal_info") or "")
-            prod_info = str(self._config.get("user_product_info") or "")
-            acct_val = str(
-                self._config.get("login_account") or self._config.get("account_id") or ""
-            )
-            log.info("【华鑫合规信息上报】账号=%s, UserProductInfo=%s", acct_val, prod_info)
-            log.info("【华鑫合规信息上报】自动组装 TerminalInfo=%s", term_info)
+            log.info("华鑫登录合规信息已在内存中完成装配，敏感字段不会写入普通日志")
             runtime = self._create_runtime()
             try:
                 session_type = getattr(native_api, "NativeSessionConfig")
@@ -545,7 +539,13 @@ class HuaxinBroker(BrokerBase):
         ).strip()
 
         if not hd:
-            for cand in ("/home/terminalinfo", "/home/userlgy/terminalinfo"):
+            configured_file = str(
+                self._config.get("terminal_info_file")
+                or os.getenv("HUAXIN_TERMINAL_INFO_FILE")
+                or ""
+            ).strip()
+            candidates = [configured_file] if configured_file else ["/home/terminalinfo"]
+            for cand in candidates:
                 if os.path.isfile(cand):
                     try:
                         with open(cand, "r", encoding="utf-8") as f:

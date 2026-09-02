@@ -610,6 +610,110 @@ def _connected_broker(runtime, **flags):
     return broker
 
 
+def test_connect_never_logs_login_identity_values(monkeypatch) -> None:
+    """验证连接日志不会输出账户、产品标识或完整 TerminalInfo。
+
+    参数:
+        monkeypatch: pytest 提供的属性替换工具。
+    返回:
+        无；断言敏感标记均未进入 INFO 日志参数。
+    副作用:
+        使用 fake runtime 完成离线连接，不加载 SDK、不访问网络或柜台。
+    """
+
+    captured = []
+
+    def _capture(message, *args, **kwargs) -> None:
+        """记录 INFO 日志模板和参数供脱敏断言。
+
+        参数:
+            message: 日志模板。
+            *args: 日志格式化参数。
+            **kwargs: 日志框架附加参数。
+        返回:
+            无。
+        副作用:
+            仅追加到测试局部列表。
+        """
+
+        captured.append((message, args, kwargs))
+
+    monkeypatch.setattr("bullet_trade.integrations.huaxin.broker.log.info", _capture)
+    broker = _broker_for_runtime(
+        _FakeRuntime(),
+        login_account="acctmark",
+        user_product_info="prodmark",
+        terminal_info="termmark",
+    )
+
+    assert broker.connect() is True
+    serialized = repr(captured)
+    assert "acctmark" not in serialized
+    assert "prodmark" not in serialized
+    assert "termmark" not in serialized
+    assert "敏感字段不会写入普通日志" in serialized
+
+
+def test_terminal_info_file_is_explicit_and_default_fallback_is_generic(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """验证硬盘标识读取显式文件，默认回退只使用通用目录。
+
+    参数:
+        monkeypatch: pytest 提供的属性替换工具。
+        tmp_path: pytest 提供的隔离临时目录。
+    返回:
+        无；断言显式文件生效且默认只检查通用路径。
+    副作用:
+        只在 pytest 临时目录写入一份假硬盘标识文件。
+    """
+
+    terminal_file = tmp_path / "terminalinfo"
+    terminal_file.write_text("HD=test-disk-id\n", encoding="utf-8")
+    broker = HuaxinBroker(
+        "acct",
+        config={
+            "local_ip": "127.0.0.1",
+            "mac_address": "00-11-22-33-44-55",
+            "user_product_info": "BT",
+            "terminal_info_file": str(terminal_file),
+        },
+    )
+
+    assert "HD=test-disk-id" in broker._resolve_terminal_info()
+
+    candidates = []
+
+    def _record_candidate(path) -> bool:
+        """记录默认候选路径并模拟文件不存在。
+
+        参数:
+            path: 实现准备检查的候选路径。
+        返回:
+            始终返回 False，避免读取真实主机文件。
+        副作用:
+            将路径追加到测试局部列表。
+        """
+
+        candidates.append(path)
+        return False
+
+    monkeypatch.setattr(broker_module.os.path, "isfile", _record_candidate)
+    default_broker = HuaxinBroker(
+        "acct",
+        config={
+            "local_ip": "127.0.0.1",
+            "mac_address": "00-11-22-33-44-55",
+            "user_product_info": "BT",
+        },
+    )
+
+    default_broker._resolve_terminal_info()
+
+    assert candidates == ["/home/terminalinfo"]
+
+
 @pytest.mark.parametrize(
     ("config", "required_field"),
     [
