@@ -61,6 +61,7 @@ class ServerConfig:
     log_account_snapshot: bool = False
     access_log_enabled: bool = True
     order_risk_enabled: bool = False
+    idempotency_max_entries: int = 50000
     huaxin_xmd_backend: Optional[str] = None
     huaxin_xmd_python: Optional[str] = None
     huaxin_xmd_sdk_dir: Optional[str] = None
@@ -250,6 +251,9 @@ def build_server_config(args) -> ServerConfig:
         flag = get_env_optional_bool("QMT_SERVER_ACCESS_LOG")
         access_log_enabled = True if flag is None else bool(flag)
     order_risk_enabled = get_env_bool("QMT_SERVER_ORDER_RISK_ENABLED", False)
+    idempotency_max_entries = get_env_int("QMT_SERVER_IDEMPOTENCY_MAX_ENTRIES", 50000)
+    if idempotency_max_entries <= 0:
+        raise ValueError("QMT_SERVER_IDEMPOTENCY_MAX_ENTRIES 必须为正整数")
     huaxin_xmd_backend = get_env("HUAXIN_XMD_BACKEND") if huaxin_server else None
     huaxin_xmd_python = get_env("HUAXIN_XMD_PYTHON") if huaxin_server else None
     huaxin_xmd_sdk_dir = get_env("HUAXIN_XMD_SDK_DIR") if huaxin_server else None
@@ -330,6 +334,7 @@ def build_server_config(args) -> ServerConfig:
         log_account_snapshot=bool(log_account_snapshot),
         access_log_enabled=bool(access_log_enabled),
         order_risk_enabled=bool(order_risk_enabled),
+        idempotency_max_entries=idempotency_max_entries,
         huaxin_xmd_backend=huaxin_xmd_backend,
         huaxin_xmd_python=huaxin_xmd_python,
         huaxin_xmd_sdk_dir=huaxin_xmd_sdk_dir,

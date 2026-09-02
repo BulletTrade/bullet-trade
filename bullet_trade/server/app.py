@@ -24,10 +24,10 @@ from bullet_trade.core.risk_control import RiskController
 from bullet_trade.utils.portfolio_printer import render_account_overview
 
 from .adapters.base import (
+    BROKER_CALL_MARKER_KEY,
     AccountContext,
     AccountRouter,
     AdapterBundle,
-    BROKER_CALL_MARKER_KEY,
     BrokerCallBoundaryMarker,
     SubAccountConfig,
     VirtualAccountManager,
@@ -51,6 +51,17 @@ class IdempotencyConflictError(ValueError):
     """表示同一幂等键被用于不同的规范化写请求。"""
 
     code = "IDEMPOTENCY_CONFLICT"
+
+
+class IdempotencyCapacityError(RuntimeError):
+    """表示进程内幂等缓存已达安全上限，不能接收新的写请求。
+
+    该异常由 ServerApplication 在占用新幂等键之前抛出，供协议层返回稳定错误码。
+    异常明确标记 ``broker_called=False``，既不修改已有缓存，也不触发券商写入。
+    """
+
+    code = "IDEMPOTENCY_CACHE_FULL"
+    broker_called = False
 
 
 _IDEMPOTENCY_KEY_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/+\-]{0,254}$")
@@ -114,6 +125,9 @@ class ServerApplication:
         self._started: Optional[asyncio.Event] = None
         self._idempotency_cache: Dict[Tuple[str, str, str], _IdempotencyEntry] = {}
         self._idempotency_lock: Optional[asyncio.Lock] = None
+        self._idempotency_max_entries = int(config.idempotency_max_entries)
+        if self._idempotency_max_entries <= 0:
+            raise ValueError("idempotency_max_entries 必须为正整数")
         self._idempotency_key_required = bool(
             adapters.broker_adapter and adapters.broker_writes_require_idempotency_key is not False
         )
@@ -692,6 +706,7 @@ class ServerApplication:
 
         Raises:
             IdempotencyConflictError: 同 key 的 action 或载荷指纹不一致时抛出。
+            IdempotencyCapacityError: 缓存已满且当前是新 key 时在券商调用前抛出。
 
         Side Effects:
             新 key 会在进程内幂等缓存中占位，防止并发双写。
@@ -714,6 +729,8 @@ class ServerApplication:
             if entry is not None:
                 self._ensure_idempotency_match(entry, action, normalized, key)
                 return dict(entry.result)
+            if len(self._idempotency_cache) >= self._idempotency_max_entries:
+                raise IdempotencyCapacityError("进程内幂等缓存已满；请先确认所有在途订单并在维护窗口安全重启服务")
             self._idempotency_cache[cache_key] = _IdempotencyEntry(
                 action=action,
                 fingerprint=normalized,
@@ -1175,6 +1192,8 @@ class ServerApplication:
                 "mode": "process_memory",
                 "key_required": self._idempotency_key_required,
                 "entries": len(self._idempotency_cache),
+                "max_entries": self._idempotency_max_entries,
+                "saturated": len(self._idempotency_cache) >= self._idempotency_max_entries,
                 "cross_restart_exactly_once": False,
                 "unknown_auto_resend": False,
             },

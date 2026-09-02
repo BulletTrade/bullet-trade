@@ -258,12 +258,15 @@ QMT_SERVER_SUB_ACCOUNT=demo@main
 | `QMT_SERVER_LOG_ACCOUNT` | `false` | 是否打印账户快照。 |
 | `QMT_SERVER_ACCESS_LOG` | `true` | 是否启用访问日志。 |
 | `QMT_SERVER_ORDER_RISK_ENABLED` | `false` | 是否启用 server 端订单/撤单风控。 |
+| `QMT_SERVER_IDEMPOTENCY_MAX_ENTRIES` | `50000` | 进程内交易写幂等条目上限；达到上限后新 key 在券商调用前失败关闭，已有 key 仍可安全查询。 |
 | `QMT_SERVER_ACCOUNTS` | 空 | 多账户映射，例如 `main=123456,hedge=654321:future`。 |
 | `QMT_SERVER_SUB_ACCOUNTS` | 空 | 子账户映射，例如 `demo@main:limit=50000`。 |
 
 交易写必须携带稳定 `idempotency_key`。Server 在当前进程内原子占位并保留到进程结束；
-不需要数据库、文件路径或额外启用开关。进程重启后不承诺跨重启 exactly-once，提交结果未知时
-只允许用柜台订单/成交事实对账，禁止自动重发。
+缓存不会按 TTL 或 LRU 淘汰，以免旧 key 被重新执行，但受 `QMT_SERVER_IDEMPOTENCY_MAX_ENTRIES`
+硬上限约束。达到上限后只拒绝新的写 key，拒绝发生在券商调用前；已有 key 的结果和冲突判断继续
+可用。应在确认所有在途/未知订单后选择维护窗口安全重启，而不是通过删除条目继续下单。进程重启后
+不承诺跨重启 exactly-once，提交结果未知时只允许用柜台订单/成交事实对账，禁止自动重发。
 
 ## 12. qmt-remote 客户端
 

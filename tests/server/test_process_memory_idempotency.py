@@ -29,7 +29,11 @@ from bullet_trade.server.adapters.base import (
     AdapterBundle,
     mark_broker_call_started,
 )
-from bullet_trade.server.app import IdempotencyConflictError, ServerApplication
+from bullet_trade.server.app import (
+    IdempotencyCapacityError,
+    IdempotencyConflictError,
+    ServerApplication,
+)
 from bullet_trade.server.config import (
     AccountConfig,
     ServerConfig,
@@ -188,12 +192,14 @@ def _build_app(
     *,
     broker: Optional[_MemoryBroker] = None,
     sub_accounts: Optional[list[SubAccountConfig]] = None,
+    idempotency_max_entries: int = 50000,
 ) -> tuple[ServerApplication, _MemoryBroker]:
     """构造启用真实写幂等键要求的内存 Server。
 
     Args:
         broker: 可选的预置假 Broker。
         sub_accounts: 可选虚拟子账户路由。
+        idempotency_max_entries: 进程内幂等缓存容量。
 
     Returns:
         tuple[ServerApplication, _MemoryBroker]: Server 与其假 Broker。
@@ -208,6 +214,7 @@ def _build_app(
         enable_broker=True,
         accounts=[AccountConfig(key="default", account_id="parent")],
         sub_accounts=list(sub_accounts or []),
+        idempotency_max_entries=idempotency_max_entries,
     )
     router = AccountRouter(config.accounts)
     fake = broker or _MemoryBroker()
@@ -270,6 +277,8 @@ async def test_server_writes_without_journal_configuration() -> None:
         "mode": "process_memory",
         "key_required": True,
         "entries": 1,
+        "max_entries": 50000,
+        "saturated": False,
         "cross_restart_exactly_once": False,
         "unknown_auto_resend": False,
     }
@@ -303,8 +312,49 @@ async def test_legacy_journal_environment_is_ignored(
     assert not hasattr(loaded, "idempotency_journal_path")
     assert not hasattr(loaded, "idempotency_journal_max_entries")
     assert not hasattr(loaded, "idempotency_ttl_seconds")
+    assert loaded.idempotency_max_entries == 50000
     assert len(broker.place_calls) == 1
     assert journal_path.exists() is False
+
+
+def test_idempotency_capacity_is_loaded_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """验证正整数容量配置会进入 ServerConfig。
+
+    Args:
+        monkeypatch: pytest 环境变量替换工具。
+
+    Returns:
+        None: 断言配置值按环境变量加载。
+    """
+
+    monkeypatch.setenv("QMT_SERVER_IDEMPOTENCY_MAX_ENTRIES", "17")
+
+    loaded = build_server_config(SimpleNamespace())
+
+    assert loaded.idempotency_max_entries == 17
+
+
+@pytest.mark.parametrize("configured", ["0", "-1"])
+def test_idempotency_capacity_rejects_non_positive_environment(
+    monkeypatch: pytest.MonkeyPatch,
+    configured: str,
+) -> None:
+    """验证非正容量在服务配置阶段失败关闭。
+
+    Args:
+        monkeypatch: pytest 环境变量替换工具。
+        configured: 待验证的零或负数文本。
+
+    Returns:
+        None: 断言配置构建抛出具名错误。
+    """
+
+    monkeypatch.setenv("QMT_SERVER_IDEMPOTENCY_MAX_ENTRIES", configured)
+
+    with pytest.raises(ValueError, match="IDEMPOTENCY_MAX_ENTRIES"):
+        build_server_config(SimpleNamespace())
 
 
 @pytest.mark.asyncio
@@ -340,6 +390,35 @@ async def test_multiple_virtual_accounts_share_one_process_cache() -> None:
         "b4-b@default",
     }
     assert len(app._idempotency_cache) == 2
+
+
+@pytest.mark.asyncio
+async def test_process_memory_capacity_fails_closed_before_broker_call() -> None:
+    """达到容量上限后拒绝新 key，但仍允许读取已有 key 的确定结果。
+
+    Returns:
+        None: 断言第二个新 key 未进入 broker，首个 key 仍保持幂等。
+    """
+
+    app, broker = _build_app(idempotency_max_entries=1)
+    first = await app._dispatch_broker(_Session(), "place_order", _place_payload("capacity-a"))
+
+    with pytest.raises(IdempotencyCapacityError) as exc_info:
+        await app._dispatch_broker(_Session(), "place_order", _place_payload("capacity-b"))
+
+    repeated = await app._dispatch_broker(
+        _Session(),
+        "place_order",
+        _place_payload("capacity-a"),
+    )
+    assert exc_info.value.code == "IDEMPOTENCY_CACHE_FULL"
+    assert exc_info.value.broker_called is False
+    assert repeated == first
+    assert len(broker.place_calls) == 1
+    health = app._health_snapshot()["value"]["idempotency"]
+    assert health["entries"] == 1
+    assert health["max_entries"] == 1
+    assert health["saturated"] is True
 
 
 @pytest.mark.asyncio
