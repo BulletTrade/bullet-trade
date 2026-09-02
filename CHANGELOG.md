@@ -5,16 +5,41 @@
 
 ## [未发布]
 
+## [0.10.0b1] - 2026-09-02
+
+### 新增
+- **华鑫 TORA 接入 Beta**：在同一 `bullet-trade` distribution 中加入第一方 Trader adapter、C ABI、自研 C++ bridge 源码、显式 `huaxin build/doctor`、Server adapter 与 Python 3.7 XMD Level 1 sidecar；厂商 SDK、头文件、动态库、文档、凭据和真实配置始终由用户从外部提供，不进入 Git 或 PyPI。
+- **类型化实时行情底座**：新增版本化市场事件、订阅回执、租约/refcount、有界队列、字段保真投影、健康状态和显式 gap/degraded 控制事件，为 L1/L2 扩展提供统一合同。
+- **统一证券身份契约**：新增 `security-id/v1` 归一化规则与合同数据，补齐 QMT 期货代码映射和场内基金 T+0/T+1 覆盖。
+- **节点资产归集合同**：新增华鑫节点资产快照、摘要、中继、划转计划与严格完成证据；写入能力仍受外部授权和运行环境门禁约束。
+
+### 增强
+- **实盘引擎安全语义**：增加启动前 capability/preflight、调度失败原子拒单、正式运行态持久化、行情时效元数据和订单审计字段；可选安全策略默认不改变未启用用户的旧路径。
+- **远程交易写入语义**：下单和撤单使用稳定 `idempotency_key`，明确 `submit_unknown/reconciling`、只读解析和券商调用边界，禁止网络不确定状态下自动重放。
+- **远程服务安全边界**：补充 TLS 配置一致性、环境变量后端选择、华鑫模块化 health 及当前行情接口；进程内幂等缓存增加 50,000 条默认硬上限，容量满时在券商调用前失败关闭。
+- **大 QMT 网关能力**：完善历史行情、实时观测元数据、持仓映射、订单/撤单确认、客户订单标识、健康刷新、GBK 策略源码和每日日志轮转。
+
 ### 修复
-- **大 QMT 实时行情时间语义**：helper 和 server adapter 保留行情源时间、独立查询完成时间、通道健康状态及一档盘口，使上层可以区分安静证券与行情通道故障；正式 helper build 标识更新为 `20260828_observation_metadata_v1`。
-- **大 QMT 策略源码编码**：恢复嵌入式 helper 的 `#encoding:gbk` 声明和真实 GBK 文件编码，避免大 QMT 内置策略环境加载 UTF-8 源码后出现编码错误。
+- **QMT 连接与事件循环**：避免重连复用 session ID，修复探针门闩跨事件循环构造和同步交易日查询阻塞事件循环。
+- **MiniQMT 实时快照**：缺少 tick、有效价格或可信时间证明时明确失败关闭，不再把历史值或无时间来源快照冒充实时报价。
+- **远程行情数据结构**：恢复 DataFrame/MultiIndex 索引和当前行情时效字段，避免远端传输后列层级或时间来源丢失。
+- **华鑫运行恢复**：完善 Trader/XMD 跨夜重建、订阅超时重试、当日归集状态及残余资金/持仓在途字段判断。
+- **发布隐私**：普通日志不再输出华鑫账户、UserProductInfo 或完整 TerminalInfo，并移除个人用户名目录回退。
+
+### 兼容性
+- **自制远程客户端**：直接调用 `broker.place_order` 或 `broker.cancel_order` 必须提供合法、稳定的 `idempotency_key`；官方 `qmt-remote` 客户端会自动生成和复用。
+- **实时行情失败模式**：MiniQMT 当前快照无法证明新鲜有效时会抛出具名错误，而不再返回空字典或历史代理值。
+- **订单队列只读视图**：`get_order_queue()` 返回浅拷贝，调用方不能再通过修改返回列表改变全局队列。
+- **配置错误时机**：数据 Provider 重载改为延迟初始化，配置错误可能在第一次真实数据调用时出现；TLS 配置不完整则在 Server 启动时直接拒绝。
+- **华鑫能力范围**：公开包当前只提供 Trader native 显式构建；Level 1 使用用户自备 Python 3.7 XMD SDK 的 sidecar，Level 2 尚未提供，不能把主包安装成功等同于华鑫就绪。
 
 ### 文档
-- **大 QMT observation metadata**：补充实时快照新增字段、通道健康与证券事件年龄的判定边界。
+- **华鑫公开使用说明**：明确 PyPI/GitHub 用户可获得的源码、构建入口、外部 SDK 边界、上层内部工具边界及 Trader/L1/L2 当前状态。
+- **Big QMT 与实盘说明**：补充实时观测、订单确认、服务实体账号、历史行情与运行时恢复边界。
 
 ### 测试
-- **大 QMT helper 构建标识回归**：显式锁定 observation metadata build，并覆盖源时间、查询完成时间、通道健康和一档盘口。
-- **大 QMT helper 编码回归**：锁定源码首行和真实 GBK 字节解码，防止格式化或编辑器再次静默转换为 UTF-8。
+- **发布制品门禁**：wheel、规范化 sdist、Git tree、native bundle、敏感资产和无 SDK clean-import 统一进入同一离线审计流程。
+- **实盘与协议回归**：补充华鑫 fake/native 合同、Remote Server 幂等、LiveEngine 失败关闭、市场事件队列、订阅状态机和 Big QMT helper 回归。
 
 ## [0.9.2] - 2026-07-06
 

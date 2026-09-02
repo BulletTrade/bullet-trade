@@ -43,7 +43,30 @@ bullet-trade server --server-type huaxin
 代码不内置生产或仿真前置地址。Trader 的 `HUAXIN_TRADE_FRONT` 和 XMD 的
 `HUAXIN_XMD_FRONT` 都必须来自部署机器上已被 Git 忽略的私密 env 文件。
 
+### 2.1 公开授权状态
+
+截至 2026-09-02，当前仓库和本次核对的本地官方资料中，没有找到一份能够覆盖“公开自研
+adapter/bridge 源码中的 TORA API 名称引用、由厂商头文件派生的字段 manifest，以及未来自研
+bridge 二进制再分发”的华鑫/TORA 书面许可。其他开源项目已经公开 TORA adapter 只能证明技术
+路径存在，不能替代 BulletTrade 自己的授权或法律审查。`0.10.0b1` 对外发布前必须取得并归档能
+确认上述边界的书面证据；在确认前不得把当前 `dev` 合入公开 `main` 或上传 PyPI。
+
+无论许可结论如何，厂商头文件、动态库、PDF、示例、柜台地址、账号、TerminalInfo 和真实业务
+数据都不会进入公开 Git、wheel 或 sdist。
+
 ## 3. 构建与诊断
+
+公开 Git、wheel 和 sdist 已包含以下内容，用户不需要工作区上层的 `huaxin/tools`：
+
+| 能力 | 公开包是否包含入口 | 用户还需自行准备 | 当前状态 |
+| --- | --- | --- | --- |
+| Trader C++ bridge | 是：C ABI、C++ 源码、CMake、`huaxin build/doctor` | Linux x86_64 工具链及有权取得的 Trader SDK | 可显式编译；仍需目标柜台验收 |
+| Level 1 行情 | 是：XMD sidecar 适配与 Server 接入 | Python 3.7、XMD SDK、私密前置与账号 | 可接入；不是 C++ native bridge |
+| Level 2 行情 | 否 | — | 当前版本不支持，不能靠上层脚本补齐 |
+| 上层 `huaxin/tools` | 不进入公开包 | — | 仅供 BulletTrade 内部部署、探测、canary 和运维，不是公开构建依赖 |
+
+因此，“用户完全不知道怎么编译”对 Trader 并不成立：安装后的 CLI 就是正式入口；但如果把“华鑫”
+理解为 L1/L2/Trader 全套 native，当前确实没有完成，必须按上表理解能力边界。
 
 离线 fake bridge 可用于安装、ABI 和队列合同回归：
 
@@ -85,6 +108,8 @@ HUAXIN_PASSWORD=<PRIVATE_PASSWORD>
 HUAXIN_MAC_ADDRESS=<PRIVATE_MAC>
 HUAXIN_USER_PRODUCT_INFO=<PRIVATE_PRODUCT_INFO>
 HUAXIN_TERMINAL_INFO=<PRIVATE_TERMINAL_INFO>
+# 若按受控文件提供硬盘标识，可显式指定；不会扫描个人用户目录。
+HUAXIN_TERMINAL_INFO_FILE=<PRIVATE_TERMINAL_INFO_FILE>
 HUAXIN_ENABLE_TRADING=false
 HUAXIN_ENABLE_CANCEL=false
 
@@ -132,8 +157,9 @@ bullet-trade --env-file <PRIVATE_CLIENT_ENV> live <STRATEGY_FILE> --broker qmt-r
 
 - XMD 快照默认最大年龄是 30 秒，配置只能收紧，不能超过 30 秒；过期快照直接报错，不用历史
   数据或其他行情源静默补齐。
-- 每次远程下单和撤单都必须携带有效 `idempotency_key`。Server 使用进程内结果缓存与
-  柜台订单事实，不创建或要求任何幂等数据库、文件路径或第二启用开关。
+- 每次远程下单和撤单都必须携带有效 `idempotency_key`。Server 使用有界、进程内且不淘汰的
+  结果缓存与柜台订单事实，不创建或要求任何幂等数据库、文件路径或第二启用开关；缓存达到
+  `QMT_SERVER_IDEMPOTENCY_MAX_ENTRIES` 后，新 key 会在券商调用前失败关闭。
 - Trader 登录后以柜台 `MaxOrderRef` 为基线，运行中只在内存中单调递增；server 重启不会复制
   一份柜台订单账本。
 - Trader 或 XMD 断线时，现有 adapter watchdog 在同一 server 进程内重建会话。重连期间查询和
