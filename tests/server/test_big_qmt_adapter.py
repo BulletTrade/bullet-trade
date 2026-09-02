@@ -893,6 +893,7 @@ async def test_big_qmt_confirmation_rejects_reverse_order_with_same_economic_fie
 
     def _place(payload):
         submission_identity["value"] = payload["qmt_user_order_id"]
+        assert len(submission_identity["value"]) == 23
         return {"order_id": "", "passorder_return": 0}
 
     def _orders(_payload):
@@ -958,6 +959,7 @@ async def test_big_qmt_place_order_confirms_live_gateway_raw_order_shape():
         """
 
         submission_identity["value"] = payload["qmt_user_order_id"]
+        assert len(submission_identity["value"]) == 23
         return {"order_id": "", "passorder_return": 0}
 
     def _orders(_payload):
@@ -1009,6 +1011,7 @@ async def test_big_qmt_place_order_confirms_live_gateway_raw_order_shape():
             "style": {"type": "market", "protect_price": 120.0},
             "market_type": "opponent_best",
             "order_remark": "strategy-business-remark",
+            "qmt_user_order_id": "BT-explicit-identity-that-is-too-long",
             "idempotency_key": "live-shape-confirmation",
             "wait_timeout": 0.05,
         },

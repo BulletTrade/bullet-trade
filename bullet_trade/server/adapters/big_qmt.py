@@ -92,6 +92,7 @@ _ORDER_STATUS_MAP = {
 _ORDER_CONFIRM_POLL_INTERVAL_SECONDS = 0.25
 _ORDER_CONFIRM_MAX_CLOCK_SKEW_SECONDS = 60.0
 _CANCEL_CONFIRM_TIMEOUT_SECONDS = 3.0
+_QMT_USER_ORDER_ID_MAX_LENGTH = 23
 
 _BIG_QMT_MARKET_PRICE_TYPES = {
     "XSHG": {
@@ -1190,10 +1191,13 @@ def _ensure_gateway_submission_identity(payload: Dict[str, Any]) -> None:
         None。
 
     Side Effects:
-        使用原幂等键的 SHA-256 截断摘要生成稳定标识，禁止依赖证券/价格/数量等经济字段。
+        将显式标识或幂等键 SHA-256 摘要收敛为 QMT 支持的 23 字符，
+        禁止依赖证券/价格/数量等经济字段。
     """
 
-    if str(payload.get("qmt_user_order_id") or "").strip():
+    existing = str(payload.get("qmt_user_order_id") or "").strip()
+    if existing:
+        payload["qmt_user_order_id"] = existing[:_QMT_USER_ORDER_ID_MAX_LENGTH]
         return
     idempotency_key = str(payload.get("idempotency_key") or "").strip()
     if not idempotency_key:
@@ -1201,7 +1205,8 @@ def _ensure_gateway_submission_identity(payload: Dict[str, Any]) -> None:
         # 但生产远程写必须由服务端提供可持久化的原 idempotency_key。
         idempotency_key = f"big-qmt-direct-{uuid4().hex}"
         payload["idempotency_key"] = idempotency_key
-    digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:28]
+    digest_length = _QMT_USER_ORDER_ID_MAX_LENGTH - len("BT-")
+    digest = hashlib.sha256(idempotency_key.encode("utf-8")).hexdigest()[:digest_length]
     payload["qmt_user_order_id"] = f"BT-{digest}"
 
 
