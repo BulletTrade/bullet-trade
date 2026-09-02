@@ -37,6 +37,7 @@ from bullet_trade.integrations.huaxin.release_audit import (
     audit_bundle,
     audit_sdist,
     audit_wheel,
+    canonicalize_sdist,
 )
 
 
@@ -1079,6 +1080,62 @@ def test_sdist_identity_parsers_are_required_fail_closed(
 
 
 @pytest.mark.unit
+def test_canonicalize_sdist_removes_opaque_archive_metadata(tmp_path: Path) -> None:
+    """验证规范化步骤移除 gzip FNAME 与 PAX 元数据并产出可审计 sdist。
+
+    参数:
+        tmp_path: pytest 提供的隔离归档目录。
+    返回:
+        无；断言原路径被安全替换且严格审计通过。
+    副作用:
+        在临时目录原子替换一份合成 sdist。
+    """
+
+    sdist = _write_sdist(
+        tmp_path,
+        tar_variant="pax",
+        gzip_filename="opaque-builder-path.tar",
+    )
+    before = audit_sdist(sdist)
+
+    canonicalized = canonicalize_sdist(sdist)
+    after = audit_sdist(sdist)
+
+    assert {
+        "GZIP_FNAME_FORBIDDEN",
+        "TAR_EXTENDED_HEADER_FORBIDDEN",
+    }.issubset(_finding_codes(before))
+    assert canonicalized == sdist.resolve()
+    assert after.passed is True, [finding.to_dict() for finding in after.findings]
+
+
+@pytest.mark.unit
+def test_canonicalize_sdist_rejects_links_without_rewriting_input(tmp_path: Path) -> None:
+    """验证外层或归档内符号链接失败关闭，且不会改写原始输入。
+
+    参数:
+        tmp_path: pytest 提供的隔离归档目录。
+    返回:
+        无；断言两种链接均被拒绝且恶意归档字节保持不变。
+    副作用:
+        在临时目录创建合成归档及指向它的符号链接。
+    """
+
+    sdist = _write_sdist(tmp_path, symlink=True)
+    before = sdist.read_bytes()
+
+    with pytest.raises(ValueError, match="普通文件和目录"):
+        canonicalize_sdist(sdist)
+
+    link = tmp_path / "linked.tar.gz"
+    link.symlink_to(sdist.name)
+    with pytest.raises(ValueError, match="符号链接"):
+        canonicalize_sdist(link)
+
+    assert sdist.read_bytes() == before
+
+
+@pytest.mark.unit
 def test_outer_artifact_symlink_and_unpacked_hard_limit_fail_closed(tmp_path: Path) -> None:
     """
     验证外层 wheel 符号链接不被 resolve 掩盖，累计声明解包量在读取前触发硬门禁。
@@ -1392,6 +1449,7 @@ def test_sdist_rejects_special_member_and_redacts_sensitive_values(tmp_path: Pat
     assert "SENSITIVE_LITERAL" in codes
     assert "PRIVATE_KEY_MATERIAL" in codes
     assert "ABSOLUTE_SDK_BUILD_PATH" in codes
+    assert "PERSONAL_HOME_PATH" in codes
     assert secret_value not in serialized
     assert terminal_value not in serialized
     assert account_value not in serialized

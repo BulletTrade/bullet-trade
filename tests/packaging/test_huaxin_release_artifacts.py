@@ -22,19 +22,20 @@ from bullet_trade.__version__ import __version__
 from bullet_trade.integrations.huaxin.release_audit import (
     audit_sdist,
     audit_wheel,
+    canonicalize_sdist,
     clean_import_wheel,
 )
 
 
 @pytest.mark.integration
-def test_current_wheel_passes_and_noncanonical_sdist_fails_closed(tmp_path: Path) -> None:
+def test_current_wheel_and_canonical_sdist_pass_release_audit(tmp_path: Path) -> None:
     """
-    构建真实 wheel/sdist，验证 wheel 可用且 setuptools 非规范 sdist 元数据被精确拒绝。
+    构建真实 wheel/sdist，规范化 sdist 后验证两个待上传制品均通过审计。
 
     参数:
         tmp_path: pytest 提供的隔离构建输出目录。
     返回:
-        无；wheel/clean-import 通过且 sdist 只因不透明身份元数据 fail closed 即通过。
+        无；wheel、clean-import 和规范化后的 sdist 全部通过即成功。
     副作用:
         调用本地 build backend 并在 tmp_path 写入两个发布归档及临时安装内容。
     """
@@ -63,18 +64,14 @@ def test_current_wheel_passes_and_noncanonical_sdist_fails_closed(tmp_path: Path
     assert len(wheels) == 1
     assert len(sdists) == 1
 
+    canonicalize_sdist(sdists[0])
     wheel_report = audit_wheel(wheels[0])
     sdist_report = audit_sdist(sdists[0])
     clean_import = clean_import_wheel(wheels[0])
 
     assert wheels[0].name.endswith("-py3-none-any.whl")
     assert wheel_report.passed is True, [finding.to_dict() for finding in wheel_report.findings]
-    assert sdist_report.passed is False
-    assert {finding.code for finding in sdist_report.findings} == {
-        "GZIP_FNAME_FORBIDDEN",
-        "TAR_EXTENDED_HEADER_FORBIDDEN",
-        "TAR_IDENTITY_METADATA_FORBIDDEN",
-    }
+    assert sdist_report.passed is True, [finding.to_dict() for finding in sdist_report.findings]
     assert clean_import.passed is True, clean_import.to_dict()
     assert wheel_report.archive_size == wheels[0].stat().st_size
     assert sdist_report.archive_size == sdists[0].stat().st_size

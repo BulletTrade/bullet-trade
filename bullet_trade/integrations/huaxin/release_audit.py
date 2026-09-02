@@ -1,11 +1,11 @@
 """
 作者: BruceLee
-文件职责: 对 BulletTrade 华鑫相关 Git tree、wheel、sdist 与 native bundle 做纯离线发布审计。
+文件职责: 规范化 sdist，并对 BulletTrade 华鑫相关 Git tree、wheel、sdist 与 native bundle 做纯离线发布审计。
 主要输入: 受跟踪源码目录、Python 发布归档或显式构建 bundle，以及可覆盖的体积策略。
 主要输出: 不含绝对本地路径和原始敏感值的确定性 SBOM、制品元数据与 fail-closed 发现项。
 上游关系: 发布前离线脚本、打包测试和未来 CI 发布门禁显式调用本模块。
-下游关系: 仅使用标准库读取归档，并在真实 native 制品存在时调用本机只读依赖检查工具。
-关键环境或配置: 不联网、不加载 native、不读取 SDK 配置；依赖/RPATH 工具缺失时仅对真实 native 制品失败。
+下游关系: 使用标准库重写待发布 sdist、读取各类归档，并在真实 native 制品存在时调用本机只读依赖检查工具。
+关键环境或配置: 不联网、不加载 native、不读取 SDK 配置；sdist 规范化会原子替换指定制品，依赖/RPATH 工具缺失时仅对真实 native 制品失败。
 """
 
 from __future__ import annotations
@@ -14,6 +14,7 @@ import ast
 import base64
 import csv
 import email.policy
+import gzip
 import hashlib
 import importlib
 import io
@@ -1958,6 +1959,19 @@ def _scan_sensitive_content(item: _ArtifactFile, builder: _AuditBuilder) -> None
     )
     if any(pattern.search(text) for pattern in token_patterns):
         builder.add("KNOWN_SECRET_FORMAT", "文件包含高置信度访问令牌格式", item.path)
+
+    personal_home_patterns = (
+        re.compile(r"(?<![A-Za-z0-9_])/(?:Users|home)/[^/\s\"'<>\x00]+/" r"[^\s\"'<>\x00]{1,512}"),
+        re.compile(
+            r"(?i)\b[A-Z]:[\\/]Users[\\/][^\\/\s\"'<>\x00]+[\\/]" r"[^\r\n\"'<>\x00]{1,512}"
+        ),
+    )
+    if any(pattern.search(text) for pattern in personal_home_patterns):
+        builder.add(
+            "PERSONAL_HOME_PATH",
+            "文件包含带个人用户目录名的绝对路径",
+            item.path,
+        )
 
     unix_path_pattern = re.compile(
         r"(?<![A-Za-z0-9_])/(?:Users|home|root|srv|private|tmp|var|opt|usr/local|mnt|data)/"
@@ -4740,6 +4754,126 @@ def _audit_pyproject_identity(
             )
 
 
+def canonicalize_sdist(sdist_path: Path) -> Path:
+    """将本地构建的 sdist 原地规范化为严格单成员 gzip 与 USTAR。
+
+    参数:
+        sdist_path: 已由本项目构建且待发布的 ``.tar.gz`` 文件。
+    返回:
+        已原子替换为规范归档的同一路径。
+    异常:
+        ValueError: 文件名、成员路径、成员类型、重复项或读取结果不安全时抛出。
+        OSError: 归档读取、临时文件写入或原子替换失败时抛出。
+        tarfile.TarError: 输入不是可读 tar.gz 或成员无法编码为 USTAR 时抛出。
+    副作用:
+        在 sdist 同目录创建临时文件，并在成功后原子替换原归档；不解包到磁盘。
+    """
+
+    requested_path = Path(sdist_path).expanduser()
+    if requested_path.is_symlink():
+        raise ValueError("待规范化 sdist 不允许是符号链接")
+    path = requested_path.resolve()
+    if not path.is_file() or not path.name.endswith(".tar.gz"):
+        raise ValueError("待规范化 sdist 必须是普通 .tar.gz 文件")
+    policy = ReleaseAuditPolicy()
+    if path.stat().st_size > policy.max_archive_scan_bytes:
+        raise ValueError("待规范化 sdist 超过压缩包读取硬上限")
+
+    entries: List[Tuple[str, bool, bool, bytes]] = []
+    seen: Set[str] = set()
+    unpacked_size = 0
+    with tarfile.open(path, mode="r:gz") as source:
+        for member in source.getmembers():
+            if len(seen) >= policy.max_file_count:
+                raise ValueError("sdist 成员数超过审计硬上限")
+            raw_name = str(member.name or "")
+            normalized = PurePosixPath(raw_name)
+            if (
+                not raw_name
+                or raw_name.startswith("/")
+                or "\\" in raw_name
+                or any(part in {"", ".", ".."} for part in normalized.parts)
+            ):
+                raise ValueError("sdist 包含不安全成员路径")
+            name = normalized.as_posix()
+            if name in seen:
+                raise ValueError("sdist 包含重复成员路径")
+            seen.add(name)
+            if member.isdir():
+                entries.append((name.rstrip("/") + "/", True, True, b""))
+                continue
+            if not member.isfile():
+                raise ValueError("sdist 只能包含普通文件和目录")
+            unpacked_size += member.size
+            if (
+                member.size > policy.max_file_bytes
+                or unpacked_size > policy.max_unpacked_scan_bytes
+            ):
+                raise ValueError("sdist 解包内容超过审计读取硬上限")
+            stream = source.extractfile(member)
+            if stream is None:
+                raise ValueError("sdist 普通文件无法读取")
+            data = stream.read(member.size + 1)
+            if len(data) != member.size:
+                raise ValueError("sdist 成员读取大小与声明不一致")
+            entries.append((name, False, bool(member.mode & 0o111), data))
+
+    tar_payload = io.BytesIO()
+    with tarfile.open(fileobj=tar_payload, mode="w:", format=tarfile.USTAR_FORMAT) as target:
+        for name, is_directory, executable, data in entries:
+            info = tarfile.TarInfo(name)
+            info.uid = 0
+            info.gid = 0
+            info.uname = ""
+            info.gname = ""
+            info.mtime = 0
+            if is_directory:
+                info.type = tarfile.DIRTYPE
+                info.mode = 0o755
+                info.size = 0
+                target.addfile(info)
+                continue
+            info.type = tarfile.REGTYPE
+            info.mode = 0o755 if executable else 0o644
+            info.size = len(data)
+            target.addfile(info, io.BytesIO(data))
+
+    gzip_payload = io.BytesIO()
+    with gzip.GzipFile(
+        fileobj=gzip_payload,
+        mode="wb",
+        filename="",
+        compresslevel=9,
+        mtime=0,
+    ) as stream:
+        stream.write(tar_payload.getvalue())
+
+    temporary_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            dir=path.parent,
+            prefix="." + path.name + ".canonical.",
+            suffix=".tmp",
+            delete=False,
+        ) as stream:
+            temporary_path = Path(stream.name)
+            stream.write(gzip_payload.getvalue())
+            stream.flush()
+            os.fsync(stream.fileno())
+        if temporary_path is None:
+            raise OSError("无法创建 sdist 规范化临时文件")
+        os.chmod(temporary_path, 0o644)
+        os.replace(temporary_path, path)
+    finally:
+        if temporary_path is not None:
+            try:
+                temporary_path.unlink()
+            except FileNotFoundError:
+                pass
+    return path
+
+
 def audit_sdist(
     sdist_path: Path,
     policy: Optional[ReleaseAuditPolicy] = None,
@@ -5886,7 +6020,7 @@ def aggregate_reports(
             "clean-import 仅对静态通过制品做清空敏感环境的尽力 smoke，不替代 OS 级网络/文件沙箱",
             "无真实 SDK/native 时不会宣称厂商动态依赖或运行 readiness 已验收",
             "bundle 的当前源码/hash/导出/target 检查只证明本地合同自洽，不是可复现构建、签名或供应链 attestation",
-            "sdist 只接受单 gzip member、严格 ustar 风格元数据和流式 tar 枚举；默认 setuptools PAX/FNAME 产物会明确失败",
+            "sdist 只接受单 gzip member、严格 ustar 风格元数据和流式 tar 枚举；发布构建须先规范化再审计",
         ],
     }
 
@@ -5902,5 +6036,6 @@ __all__ = [
     "audit_git_tree",
     "audit_sdist",
     "audit_wheel",
+    "canonicalize_sdist",
     "clean_import_wheel",
 ]

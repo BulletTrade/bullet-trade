@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 作者: BruceLee
-文件职责: 构建或接收本地 BulletTrade 发布制品，并执行华鑫发布边界的纯离线审计。
+文件职责: 构建或接收本地 BulletTrade 发布制品，规范化 sdist，并执行华鑫发布边界的纯离线审计。
 主要输入: Git 根目录、wheel/sdist/native bundle 路径及可选 `--build --no-isolation` 动作。
 主要输出: 不含绝对本地路径和原始敏感值的 JSON 审计报告与稳定退出码。
 上游关系: 开发者、发布人员和未来 CI 在发布前显式运行本脚本。
 下游关系: bullet_trade.integrations.huaxin.release_audit 的 Git/归档/bundle 审计函数。
-关键环境或配置: 不联网、不加载 SDK、不交易；构建只使用已安装的本地 build backend。
+关键环境或配置: 不联网、不加载 SDK、不交易；构建只使用已安装的本地 build backend，并会原子替换本次构建的 sdist。
 """
 
 from __future__ import annotations
@@ -15,6 +15,7 @@ import argparse
 import json
 import subprocess
 import sys
+import tarfile
 import tempfile
 from pathlib import Path
 from typing import Any, List, Mapping, Optional, Sequence, Tuple
@@ -27,6 +28,7 @@ from bullet_trade.integrations.huaxin.release_audit import (
     audit_git_tree,
     audit_sdist,
     audit_wheel,
+    canonicalize_sdist,
     clean_import_wheel,
 )
 
@@ -119,7 +121,14 @@ def _build_distributions(project_root: Path, dist_dir: Path) -> Tuple[bool, int]
         )
     except (OSError, subprocess.SubprocessError):
         return False, -1
-    return completed.returncode == 0, completed.returncode
+    if completed.returncode != 0:
+        return False, completed.returncode
+    try:
+        for sdist in sorted(dist_dir.glob("*.tar.gz")):
+            canonicalize_sdist(sdist)
+    except (OSError, ValueError, tarfile.TarError):
+        return False, -1
+    return True, 0
 
 
 def _discover_built_artifacts(dist_dir: Path) -> Tuple[List[Path], List[Path]]:
