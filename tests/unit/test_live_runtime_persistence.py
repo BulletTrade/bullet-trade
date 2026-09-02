@@ -355,8 +355,10 @@ def test_nested_live_state_is_validated_before_g_assignment(tmp_path, payload) -
 
 
 @pytest.mark.parametrize("filename", ["g.pkl.tmp", "live_state.json.tmp"])
-def test_orphan_atomic_tmp_blocks_initialization(tmp_path, filename: str) -> None:
-    """验证遗留原子写临时文件不会被覆盖或当作首次运行忽略。
+def test_orphan_atomic_tmp_without_committed_state_blocks_initialization(
+    tmp_path, filename: str
+) -> None:
+    """验证没有已提交最终状态时，遗留临时文件仍会阻断初始化。
 
     Args:
         tmp_path: pytest 提供的临时目录。
@@ -376,6 +378,116 @@ def test_orphan_atomic_tmp_blocks_initialization(tmp_path, filename: str) -> Non
         init_live_runtime(str(runtime))
 
     assert tmp_file.read_bytes() == original
+
+
+@pytest.mark.parametrize(
+    ("committed_filename", "tmp_filename"),
+    [
+        ("g.pkl", "g.pkl.tmp"),
+        ("live_state.json", "live_state.json.tmp"),
+    ],
+)
+def test_corrupt_committed_state_with_orphan_tmp_blocks_initialization(
+    tmp_path, committed_filename: str, tmp_filename: str
+) -> None:
+    """验证最终状态损坏时不会因为存在临时文件而自动恢复。
+
+    Args:
+        tmp_path: pytest 提供的临时目录。
+        committed_filename: 参数化注入的损坏最终文件名。
+        tmp_filename: 与最终文件对应的临时文件名。
+
+    Returns:
+        None。通过异常和两份原始字节不变断言表达成功条件。
+    """
+
+    runtime = tmp_path / "corrupt-committed-state-with-orphan-tmp"
+    runtime.mkdir()
+    committed_file = runtime / committed_filename
+    tmp_file = runtime / tmp_filename
+    committed_bytes = b"corrupt-committed-state"
+    tmp_bytes = b"uncommitted-candidate-state"
+    committed_file.write_bytes(committed_bytes)
+    tmp_file.write_bytes(tmp_bytes)
+
+    with pytest.raises(LiveRuntimePersistenceError):
+        init_live_runtime(str(runtime))
+
+    assert committed_file.read_bytes() == committed_bytes
+    assert tmp_file.read_bytes() == tmp_bytes
+
+
+@pytest.mark.parametrize("filename", ["g.pkl.tmp", "live_state.json.tmp"])
+def test_valid_committed_state_wins_over_orphan_tmp(tmp_path, filename: str) -> None:
+    """验证有效最终状态与遗留临时文件共存时按最终状态启动。
+
+    Args:
+        tmp_path: pytest 提供的临时目录。
+        filename: 参数化注入的临时文件名。
+
+    Returns:
+        None。通过恢复内容和临时文件字节不变断言表达成功条件。
+    """
+
+    runtime = tmp_path / "committed-state-with-orphan-tmp"
+    runtime.mkdir()
+    expected_cursor = datetime(2026, 9, 2, 14, 50)
+    if filename == "g.pkl.tmp":
+        with (runtime / "g.pkl").open("wb") as state_file:
+            pickle.dump({"committed_value": 7}, state_file)
+    else:
+        (runtime / "live_state.json").write_text(
+            json.dumps({"scheduler": {"last_cursor": expected_cursor.isoformat()}}),
+            encoding="utf-8",
+        )
+    tmp_file = runtime / filename
+    orphan_bytes = b"forensic-partial-write"
+    tmp_file.write_bytes(orphan_bytes)
+
+    init_live_runtime(str(runtime))
+
+    if filename == "g.pkl.tmp":
+        assert g.committed_value == 7
+    else:
+        assert load_scheduler_cursor() == expected_cursor
+    assert tmp_file.read_bytes() == orphan_bytes
+
+
+@pytest.mark.parametrize("filename", ["g.pkl.tmp", "live_state.json.tmp"])
+def test_next_save_overwrites_orphan_tmp_after_committed_restore(
+    tmp_path, filename: str
+) -> None:
+    """验证从有效最终状态恢复后，下一次保存可覆盖遗留临时文件。
+
+    Args:
+        tmp_path: pytest 提供的临时目录。
+        filename: 参数化注入的临时文件名。
+
+    Returns:
+        None。通过新最终状态和临时文件消失断言表达成功条件。
+    """
+
+    runtime = tmp_path / "overwrite-orphan-tmp"
+    runtime.mkdir()
+    if filename == "g.pkl.tmp":
+        with (runtime / "g.pkl").open("wb") as state_file:
+            pickle.dump({"version": "old"}, state_file)
+    else:
+        (runtime / "live_state.json").write_text("{}", encoding="utf-8")
+    tmp_file = runtime / filename
+    tmp_file.write_bytes(b"forensic-partial-write")
+    init_live_runtime(str(runtime))
+
+    if filename == "g.pkl.tmp":
+        g.version = "new"
+        save_g()
+        with (runtime / "g.pkl").open("rb") as state_file:
+            assert pickle.load(state_file)["version"] == "new"
+    else:
+        expected_cursor = datetime(2026, 9, 2, 14, 51)
+        persist_scheduler_cursor(expected_cursor)
+        assert load_scheduler_cursor() == expected_cursor
+    assert not tmp_file.exists()
 
 
 def test_first_run_resets_g_after_all_preflight_checks_pass(tmp_path) -> None:

@@ -345,22 +345,33 @@ def _load_candidate_g(path: str) -> Optional[Dict[str, Any]]:
     return loaded
 
 
-def _reject_orphan_tmp(path: str) -> None:
-    """拒绝把遗留临时文件当作可安全覆盖的首次启动状态。
+def _validate_orphan_tmp_boundary(path: str, *, committed_exists: bool) -> None:
+    """校验遗留临时文件是否有可用的已提交最终状态。
 
     Args:
         path: 最终状态文件路径；函数检查同名 ``.tmp``。
+        committed_exists: 最终状态文件是否在本次读取前存在并已通过校验。
 
     Returns:
-        None。不存在临时文件时直接返回。
+        None。临时文件不存在或最终状态有效时直接返回。
 
     Raises:
-        FileExistsError: 检测到遗留临时文件时抛出。
+        FileExistsError: 仅有遗留临时文件而没有有效最终状态时抛出。
+
+    Side Effects:
+        最终状态有效时只记录告警，不读取、改名或删除临时文件。
     """
 
     tmp_path = path + ".tmp"
-    if os.path.exists(tmp_path):
-        raise FileExistsError(f"检测到未决原子写临时文件: {tmp_path}")
+    if not os.path.exists(tmp_path):
+        return
+    if not committed_exists:
+        raise FileExistsError(f"检测到未决原子写临时文件且最终状态不存在: {tmp_path}")
+    log.warning(
+        "检测到遗留原子写临时文件，已按通过校验的最终状态继续启动；"
+        "临时文件将在下次正常保存时覆盖: %s",
+        tmp_path,
+    )
 
 
 def _load_state() -> Dict[str, Any]:
@@ -385,8 +396,12 @@ def _load_state() -> Dict[str, Any]:
             return copy.deepcopy(_state_cache)
         path = _state_path()
         try:
-            _reject_orphan_tmp(path)
+            committed_exists = os.path.exists(path)
             _state_cache = _load_candidate_state(path)
+            _validate_orphan_tmp_boundary(
+                path,
+                committed_exists=committed_exists,
+            )
         except Exception as exc:
             _remember_and_raise_failure("load_live_state", path, exc)
         return copy.deepcopy(_state_cache)
@@ -419,9 +434,8 @@ def _write_state(state: Dict[str, Any]) -> None:
                 indent=2,
                 sort_keys=True,
             ).encode("utf-8")
-            _reject_orphan_tmp(state_path)
             os.makedirs(os.path.dirname(tmp), exist_ok=True)
-            with open(tmp, "xb") as state_file:
+            with open(tmp, "wb") as state_file:
                 state_file.write(payload)
                 state_file.flush()
                 os.fsync(state_file.fileno())
@@ -459,14 +473,22 @@ def init_live_runtime(runtime_dir: str) -> None:
     try:
         if os.path.exists(candidate_dir) and not os.path.isdir(candidate_dir):
             raise NotADirectoryError(candidate_dir)
-        _reject_orphan_tmp(g_path)
+        committed_g_exists = os.path.exists(g_path)
         candidate_g = _load_candidate_g(g_path)
+        _validate_orphan_tmp_boundary(
+            g_path,
+            committed_exists=committed_g_exists,
+        )
     except Exception as exc:
         _remember_and_raise_failure("load_g", g_path, exc)
 
     try:
-        _reject_orphan_tmp(state_path)
+        committed_state_exists = os.path.exists(state_path)
         candidate_state = _load_candidate_state(state_path)
+        _validate_orphan_tmp_boundary(
+            state_path,
+            committed_exists=committed_state_exists,
+        )
     except Exception as exc:
         _remember_and_raise_failure("load_live_state", state_path, exc)
 
@@ -505,8 +527,7 @@ def save_g() -> None:
                 getattr(g, "_data", {}),
                 protocol=pickle.HIGHEST_PROTOCOL,
             )
-            _reject_orphan_tmp(state_path)
-            with open(tmp, "xb") as state_file:
+            with open(tmp, "wb") as state_file:
                 state_file.write(payload)
                 state_file.flush()
                 os.fsync(state_file.fileno())
