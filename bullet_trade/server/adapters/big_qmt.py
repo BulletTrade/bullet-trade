@@ -90,6 +90,24 @@ _ORDER_STATUS_MAP = {
 }
 
 _ORDER_CONFIRM_POLL_INTERVAL_SECONDS = 0.25
+_ORDER_CONFIRM_MAX_CLOCK_SKEW_SECONDS = 60.0
+_CANCEL_CONFIRM_TIMEOUT_SECONDS = 3.0
+
+_BIG_QMT_MARKET_PRICE_TYPES = {
+    "XSHG": {
+        "opponent_best": 44,
+        "home_best": 45,
+        "five_level_ioc": 42,
+        "five_level_to_limit": 43,
+    },
+    "XSHE": {
+        "opponent_best": 44,
+        "home_best": 45,
+        "immediate_or_cancel": 46,
+        "five_level_ioc": 47,
+        "fill_or_kill": 48,
+    },
+}
 
 
 @dataclass
@@ -534,6 +552,7 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
         request.update(self._account_payload(account))
         _ensure_virtual_account_remark(request)
         _ensure_gateway_submission_identity(request)
+        _apply_big_qmt_market_price_type(request)
         submitted_at = time.time()
         wait_timeout = _positive_float((payload or {}).get("wait_timeout"))
         known_order_ids = set()
@@ -725,6 +744,101 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
         if "value" not in value and "success" in value:
             value["value"] = bool(value.get("success"))
         return dict_payload(value)
+
+    async def cancel_order_request(
+        self, account: AccountContext, payload: Dict[str, Any]
+    ) -> Dict[str, Any]:
+        """撤销一个精确订单，并短暂轮询该订单的柜台终态。
+
+        Args:
+            account: Server 已解析的真实账户上下文。
+            payload: 含精确 ``order_id`` 和幂等键的撤单请求。
+
+        Returns:
+            Dict[str, Any]: 已撤/部撤时返回成功，已成/已拒时返回明确失败；
+            等待窗口内没有终态时返回 ``submit_unknown``，绝不重复发送撤单。
+
+        Side Effects:
+            仅调用一次 BigQMT helper ``/cancel_order``，随后只读查询同一订单号。
+        """
+
+        request = dict(payload or {})
+        order_id = str(request.get("order_id") or "").strip()
+        if not order_id:
+            raise ValueError("缺少 order_id")
+        request.update(self._account_payload(account))
+        mark_broker_call_started(request)
+        data = await self.client.post("/cancel_order", request)
+        result = _extract_dict(data)
+        result.setdefault("order_id", order_id)
+        if result.get("success") is False or result.get("value") is False:
+            result.setdefault("status", "rejected")
+            result.setdefault("submission_state", "rejected")
+            result.setdefault("cancel_outcome", "rejected")
+            result["value"] = False
+            return result
+
+        deadline = time.monotonic() + _CANCEL_CONFIRM_TIMEOUT_SECONDS
+        last_snapshot: Optional[Dict[str, Any]] = None
+        while True:
+            try:
+                snapshot = await self.get_order_status(account, order_id)
+            except BigQmtGatewayError:
+                snapshot = {}
+            actual_order_id = str(snapshot.get("order_id") or "").strip()
+            if actual_order_id == order_id:
+                last_snapshot = snapshot
+                status = str(snapshot.get("status") or "").strip().lower()
+                if status in {
+                    "canceled",
+                    "cancelled",
+                    "partly_canceled",
+                    "partly_cancelled",
+                }:
+                    result.update(
+                        {
+                            "order_id": order_id,
+                            "status": status,
+                            "submission_state": status,
+                            "value": True,
+                            "success": True,
+                            "cancel_outcome": "cancelled",
+                            "last_snapshot": snapshot,
+                        }
+                    )
+                    return result
+                if status in {"filled", "rejected", "failed", "error"}:
+                    result.update(
+                        {
+                            "order_id": order_id,
+                            "status": status,
+                            "submission_state": status,
+                            "value": False,
+                            "success": False,
+                            "cancel_outcome": "not_canceled_already_terminal",
+                            "last_snapshot": snapshot,
+                        }
+                    )
+                    return result
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(
+                min(_ORDER_CONFIRM_POLL_INTERVAL_SECONDS, deadline - time.monotonic())
+            )
+
+        result.update(
+            {
+                "order_id": order_id,
+                "status": "submit_unknown",
+                "submission_state": "submit_unknown",
+                "submit_unknown": True,
+                "value": False,
+                "success": False,
+                "cancel_outcome": "unknown",
+                "last_snapshot": last_snapshot,
+            }
+        )
+        return result
 
     def _account_payload(self, account: AccountContext) -> Dict[str, Any]:
         return {
@@ -1091,6 +1205,85 @@ def _ensure_gateway_submission_identity(payload: Dict[str, Any]) -> None:
     payload["qmt_user_order_id"] = f"BT-{digest}"
 
 
+def _apply_big_qmt_market_price_type(payload: Dict[str, Any]) -> None:
+    """把公共沪深市价类型翻译为 BigQMT 原生 ``pr_type``。
+
+    Args:
+        payload: 即将发往 helper 的订单载荷；可含公共 ``style`` 和
+            ``market_type``，也可已经显式携带数字 ``pr_type``。
+
+    Returns:
+        None。
+
+    Raises:
+        ValueError: 市价类型不适用于当前沪深市场时抛出，避免静默退化成限价 11。
+
+    Side Effects:
+        仅在市价意图且尚无数字原生类型时原地写入 ``pr_type``。
+    """
+
+    style = payload.get("style")
+    style = style if isinstance(style, dict) else {}
+    if payload.get("pr_type") not in (None, "") or payload.get("prType") not in (None, ""):
+        return
+    if style.get("pr_type") not in (None, "") or style.get("prType") not in (None, ""):
+        return
+    style_type = str(style.get("type") or "").strip().lower()
+    market_type = str(style.get("market_type") or payload.get("market_type") or "").strip().lower()
+    if style_type not in {"market", *set(_all_big_qmt_market_types())} and not payload.get(
+        "market"
+    ):
+        return
+    if style_type in _all_big_qmt_market_types() and not market_type:
+        market_type = style_type
+    if not market_type:
+        market_type = "opponent_best"
+
+    security = str(
+        payload.get("security") or payload.get("stock") or payload.get("stockcode") or ""
+    ).strip()
+    exchange = _big_qmt_exchange_suffix(security)
+    pr_type = _BIG_QMT_MARKET_PRICE_TYPES.get(exchange, {}).get(market_type)
+    if pr_type is None:
+        raise ValueError(
+            "BigQMT 市价类型不适用于当前交易所: " f"security={security or '-'} market_type={market_type or '-'}"
+        )
+    payload["market_type"] = market_type
+    payload["pr_type"] = pr_type
+
+
+def _all_big_qmt_market_types() -> frozenset:
+    """返回 BigQMT 沪深映射支持的公共市价类型集合。
+
+    Returns:
+        frozenset: 沪深映射表中所有 canonical 市价类型。
+    """
+
+    return frozenset(
+        market_type
+        for exchange_types in _BIG_QMT_MARKET_PRICE_TYPES.values()
+        for market_type in exchange_types
+    )
+
+
+def _big_qmt_exchange_suffix(security: str) -> str:
+    """把常用沪深证券后缀规范为 BigQMT 映射键。
+
+    Args:
+        security: 带 ``XSHG/XSHE``、``SH/SZ`` 或 ``SSE/SZSE`` 后缀的证券代码。
+
+    Returns:
+        str: ``XSHG``、``XSHE`` 或无法识别时的空字符串。
+    """
+
+    suffix = str(security or "").rsplit(".", 1)[-1].upper()
+    if suffix in {"XSHG", "SH", "SSE"}:
+        return "XSHG"
+    if suffix in {"XSHE", "SZ", "SZSE"}:
+        return "XSHE"
+    return ""
+
+
 def _positive_float(value: Any) -> float:
     try:
         parsed = float(value)
@@ -1205,7 +1398,7 @@ def _order_has_safe_submission_time(order: Dict[str, Any], submitted_at: Optiona
         submitted_at: 请求发送前的 wall-clock 时间戳。
 
     Returns:
-        bool: 找到可解析订单时间且它不早于请求前五秒时返回 True。
+        bool: 找到可解析订单时间，且它没有早于请求前允许的 QMT 时钟偏差时返回 True。
     """
 
     if submitted_at is None:
@@ -1214,7 +1407,7 @@ def _order_has_safe_submission_time(order: Dict[str, Any], submitted_at: Optiona
         value = order.get(key)
         parsed = _parse_order_timestamp(value)
         if parsed is not None:
-            return parsed >= submitted_at - 5.0
+            return parsed >= submitted_at - _ORDER_CONFIRM_MAX_CLOCK_SKEW_SECONDS
     return False
 
 
@@ -1247,6 +1440,16 @@ def _parse_order_timestamp(value: Any) -> Optional[float]:
 
 
 def _order_matches_place_request(order: Dict[str, Any], request: Dict[str, Any]) -> bool:
+    """核对订单的证券、方向、数量和限价经济字段。
+
+    Args:
+        order: 已通过强订单标识和新订单号检查的柜台订单。
+        request: 原始 BigQMT 下单请求。
+
+    Returns:
+        bool: 核心经济字段一致时返回 True；市价保护价不与柜台生成价强行比较。
+    """
+
     security = request.get("security") or request.get("stock") or request.get("stockcode")
     if security and order.get("security") != security:
         return False
@@ -1261,34 +1464,41 @@ def _order_matches_place_request(order: Dict[str, Any], request: Dict[str, Any])
                 return False
         except (TypeError, ValueError):
             return False
-    price = _request_order_price(request)
-    order_price = order.get("order_price")
-    if order_price in (None, ""):
-        order_price = order.get("price")
-    if price not in (None, "") and order_price not in (None, "", 0, 0.0):
-        if not _float_close(order_price, price):
-            return False
-    sub_account_id = _virtual_account_id(request)
-    if sub_account_id:
-        row_sub = str(order.get("sub_account_id") or order.get("virtual_account_id") or "")
-        if row_sub != sub_account_id and not _remark_matches_virtual_account(
-            order.get("order_remark") or order.get("remark"),
-            sub_account_id,
-        ):
-            return False
-    remark = request.get("order_remark") or request.get("remark")
-    if remark and not (
-        order.get("order_remark") == remark
-        or order.get("remark") == remark
-        or (
-            bool(sub_account_id)
-            and _remark_matches_virtual_account(
-                order.get("order_remark") or order.get("remark"), sub_account_id
-            )
-        )
-    ):
-        return False
+    if not _request_is_market_order(request):
+        price = _request_order_price(request)
+        order_price = order.get("order_price")
+        if order_price in (None, ""):
+            order_price = order.get("price")
+        if price not in (None, "") and order_price not in (None, "", 0, 0.0):
+            if not _float_close(order_price, price):
+                return False
     return True
+
+
+def _request_is_market_order(request: Dict[str, Any]) -> bool:
+    """判断请求是否表达公共或原生市价意图。
+
+    Args:
+        request: 原始下单请求。
+
+    Returns:
+        bool: style、market 标记或原生非 11 价格类型表明市价意图时返回 True。
+    """
+
+    style = request.get("style")
+    style = style if isinstance(style, dict) else {}
+    style_type = str(style.get("type") or "").strip().lower()
+    if style_type == "market" or style_type in _all_big_qmt_market_types():
+        return True
+    if bool(request.get("market")):
+        return True
+    pr_type = request.get("pr_type")
+    if pr_type in (None, ""):
+        pr_type = request.get("prType")
+    try:
+        return pr_type not in (None, "") and int(pr_type) != 11
+    except (TypeError, ValueError):
+        return False
 
 
 def _submission_unknown_order(order: Dict[str, Any], warning: str) -> Dict[str, Any]:
@@ -1377,10 +1587,22 @@ def _normalize_position(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _normalize_order(row: Dict[str, Any]) -> Dict[str, Any]:
+    """规范化 BigQMT 委托字段，并提升真机 raw 中的方向和委托时间。
+
+    Args:
+        row: helper 返回的订单字典，可包含嵌套 ``raw`` 原始字段。
+
+    Returns:
+        Dict[str, Any]: 可用于订单确认、撤单确认和公共查询的规范订单。
+    """
+
     item = dict(row)
+    raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
     raw_status = item.get("raw_status")
     if raw_status is None:
-        raw_status = item.get("m_nOrderStatus") or item.get("order_status")
+        raw_status = (
+            item.get("m_nOrderStatus") or item.get("order_status") or raw.get("m_nOrderStatus")
+        )
     raw_int = _to_int(raw_status)
     if raw_int is not None:
         item["raw_status"] = raw_int
@@ -1396,9 +1618,31 @@ def _normalize_order(row: Dict[str, Any]) -> Dict[str, Any]:
     item.setdefault("filled", item.get("traded") or item.get("m_nTradedVolume"))
     item.setdefault("amount", item.get("volume") or item.get("m_nVolume"))
     item.setdefault("price", item.get("order_price") or item.get("m_dLimitPrice"))
+    side = _normalize_big_qmt_order_side(
+        item.get("side") or item.get("direction") or item.get("m_nOpType") or raw.get("m_nOpType")
+    )
+    if side:
+        item["side"] = side
+        item.setdefault("direction", side)
+    order_time = _big_qmt_order_timestamp(item, raw)
+    if order_time is not None:
+        item.setdefault("order_time", order_time)
+    qmt_user_order_id = (
+        item.get("qmt_user_order_id")
+        or item.get("m_strUserOrderId")
+        or raw.get("qmt_user_order_id")
+        or raw.get("m_strUserOrderId")
+        or raw.get("m_strRemark")
+    )
+    if qmt_user_order_id:
+        item.setdefault("qmt_user_order_id", qmt_user_order_id)
     item.setdefault(
         "order_remark",
-        item.get("remark") or item.get("m_strRemark") or item.get("m_strUserOrderId"),
+        item.get("remark")
+        or item.get("m_strRemark")
+        or item.get("m_strUserOrderId")
+        or raw.get("m_strRemark")
+        or raw.get("m_strUserOrderId"),
     )
     if item.get("order_remark") and "remark" not in item:
         item["remark"] = item.get("order_remark")
@@ -1411,6 +1655,54 @@ def _normalize_order(row: Dict[str, Any]) -> Dict[str, Any]:
         item.setdefault("sub_account_id", sub_account_id)
         item.setdefault("virtual_account_id", sub_account_id)
     return item
+
+
+def _normalize_big_qmt_order_side(value: Any) -> str:
+    """把 QMT 操作类型或文本方向规范为 BUY/SELL。
+
+    Args:
+        value: ``m_nOpType`` 数字或买卖方向文本。
+
+    Returns:
+        str: ``BUY``、``SELL`` 或无法识别时的空字符串。
+    """
+
+    text = str(value or "").strip().upper()
+    if text in {"23", "BUY", "B", "买", "买入"}:
+        return "BUY"
+    if text in {"24", "SELL", "S", "卖", "卖出"}:
+        return "SELL"
+    return ""
+
+
+def _big_qmt_order_timestamp(item: Dict[str, Any], raw: Dict[str, Any]) -> Optional[float]:
+    """从顶层或 raw 的 QMT 日期时间字段解析委托时间。
+
+    Args:
+        item: helper 的规范字段候选。
+        raw: helper 保留的 QMT 原始订单字段。
+
+    Returns:
+        Optional[float]: 本地时区 Unix 秒；缺失或格式无效时为 None。
+    """
+
+    for source in (item, raw):
+        date_value = source.get("m_strInsertDate") or source.get("insert_date")
+        time_value = source.get("m_strInsertTime") or source.get("insert_time")
+        if date_value not in (None, "") and time_value not in (None, ""):
+            date_text = "".join(char for char in str(date_value) if char.isdigit())[:8]
+            time_text = "".join(char for char in str(time_value) if char.isdigit())[:6]
+            if len(date_text) == 8 and len(time_text) == 6:
+                try:
+                    return datetime.strptime(date_text + time_text, "%Y%m%d%H%M%S").timestamp()
+                except ValueError:
+                    pass
+    for source in (item, raw):
+        for key in ("order_time", "datetime", "time"):
+            parsed = _parse_order_timestamp(source.get(key))
+            if parsed is not None:
+                return parsed
+    return None
 
 
 def _normalize_trade(row: Dict[str, Any]) -> Dict[str, Any]:

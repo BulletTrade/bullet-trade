@@ -934,3 +934,201 @@ async def test_big_qmt_confirmation_rejects_reverse_order_with_same_economic_fie
 
     assert order["status"] == "submit_unknown"
     assert submission_identity["value"].startswith("BT-")
+
+
+@pytest.mark.asyncio
+async def test_big_qmt_place_order_confirms_live_gateway_raw_order_shape():
+    """验证真机 raw 方向、时间和强订单标识足以确认实际订单号。
+
+    Returns:
+        None。
+    """
+
+    calls = 0
+    submission_identity = {"value": ""}
+
+    def _place(payload):
+        """记录 sidecar 实际收到的强订单标识。
+
+        Args:
+            payload: adapter 发给 BigQMT helper 的下单载荷。
+
+        Returns:
+            dict: 模拟 passorder 未同步返回订单号的响应。
+        """
+
+        submission_identity["value"] = payload["qmt_user_order_id"]
+        return {"order_id": "", "passorder_return": 0}
+
+    def _orders(_payload):
+        """先返回下单前快照，再返回真机字段形态的新订单。
+
+        Args:
+            _payload: 订单查询过滤条件，本测试不使用。
+
+        Returns:
+            dict: helper 的订单列表响应。
+        """
+
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return {"orders": []}
+        return {
+            "orders": [
+                {
+                    "order_id": "5236",
+                    "security": "511880.XSHG",
+                    "amount": 100,
+                    "filled": 100,
+                    "order_price": 110.836,
+                    "raw_status": 56,
+                    "order_remark": submission_identity["value"],
+                    "qmt_user_order_id": submission_identity["value"],
+                    "raw": {
+                        "m_nOpType": 23,
+                        "m_strInsertDate": time.strftime("%Y%m%d"),
+                        "m_strInsertTime": time.strftime("%H%M%S"),
+                        "m_strRemark": submission_identity["value"],
+                    },
+                }
+            ]
+        }
+
+    client = _FakeGatewayClient({"/place_order": _place, "/orders": _orders})
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    adapter = BigQmtBrokerAdapter(config, router, client)
+
+    order = await adapter.place_order(
+        router.get("default"),
+        {
+            "security": "511880.XSHG",
+            "side": "BUY",
+            "amount": 100,
+            "style": {"type": "market", "protect_price": 120.0},
+            "market_type": "opponent_best",
+            "order_remark": "strategy-business-remark",
+            "idempotency_key": "live-shape-confirmation",
+            "wait_timeout": 0.05,
+        },
+    )
+
+    assert order["order_id"] == "5236"
+    assert order["status"] == "filled"
+    assert order["side"] == "BUY"
+    assert client.calls[1][2]["pr_type"] == 44
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("security", "market_type", "expected_pr_type"),
+    [
+        ("511880.XSHG", None, 44),
+        ("511880.XSHG", "opponent_best", 44),
+        ("511880.XSHG", "home_best", 45),
+        ("511880.XSHG", "five_level_ioc", 42),
+        ("511880.XSHG", "five_level_to_limit", 43),
+        ("159001.XSHE", None, 44),
+        ("159001.XSHE", "opponent_best", 44),
+        ("159001.XSHE", "home_best", 45),
+        ("159001.XSHE", "immediate_or_cancel", 46),
+        ("159001.XSHE", "five_level_ioc", 47),
+        ("159001.XSHE", "fill_or_kill", 48),
+    ],
+)
+async def test_big_qmt_maps_canonical_market_type_to_native_pr_type(
+    security, market_type, expected_pr_type
+):
+    """验证沪深公共市价类型映射为已真机验证的 BigQMT pr_type。
+
+    Args:
+        security: 带交易所后缀的证券代码。
+        market_type: 公共 canonical 市价类型。
+        expected_pr_type: BigQMT 原生价格类型。
+
+    Returns:
+        None。
+    """
+
+    client = _FakeGatewayClient({"/place_order": {"order_id": "", "passorder_return": 0}})
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    adapter = BigQmtBrokerAdapter(config, router, client)
+
+    await adapter.place_order(
+        router.get("default"),
+        {
+            "security": security,
+            "side": "BUY",
+            "amount": 100,
+            "style": {"type": "market", "protect_price": 100.0},
+            **({"market_type": market_type} if market_type else {}),
+        },
+    )
+
+    assert client.calls[0][2]["pr_type"] == expected_pr_type
+
+
+@pytest.mark.asyncio
+async def test_big_qmt_preserves_explicit_native_pr_type():
+    """验证调用方显式传入的原生 pr_type 不会被公共映射覆盖。
+
+    Returns:
+        None。
+    """
+
+    client = _FakeGatewayClient({"/place_order": {"order_id": "", "passorder_return": 0}})
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    adapter = BigQmtBrokerAdapter(config, router, client)
+
+    await adapter.place_order(
+        router.get("default"),
+        {
+            "security": "511880.XSHG",
+            "side": "BUY",
+            "amount": 100,
+            "style": {"type": "market", "protect_price": 100.0},
+            "market_type": "opponent_best",
+            "pr_type": 5,
+        },
+    )
+
+    assert client.calls[0][2]["pr_type"] == 5
+
+
+@pytest.mark.asyncio
+async def test_big_qmt_cancel_request_confirms_exact_order_terminal_status():
+    """验证撤单只发送一次，并以精确订单号的已撤状态收口。
+
+    Returns:
+        None。
+    """
+
+    client = _FakeGatewayClient(
+        {
+            "/cancel_order": {"order_id": "6128", "success": True},
+            "/order_status": {
+                "order_id": "6128",
+                "security": "511880.XSHG",
+                "raw_status": 54,
+                "amount": 100,
+                "filled": 0,
+            },
+        }
+    )
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    adapter = BigQmtBrokerAdapter(config, router, client)
+
+    result = await adapter.cancel_order_request(
+        router.get("default"),
+        {"order_id": "6128", "idempotency_key": "cancel-exact-6128"},
+    )
+
+    assert result["order_id"] == "6128"
+    assert result["status"] == "partly_canceled"
+    assert result["value"] is True
+    assert result["last_snapshot"]["raw_status"] == 54
+    assert [path for _, path, _ in client.calls].count("/cancel_order") == 1
