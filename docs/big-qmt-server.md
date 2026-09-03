@@ -118,7 +118,17 @@ bullet-trade --env-file .env.bigqmt server --server-type big_qmt --listen 127.0.
 bullet-trade --env-file .env.bigqmt server --server-type big_qmt --listen 0.0.0.0
 ```
 
-端口、网关地址、超时和数据/交易模块都有默认值，不需要写进首次配置。聚宽路线只开放 `58620`，不要开放 `9000`；公网使用时建议再配合 VPN、IP 白名单或 TLS。
+端口、网关地址、超时和数据/交易模块都有默认值，不需要写进首次配置。聚宽路线只开放 `58620`，不要开放 `9000`。
+
+!!! danger "不要把 58620 作为裸 TCP 直接暴露到公网"
+    跨互联网访问时应使用 VPN、加密隧道，或正确配置 TLS 与 IP 白名单。`QMT_SERVER_TOKEN` 只负责身份校验，不能代替传输加密。
+
+### 从 0.10.0 Beta 1 升级
+
+- 升级运行 BulletTrade server 的 Python 包或源码并重启 server。
+- 聚宽运行策略需要重新上传本版 `helpers/bullet_trade_jq_remote_helper.py`，以获得 `data.history` 的 180 秒默认等待窗口。
+- 大 QMT 中运行的 `helpers/big_qmt_gateway_strategy_sample.py` 本批没有变化，不需要仅为本次升级重新复制或重启网关策略。
+- 本地运行策略直接使用升级后的 `qmt-remote` 客户端，不需要额外增加超时配置。
 
 <a id="joinquant-route"></a>
 

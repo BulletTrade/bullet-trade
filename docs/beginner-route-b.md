@@ -26,7 +26,7 @@
 bullet-trade --env-file .env.bigqmt server --server-type big_qmt --listen 0.0.0.0
 ```
 
-只对外开放 `58620`，不要开放大 QMT 内部的 `9000`。公网接入建议配合 VPN、IP 白名单或 TLS。
+只对外开放 `58620`，不要开放大 QMT 内部的 `9000`。不要把 `58620` 作为裸 TCP 直接暴露到公网；跨互联网访问应使用 VPN、加密隧道，或正确配置 TLS 与 IP 白名单。
 
 ## 2. 上传一个 helper
 
