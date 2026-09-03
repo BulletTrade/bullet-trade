@@ -119,11 +119,13 @@ class _FakeGatewayClient:
     def __init__(self, responses, config=None):
         self.responses = responses
         self.calls = []
+        self.timeouts = []
         self.config = config or BigQmtGatewayConfig()
         self.last_health = None
 
-    async def post(self, path, payload=None):
+    async def post(self, path, payload=None, *, timeout_seconds=None):
         self.calls.append(("POST", path, payload or {}))
+        self.timeouts.append((path, timeout_seconds))
         value = self.responses[path]
         if isinstance(value, Exception):
             raise value
@@ -297,6 +299,7 @@ async def test_big_qmt_data_adapter_normalizes_gateway_payloads():
     assert history["dtype"] == "dataframe"
     assert history["columns"] == ["open", "close"]
     assert history["records"] == [[1.0, 2.0]]
+    assert client.timeouts[0] == ("/data/history", 120.0)
 
     snapshot = await adapter.get_snapshot({"security": "000001.XSHE"})
     assert snapshot["sid"] == "000001.XSHE"

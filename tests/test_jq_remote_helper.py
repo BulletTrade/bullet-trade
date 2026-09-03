@@ -4,6 +4,31 @@ from helpers import bullet_trade_jq_remote_helper as helper
 from tests.test_remote_server import stub_server  # 复用 stub server fixture
 
 
+def test_short_lived_client_uses_long_default_only_for_history():
+    """历史行情默认等待更久，普通动作和显式超时保持原语义。"""
+
+    client = helper._ShortLivedClient(
+        "127.0.0.1",
+        58620,
+        "token",
+        retries=0,
+        rpc_timeout=60,
+    )
+
+    assert client._resolve_request_timeout("broker.account", None) == 60.0
+    assert client._resolve_request_timeout("data.history", None) == 180.0
+    assert client._resolve_request_timeout("data.history", 45) == 45.0
+
+    slow_client = helper._ShortLivedClient(
+        "127.0.0.1",
+        58620,
+        "token",
+        retries=0,
+        rpc_timeout=240,
+    )
+    assert slow_client._resolve_request_timeout("data.history", None) == 240.0
+
+
 class _RecordingClient:
     def __init__(self):
         self.requests = []

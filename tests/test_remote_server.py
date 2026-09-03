@@ -193,8 +193,8 @@ def test_remote_connection_default_timeout_applies_while_reconnecting(monkeypatc
     assert background_future.cancelled()
 
 
-def test_remote_connection_explicit_none_timeout_keeps_legacy_wait(monkeypatch):
-    """显式 timeout=None 时保留旧版无限等待语义，省略参数才用默认保护窗口。"""
+def test_remote_connection_uses_action_default_and_keeps_explicit_timeout(monkeypatch):
+    """历史请求使用长默认值，显式超时和旧版无限等待语义保持不变。"""
 
     class _RecordedFuture:
         def __init__(self):
@@ -220,9 +220,11 @@ def test_remote_connection_explicit_none_timeout_keeps_legacy_wait(monkeypatch):
     monkeypatch.setattr(asyncio, "run_coroutine_threadsafe", _run_coroutine_threadsafe)
 
     assert conn.request("broker.account", {}) == {"ok": True}
+    assert conn.request("data.history", {}) == {"ok": True}
     assert conn.request("broker.account", {}, timeout=None) == {"ok": True}
+    assert conn.request("data.history", {}, timeout=45) == {"ok": True}
 
-    assert recorded_future.timeouts == [60, None]
+    assert recorded_future.timeouts == [60, 180.0, None, 45]
 
 
 def test_remote_connection_classifies_concrete_write_actions():
@@ -689,6 +691,7 @@ def test_server_session_extends_place_order_timeout_for_long_wait():
     session = ClientSession.__new__(ClientSession)
 
     assert session._request_timeout_for("broker.account", {}) == 60.0
+    assert session._request_timeout_for("data.history", {}) == 150.0
     assert session._request_timeout_for("broker.place_order", {"wait_timeout": 16}) == 60.0
     assert session._request_timeout_for("broker.place_order", {"wait_timeout": 90}) == 120.0
     assert session._request_timeout_for("broker.place_order", {"wait_timeout": "bad"}) == 60.0
@@ -702,6 +705,7 @@ def test_server_session_request_timeout_can_be_configured(monkeypatch):
 
     assert session._request_timeout_for("broker.account", {}) == 130.0
     assert session._request_timeout_for("data.get_index_stocks", {}) == 130.0
+    assert session._request_timeout_for("data.history", {}) == 150.0
     assert session._request_timeout_for("broker.place_order", {"wait_timeout": 90}) == 130.0
 
 
@@ -713,6 +717,7 @@ def test_server_session_request_timeout_ignores_invalid_env(monkeypatch):
     monkeypatch.setenv("QMT_SERVER_REQUEST_TIMEOUT", "-1")
 
     assert session._request_timeout_for("broker.account", {}) == 60.0
+    assert session._request_timeout_for("data.history", {}) == 150.0
 
 
 def test_server_session_treats_winerror64_as_expected_disconnect():
