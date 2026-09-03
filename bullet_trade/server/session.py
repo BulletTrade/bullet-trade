@@ -22,6 +22,7 @@ class ClientSession:
 
     # 请求超时时间（秒），超过此时间未完成的请求会被取消
     REQUEST_TIMEOUT = 60.0
+    HISTORY_REQUEST_TIMEOUT = 150.0
     PLACE_ORDER_TIMEOUT_MARGIN = 30.0
     REQUEST_TIMEOUT_ENV = ("QMT_SERVER_REQUEST_TIMEOUT_SECONDS", "QMT_SERVER_REQUEST_TIMEOUT")
     PLACE_ORDER_TIMEOUT_MARGIN_ENV = (
@@ -233,12 +234,15 @@ class ClientSession:
             float: session 外层 `asyncio.wait_for` 使用的超时秒数。
 
         业务原因:
-            `broker.place_order` 可能显式传入较长 `wait_timeout` 等待订单终态。
-            session 外层超时必须不小于该业务等待窗口加安全余量，否则会在
-            broker adapter 返回 `open/timed_out` 之前先返回 REQUEST_TIMEOUT。
+            `data.history` 在大 QMT 中会先下载再读取，默认需要比普通查询更长
+            的等待窗口。`broker.place_order` 可能显式传入较长 `wait_timeout`
+            等待订单终态；session 外层超时必须不小于该业务等待窗口加安全
+            余量，否则会在 adapter 返回前先产生 REQUEST_TIMEOUT。
         """
 
         timeout = self._positive_env_float(self.REQUEST_TIMEOUT_ENV, self.REQUEST_TIMEOUT)
+        if str(action or "") == "data.history":
+            return max(timeout, self.HISTORY_REQUEST_TIMEOUT)
         if str(action or "") != "broker.place_order":
             return timeout
         try:

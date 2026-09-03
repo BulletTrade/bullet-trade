@@ -93,6 +93,7 @@ _ORDER_CONFIRM_POLL_INTERVAL_SECONDS = 0.25
 _ORDER_CONFIRM_MAX_CLOCK_SKEW_SECONDS = 60.0
 _CANCEL_CONFIRM_TIMEOUT_SECONDS = 3.0
 _QMT_USER_ORDER_ID_MAX_LENGTH = 23
+_BIG_QMT_HISTORY_TIMEOUT_SECONDS = 120.0
 
 _BIG_QMT_MARKET_PRICE_TYPES = {
     "XSHG": {
@@ -199,8 +200,31 @@ class BigQmtGatewayClient:
     async def get(self, path: str) -> Any:
         return await self._run_blocking(self.request_json, path, None, "GET")
 
-    async def post(self, path: str, payload: Optional[Dict[str, Any]] = None) -> Any:
-        return await self._run_blocking(self.request_json, path, payload or {}, "POST")
+    async def post(
+        self,
+        path: str,
+        payload: Optional[Dict[str, Any]] = None,
+        *,
+        timeout_seconds: Optional[float] = None,
+    ) -> Any:
+        """提交一个大 QMT 网关请求，并允许慢接口使用独立超时。
+
+        Args:
+            path: 网关相对路径。
+            payload: JSON 请求载荷。
+            timeout_seconds: 本次请求超时；为空时使用普通网关默认值。
+
+        Returns:
+            Any: 解包后的网关响应。
+        """
+
+        return await self._run_blocking(
+            self.request_json,
+            path,
+            payload or {},
+            "POST",
+            timeout_seconds,
+        )
 
     async def post_first(
         self, paths: Iterable[str], payload: Optional[Dict[str, Any]] = None
@@ -230,8 +254,28 @@ class BigQmtGatewayClient:
         path: str,
         payload: Optional[Dict[str, Any]],
         method: str,
+        timeout_seconds: Optional[float] = None,
     ) -> Any:
+        """同步调用内部 HTTP/JSON 网关并解析结构化响应。
+
+        Args:
+            path: 网关相对路径。
+            payload: JSON 请求载荷。
+            method: HTTP 方法。
+            timeout_seconds: 本次调用超时；为空时使用配置默认值。
+
+        Returns:
+            Any: 解包后的网关响应。
+
+        Raises:
+            BigQmtGatewayError: HTTP、网络、超时或响应格式不正确时抛出。
+        """
+
         url = self._url(path)
+        effective_timeout = max(
+            0.1,
+            float(self.config.timeout_seconds if timeout_seconds is None else timeout_seconds),
+        )
         body = None
         headers = {
             "Accept": "application/json",
@@ -248,7 +292,7 @@ class BigQmtGatewayClient:
 
         req = urllib.request.Request(url, data=body, headers=headers, method=method)
         try:
-            with urllib.request.urlopen(req, timeout=self.config.timeout_seconds) as resp:
+            with urllib.request.urlopen(req, timeout=effective_timeout) as resp:
                 raw = resp.read()
         except urllib.error.HTTPError as exc:
             self._record_failure(str(exc))
@@ -262,7 +306,7 @@ class BigQmtGatewayClient:
         except TimeoutError as exc:
             self._record_failure("timeout")
             raise BigQmtGatewayError(
-                f"big QMT gateway 请求超时（>{self.config.timeout_seconds}s）",
+                f"big QMT gateway 请求超时（>{effective_timeout}s）",
                 code="BIG_QMT_GATEWAY_TIMEOUT",
             ) from exc
 
@@ -402,7 +446,23 @@ class BigQmtDataAdapter(RemoteDataAdapter):
             pass
 
     async def get_history(self, payload: Dict) -> Dict:
-        data = await self.client.post("/data/history", payload)
+        """下载并读取大 QMT 历史行情。
+
+        Args:
+            payload: 历史行情请求参数。
+
+        Returns:
+            Dict: qmt-remote 兼容的 DataFrame 包装。
+        """
+
+        data = await self.client.post(
+            "/data/history",
+            payload,
+            timeout_seconds=max(
+                self.client.config.timeout_seconds,
+                _BIG_QMT_HISTORY_TIMEOUT_SECONDS,
+            ),
+        )
         return _as_dataframe_payload(data)
 
     async def get_snapshot(self, payload: Dict) -> Dict:

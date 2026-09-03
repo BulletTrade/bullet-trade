@@ -22,6 +22,7 @@ from bullet_trade.core.globals import log
 from bullet_trade.server.protocol import ProtocolError, encode_message, read_message
 
 _REQUEST_TIMEOUT_DEFAULT = object()
+_HISTORY_REQUEST_TIMEOUT_SECONDS = 180.0
 _INSTALL_SOURCE_SNAPSHOT_ACTION = "broker.install_source_snapshot"
 _AMBIGUOUS_WRITE_ACTIONS = frozenset({"broker.place_order", "broker.cancel_order"})
 _IDEMPOTENT_TRANSITION_ACTIONS = frozenset(
@@ -204,8 +205,9 @@ class RemoteQmtConnection:
         Args:
             action: 远程 action 名称，例如 `broker.place_order`。
             payload: 请求 payload；为空时使用空字典。
-            timeout: 本次请求超时秒数。省略参数时使用连接默认 `request_timeout`；
-                显式传入 `None` 时保留旧版无限等待语义。
+            timeout: 本次请求超时秒数。省略参数时普通请求使用连接默认
+                `request_timeout`，`data.history` 至少等待 180 秒；显式传入
+                `None` 时保留旧版无限等待语义。
 
         Returns:
             Dict: 远程服务返回的响应字典。
@@ -220,7 +222,15 @@ class RemoteQmtConnection:
         prepared_payload = self._prepare_request_payload(action, payload or {})
         coro = self._request_async(action, prepared_payload)
         future = asyncio.run_coroutine_threadsafe(coro, self._loop)
-        effective_timeout = self.request_timeout if timeout is _REQUEST_TIMEOUT_DEFAULT else timeout
+        if timeout is _REQUEST_TIMEOUT_DEFAULT:
+            effective_timeout = self.request_timeout
+            if str(action or "") == "data.history":
+                effective_timeout = max(
+                    effective_timeout,
+                    _HISTORY_REQUEST_TIMEOUT_SECONDS,
+                )
+        else:
+            effective_timeout = timeout
         try:
             return future.result(timeout=effective_timeout)
         except concurrent.futures.TimeoutError as exc:

@@ -42,6 +42,7 @@ _BROKER_CLIENT: Optional["RemoteBrokerClient"] = None
 _DEBUG: bool = True
 HELPER_PROTOCOL_VERSION: int = 1
 DEFAULT_RPC_TIMEOUT_SECONDS: float = 60.0
+DEFAULT_HISTORY_RPC_TIMEOUT_SECONDS: float = 180.0
 DEFAULT_PLACE_ORDER_TIMEOUT_MARGIN_SECONDS: float = 30.0
 DEFAULT_JQ_COMPAT_WAIT_TIMEOUT_SECONDS: float = 16.0
 
@@ -1123,6 +1124,32 @@ class _ShortLivedClient:
         self.retry_interval = max(0.1, float(retry_interval))
         self.rpc_timeout = max(5.0, float(rpc_timeout))
 
+    def _resolve_request_timeout(
+        self,
+        action: str,
+        timeout: Optional[float],
+    ) -> float:
+        """计算一次短连接 RPC 请求的实际超时。
+
+        Args:
+            action: RPC 动作名称。
+            timeout: 调用方显式指定的超时；为空时使用动作默认值。
+
+        Returns:
+            实际使用的超时秒数，且不会小于 5 秒。
+        """
+
+        if timeout is None:
+            effective_timeout = self.rpc_timeout
+            if action == "data.history":
+                effective_timeout = max(
+                    effective_timeout,
+                    DEFAULT_HISTORY_RPC_TIMEOUT_SECONDS,
+                )
+        else:
+            effective_timeout = float(timeout)
+        return max(5.0, effective_timeout)
+
     def request(
         self,
         action: str,
@@ -1135,7 +1162,8 @@ class _ShortLivedClient:
         Args:
             action: RPC 动作名称，如 "broker.place_order"
             payload: 请求载荷
-            timeout: 本次请求超时；不传时使用客户端默认 rpc_timeout
+            timeout: 本次请求超时；不传时普通请求使用客户端默认 rpc_timeout，
+                data.history 至少等待 180 秒。
             
         Returns:
             响应字典
@@ -1143,7 +1171,7 @@ class _ShortLivedClient:
         Raises:
             RuntimeError: 所有重试都失败后抛出最后一个异常
         """
-        effective_timeout = max(5.0, float(timeout or self.rpc_timeout))
+        effective_timeout = self._resolve_request_timeout(action, timeout)
         last_error: Optional[Exception] = None
         attempts = self.retries + 1
         request_start_time = time.time()
