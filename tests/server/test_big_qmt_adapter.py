@@ -13,6 +13,7 @@ from bullet_trade.server.adapters.big_qmt import (
     BigQmtGatewayConfig,
     BigQmtGatewayError,
     _normalize_position,
+    _normalize_trade,
     build_big_qmt_bundle,
 )
 from bullet_trade.server.app import ServerApplication
@@ -78,6 +79,30 @@ def test_big_qmt_gateway_stable_pre_passorder_error_implies_not_called() -> None
         )
 
     assert raised.value.broker_called is False
+
+
+def test_big_qmt_trade_promotes_native_trade_datetime() -> None:
+    """真机成交日期和时间必须进入统一成交时间字段。
+
+    Returns:
+        None: 三个公共时间别名均保留真实成交时刻时通过。
+    """
+
+    trade = _normalize_trade(
+        {
+            "trade_id": "trade-9968",
+            "order_id": "9968",
+            "raw": {
+                "m_strTradeDate": "20260902",
+                "m_strTradeTime": "140101",
+            },
+        }
+    )
+
+    expected = "2026-09-02 14:01:01"
+    assert trade["trade_time"] == expected
+    assert trade["traded_time"] == expected
+    assert trade["time"] == expected
 
 
 class _FakeGatewayClient:

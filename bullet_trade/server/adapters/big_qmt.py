@@ -1710,8 +1710,44 @@ def _big_qmt_order_timestamp(item: Dict[str, Any], raw: Dict[str, Any]) -> Optio
     return None
 
 
+def _big_qmt_trade_datetime(item: Dict[str, Any], raw: Dict[str, Any]) -> str:
+    """从顶层或 raw 的 QMT 日期时间字段解析成交时间。
+
+    Args:
+        item: helper 的规范字段候选。
+        raw: helper 保留的 QMT 原始成交字段。
+
+    Returns:
+        str: ``YYYY-MM-DD HH:MM:SS``；缺失或格式无效时为空字符串。
+    """
+
+    for source in (item, raw):
+        date_value = source.get("m_strTradeDate") or source.get("trade_date")
+        time_value = source.get("m_strTradeTime") or source.get("trade_time")
+        if date_value not in (None, "") and time_value not in (None, ""):
+            date_text = "".join(char for char in str(date_value) if char.isdigit())[:8]
+            time_text = "".join(char for char in str(time_value) if char.isdigit())[:6]
+            if len(date_text) == 8 and len(time_text) == 6:
+                try:
+                    parsed = datetime.strptime(date_text + time_text, "%Y%m%d%H%M%S")
+                except ValueError:
+                    continue
+                return parsed.strftime("%Y-%m-%d %H:%M:%S")
+    return ""
+
+
 def _normalize_trade(row: Dict[str, Any]) -> Dict[str, Any]:
+    """规范化 BigQMT 成交字段，并提升真机 raw 中的成交时间。
+
+    Args:
+        row: helper 返回的成交字典，可包含嵌套 ``raw`` 原始字段。
+
+    Returns:
+        Dict[str, Any]: 可用于公共成交查询和 V2 账本同步的规范成交。
+    """
+
     item = dict(row)
+    raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
     if "security" not in item:
         security = _security_from_qmt_fields(item)
         if security:
@@ -1720,6 +1756,11 @@ def _normalize_trade(row: Dict[str, Any]) -> Dict[str, Any]:
     item.setdefault("order_id", item.get("m_strOrderSysID") or item.get("order_sys_id"))
     item.setdefault("amount", item.get("volume") or item.get("m_nVolume"))
     item.setdefault("price", item.get("trade_price") or item.get("m_dTradePrice"))
+    trade_time = _big_qmt_trade_datetime(item, raw)
+    if trade_time:
+        item["trade_time"] = trade_time
+        item.setdefault("traded_time", trade_time)
+        item.setdefault("time", trade_time)
     item.setdefault(
         "order_remark",
         item.get("remark") or item.get("m_strRemark") or item.get("m_strUserOrderId"),
