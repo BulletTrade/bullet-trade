@@ -5,7 +5,7 @@
 
 ## [未发布]
 
-## [0.10.0b1] - 2026-09-02
+## [0.10.0b1] - 2026-09-03
 
 ### 新增
 - **华鑫 TORA 接入 Beta**：在同一 `bullet-trade` distribution 中加入第一方 Trader adapter、C ABI、自研 C++ bridge 源码、显式 `huaxin build/doctor`、Server adapter 与 Python 3.7 XMD Level 1 sidecar；厂商 SDK、头文件、动态库、文档、凭据和真实配置始终由用户从外部提供，不进入 Git 或 PyPI。
