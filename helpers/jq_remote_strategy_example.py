@@ -14,29 +14,22 @@
 """
 
 import datetime
-import os
-
 from jqdata import *  # 聚宽内置
 
 import bullet_trade_jq_remote_helper as bt
 
 # ===== 配置区域 =====
-BT_REMOTE_HOST = '111.111.111.111'  #远程qmt服务器
-BT_REMOTE_PORT = 58620              #远程qmt服务器端口
-BT_REMOTE_TOKEN = 'my_remote_token_879237283'  #修改为你自己的服务器token秘钥
-ACCOUNT_KEY = None  # 可选
-SUB_ACCOUNT = None  # 可选
+BT_REMOTE_HOST = "请填写你的公网地址或域名"
+BT_REMOTE_TOKEN = "请填写 QMT_SERVER_TOKEN"
 
 
 def _ensure_configured():
-    if not BT_REMOTE_TOKEN:
-        raise RuntimeError("请先在 BT_REMOTE_HOST/BT_REMOTE_PORT/BT_REMOTE_TOKEN/ACCOUNT_KEY/SUB_ACCOUNT 填写远程服务器配置")
+    """检查并初始化远程连接；输入为顶部地址和令牌，返回值为空。"""
+    if BT_REMOTE_HOST.startswith("请填写") or BT_REMOTE_TOKEN.startswith("请填写"):
+        raise RuntimeError("请先填写 BT_REMOTE_HOST 和 BT_REMOTE_TOKEN")
     bt.configure(
         host=BT_REMOTE_HOST,
-        port=BT_REMOTE_PORT,
         token=BT_REMOTE_TOKEN,
-        account_key=ACCOUNT_KEY,
-        sub_account_id=SUB_ACCOUNT,
     )
     # 让券商端可用数据补价
     bt.get_broker_client().bind_data_client(bt.get_data_client())
@@ -54,7 +47,7 @@ def process_initialize(context):
 
 def initialize(context):
     """
-    占位：聚宽重启后由 process_initialize 完成实际初始化。
+    注册账户查询和交易示例任务；输入为聚宽 context，返回值为空。
     """
     set_benchmark("000001.XSHE")
     set_option("use_real_price", True)

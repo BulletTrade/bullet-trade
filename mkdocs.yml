@@ -6,40 +6,43 @@ docs_dir: docs
 use_directory_urls: false
 nav:
   - 官方首页: /
-  - 文档首页: index.md
-  - 新手入门:
-      - 环境准备：安装 Python: python-setup.md
-      - 总览与选型: beginner-guide.md
-      - 方案 A：独立运行: beginner-route-a.md
-      - 方案 B：聚宽侧模拟盘运行:
-          - 方案 B 总流程: beginner-route-b.md
-          - 策略修改方案对比: joinquant-integration-options.md
-          - 策略修改方案 1：显式调用 helper: joinquant-helper-explicit.md
-          - 策略修改方案 2：接管聚宽函数: joinquant-live-takeover-usage.md
-          - 模拟盘完全接管设计说明: joinquant-live-takeover.md
-  - 快速上手: quickstart.md
-  - 研究环境: research.md
-  - 配置总览: config.md
-  - 回测引擎: backtest.md
-  - 回测数据会话优化: backtest-data-session.md
-  - 参数优化: optimize.md
-  - 实盘引擎: live.md
-  - 华鑫 TORA 接入（第一阶段）: huaxin.md
-  - Tick 行情指南: tick.md
-  - 交易支撑: trade-support.md
-  - QMT 服务配置: qmt-server.md
-  - 大 QMT 服务向导: big-qmt-server.md
-  - API 文档: api.md
-  - 数据源:
-      - 数据源指南: data/DATA_PROVIDER_GUIDE.md
-      - 数据源能力矩阵: data/DATA_PROVIDER_MATRIX.md
-      - 数据源接入验收框架: data/DATA_PROVIDER_ACCEPTANCE.md
-      - 聚宽数据: data/DATA_PROVIDER_JQDATA.md
-      - MiniQMT 数据: data/DATA_PROVIDER_MINIQMT.md
-      - Tushare 数据: data/DATA_PROVIDER_TUSHARE.md
-      - RQData 数据 Beta: data/DATA_PROVIDER_RQDATA.md
-      - easy_tdx 通达信数据 Beta: data/DATA_PROVIDER_EASY_TDX.md
-  - 邀请贡献: contributing.md
+  - 从这里开始:
+      - 文档首页: index.md
+      - 安装 Python 与 BulletTrade: python-setup.md
+      - 新手选型: beginner-guide.md
+      - 快速上手: quickstart.md
+  - 大 QMT（当前推荐）:
+      - 两种接入方式: big-qmt-server.md
+      - 本地运行策略: beginner-route-a.md
+      - 聚宽运行策略: beginner-route-b.md
+      - 聚宽策略改造方式: joinquant-integration-options.md
+      - 显式调用 helper: joinquant-helper-explicit.md
+      - 接管聚宽函数: joinquant-live-takeover-usage.md
+  - 研究与回测:
+      - 研究环境: research.md
+      - 回测引擎: backtest.md
+      - 回测数据会话优化: backtest-data-session.md
+      - 参数优化: optimize.md
+  - 配置与参考:
+      - 极简配置与完整配置: config.md
+      - 实盘引擎: live.md
+      - 交易支撑: trade-support.md
+      - Tick 行情: tick.md
+      - QMT 服务参考: qmt-server.md
+      - API 文档: api.md
+      - 数据源:
+          - 数据源指南: data/DATA_PROVIDER_GUIDE.md
+          - 能力矩阵: data/DATA_PROVIDER_MATRIX.md
+          - 接入验收框架: data/DATA_PROVIDER_ACCEPTANCE.md
+          - 聚宽数据: data/DATA_PROVIDER_JQDATA.md
+          - Tushare 数据: data/DATA_PROVIDER_TUSHARE.md
+          - RQData 数据 Beta: data/DATA_PROVIDER_RQDATA.md
+          - easy_tdx 通达信数据 Beta: data/DATA_PROVIDER_EASY_TDX.md
+  - 高级接入与贡献:
+      - MiniQMT（兼容方案）: data/DATA_PROVIDER_MINIQMT.md
+      - 华鑫 TORA（自备 SDK）: huaxin.md
+      - 聚宽接管设计说明: joinquant-live-takeover.md
+      - 邀请贡献: contributing.md
 theme:
   name: material
   language: zh

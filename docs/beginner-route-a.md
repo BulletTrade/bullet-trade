@@ -1,223 +1,73 @@
-# 方案 A：独立运行
+# 本地运行策略
 
-[返回新手入门总览](beginner-guide.md)
+[返回新手选型](beginner-guide.md)
 
-这一条路的意思是：
-
-- 策略主体在你自己的机器或服务器运行
-- BulletTrade 负责调度、取数、计算信号和下单
-- QMT / MiniQMT 与策略放在同一台 Windows 机器上运行
-
-新手先按这条最小链路理解：
+这条路线把策略、Python 环境和日志都放在自己的 Windows 机器上，大 QMT 只负责行情与交易通道。
 
 ```text
-策略文件 -> bullet-trade live -> QMT / MiniQMT -> 券商
+my_strategy.py -> bullet-trade live -> 127.0.0.1:58620 -> 大 QMT -> 券商
 ```
-
-也就是说，你先不要同时引入太多组件。  
-先在一台 Windows 机器上把“最小策略能启动、能取数、能看到账户、能发测试单”跑通，再考虑远程、复杂策略或多账户。
 
 ## 适合谁
 
-优先考虑下面这些：
+- 希望自己管理策略文件、日志和运行时间。
+- 策略主要使用量价数据和通用聚宽 API。
+- 不依赖聚宽平台独有的财务、因子或研究环境。
 
-- 均线、动量、成交额过滤、ETF 轮动、网格、择时
-- 以量价数据为主的日频或分钟频策略
-- 主要依赖通用聚宽风格 API，而不是平台侧研究环境
-- 你愿意自己掌控日志、部署和运行状态
+## 1. 先启动大 QMT 网关
 
-## 第一步：统一准备
+先完成 [大 QMT：两种接入方式](big-qmt-server.md) 中的公共步骤：
 
-### 1. 先理解机器角色
+1. 在大 QMT 新建策略并粘贴 `helpers/big_qmt_gateway_strategy_sample.py`。
+2. 创建“策略交易”运行项，不勾选“启动本地 Python”。
+3. 启动网关，确认本机 `127.0.0.1:9000` 正常。
 
-在这套方案里，常见角色只有 2 个：
+helper 中普通下单和按明确订单号撤单已经默认开启，无需额外配置或再次开启。
 
-- BulletTrade：负责本地策略执行
-- QMT / MiniQMT：真正连券商执行下单
+## 2. 准备三个配置
 
-最关键的一点是：
-
-- **QMT / MiniQMT 和 BulletTrade 应该放在同一台 Windows 机器上**
-
-本页默认讲 MiniQMT/xtquant 直连模式，也就是 `.env` 里配置 `DEFAULT_DATA_PROVIDER=qmt`、`DEFAULT_BROKER=qmt` 和 `QMT_DATA_PATH`。如果券商不再提供 MiniQMT，需要使用大 QMT 承接网关能力，不要套用本页的 `QMT_DATA_PATH` 配置，请改看 [大 QMT 服务向导](big-qmt-server.md)。大 QMT 启动后，上层策略仍可按方案 A 用 `qmt-remote` 运行。
-
-两种 QMT 后端不要混着配：
-
-| 后端 | 适合场景 | 关键配置 |
-| --- | --- | --- |
-| MiniQMT / xtquant 直连 | 券商仍提供 MiniQMT，能访问 `userdata_mini` | `DEFAULT_DATA_PROVIDER=qmt`、`DEFAULT_BROKER=qmt`、`QMT_DATA_PATH=...` |
-| 大 QMT helper + qmt-remote | 券商关闭 MiniQMT，只能用大 QMT 策略环境 | 先启动大 QMT helper，再让策略连接 `qmt-remote` |
-
-### 2. 建议的基础准备
-
-- 已按 [环境准备：先安装 Python，再创建虚拟环境](python-setup.md) 完成 Python 安装
-- 已安装并登录的 QMT，并且该环境支持 MiniQMT
-- 一台可以运行 QMT / MiniQMT 的 Windows 机器
-
-这里有两个关键要求：
-
-- 后面的本地取数和实盘链路，默认都要能访问 `userdata_mini`
-- 登录时请使用 **独立交易** 方式启动 QMT
-
-可以参考下面这两张图：
-登录要选择独立交易！
-![登录时选择独立交易](assets/miniqmt_login.png)
-
-![MiniQMT 启动入口](assets/mini_qmt.png)
-
-大 QMT 的登录和 helper 启动流程不同，见 [大 QMT 服务向导](big-qmt-server.md)。
-
-### 3. 先完成共享环境准备文档
-
-如果你现在还没有装 Python，或者命令行里还不能正常执行：
-
-- `python --version`
-- `pip --version`
-
-请先完成这篇：
-
-- [环境准备：先安装 Python，再创建虚拟环境](python-setup.md)
-
-做完以后，再继续本页后面的步骤。
-
-## 第二步：先跑一个最简单的回测
-
-不建议第一枪就直接拿复杂策略上实盘。  
-先确认 Python、BulletTrade、MiniQMT 数据和最小策略链路都没问题。
-
-如果你还不知道 `.env` 是什么，或者不知道怎么在 Windows 里创建这个文件，先看：
-
-- [什么是 `.env` 文件，怎么创建](python-setup.md#env-file)
-
-下面这个代码块不是命令行命令，而是要写进 `.env` 文件里的内容。
-
-先准备一个最小 `.env`：
+将 `env.bigqmt.example` 复制为 `.env.bigqmt`，只填写：
 
 ```env
-DEFAULT_DATA_PROVIDER=qmt
-QMT_DATA_PATH=C:\QMT\userdata_mini
-QMT_ACCOUNT_ID=123456
+QMT_SERVER_TOKEN=请生成一个新的客户端令牌
+QMT_ACCOUNT_ID=你的QMT资金账号
+BIG_QMT_GATEWAY_PASSWORD=与helper顶部完全一致
 ```
 
-再新建一个最简单的策略文件，例如 `my_first_strategy.py`：
+端口、主机、账户类型和超时都有默认值，不需要写。
 
-```python
-from jqdata import *
+## 3. 启动本地服务
 
-
-def initialize(context):
-    set_benchmark('000300.XSHG')
-    g.stock = '510300.XSHG'
-    g.has_bought = False
-    run_daily(market_open, time='open')
-
-
-def market_open(context):
-    if not g.has_bought:
-        order_value(g.stock, context.portfolio.available_cash)
-        g.has_bought = True
-        log.info(f"买入 {g.stock}，金额={context.portfolio.available_cash:.2f}")
+```powershell
+bullet-trade --env-file .env.bigqmt server --server-type big_qmt --listen 127.0.0.1
 ```
 
-运行：
+保持这个窗口运行。策略不会直接连接大 QMT 的 `9000`，而是连接 BulletTrade 的 `58620`。
 
-```bash
-bullet-trade backtest my_first_strategy.py \
-  --start 2024-01-01 \
-  --end 2024-06-01 \
-  --benchmark 000300.XSHG \
-  --output backtest_results/first
+## 4. 运行自己的策略
+
+打开另一个命令行窗口：
+
+```powershell
+bullet-trade --env-file .env.bigqmt live my_strategy.py --broker qmt-remote
 ```
 
-![最小回测成功结果页](assets/backtest_result2.png)
+`QMT_SERVER_HOST` 和 `QMT_SERVER_PORT` 默认就是 `127.0.0.1:58620`，本机使用时不要重复配置。
 
-## 第三步：最简单的部署方式，BulletTrade 和 QMT 在同一台 Windows 机器
-
-这是最建议新手先走通的方式。
-
-下面这个代码块同样是写进 `.env` 文件里的内容，不是直接输入到命令行的命令。
-
-最小 `.env`：
+如果策略还希望从大 QMT 读取行情，再增加一项：
 
 ```env
-DEFAULT_DATA_PROVIDER=qmt
-DEFAULT_BROKER=qmt
-QMT_DATA_PATH=C:\QMT\userdata_mini
-QMT_ACCOUNT_ID=123456
+DEFAULT_DATA_PROVIDER=qmt-remote
 ```
 
-运行：
+如果策略使用 JQData 或其他数据源，这一项不需要写。
 
-```bash
-bullet-trade live my_first_strategy.py --broker qmt
-```
+## 5. 按顺序验收
 
-## 第四步：先跑通最小实盘链路，再替换成复杂策略
+1. 确认服务 health 和大 QMT 后端可用。
+2. 读取资金、持仓、当日委托和成交。
+3. 确认策略正常调度。
+4. 在仿真账号提交一笔最小限价单。
+5. 核对 QMT 委托、撤单、成交和最终持仓。
 
-建议顺序：
-
-1. 先用最小策略跑回测
-2. 再用最小策略跑 `live`
-3. 确认日志里能看到策略启动、调度触发、账户信息和下单结果
-4. 最后再替换成复杂策略
-
-下面这种日志，才说明本地直跑链路基本正常：
-
-![本地实盘日志示意](assets/qmt-trade-live.png)
-
-## 最小验收标准
-
-在替换成正式策略前，建议至少满足这些条件：
-
-| 检查项 | 通过标准 |
-| --- | --- |
-| Python 环境 | `bullet-trade --version` 能正常输出 |
-| 数据路径 | `QMT_DATA_PATH` 指向正确的 `userdata_mini` |
-| 回测 | 最小策略能生成结果 |
-| live 启动 | 日志能看到策略启动和调度 |
-| 账户 | 能读取到账户资金和持仓 |
-| 下单 | 小金额或仿真测试单能在 QMT 侧看到委托结果 |
-
-## 常见坑
-
-### 1. 不要第一步就直接拿复杂策略做验证
-
-复杂策略没信号时，你很难第一时间判断是：
-
-- 环境没通
-- 选股没通
-- 数据没通
-- 函数不兼容
-- 还是单纯当天没有信号
-
-### 2. `QMT_DATA_PATH` 要写正确
-
-QMT 数据目录要写到 `.env` 的 `QMT_DATA_PATH`。
-
-### 3. 本地运行没有行情或数据不对
-
-优先排查：
-
-- `DEFAULT_DATA_PROVIDER` 是否设置正确
-- `QMT_DATA_PATH` 是否指向正确的 `userdata_mini`
-- QMT / MiniQMT 本地是否已经准备好对应数据
-- 代码格式是否统一为 `.XSHG/.XSHE`
-
-### 4. 代码能回测，实盘却不工作
-
-常见原因：
-
-- 回测和实盘使用的本地数据目录、数据下载范围或频率不一致
-- 回测是日频，实盘是分钟频
-- 回测只验证了策略逻辑，没有验证真实下单链路
-- 回测里有信号，实盘当日未必有信号
-
-## 正式上线前检查清单
-
-- 你已经确认本策略适合方案 A
-- 你已经跑通最小回测
-- 你已经跑通最小实盘链路
-- 你已经确认 QMT 登录正常
-- 你已经确认 `QMT_DATA_PATH` 正确
-- 你已经先用最小资金或模拟环境验证
-- 你已经能在日志里区分“没有信号”和“有信号但下单失败”
+遇到 `9000`、密码、启动方式等问题，统一查看 [大 QMT 常见问题](big-qmt-server.md#common-questions)。

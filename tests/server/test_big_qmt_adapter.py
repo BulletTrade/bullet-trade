@@ -20,7 +20,8 @@ from bullet_trade.server.app import ServerApplication
 from bullet_trade.server.config import AccountConfig, ServerConfig
 
 
-def test_big_qmt_server_env_example_contains_account_route_and_timeout_order():
+def test_big_qmt_server_env_example_keeps_only_required_first_run_values():
+    """检查大 QMT 入门模板只保留三个必填项；输入为空，返回值为空。"""
     path = Path(__file__).resolve().parents[2] / "env.bigqmt.example"
     values = {}
     for raw_line in path.read_text(encoding="utf-8").splitlines():
@@ -30,11 +31,20 @@ def test_big_qmt_server_env_example_contains_account_route_and_timeout_order():
         key, value = line.split("=", 1)
         values[key.strip()] = value.strip()
 
-    assert values["QMT_SERVER_TYPE"] == "big_qmt"
-    assert values["QMT_SERVER_ACCOUNTS"].startswith("default=")
-    assert int(values["QMT_SERVER_REQUEST_TIMEOUT_SECONDS"]) > int(
-        values["BIG_QMT_GATEWAY_TIMEOUT_SECONDS"]
-    )
+    assert set(values) == {
+        "QMT_SERVER_TOKEN",
+        "QMT_ACCOUNT_ID",
+        "BIG_QMT_GATEWAY_PASSWORD",
+    }
+
+
+def test_big_qmt_helper_enables_normal_trading_and_order_cancel_by_default():
+    """检查普通下单和按订单号撤单默认开启；输入为空，返回值为空。"""
+    path = Path(__file__).resolve().parents[2] / "helpers/big_qmt_gateway_strategy_sample.py"
+    source = path.read_text(encoding="gbk")
+
+    assert "ENABLE_TRADING = True" in source
+    assert "ENABLE_CANCEL_ORDER = True" in source
 
 
 def test_big_qmt_gateway_error_preserves_broker_called_false() -> None:

@@ -1,15 +1,25 @@
 # 配置总览
 
-这页分两层：
+这是一份按需查询的完整参考，不要求新用户复制全部配置。当前推荐的大 QMT 首次接入只需要三个服务端值；完成后即可停止阅读本页。
+
+```env
+QMT_SERVER_TOKEN=请生成一个新的客户端令牌
+QMT_ACCOUNT_ID=你的QMT资金账号
+BIG_QMT_GATEWAY_PASSWORD=与helper顶部完全一致
+```
+
+聚宽策略只填写 `host` 和 `token`；本地策略可直接复用这份 `.env.bigqmt`。完整步骤见 [大 QMT：两种接入方式](big-qmt-server.md)。
+
+其余内容分两层：
 
 - 前半部分是**最小可跑配置**，新机器先按这里配通。
 - 后半部分是**当前代码仍然生效的完整配置索引**。有默认值的不一定要写进 `.env`，但文档里必须能查到。
 
 没有列入这里的旧变量，通常表示当前代码没有读取，或者只是某个示例脚本里的 Python 常量，不再作为通用 `.env` 配置入口。
 
-## 1. 本地 QMT 最小配置
+## 1. MiniQMT 本地直连配置（兼容方案）
 
-适用场景：策略和 QMT 在同一台 Windows 机器上运行。
+适用场景：券商仍提供 MiniQMT/xtquant，且策略和 QMT 在同一台 Windows 机器上运行。新用户优先选择上面的大 QMT 路线。
 
 这是 MiniQMT/xtquant 直连模式，依赖 `QMT_DATA_PATH` 指向 `userdata_mini`。大 QMT 不能直接使用这组配置；大 QMT 先按 [大 QMT 服务向导](big-qmt-server.md) 启动 helper 和 `--server-type big_qmt`，策略侧再使用第 3 节的 `qmt-remote`。
 
