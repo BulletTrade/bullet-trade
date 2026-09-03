@@ -11,7 +11,7 @@
 - **华鑫 TORA 接入 Beta**：在同一 `bullet-trade` distribution 中加入第一方 Trader adapter、C ABI、自研 C++ bridge 源码、显式 `huaxin build/doctor`、Server adapter 与 Python 3.7 XMD Level 1 sidecar；厂商 SDK、头文件、动态库、文档、凭据和真实配置始终由用户从外部提供，不进入 Git 或 PyPI。
 - **类型化实时行情底座**：新增版本化市场事件、订阅回执、租约/refcount、有界队列、字段保真投影、健康状态和显式 gap/degraded 控制事件，为 L1/L2 扩展提供统一合同。
 - **统一证券身份契约**：新增 `security-id/v1` 归一化规则与合同数据，补齐 QMT 期货代码映射和场内基金 T+0/T+1 覆盖。
-- **节点资产归集合同**：新增华鑫节点资产快照、摘要、中继、划转计划与严格完成证据；写入能力仍受外部授权和运行环境门禁约束。
+- **节点资产归集合同**：新增华鑫节点资产快照、摘要、中继、划转计划与严格完成证据；写入能力仍受外部业务授权和运行环境门禁约束。
 
 ### 增强
 - **实盘引擎安全语义**：增加启动前 capability/preflight、调度失败原子拒单、正式运行态持久化、行情时效元数据和订单审计字段；可选安全策略默认不改变未启用用户的旧路径。
@@ -27,7 +27,7 @@
 - **发布隐私**：普通日志不再输出华鑫账户、UserProductInfo 或完整 TerminalInfo，并移除个人用户名目录回退。
 
 ### 兼容性
-- **自制远程客户端**：直接调用 `broker.place_order` 或 `broker.cancel_order` 必须提供合法、稳定的 `idempotency_key`；官方 `qmt-remote` 客户端会自动生成和复用。
+- **自制远程客户端**：`idempotency_key` 是已有能力，本版将真实 Broker 的 `broker.place_order` 和 `broker.cancel_order` 从可选升级为强制；官方 `qmt-remote` 客户端会自动生成并在同一次未知态恢复中复用，自制 RPC 客户端必须为同一业务委托稳定复用原 key。
 - **实时行情失败模式**：MiniQMT 当前快照无法证明新鲜有效时会抛出具名错误，而不再返回空字典或历史代理值。
 - **订单队列只读视图**：`get_order_queue()` 返回浅拷贝，调用方不能再通过修改返回列表改变全局队列。
 - **配置错误时机**：数据 Provider 重载改为延迟初始化，配置错误可能在第一次真实数据调用时出现；TLS 配置不完整则在 Server 启动时直接拒绝。

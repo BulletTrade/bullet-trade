@@ -43,16 +43,15 @@ bullet-trade server --server-type huaxin
 代码不内置生产或仿真前置地址。Trader 的 `HUAXIN_TRADE_FRONT` 和 XMD 的
 `HUAXIN_XMD_FRONT` 都必须来自部署机器上已被 Git 忽略的私密 env 文件。
 
-### 2.1 公开授权状态
+### 2.1 开源发布边界
 
-截至 2026-09-02，当前仓库和本次核对的本地官方资料中，没有找到一份能够覆盖“公开自研
-adapter/bridge 源码中的 TORA API 名称引用、由厂商头文件派生的字段 manifest，以及未来自研
-bridge 二进制再分发”的华鑫/TORA 书面许可。其他开源项目已经公开 TORA adapter 只能证明技术
-路径存在，不能替代 BulletTrade 自己的授权或法律审查。`0.10.0b1` 对外发布前必须取得并归档能
-确认上述边界的书面证据；在确认前不得把当前 `dev` 合入公开 `main` 或上传 PyPI。
+BulletTrade 公开发布的华鑫能力仅包含项目自行编写的 adapter、flat C ABI、bridge 源码、构建
+入口、调用示例、测试桩和文档。源码中对 TORA API 名称、类型和回调的引用只用于实现互操作，
+不复制或再分发厂商 SDK 源文件及二进制制品。
 
-无论许可结论如何，厂商头文件、动态库、PDF、示例、柜台地址、账号、TerminalInfo 和真实业务
-数据都不会进入公开 Git、wheel 或 sdist。
+厂商头文件、动态库、PDF、示例包、柜台地址、账号、TerminalInfo 和真实业务数据不会进入公开
+Git、wheel 或 sdist。用户必须通过外部目录自行提供有权使用的 SDK，并自行遵守取得该 SDK 时
+适用的许可和使用条件；BulletTrade 的开源许可证不授予任何厂商 SDK 权利。
 
 ## 3. 构建与诊断
 
