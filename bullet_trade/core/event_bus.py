@@ -152,7 +152,7 @@ class EventBus:
         sig = inspect.signature(callback)
         if len(sig.parameters) != 1:
             logger.warning(
-                f"⚠️  回调函数 {callback.__name__} 应该接受1个参数(event)，"
+                f"回调函数 {callback.__name__} 应该接受1个参数(event)，"
                 f"当前有 {len(sig.parameters)} 个参数"
             )
         
@@ -161,11 +161,11 @@ class EventBus:
         if callback not in subscribers_list:
             subscribers_list.append(callback)
             logger.debug(
-                f"✅ 订阅事件: {event_cls.__name__} -> {callback.__name__} "
+                f"订阅事件: {event_cls.__name__} -> {callback.__name__} "
                 f"(优先级: {priority})"
             )
         else:
-            logger.warning(f"⚠️  重复订阅: {event_cls.__name__} -> {callback.__name__}")
+            logger.warning(f"重复订阅: {event_cls.__name__} -> {callback.__name__}")
     
     def unsubscribe(self, event_cls: Type[Event], callback: Callable):
         """
@@ -176,7 +176,7 @@ class EventBus:
             callback: 要移除的回调函数
         """
         if event_cls not in self._subscribers:
-            logger.warning(f"⚠️  事件 {event_cls.__name__} 没有订阅者")
+            logger.warning(f"事件 {event_cls.__name__} 没有订阅者")
             return
         
         removed = False
@@ -184,11 +184,11 @@ class EventBus:
             if callback in callbacks:
                 callbacks.remove(callback)
                 removed = True
-                logger.debug(f"✅ 取消订阅: {event_cls.__name__} -> {callback.__name__}")
+                logger.debug(f"取消订阅: {event_cls.__name__} -> {callback.__name__}")
         
         if not removed:
             logger.warning(
-                f"⚠️  未找到订阅: {event_cls.__name__} -> {callback.__name__}"
+                f"未找到订阅: {event_cls.__name__} -> {callback.__name__}"
             )
         
         # 清理空的优先级字典
@@ -207,14 +207,14 @@ class EventBus:
             if event_cls in self._subscribers:
                 count = sum(len(cbs) for cbs in self._subscribers[event_cls].values())
                 del self._subscribers[event_cls]
-                logger.info(f"🗑️  已取消 {event_cls.__name__} 的 {count} 个订阅")
+                logger.info(f"已取消 {event_cls.__name__} 的 {count} 个订阅")
         else:
             total = sum(
                 sum(len(cbs) for cbs in priorities.values())
                 for priorities in self._subscribers.values()
             )
             self._subscribers.clear()
-            logger.info(f"🗑️  已取消所有订阅（共 {total} 个）")
+            logger.info(f"已取消所有订阅（共 {total} 个）")
     
     async def emit(self, event: Event, timeout: Optional[float] = None):
         """
@@ -233,10 +233,10 @@ class EventBus:
         
         event_cls = type(event)
         if event_cls not in self._subscribers:
-            logger.debug(f"📢 事件 {event_cls.__name__} 没有订阅者")
+            logger.debug(f"事件 {event_cls.__name__} 没有订阅者")
             return
         
-        logger.debug(f"📢 发布事件: {event}")
+        logger.debug(f"发布事件: {event}")
         
         # 按优先级从高到低排序
         priorities = sorted(self._subscribers[event_cls].keys(), reverse=True)
@@ -259,19 +259,19 @@ class EventBus:
                     
                     self._stats['callbacks_executed'] += 1
                     logger.debug(
-                        f"  ✅ 执行回调: {callback.__name__} (优先级: {priority})"
+                        f"执行回调: {callback.__name__} (优先级: {priority})"
                     )
                     
                 except asyncio.TimeoutError:
                     self._stats['errors'] += 1
                     logger.error(
-                        f"  ⏱️  回调超时: {callback.__name__} "
+                        f"回调超时: {callback.__name__} "
                         f"(>{timeout}s, 事件: {event_cls.__name__})"
                     )
                 except Exception as e:
                     self._stats['errors'] += 1
                     logger.error(
-                        f"  ❌ 回调执行失败: {callback.__name__} "
+                        f"回调执行失败: {callback.__name__} "
                         f"(事件: {event_cls.__name__}, 错误: {e})",
                         exc_info=True
                     )
@@ -384,4 +384,3 @@ def create_event_class(
         >>> event = MarketOpenEvent(time="09:30:00")
     """
     return type(name, (base,), {'priority': priority})
-

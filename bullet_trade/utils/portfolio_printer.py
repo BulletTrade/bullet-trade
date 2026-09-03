@@ -58,7 +58,7 @@ def render_account_overview(snapshot: Dict[str, Any], limit: int = 20) -> str:
 
         position_ratio = (invested / total_value * 100.0) if total_value > 0 else 0.0
         header = (
-            f"📊 券商账户概览: 总资产 {_fmt_currency(total_value)}, 可用资金 {_fmt_currency(cash)}, 仓位 {position_ratio:.2f}%"
+            f"券商账户概览: 总资产 {_fmt_currency(total_value)}, 可用资金 {_fmt_currency(cash)}, 仓位 {position_ratio:.2f}%"
         )
 
         if not entries:
