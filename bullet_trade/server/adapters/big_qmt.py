@@ -829,7 +829,11 @@ class BigQmtDataAdapter(RemoteDataAdapter):
         available: pd.DataFrame,
         listing: Optional[pd.Timestamp],
     ) -> List[Dict[str, Any]]:
-        """取得相关事件及前一实际收盘；输入覆盖日期、已有日线和上市日，返回完整事件，不用dr。"""
+        """取得相关事件及实际前收盘；输入覆盖日期、日线和上市日，返回事件，不用dr。
+
+        股改仅计算源字段已表达的现金、同证券送转股及配股，不推定未提供的其他权益。
+        缺字段、非法标识或缺少前收盘仍抛错，不修改源事件或回退原生复权。
+        """
         data = await self.client.post(
             "/data/split_dividend",
             {
@@ -868,8 +872,6 @@ class BigQmtDataAdapter(RemoteDataAdapter):
                 raise AdjustmentError("QMT除权事件字段不完整")
             if not isinstance(raw_event["share_reform"], bool):
                 raise AdjustmentError("QMT股改标识不是布尔值")
-            if raw_event["share_reform"]:
-                raise NotImplementedError("尚不支持股改事件: %s" % event_date)
             relevant.append((event_date, raw_event))
         for event_date, raw_event in relevant:
             end = pd.Timestamp(event_date) - pd.Timedelta(days=1)

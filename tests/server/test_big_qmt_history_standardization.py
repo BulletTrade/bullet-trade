@@ -85,7 +85,7 @@ def _event(security):
 
 
 def _share_reform_event(event_date):
-    """建立完整且映射一致的股改反例；输入事件日期，返回新事实字典，不提供处理股改的算法。"""
+    """建立字段完整且映射一致的股改事实；输入日期，返回新字典，不补未提供的权益。"""
     event = _event(_SECURITIES[0])
     event.update(
         date=event_date,
@@ -841,28 +841,38 @@ def test_prefetched_previous_day_does_not_make_first_return_day_reform_relevant(
 
 
 @pytest.mark.parametrize("fq", ["pre", "post"])
-def test_relevant_share_reform_is_not_covered_by_historical_precision_exception(fq):
-    """相关股改明确不支持不能豁免；输入复权方式，无返回，已有前收盘也必须报股改语义错误。"""
+def test_relevant_share_reform_uses_only_expressed_cash_and_shares(fq):
+    """股改仅按已表达现金份额复权；输入方式，无返回，断言手算结果且不读取原生因子。"""
     gateway = _FakeGateway()
     gateway.events[_SECURITIES[0]][0] = _share_reform_event(_EVENT_DATE)
     provider, _ = _client(gateway)
-    with pytest.raises(RemoteServerError, match="股改|share_reform") as raised:
-        _price_request(provider, count=4, fq=fq)
-    assert raised.value.code == "REQUEST_FAILED"
+    result = _price_request(provider, count=4, fq=fq, fields=["close", "factor"])
+    # 本合成窗口 C=10；(10-.009)/1.1 按两位报价得到 E=9.08。
+    expected = [9.08, 9.08, 8.0, 8.0] if fq == "pre" else [10.0, 10.0, 8.81, 8.81]
+    factors = [0.908, 0.908, 1.0, 1.0] if fq == "pre" else [1.0, 1.0, 10 / 9.08, 10 / 9.08]
+    assert result["close"].tolist() == expected
+    np.testing.assert_allclose(result["factor"], factors, rtol=1e-14)
 
 
-def test_stock_post_with_2007_share_reform_fails_before_requesting_event_price_dependency():
-    """股票全历史post遇2007股改先报不支持；无输入，无返回，不以缺前收盘或精度差掩盖原因。"""
+@pytest.mark.parametrize("flag", [None, 0, 1, "true", "false"])
+def test_share_reform_non_boolean_flag_still_fails(flag):
+    """拒绝非布尔股改标识；输入错误值，无返回，不能因支持已表达权益而放松事件校验。"""
+    gateway = _FakeGateway()
+    gateway.events[_SECURITIES[0]][0]["share_reform"] = flag
+    provider, _ = _client(gateway)
+    with pytest.raises(RemoteServerError, match="股改标识不是布尔值"):
+        _price_request(provider, count=4, fq="post")
+
+
+def test_stock_post_with_2007_share_reform_still_requires_actual_previous_close():
+    """股改post仍须真实前收盘；无输入，无返回，缺历史依赖明确失败而非重设原点。"""
     gateway = _FakeGateway()
     gateway.start_date = "1991-04-03"
     old = _share_reform_event("2007-06-20")
     gateway.events[_SECURITIES[0]].insert(0, old)
     provider, _ = _client(gateway)
-    with pytest.raises((ValueError, RuntimeError), match="股改|share_reform"):
+    with pytest.raises((ValueError, RuntimeError), match="无法取得除权前实际交易日收盘"):
         _price_request(provider, count=4, fq="post")
-    for path, payload in gateway.calls:
-        if path == "/data/history":
-            assert pd.Timestamp(payload["start"]).year != 2007
 
 
 def test_event_previous_close_skips_three_confirmed_suspended_days():
@@ -1062,12 +1072,13 @@ def test_public_failure_remains_empty_without_changing_reference_or_using_native
     )
 
 
-def test_public_share_reform_error_uses_real_remote_error_semantics_without_native_fallback(
+def test_public_invalid_share_reform_uses_real_remote_error_semantics_without_native_fallback(
     monkeypatch,
 ):
-    """公开股改错误按远端wire仍返回空表；输入替换器，无返回，保留同fq/ref重试且无原生成功。"""
+    """非法股改标识按远端wire返回空表；输入替换器，无返回，保留同fq/ref重试且无原生成功。"""
     gateway = _FakeGateway()
     gateway.events[_SECURITIES[0]][0] = _share_reform_event(_EVENT_DATE)
+    gateway.events[_SECURITIES[0]][0]["share_reform"] = "true"
     provider, requests = _client(gateway)
     monkeypatch.setattr(data_api, "_ensure_auth", lambda: provider)
     monkeypatch.setattr(data_api, "_get_default_provider", lambda: provider)
