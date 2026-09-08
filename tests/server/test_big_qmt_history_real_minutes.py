@@ -2,13 +2,13 @@
 
 作者：BruceLee
 职责：核对真实基础分钟的完整轴、竞价、量单位、现金事件前复权和窗口不变量。
-输入：2026-09-08保存的两证券各482根真实1m，旧原生多分钟none对照，及既有418日日线、
+输入：2026-09-08保存的两证券各482根真实1m与各1根真实前驱分钟，旧原生多分钟none对照，及418日日线、
 上市资料和完整事件；不使用聚宽因子，不合成停牌标记、公司事件或历史前收盘。
 输出：pytest逐格断言；原生多分钟money差异固定记录，不为对齐修改原始金额。
 上下游：真实BigQmtDataAdapter与wire编解码，四接口白名单内存Gateway；不启动服务或策略。
 边界：5个早期日历窗口有真实trade_days，其余重放日线存档日期；前复权手算不是JQ数值验收。
-真实股票post含股改仍失败；ETF新增35事件前依赖存档后，可验QMT返回的六事件固定原点链，
-仍不证明源无漏报或与聚宽绝对因子一致；缺依赖反例必须继续失败。
+两证券共35事件前依赖齐备后，可验QMT已表达权益的固定原点链，股改true不添加额外收益；
+仍不证明事件外权益、源无漏报或与聚宽绝对因子一致；缺依赖和非法标识必须继续失败。
 环境：仅本地JSON/pandas/pytest，无账号、地址、认证配置或网络副作用。
 """
 
@@ -38,6 +38,16 @@ _REFERENCE = "2026-09-07"
 _CASH_FACTS = {
     "000001.XSHE": ("2026-06-12", "11.3", "0.36", 2),
     "510500.XSHG": ("2026-07-15", "8.413", "0.149", 3),
+}
+_POST_FACTOR_SNAPSHOT = {
+    "000001.XSHE": (
+        "104.1949589411335515358066492679568431981",
+        "107.6236778825236866868935225528256241443",
+    ),
+    "510500.XSHG": (
+        "0.3340855449043369310047026073118897688125",
+        "0.3401091105130913117791097574195218568513",
+    ),
 }
 _NATIVE_MONEY_DIAGNOSTIC = {
     "000001.XSHE": {
@@ -105,6 +115,9 @@ class _MinuteReplayGateway:
         self.config = BigQmtGatewayConfig()
         self.calls = []
         self.minutes = {s: _frame(_case(minute_facts, s)["raw"]) for s in _SECURITIES}
+        self.minute_predecessors = {
+            s: _frame(_case(minute_facts, s)["predecessor"]["response"]) for s in _SECURITIES
+        }
         self.daily = {s: _frame(_case(daily_facts, s)["raw"], daily=True) for s in _SECURITIES}
         self.facts = {s: deepcopy(_case(daily_facts, s)) for s in _SECURITIES}
         self.dependencies = {}
@@ -188,6 +201,10 @@ class _MinuteReplayGateway:
             assert payload.get("fill_data") is False
         daily = payload["frequency"] == "1d"
         frame = (self.daily if daily else self.minutes)[security]
+        if not daily:
+            prior = self.minute_predecessors[security].loc[:, frame.columns]
+            frame = pd.concat([prior, frame]).sort_index()
+            assert frame.index.is_unique
         if daily and set(payload["fields"]).issubset({"close", "preClose", "suspendFlag"}):
             dependency = self.dependencies[security]
             if not dependency.empty:
@@ -280,7 +297,7 @@ def _expected_post_factors(gateway, security, index):
             day = pd.Timestamp(event["date"])
             if not origin < day <= index[-1]:
                 continue
-            assert event["share_reform"] is False, "真实股票股改尚未授权支持"
+            assert isinstance(event["share_reform"], bool), "股改标记必须明确，不隐式强转真假"
             before = dependencies.loc[
                 (dependencies.index < day) & dependencies["suspendFlag"].eq(0)
             ]
@@ -444,12 +461,12 @@ async def test_real_minutes_count_and_start_overlap_keep_same_reference(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("security", _SECURITIES)
-@pytest.mark.parametrize("fq", ["none", "pre"])
+@pytest.mark.parametrize("fq", ["none", "pre", "post"])
 async def test_real_five_minute_count_crosses_cash_event_after_basic_adjustment(
-    minute_facts, daily_facts, security, fq
+    minute_facts, daily_facts, post_dependencies, security, fq
 ):
     """跨除权交易日的逆向五分钟按基础bar复权；输入真实存档/证券/方式，无返回，不将跨日组判错。"""
-    gateway = _MinuteReplayGateway(minute_facts, daily_facts)
+    gateway = _MinuteReplayGateway(minute_facts, daily_facts, post_dependencies)
     end = _CASH_FACTS[security][0] + " 09:32:00"
     actual = await _read(
         gateway, minute_facts, security, fq=fq, frequency="5m", start=None, count=1, end=end
@@ -527,17 +544,12 @@ async def test_real_minutes_missing_required_bar_is_not_intersection_or_pause(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("security", _SECURITIES)
-async def test_real_post_unaccepted_dependencies_do_not_change_fixed_listing_origin(
+async def test_real_post_missing_dependencies_do_not_change_fixed_listing_origin(
     minute_facts, daily_facts, security
 ):
-    """真实post明确保留未验收边界；输入真实样本/证券，无返回，股改或缺早期C不可换原点/原生兜底。"""
+    """缺真实post依赖必须失败；输入真实样本/证券，无返回，缺早期C不可换原点或原生兜底。"""
     gateway = _MinuteReplayGateway(minute_facts, daily_facts)
-    error, message = (
-        (NotImplementedError, "股改")
-        if security == "000001.XSHE"
-        else (AdjustmentError, "无法取得除权前实际交易日收盘")
-    )
-    with pytest.raises(error, match=message):
+    with pytest.raises(AdjustmentError, match="无法取得除权前实际交易日收盘"):
         await _read(gateway, minute_facts, security, fq="post", start=None, count=2)
     requests = [p for path, p in gateway.calls if path == "/data/split_dividend"]
     assert len(requests) == 1
@@ -583,35 +595,55 @@ def test_real_post_dependencies_preserve_complete_event_windows_and_actual_close
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("security", _SECURITIES)
 @pytest.mark.parametrize("frequency", _FREQUENCIES)
-async def test_real_etf_post_minutes_use_all_six_events_and_fixed_listing_origin(
-    minute_facts, daily_facts, post_dependencies, frequency
+async def test_real_post_minutes_use_all_returned_events_and_fixed_listing_origin(
+    minute_facts, daily_facts, post_dependencies, security, frequency
 ):
-    """真实ETF后复权五周期全轴对照；输入样本和周期，无返回，以QMT六事件独立数学而非JQ种子验收。"""
-    security = "510500.XSHG"
+    """真实后复权五周期全轴对照；输入样本/证券/周期，无返回，以QMT完整返回事件而非JQ种子验收。"""
     gateway = _MinuteReplayGateway(minute_facts, daily_facts, post_dependencies)
     actual = await _read(gateway, minute_facts, security, fq="post", frequency=frequency)
     bases = _expected_basic(gateway, security, "post")
     pd.testing.assert_frame_equal(
         actual, _aggregate(bases, int(frequency[:-1])), check_exact=True, check_dtype=False
     )
-    # 独立六次Decimal40累计，量化差保留；不采用保存的JQ绝对因子0.340061。
-    assert bases.iloc[0]["factor"] == float("0.3340855449043369310047026073118897688125")
-    assert bases.iloc[-1]["factor"] == float("0.3401091105130913117791097574195218568513")
+    # 仅从本证券上市日F0=1累计，快照来自独立Decimal40计算，不采用保存的JQ绝对因子。
+    assert bases.iloc[0]["factor"] == float(_POST_FACTOR_SNAPSHOT[security][0])
+    assert bases.iloc[-1]["factor"] == float(_POST_FACTOR_SNAPSHOT[security][1])
     requests = [p for path, p in gateway.calls if path == "/data/split_dividend"]
-    assert len(requests) == 1 and requests[0]["start"] == "2013-03-15"
-    # 2015前两个日历日确为停牌，只能透过flag寻找4/10真实收盘，不读取其填充价作C。
+    listing = pd.Timestamp(gateway.facts[security]["info"]["start_date"]).strftime("%Y-%m-%d")
+    assert len(requests) == 1 and requests[0]["start"] == listing
+    # 只能透过明确flag寻找股票2007-05-31或ETF2015-04-10实际C，不读取其后的停牌填充价。
     pause_requests = [p for path, p in gateway.calls if path == "/data/history" and p["fill_data"]]
-    assert {p["start"] for p in pause_requests} == {"2015-04-13", "2015-04-14"}
+    expected_pause_days = (
+        {
+            "2007-06-01",
+            "2007-06-04",
+            "2007-06-05",
+            "2007-06-06",
+            "2007-06-07",
+            "2007-06-08",
+            "2007-06-11",
+            "2007-06-12",
+            "2007-06-13",
+            "2007-06-14",
+            "2007-06-15",
+            "2007-06-18",
+            "2007-06-19",
+        }
+        if security == "000001.XSHE"
+        else {"2015-04-13", "2015-04-14"}
+    )
+    assert {p["start"] for p in pause_requests} == expected_pause_days
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("security", _SECURITIES)
 @pytest.mark.parametrize("frequency", _FREQUENCIES)
-async def test_real_etf_post_minute_overlap_never_restarts_factor_at_query_beginning(
-    minute_facts, daily_facts, post_dependencies, frequency
+async def test_real_post_minute_overlap_never_restarts_factor_at_query_beginning(
+    minute_facts, daily_facts, post_dependencies, security, frequency
 ):
-    """真实ETF后复权窗口保持同一原点；输入样本和周期，无返回，比较全窗/count/显式start两组。"""
-    security = "510500.XSHG"
+    """真实后复权窗口保持同一原点；输入样本/证券/周期，无返回，比较全窗/count/显式start两组。"""
     gateway = _MinuteReplayGateway(minute_facts, daily_facts, post_dependencies)
     full = await _read(gateway, minute_facts, security, fq="post", frequency=frequency)
     counted = await _read(
@@ -623,17 +655,16 @@ async def test_real_etf_post_minute_overlap_never_restarts_factor_at_query_begin
     )
     pd.testing.assert_frame_equal(counted, full.tail(2), check_exact=True)
     pd.testing.assert_frame_equal(explicit, counted, check_exact=True)
-    assert {p["start"] for path, p in gateway.calls if path == "/data/split_dividend"} == {
-        "2013-03-15"
-    }
+    listing = pd.Timestamp(gateway.facts[security]["info"]["start_date"]).strftime("%Y-%m-%d")
+    assert {p["start"] for path, p in gateway.calls if path == "/data/split_dividend"} == {listing}
 
 
 @pytest.mark.asyncio
-async def test_real_etf_post_daily_matches_independent_408_day_prices_fields_and_overlap(
-    minute_facts, daily_facts, post_dependencies
+@pytest.mark.parametrize("security", _SECURITIES)
+async def test_real_post_daily_matches_independent_408_day_prices_fields_and_overlap(
+    minute_facts, daily_facts, post_dependencies, security
 ):
-    """真实408日后复权字段和窗口逐格对照；输入三存档，无返回，股/份单位与日线preClose分别处理。"""
-    security = "510500.XSHG"
+    """真实408日后复权字段和窗口逐格对照；输入存档及证券，无返回，量单位与日线preClose分别处理。"""
     gateway = _MinuteReplayGateway(minute_facts, daily_facts, post_dependencies)
     fields = [*_FIELDS, "factor", "pre_close", "paused"]
     actual = await _read(
@@ -661,25 +692,27 @@ async def test_real_etf_post_daily_matches_independent_408_day_prices_fields_and
         fields=fields,
     )
     pd.testing.assert_frame_equal(counted, actual.tail(40), check_exact=True)
+    first_day = _case(minute_facts, security)["start"][:10]
+    last_day = _case(minute_facts, security)["end"][:10]
     window = await _read(
         gateway,
         minute_facts,
         security,
         fq="post",
         frequency="1d",
-        start="2026-07-14",
-        end="2026-07-15",
+        start=first_day,
+        end=last_day,
         fields=fields,
     )
-    pd.testing.assert_frame_equal(window, actual.loc["2026-07-14":"2026-07-15"], check_exact=True)
+    pd.testing.assert_frame_equal(window, actual.loc[first_day:last_day], check_exact=True)
 
 
 @pytest.mark.asyncio
-async def test_real_etf_post_daily_and_minute_share_factor_and_close_without_native_dr(
-    minute_facts, daily_facts, post_dependencies
+@pytest.mark.parametrize("security", _SECURITIES)
+async def test_real_post_daily_and_minute_share_factor_and_close_without_native_dr(
+    minute_facts, daily_facts, post_dependencies, security
 ):
-    """日分钟共用固定post因子且不依赖dr；输入真实样本，无返回，逐日同因子/收盘并验证前后复权比例。"""
-    security = "510500.XSHG"
+    """日分钟共用固定post因子且不依赖dr；输入样本及证券，无返回，同因子/收盘并验证三模式关系。"""
     gateway = _MinuteReplayGateway(minute_facts, daily_facts, post_dependencies)
     post = await _read(gateway, minute_facts, security, fq="post", fields=["close", "factor"])
     daily = await _read(
@@ -688,8 +721,8 @@ async def test_real_etf_post_daily_and_minute_share_factor_and_close_without_nat
         security,
         fq="post",
         frequency="1d",
-        start="2026-07-14",
-        end="2026-07-15",
+        start=_case(minute_facts, security)["start"][:10],
+        end=_case(minute_facts, security)["end"][:10],
         fields=["close", "factor"],
     )
     for day in daily.index:
@@ -700,6 +733,19 @@ async def test_real_etf_post_daily_and_minute_share_factor_and_close_without_nat
     np.testing.assert_allclose(
         post["factor"] / post["factor"].iloc[-1], pre["factor"], rtol=0, atol=np.finfo(float).eps
     )
+    none = await _read(
+        gateway, minute_facts, security, fq="none", fields=["close", "factor", "money"]
+    )
+    assert none["factor"].eq(1).all()
+    decimals = _CASH_FACTS[security][3]
+    np.testing.assert_array_equal(post["close"], np.round(none["close"] * post["factor"], decimals))
+    pre_values = await _read(gateway, minute_facts, security, fq="pre", fields=["close", "money"])
+    np.testing.assert_array_equal(
+        pre_values["close"], np.round(none["close"] * pre["factor"], decimals)
+    )
+    post_money = await _read(gateway, minute_facts, security, fq="post", fields=["money"])
+    pd.testing.assert_series_equal(none["money"], pre_values["money"], check_exact=True)
+    pd.testing.assert_series_equal(none["money"], post_money["money"], check_exact=True)
     # 这是显式构造的敏感性反例；只改不应参与候选数学的原生dr，实际事件事实和C保持不动。
     for event in gateway.facts[security]["events"]["events"]:
         event["qmt_dr"] = event["qmt_raw"]["dr"] = 123.0
@@ -729,11 +775,57 @@ def test_real_early_calendar_windows_match_saved_dependency_axes(
 
 
 @pytest.mark.asyncio
-async def test_real_stock_post_still_rejects_share_reform_even_with_all_29_dependencies(
-    minute_facts, daily_facts, post_dependencies
+@pytest.mark.parametrize("invalid_flag", [None, 0, 1, "true", float("nan")])
+async def test_real_stock_post_rejects_nonboolean_share_reform_with_all_dependencies(
+    minute_facts, daily_facts, post_dependencies, invalid_flag
 ):
-    """股票29条前收盘齐备也不冒充支持股改；输入三存档，无返回，明确2007事件失败且不原生兜底。"""
+    """真实股改标记只接受bool；输入样本及非法标记，无返回，不能因放行true而隐式转换其他值。"""
     gateway = _MinuteReplayGateway(minute_facts, daily_facts, post_dependencies)
-    with pytest.raises(NotImplementedError, match="股改.*2007-06-20"):
+    event = next(e for e in gateway.facts["000001.XSHE"]["events"]["events"] if e["share_reform"])
+    event["share_reform"] = invalid_flag
+    with pytest.raises(AdjustmentError, match="股改标识不是布尔值"):
         await _read(gateway, minute_facts, "000001.XSHE", fq="post", start=None, count=2)
     assert all(p["fq"] == "none" for path, p in gateway.calls if path == "/data/history")
+
+
+@pytest.mark.asyncio
+async def test_real_stock_post_missing_actual_close_cannot_use_suspended_fill_price(
+    minute_facts, daily_facts, post_dependencies
+):
+    """删除股改前实际C必须失败；输入真实样本，无返回，不能将连续停牌填充价格当实际收盘。"""
+    gateway = _MinuteReplayGateway(minute_facts, daily_facts, post_dependencies)
+    gateway.dependencies["000001.XSHE"] = gateway.dependencies["000001.XSHE"].drop(
+        pd.Timestamp("2007-05-31")
+    )
+    with pytest.raises(AdjustmentError, match="没有明确停牌事实.*2007-05-31"):
+        await _read(gateway, minute_facts, "000001.XSHE", fq="post", start=None, count=2)
+    assert all(p["fq"] == "none" for path, p in gateway.calls if path == "/data/history")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("security", _SECURITIES)
+@pytest.mark.parametrize("fq", ["none", "pre", "post"])
+async def test_real_first_minute_previous_close_uses_saved_actual_predecessor(
+    minute_facts, daily_facts, post_dependencies, security, fq
+):
+    """完整480分钟首行昨收由真实前驱计算；输入存档/证券/模式，无返回，不以日线价冒充前一bar。"""
+    gateway = _MinuteReplayGateway(minute_facts, daily_facts, post_dependencies)
+    recorded = _case(minute_facts, security)["predecessor"]
+    request = recorded["request"]
+    assert request["frequency"] == "1m" and request["fq"] == "none"
+    assert request["fill_data"] is False and request["subscribe"] is False
+    assert request["start"] == request["end"]
+    predecessor = gateway.minute_predecessors[security]
+    assert len(predecessor) == 1 and predecessor.index[0] == pd.Timestamp(request["start"])
+    assert predecessor.iloc[0]["suspendFlag"] == 0
+    fields = [*_FIELDS, "factor", "pre_close", "paused"]
+    actual = await _read(gateway, minute_facts, security, fq=fq, fields=fields)
+    expected = _expected_basic(gateway, security, fq)
+    expected["pre_close"] = expected["close"].shift(1)
+    # 两份真实前驱均在该窗口的最新现金事件前，其因子与首输出分钟完全相同。
+    previous_close = np.round(
+        predecessor.iloc[0]["close"] * expected.iloc[0]["factor"], _CASH_FACTS[security][3]
+    )
+    expected.loc[expected.index[0], "pre_close"] = previous_close
+    assert len(actual) == 480
+    pd.testing.assert_frame_equal(actual, expected[fields], check_exact=True, check_dtype=False)
