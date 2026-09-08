@@ -618,9 +618,17 @@ def test_big_qmt_position_zero_average_cost_falls_back_to_positive_open_price():
 
 @pytest.mark.asyncio
 async def test_big_qmt_place_order_confirms_submission_in_adapter():
+    """验证适配器凭券商真实回显确认提交；无输入和返回值，仅操作本地模拟客户端。"""
     orders_calls = 0
+    submission_identity = {}
+
+    def _place(payload):
+        """保存券商收到的客户键；输入实际提交载荷，返回尚无订单号的原生响应。"""
+        submission_identity["value"] = payload["qmt_user_order_id"]
+        return {"order_id": "", "passorder_return": 0}
 
     def _orders(_payload):
+        """返回提交前后订单快照；输入查询载荷，返回包含真实客户键的模拟订单。"""
         nonlocal orders_calls
         orders_calls += 1
         if orders_calls == 1:
@@ -635,6 +643,7 @@ async def test_big_qmt_place_order_confirms_submission_in_adapter():
                     "order_price": 1.0,
                     "raw_status": 50,
                     "order_remark": "sub:sub-a|bt:alpha:abcd1234",
+                    "qmt_user_order_id": submission_identity["value"],
                     "sub_account_id": "sub-a",
                     "order_time": time.time(),
                 }
@@ -643,15 +652,7 @@ async def test_big_qmt_place_order_confirms_submission_in_adapter():
 
     client = _FakeGatewayClient(
         {
-            "/place_order": {
-                "order_id": "",
-                "passorder_return": 0,
-                "security": "000001.XSHE",
-                "amount": 100,
-                "price": 1.0,
-                "order_remark": "sub:sub-a|bt:alpha:abcd1234",
-                "sub_account_id": "sub-a",
-            },
+            "/place_order": _place,
             "/orders": _orders,
         },
     )
@@ -1173,3 +1174,120 @@ async def test_big_qmt_cancel_request_confirms_exact_order_terminal_status():
     assert result["value"] is True
     assert result["last_snapshot"]["raw_status"] == 54
     assert [path for _, path, _ in client.calls].count("/cancel_order") == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("duplicate", [False, True])
+@pytest.mark.parametrize("identity_location", ["top", "raw", "remark"])
+async def test_bigqmt_virtual_market_fill_with_only_customer_identity(duplicate, identity_location):
+    """重放缺少子仓标签的市价成交；输入重复候选标记，返回空并断言唯一认领。"""
+    state = {}
+
+    def place(payload):
+        """记录实际提交身份；输入下单载荷，返回无同步订单号的原生回包。"""
+        state.update(payload)
+        return {"order_id": "", "passorder_return": 0}
+
+    def orders(payload):
+        """返回只回显客户标识的成交；输入查询参数，返回受控券商快照。"""
+        if not state:
+            return []
+        row = dict(
+            order_id="real-filled",
+            security="159967.XSHE",
+            amount=62900,
+            filled=62900,
+            status="filled",
+            side="SELL",
+            order_price=0.773,
+            order_time=time.time(),
+            qmt_user_order_id=state["qmt_user_order_id"],
+            order_remark=state["qmt_user_order_id"],
+        )
+        if identity_location != "top":
+            row.pop("qmt_user_order_id")
+        if identity_location == "raw":
+            row.pop("order_remark")
+            row["raw"] = {"m_strUserOrderId": state["qmt_user_order_id"]}
+        return [row, dict(row, order_id="ambiguous-other")] if duplicate else [row]
+
+    client = _FakeGatewayClient({"/place_order": place, "/orders": orders})
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    adapter = BigQmtBrokerAdapter(config, router, client)
+    result = await adapter.place_order(
+        router.get("default"),
+        dict(
+            security="159967.XSHE",
+            side="SELL",
+            amount=62900,
+            style={"type": "market", "price": 0.762},
+            sub_account_id="b4-test",
+            order_remark="signal:286/exec:176",
+            idempotency_key="test-b4-fill",
+            wait_timeout=0.02,
+        ),
+    )
+    assert result["status"] == ("submit_unknown" if duplicate else "filled")
+    assert len([x for x in client.calls if x[1] == "/place_order"]) == 1
+    if not duplicate:
+        assert result["sub_account_id"] == "b4-test"
+        assert await adapter.list_orders(router.get("default"), {"sub_account_id": "other"}) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "identity_case", ["missing", "conflict", "raw_conflict", "remark_conflict"]
+)
+async def test_bigqmt_confirmation_requires_unambiguous_broker_identity(identity_case):
+    """验证备注不能替代缺失或冲突的客户键；输入冲突种类，返回空并断言不重发。"""
+    state = {}
+
+    def place(payload):
+        """保存本次提交；输入请求载荷，返回尚未确认的原生下单结果。"""
+        state.update(payload)
+        return {"order_id": "", "passorder_return": 0}
+
+    def orders(payload):
+        """生成存在身份缺口的回报；输入查询载荷，返回本地模拟订单列表。"""
+        if not state:
+            return []
+        row = dict(
+            order_id="untrusted-order",
+            security="159967.XSHE",
+            side="SELL",
+            amount=62900,
+            order_price=0.773,
+            order_time=time.time(),
+            order_remark=state["order_remark"],
+            sub_account_id="b4-test",
+        )
+        if identity_case == "conflict":
+            row["qmt_user_order_id"] = "BT-another"
+        elif identity_case == "raw_conflict":
+            row["qmt_user_order_id"] = state["qmt_user_order_id"]
+            row["raw"] = {"m_strUserOrderId": "BT-another"}
+        elif identity_case == "remark_conflict":
+            row["qmt_user_order_id"] = state["qmt_user_order_id"]
+            row["remark"] = "BT-another"
+        return [row]
+
+    client = _FakeGatewayClient({"/place_order": place, "/orders": orders})
+    config = _server_config()
+    router = AccountRouter(config.accounts)
+    adapter = BigQmtBrokerAdapter(config, router, client)
+    result = await adapter.place_order(
+        router.get("default"),
+        dict(
+            security="159967.XSHE",
+            side="SELL",
+            amount=62900,
+            style={"type": "market", "price": 0.762},
+            sub_account_id="b4-test",
+            order_remark="signal:286/exec:176",
+            idempotency_key="review-identity",
+            wait_timeout=0.01,
+        ),
+    )
+    assert result["status"] == "submit_unknown"
+    assert len([call for call in client.calls if call[1] == "/place_order"]) == 1

@@ -1322,3 +1322,123 @@ def test_big_qmt_helper_split_dividend_filters_epoch_millisecond_keys(monkeypatc
     ]
     assert result["value"]["events"][0]["bonus_pre_tax"] == 40.0
     assert result["value"]["events"][0]["per_base"] == 10
+
+
+@pytest.mark.parametrize("price", [0.0, 0.762, 0.773, 0.774])
+def test_bigqmt_market_tag_uses_exact_customer_identity(monkeypatch, tmp_path, price):
+    """验证市价差异不丢失精确标签；输入临时目录和成交价，返回空并核对冲突。"""
+    helper = _load_helper()
+    monkeypatch.setattr(helper, "LOG_FILE", str(tmp_path / "helper.log"))
+    helper.ORDER_TAG_STORE_LOADED = True
+    tag = dict(
+        security="159967.XSHE",
+        side="SELL",
+        amount=62900,
+        price=0.762,
+        pr_type=44,
+        qmt_user_order_id="BT-exact",
+        sub_account_id="b4-test",
+        order_remark="sub:b4-test|signal:286/exec:176",
+    )
+    row = dict(
+        order_id="real-filled",
+        security="159967.XSHE",
+        side="SELL",
+        amount=62900,
+        order_price=price,
+        qmt_user_order_id="BT-exact",
+        order_remark="BT-exact",
+    )
+    assert helper._order_matches_tag(row, tag)
+    assert not helper._order_matches_tag(dict(row, qmt_user_order_id="BT-other"), tag)
+    assert not helper._order_matches_tag(dict(row, side="BUY"), tag)
+    assert not helper._order_matches_tag(dict(row, amount=100), tag)
+    assert not helper._order_matches_tag(dict(row, sub_account_id="another"), tag)
+    monkeypatch.setattr(helper, "_parse_order_epoch", lambda value: 1000)
+    assert not helper._order_matches_tag(row, dict(tag, created_at=2000))
+    if price in (0.773, 0.774):
+        assert not helper._order_matches_tag(row, dict(tag, pr_type=11))
+    helper.PENDING_ORDER_TAGS = [tag]
+    helper.ORDER_TAGS_BY_ID = {}
+    ambiguous = helper._attach_virtual_tags_to_orders([dict(row), dict(row, order_id="other")])
+    assert all(not item.get("sub_account_id") for item in ambiguous)
+    assert not helper.ORDER_TAGS_BY_ID
+    helper.PENDING_ORDER_TAGS = [tag, dict(tag, sub_account_id="conflicting")]
+    assert not helper._attach_virtual_tags_to_orders([dict(row)])[0].get("sub_account_id")
+    helper.PENDING_ORDER_TAGS = [tag]
+    result = helper._attach_virtual_tags_to_orders([dict(row)])[0]
+    assert result["sub_account_id"] == "b4-test"
+    helper.ORDER_TAG_STORE_LOADED = False
+    helper.PENDING_ORDER_TAGS = []
+    helper.ORDER_TAGS_BY_ID = {}
+    assert helper._attach_virtual_tags_to_orders([dict(row)])[0]["sub_account_id"] == "b4-test"
+
+
+@pytest.mark.parametrize("bound", [False, True])
+@pytest.mark.parametrize("identity_case", ["missing", "conflict", "raw_conflict"])
+def test_bigqmt_helper_never_fabricates_or_overrides_broker_identity(
+    monkeypatch, tmp_path, bound, identity_case
+):
+    """验证已绑定和待绑定都保留身份缺口；输入绑定状态和冲突种类，返回空并核对标签。"""
+    helper = _load_helper()
+    monkeypatch.setattr(helper, "LOG_FILE", str(tmp_path / "helper.log"))
+    helper.ORDER_TAG_STORE_LOADED = True
+    tag = dict(
+        security="159967.XSHE",
+        side="SELL",
+        amount=62900,
+        price=0.762,
+        pr_type=44,
+        qmt_user_order_id="BT-local",
+        sub_account_id="b4-test",
+        order_remark="sub:b4-test|signal:286/exec:176",
+    )
+    row = dict(
+        order_id="untrusted-order",
+        security="159967.XSHE",
+        side="SELL",
+        amount=62900,
+        order_price=0.762,
+        qmt_user_order_id="",
+        order_remark="",
+    )
+    if identity_case == "conflict":
+        row["qmt_user_order_id"] = "BT-another"
+    elif identity_case == "raw_conflict":
+        row["qmt_user_order_id"] = "BT-local"
+        row["raw"] = {"m_strUserOrderId": "BT-another"}
+    helper.PENDING_ORDER_TAGS = [tag]
+    helper.ORDER_TAGS_BY_ID = {row["order_id"]: dict(tag)} if bound else {}
+    result = helper._attach_virtual_tags_to_orders([dict(row)])[0]
+    assert not result.get("sub_account_id")
+    assert not result.get("order_remark")
+    assert result["qmt_user_order_id"] == row["qmt_user_order_id"]
+
+
+def test_bigqmt_helper_keeps_unkeyed_legacy_tag_without_creating_identity(monkeypatch, tmp_path):
+    """验证两端无客户键的历史标签兼容；输入临时目录，返回空并保证不会合成强身份。"""
+    helper = _load_helper()
+    monkeypatch.setattr(helper, "LOG_FILE", str(tmp_path / "helper.log"))
+    helper.ORDER_TAG_STORE_LOADED = True
+    helper.ORDER_TAGS_BY_ID = {}
+    helper.PENDING_ORDER_TAGS = [
+        dict(
+            security="159967.XSHE",
+            side="SELL",
+            amount=62900,
+            price=0.762,
+            pr_type=11,
+            sub_account_id="legacy-sub",
+            order_remark="legacy-remark",
+        )
+    ]
+    row = dict(
+        order_id="legacy-order",
+        security="159967.XSHE",
+        side="SELL",
+        amount=62900,
+        order_price=0.762,
+    )
+    result = helper._attach_virtual_tags_to_orders([row])[0]
+    assert result["sub_account_id"] == "legacy-sub"
+    assert not result.get("qmt_user_order_id")

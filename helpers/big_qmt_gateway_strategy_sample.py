@@ -958,15 +958,48 @@ def _float_close(left: Any, right: Any) -> bool:
 
 
 def _order_matches_tag(row: Dict[str, Any], tag: Dict[str, Any]) -> bool:
+    """核对标签身份与订单事实；输入回报和标签，返回能否绑定，不修改状态。"""
+    row_key = str(row.get("qmt_user_order_id") or "").strip()
+    tag_key = str(tag.get("qmt_user_order_id") or "").strip()
+    raw = row.get("raw") if isinstance(row.get("raw"), dict) else {}
+    # 有客户键的提交必须由券商回显同一键，不能按经济字段合成强身份。
+    if bool(row_key) != bool(tag_key) or row_key != tag_key:
+        return False
+    if tag_key:
+        native_keys = [raw.get("qmt_user_order_id"), raw.get("m_strUserOrderId")]
+        if any(
+            str(value).strip() != tag_key
+            for value in native_keys if value not in (None, "")
+        ):
+            return False
+        remarks = [row.get("order_remark"), row.get("remark"), raw.get("m_strRemark")]
+        if any(
+            str(value or "").strip().startswith("BT-")
+            and str(value).strip() != tag_key
+            for value in remarks
+        ):
+            return False
+    row_sub = str(row.get("sub_account_id") or row.get("virtual_account_id") or "")
+    tag_sub = str(tag.get("sub_account_id") or tag.get("virtual_account_id") or "")
+    if row_sub and tag_sub and row_sub != tag_sub:
+        return False
+    row_side = str(row.get("side") or "").upper()
+    if not row_side:
+        row_side = {23: "BUY", 24: "SELL"}.get(raw.get("m_nOpType"), "")
+    if row_side and row_side != str(tag.get("side") or "").upper():
+        return False
     if str(row.get("security") or "") != str(tag.get("security") or ""):
         return False
     amount = int(row.get("amount") or 0)
     tag_amount = int(tag.get("amount") or 0)
     if tag_amount > 0 and amount != tag_amount:
         return False
+    # 强客户键对应同一次提交；市价保护价不是柜台生成价，不能参与身份比较。
+    exact_market = (row_key and tag_key and row_key == tag_key
+                    and int(tag.get("pr_type") or 11) != 11)
     tag_price = tag.get("price")
     order_price = row.get("order_price")
-    if tag_price not in (None, "") and order_price not in (None, "", 0, 0.0):
+    if not exact_market and tag_price not in (None, "") and order_price not in (None, "", 0, 0.0):
         if not _float_close(order_price, tag_price):
             return False
     order_epoch = _parse_order_epoch(row)
@@ -978,11 +1011,9 @@ def _order_matches_tag(row: Dict[str, Any], tag: Dict[str, Any]) -> bool:
 
 
 def _apply_order_tag(row: Dict[str, Any], tag: Dict[str, Any]) -> bool:
+    """补全业务标签但不生成客户键；输入已核验回报和标签，原地修改并返回是否变化。"""
     changed = False
     qmt_user_order_id = tag.get("qmt_user_order_id")
-    if qmt_user_order_id not in (None, "") and not row.get("qmt_user_order_id"):
-        row["qmt_user_order_id"] = qmt_user_order_id
-        changed = True
     for key in ("order_remark", "remark", "strategy_name", "sub_account_id", "virtual_account_id"):
         value = tag.get(key)
         current = row.get(key)
@@ -998,6 +1029,7 @@ def _apply_order_tag(row: Dict[str, Any], tag: Dict[str, Any]) -> bool:
 
 
 def _attach_virtual_tags_to_orders(orders: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """按双向唯一事实补标签；输入订单列表，返回原列表，必要时持久化标签映射。"""
     _load_order_tag_store_once()
     changed = False
     with ORDER_TAG_LOCK:
@@ -1005,14 +1037,23 @@ def _attach_virtual_tags_to_orders(orders: List[Dict[str, Any]]) -> List[Dict[st
         for order in orders:
             order_id = str(order.get("order_id") or "").strip()
             tag = ORDER_TAGS_BY_ID.get(order_id) if order_id else None
+            # 已有绑定也不能遮蔽券商身份冲突或缺失，防止旧映射污染新回报。
+            if tag is not None and not _order_matches_tag(order, tag):
+                continue
             if tag is None:
-                for pending in reversed(PENDING_ORDER_TAGS):
-                    if _order_matches_tag(order, pending):
-                        tag = pending
+                candidates = [pending for pending in PENDING_ORDER_TAGS
+                              if _order_matches_tag(order, pending)]
+                if len(candidates) == 1:
+                    candidate = candidates[0]
+                    # 同一标签对应多个券商委托时不任选一单，也不覆盖已有绑定。
+                    matching_orders = [row for row in orders if _order_matches_tag(row, candidate)]
+                    bound_elsewhere = any(key != order_id and value == candidate
+                                          for key, value in ORDER_TAGS_BY_ID.items())
+                    if len(matching_orders) == 1 and not bound_elsewhere:
+                        tag = candidate
                         if order_id:
-                            ORDER_TAGS_BY_ID[order_id] = dict(pending)
+                            ORDER_TAGS_BY_ID[order_id] = dict(candidate)
                             changed = True
-                        break
             if tag is not None and _apply_order_tag(order, tag):
                 changed = True
         if changed:
