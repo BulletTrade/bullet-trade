@@ -2266,7 +2266,7 @@ def get_price(
         fill_paused: 是否填充停牌数据
 
     Returns:
-        DataFrame
+        DataFrame。真实价格模式重试时保留同一复权参考日；普通取数失败仍记录日志并返回空表。
 
     Raises:
         FutureDataError: 当 avoid_future_data=True 时访问未来数据
@@ -2383,6 +2383,7 @@ def get_price(
     # 真实价格模式：使用当前回测时间作为复权参考日期
     # 注意：当 panel=False 时跳过真实价格模式，因为 get_price_engine 不支持 panel 参数
     # 此时直接使用标准的 get_price，它正确支持 panel=False 返回长表格式
+    reference_kwargs = {}
     if use_real_price and fq == "pre" and panel:
         # 使用当前回测日期作为复权参考日期，以获得当时的真实价格
 
@@ -2398,6 +2399,7 @@ def get_price(
                 log.warning(f"无法转换 current_dt 为 date 类型: {current_dt}, 使用今天日期")
                 pre_factor_ref_date = Date.today()
 
+        reference_kwargs["pre_factor_ref_date"] = pre_factor_ref_date
         raw_df = None
         final = None
         try:
@@ -2435,13 +2437,13 @@ def get_price(
                 final = _make_compatible_dataframe(raw_df, fields)
         except Exception as e:
             _raise_if_not_implemented(e)
-            log.warning(f"真实价格模式调用失败: {e}，回退到标准复权")
+            log.warning(f"真实价格模式调用失败: {e}，保留复权基准日重试")
             final = None
         if final is not None:
             _raise_if_empty_minute_data(avoid_future, freq, raw_df, security, end_date)
             return final
 
-    # 标准模式或真实价格模式失败时的回退策略
+    # 标准模式或真实价格模式失败后的同基准重试。
     raw_df = None
     final = None
     try:
@@ -2457,6 +2459,7 @@ def get_price(
             panel=panel,
             fill_paused=fill_paused,
             force_no_engine=force_no_engine,
+            **reference_kwargs,
         )
         raw_df = df if isinstance(df, pd.DataFrame) else None
 
