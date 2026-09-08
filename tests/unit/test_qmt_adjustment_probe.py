@@ -150,6 +150,60 @@ def test_exception_is_recorded_without_secret_or_retry():
     assert len(report["errors"]) == 1
 
 
+def test_capture_keeps_helper_build_and_complete_event_fields():
+    """核对新版helper元数据和七字段完整性；无输入/返回，不访问网络或记录账户。"""
+
+    good, _ = _request_recorder()
+
+    def request(path, payload):
+        """给假健康/事件增加版本及完整事实；输入路径参数，返回字典，无外部副作用。"""
+        response = good(path, payload)
+        if path == "/health":
+            response.update(
+                gateway_build_id="20260908_dividend_facts_v1",
+                dividend_event_schema="big-qmt-dividend-events/v1",
+            )
+        if path == "/data/split_dividend":
+            response["events"][0].update(
+                cash_per_share=0.1,
+                gift=0,
+                transfer=0,
+                rights=0,
+                rights_price=0,
+                share_reform=False,
+                qmt_dr=1.01,
+            )
+        return response
+
+    report = _capture(request)
+    for stage in ("health_before", "health_after"):
+        assert report[stage]["gateway_build_id"] == "20260908_dividend_facts_v1"
+        assert report[stage]["dividend_event_schema"] == "big-qmt-dividend-events/v1"
+        assert "account_id" not in report[stage]
+    assert report["cases"][0]["event_fields_complete"] is True
+    assert report["cases"][0]["history_completeness_verified"] is False
+    assert report["adjustment_accepted"] is False
+
+
+def test_capture_preserves_invalid_event_error_code_without_message():
+    """核对坏事件错误码不会被吞掉且正文仍脱敏；无输入/返回，不访问真实helper。"""
+
+    good, _ = _request_recorder()
+
+    def request(path, payload):
+        """对事件返回约定错误码；输入路径参数，返回假结果或异常，无外部副作用。"""
+        if path == "/data/split_dividend":
+            error = RuntimeError("PRIVATE_TEXT_MUST_NOT_LEAK")
+            error.code = "SPLIT_DIVIDEND_INVALID_DATA"
+            raise error
+        return good(path, payload)
+
+    report = _capture(request)
+    assert report["capture_ok"] is False
+    assert report["errors"][0]["code"] == "SPLIT_DIVIDEND_INVALID_DATA"
+    assert "PRIVATE_TEXT_MUST_NOT_LEAK" not in str(report)
+
+
 @pytest.mark.parametrize("bad_value", [None, float("nan"), float("inf"), -1, 0])
 def test_invalid_price_preserves_response_and_fails_capture(bad_value):
     """输入缺失/非法价，断言保留响应并标采集失败；无返回，无网络。"""

@@ -382,12 +382,13 @@ def test_big_qmt_gateway_handler_reads_request_headers():
 
 
 def test_runtime_health_reports_gateway_build_id():
+    """核对健康信息的 helper 构建号；无输入，返回 None，不启动服务。"""
     helper = _load_helper()
     runtime = helper._GatewayRuntime()
 
     health = runtime.health()
 
-    assert helper.GATEWAY_BUILD_ID == "20260901_history_contract_v1"
+    assert helper.GATEWAY_BUILD_ID == "20260908_dividend_facts_v1"
     assert health["gateway_build_id"] == helper.GATEWAY_BUILD_ID
 
 
@@ -497,6 +498,7 @@ def test_runtime_does_not_queue_when_context_missing_even_in_queue_mode():
 
 
 def test_big_qmt_helper_dispatches_non_tick_data_apis(monkeypatch):
+    """核对非 tick 路由和旧事件字段；输入替身夹具，返回 None，仅调用假 QMT 上下文。"""
     helper = _load_helper()
     context = _FakeContext()
     download_calls = []
@@ -584,7 +586,11 @@ def test_big_qmt_helper_dispatches_non_tick_data_apis(monkeypatch):
         {"security": "000001.XSHE", "start": "20200101", "end": "20201231"},
     )
     assert split_dividend["ok"] is True
-    assert split_dividend["value"]["events"] == [
+    legacy_fields = ("security", "date", "security_type", "scale_factor", "bonus_pre_tax", "per_base")
+    assert [
+        {field: event[field] for field in legacy_fields}
+        for event in split_dividend["value"]["events"]
+    ] == [
         {
             "security": "000001.XSHE",
             "date": "2020-01-01",
@@ -1285,14 +1291,18 @@ def test_big_qmt_helper_date_filter_accepts_epoch_milliseconds():
 
 
 def test_big_qmt_helper_split_dividend_filters_epoch_millisecond_keys(monkeypatch):
+    """用完整七字段事件验证毫秒日期筛选；输入替身夹具，返回 None，不访问外部 QMT。"""
     helper = _load_helper()
 
     class _Context:
+        """仅提供固定除权事件的假上下文，无服务器或交易状态。"""
+
         def get_divid_factors(self, qmt_security):
+            """检查请求代码并返回事件；输入证券代码，返回完整七字段字典，无外部副作用。"""
             assert qmt_security == "000001.SZ"
             return {
-                "673113600000": [1, 2, 3],
-                "1278000000000": [4, 5, 6],
+                "673113600000": [1, 2, 3, 0, 0, 0, 1],
+                "1278000000000": [4, 5, 6, 0, 0, 0, 1],
             }
 
     result = helper._dispatch_qmt_action(

@@ -24,13 +24,30 @@ __all__ = ["capture_adjustment_inputs", "summarize_capture", "main"]
 MODES = ("none", "front", "front_ratio", "back", "back_ratio")
 FREQUENCIES = ("1m", "5m", "15m", "30m", "60m", "1d")
 FIELDS = ("open", "high", "low", "close", "volume", "money", "preClose")
-_HEALTH_FIELDS = ("ready", "qmt_api_ready", "build", "version", "pid")
-_EVENT_FACT_FIELDS = {"cash_per_share", "gift", "transfer", "rights", "rights_price"}
+_HEALTH_FIELDS = (
+    "ready",
+    "qmt_api_ready",
+    "build",
+    "version",
+    "pid",
+    "gateway_build_id",
+    "dividend_event_schema",
+)
+_EVENT_FACT_FIELDS = {
+    "cash_per_share",
+    "gift",
+    "transfer",
+    "rights",
+    "rights_price",
+    "share_reform",
+    "qmt_dr",
+}
 _ERROR_CODES = {
     "BAD_REQUEST",
     "QMT_API_NOT_READY",
     "HISTORY_FAILED",
     "SPLIT_DIVIDEND_FAILED",
+    "SPLIT_DIVIDEND_INVALID_DATA",
     "ENSURE_CACHE_FAILED",
     "HTTP_401",
     "HTTP_403",

@@ -1,22 +1,22 @@
 #encoding:gbk
 # Author: BruceLee
-# Date: 2026-08-28
-# Version: 20260901_history_contract_v1
-# File: Big QMT embedded gateway strategy sample.
-# Description: Run inside a dedicated Big QMT strategy and expose a
-# BulletTrade-compatible local HTTP/JSON data and trading gateway.
-# Big QMT embedded gateway strategy sample.
-# Run this file inside a dedicated Big QMT strategy to expose a local HTTP/JSON
-# bridge. Validate scheduling, thread boundaries and QMT API availability in a
-# simulation environment before production use.
+# Date: 2026-09-08
+# Version: 20260908_dividend_facts_v1
+# 职责：在大 QMT 内提供现有 HTTP 行情和交易桥接，以及完整除权事件事实。
+# 输入：HTTP 请求、ContextInfo 和下方现有账户/端口/认证配置。
+# 输出：兼容现有客户端的 JSON；除权事件同时保留旧字段及 QMT 原始七字段。
+# 上下游：由外部 BulletTrade 服务调用；复权计算留在 QMT 外，不在此修改策略公式。
+# 环境：源码必须保持 GBK，依赖 QMT 内置 Python/Tornado；仿真核验后再考虑生产。
 
 import calendar
+from datetime import datetime, timedelta, timezone
 import json
 import logging
 from logging.handlers import TimedRotatingFileHandler
 import math
 import os
 import queue
+import re
 import sys
 import threading
 import time
@@ -44,7 +44,10 @@ LISTEN_PORT = 9000
 
 # Build marker shown in startup logs and /health. Update this when copying a new
 # helper build into QMT so tests can prove the running file version.
-GATEWAY_BUILD_ID = "20260901_history_contract_v1"
+GATEWAY_BUILD_ID = "20260908_dividend_facts_v1"
+
+# 除权事实协议版本；仅说明字段格式，不证明本地事件已下载完整或算法验收通过。
+DIVIDEND_EVENT_SCHEMA = "big-qmt-dividend-events/v1"
 
 # Shared password required by non-health HTTP APIs. Change this to a private
 # local value outside simulation; clients send it as X-BulletTrade-Password or
@@ -1034,16 +1037,26 @@ def _qmt_period(value: Any) -> str:
 
 
 def _qmt_dividend_type(value: Any) -> str:
-    text = str(value or "follow").strip().lower()
+    """归一化明确复权值；输入模式或 None，返回 QMT 字符串，非法值抛错，无外部副作用。
+
+    None 明确表示不复权；省略参数的旧 follow 默认由调用方处理，不能依赖真值判断。
+    """
+    if value is None:
+        return "none"
+    if not isinstance(value, str):
+        raise ValueError("复权模式必须为字符串或 None")
+    text = value.strip().lower()
     mapping = {
         "pre": "front_ratio",
         "post": "back_ratio",
         "qfq": "front_ratio",
         "hfq": "back_ratio",
         "none": "none",
-        "": "follow",
     }
-    return mapping.get(text, text)
+    result = mapping.get(text, text)
+    if result not in ("none", "front", "back", "front_ratio", "back_ratio", "follow"):
+        raise ValueError("不支持的复权模式")
+    return result
 
 
 def _date_digits(value: Any, max_length: int = 8) -> str:
@@ -1092,29 +1105,90 @@ def _is_miniqmt_fund_security(security: Any) -> bool:
     return len(code) == 6 and code.startswith("5")
 
 
+def _dividend_date(value: Any, label: str, allow_empty: bool = False) -> str:
+    """校验除权日期；输入日期值、字段名及空值许可，返回 ISO 日期，非法值抛 ValueError。
+
+    支持日/秒级日期文本和秒/毫秒时间戳；时间戳固定按中国时区解析，不依赖宿主机时区。
+    不访问 QMT，不改变共享的行情日期处理逻辑。
+    """
+    if value is None or value == "":
+        if allow_empty:
+            return ""
+        raise ValueError("%s 不能为空" % label)
+    if isinstance(value, bool):
+        raise ValueError("%s 不能是布尔值" % label)
+    text = str(value).strip()
+    formats = (
+        (r"[0-9]{8}", "%Y%m%d"),
+        (r"[0-9]{14}", "%Y%m%d%H%M%S"),
+        (r"[0-9]{4}-[0-9]{2}-[0-9]{2}", "%Y-%m-%d"),
+        (r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}", "%Y-%m-%dT%H:%M:%S"),
+        (r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}", "%Y-%m-%d %H:%M:%S"),
+    )
+    try:
+        for pattern, date_format in formats:
+            if re.fullmatch(pattern, text):
+                return datetime.strptime(text, date_format).date().isoformat()
+        if re.fullmatch(r"[0-9]{9,13}", text):
+            seconds = int(text) / (1000.0 if len(text) >= 11 else 1.0)
+            return datetime.fromtimestamp(seconds, timezone(timedelta(hours=8))).date().isoformat()
+    except (ValueError, OverflowError, OSError):
+        pass
+    raise ValueError("%s 不是有效日期" % label)
+
+
 def _split_dividend_row(qmt_security: str, template_security: Any, key: Any, item: Any) -> Dict[str, Any]:
-    values = list(item) if isinstance(item, (list, tuple)) else []
+    """转换单条 QMT 事件；输入证券、日期键与七项数组，返回兼容旧字段的完整事实字典。
 
-    def _number(index: int, default: float = 0.0) -> float:
+    缺失、非有限值或非法比例抛 ValueError，不补零、不访问网络、不生成累计因子。
+    送转负数保持原值供基金折算核对；原生 dr 仅用于诊断，不视为聚宽累计 factor。
+    """
+    event_date = _dividend_date(key, "事件日期")
+    names = ("interest", "stockBonus", "stockGift", "allotNum", "allotPrice", "gugai", "dr")
+    if not isinstance(item, (list, tuple)) or len(item) != len(names):
+        raise ValueError("%s 除权事件必须包含完整七字段" % event_date)
+    values = []
+    for index, name in enumerate(names):
         try:
-            return float(values[index] if index < len(values) else default)
-        except Exception:
-            return default
-
-    cash_dividend = _number(0)
-    bonus_share = _number(1)
-    transfer_share = _number(2)
-    rights_issue = _number(3)
+            if isinstance(item[index], bool) and name != "gugai":
+                raise ValueError("数值字段不能是布尔值")
+            number = float(item[index])
+        except (TypeError, ValueError, OverflowError):
+            raise ValueError("%s 除权字段 %s 不是有效数值" % (event_date, name))
+        if not math.isfinite(number):
+            raise ValueError("%s 除权字段 %s 必须有限" % (event_date, name))
+        values.append(number)
+    cash_dividend, bonus_share, transfer_share, rights_issue, rights_price, gugai, dr = values
+    if cash_dividend < 0 or rights_issue < 0 or rights_price < 0:
+        raise ValueError("%s 现金、配股数量及配股价不能为负" % event_date)
+    scale_factor = 1.0 + bonus_share + transfer_share + rights_issue
+    if not math.isfinite(scale_factor) or scale_factor <= 0:
+        raise ValueError("%s 合并股本比例必须为正且有限" % event_date)
+    if gugai not in (0.0, 1.0):
+        raise ValueError("%s 股改标识不是已知的 0/1" % event_date)
+    if dr <= 0:
+        raise ValueError("%s QMT 原生除权系数必须为正" % event_date)
     is_fund = _is_miniqmt_fund_security(qmt_security)
     per_base = 1 if is_fund else 10
     bonus_pre_tax = cash_dividend if is_fund else cash_dividend * 10.0
+    if not math.isfinite(bonus_pre_tax):
+        raise ValueError("%s 兼容现金字段超出数值范围" % event_date)
     return {
         "security": _from_qmt_security(template_security or qmt_security),
-        "date": _date_iso(key),
+        "date": event_date,
         "security_type": "fund" if is_fund else "stock",
-        "scale_factor": float(1.0 + bonus_share + transfer_share + rights_issue),
+        "scale_factor": float(scale_factor),
         "bonus_pre_tax": float(bonus_pre_tax),
         "per_base": per_base,
+        "cash_per_share": cash_dividend,
+        "gift": bonus_share,
+        "transfer": transfer_share,
+        "rights": rights_issue,
+        "rights_price": rights_price,
+        "share_reform": gugai == 1.0,
+        "qmt_dr": dr,
+        "qmt_raw": dict(zip(names, values)),
+        "source_timestamp": str(key),
     }
 
 
@@ -1634,6 +1708,11 @@ def _auto_ensure_history_cache(qmt_security: str, period: str, start: Any, end: 
 
 
 def _query_history(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """读取现有历史行情；输入 QMT 上下文和请求，返回 JSON 成功或错误响应。
+
+    显式 fq（含 None）优先于 dividend_type；两者均省略时保留旧 follow 默认。
+    沿用原行情补缓存及读取流程，非法复权参数在补缓存前返回 BAD_REQUEST；不调用交易接口。
+    """
     security = payload.get("security")
     securities = payload.get("securities") or payload.get("symbols")
     if not security and securities:
@@ -1657,7 +1736,11 @@ def _query_history(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]
         if qmt_field not in qmt_fields:
             qmt_fields.append(qmt_field)
     count = _to_int(payload.get("count"), -1)
-    dividend_type = _qmt_dividend_type(payload.get("fq") or payload.get("dividend_type"))
+    try:
+        mode = payload["fq"] if "fq" in payload else payload.get("dividend_type", "follow")
+        dividend_type = _qmt_dividend_type(mode)
+    except ValueError as exc:
+        return _error("BAD_REQUEST", str(exc), payload.get("request_id"))
     fill_data = _to_bool(payload.get("fill_data"), _to_bool(payload.get("fill_paused"), True))
     subscribe = _to_bool(payload.get("subscribe"), False)
     try:
@@ -2128,29 +2211,66 @@ def _query_index_stocks(context_info: Any, payload: Dict[str, Any]) -> Dict[str,
 
 
 def _query_split_dividend(context_info: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+    """查询完整除权事实；输入 QMT 上下文和请求，返回事件列表、来源和明确完整性边界。
+
+    仅调用单参数 get_divid_factors，并在本地筛日期；不下载、不订阅、不计算复权或交易。
+    API 失败与坏结构分开报错；空字典可返回空列表，但不能证明历史已完整。
+    """
     security = payload.get("security") or payload.get("stockcode")
     if not security:
         return _error("BAD_REQUEST", "get_split_dividend missing security", payload.get("request_id"))
     qmt_security = _to_qmt_security(security)
-    start = payload.get("start") or payload.get("start_date") or ""
-    end = payload.get("end") or payload.get("end_date") or ""
+    try:
+        start = _dividend_date(payload.get("start", payload.get("start_date")), "start", True)
+        end = _dividend_date(payload.get("end", payload.get("end_date")), "end", True)
+        if start and end and start > end:
+            raise ValueError("start 不能晚于 end")
+    except ValueError as exc:
+        return _error("BAD_REQUEST", str(exc), payload.get("request_id"))
     try:
         if context_info is None:
             return _context_not_ready(payload)
-        raw = context_info.get_divid_factors(qmt_security) or {}
-        events = []
-        for key in sorted(raw.keys()):
-            if not _date_in_range(key, start, end):
-                continue
-            item = raw.get(key)
-            events.append(_split_dividend_row(qmt_security, security, key, item))
-        return _ok({"events": events}, payload.get("request_id"))
+        getter = getattr(context_info, "get_divid_factors", None)
+        if not callable(getter):
+            raise QmtApiUnavailable("ContextInfo.get_divid_factors 不可用")
+        raw = getter(qmt_security)
     except QmtApiUnavailable as exc:
         LOGGER.exception("get_divid_factors unavailable: %s", exc)
         return _error("QMT_API_NOT_READY", str(exc), payload.get("request_id"))
     except Exception as exc:
         LOGGER.exception("get_divid_factors failed: %s", exc)
         return _error("SPLIT_DIVIDEND_FAILED", str(exc), payload.get("request_id"))
+    try:
+        if not isinstance(raw, dict):
+            raise ValueError("get_divid_factors 未返回明确字典，不能视为无事件")
+        dated = []
+        seen = set()
+        for key, item in raw.items():
+            event_date = _dividend_date(key, "事件日期")
+            if (start and event_date < start) or (end and event_date > end):
+                continue
+            if event_date in seen:
+                raise ValueError("%s 存在重复日期事件" % event_date)
+            seen.add(event_date)
+            dated.append((event_date, key, item))
+        events = [
+            _split_dividend_row(qmt_security, security, key, item)
+            for _, key, item in sorted(dated)
+        ]
+    except (ValueError, TypeError) as exc:
+        return _error("SPLIT_DIVIDEND_INVALID_DATA", str(exc), payload.get("request_id"))
+    return _ok(
+        {
+            "events": events,
+            "schema": DIVIDEND_EVENT_SCHEMA,
+            "source": "ContextInfo.get_divid_factors",
+            "gateway_build_id": GATEWAY_BUILD_ID,
+            "raw_event_count": len(raw),
+            "event_fields_complete": bool(events),
+            "history_completeness_verified": False,
+        },
+        payload.get("request_id"),
+    )
 
 
 def _call_passorder(
@@ -2692,6 +2812,8 @@ ACCOUNT_QUERY_ACTIONS = set(
 
 
 class _GatewayRuntime:
+    """协调 QMT 上下文、现有 HTTP 服务和请求队列；保留既有生命周期与交易调用边界。"""
+
     def __init__(self) -> None:
         self.context_info = None
         self.init_called = False
@@ -2824,6 +2946,7 @@ class _GatewayRuntime:
             job["event"].set()
 
     def health(self) -> Dict[str, Any]:
+        """返回运行与版本信息；无参数，输出健康字典，仅读取内存/日志文件状态，不启停服务。"""
         now = time.time()
         context_ready = self.context_info is not None
         qmt_api_ready = _qmt_global_available("get_trade_detail_data")
@@ -2850,6 +2973,7 @@ class _GatewayRuntime:
             "backend_type": "big_qmt",
             "strategy": "bt_big_qmt_gateway",
             "gateway_build_id": GATEWAY_BUILD_ID,
+            "dividend_event_schema": DIVIDEND_EVENT_SCHEMA,
             "listen": "%s:%s" % (LISTEN_HOST, LISTEN_PORT),
             "log_file": LOG_FILE,
             "log_file_size_bytes": log_file_size_bytes,
