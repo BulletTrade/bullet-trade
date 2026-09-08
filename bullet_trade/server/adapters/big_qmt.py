@@ -1474,29 +1474,18 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
         known_order_ids: Optional[set] = None,
         submitted_at: Optional[float] = None,
     ) -> Optional[Dict[str, Any]]:
+        """查询本父账户的新委托；输入请求、已知订单和提交时间，返回唯一匹配订单或空。"""
         known = {str(item) for item in (known_order_ids or set()) if str(item)}
         qmt_user_order_id = str(
             request.get("qmt_user_order_id") or order.get("qmt_user_order_id") or ""
         ).strip()
-        order_id = str(order.get("order_id") or order.get("order_ref") or "").strip()
-        if order_id and order_id != "0":
-            filters = {"order_id": order_id}
-            sub_account_id = _virtual_account_id(request)
-            if sub_account_id:
-                filters["sub_account_id"] = sub_account_id
-            orders = await self.list_orders(account, filters)
-            for item in orders:
-                if _matches_confirmed_big_qmt_submission(
-                    item, request, qmt_user_order_id, known, submitted_at
-                ):
-                    return item
+        # 原生回报可能只有客户标识，子仓标签尚未附加。确认前按子仓过滤会
+        # 把本次真实成交排除；在当前父账户内验证强身份后再恢复子仓标签。
         filters = {
             "security": request.get("security") or request.get("stock") or request.get("stockcode")
         }
-        sub_account_id = _virtual_account_id(request)
-        if sub_account_id:
-            filters["sub_account_id"] = sub_account_id
         orders = await self.list_orders(account, filters)
+        matched = []
         for item in orders:
             item_id = str(item.get("order_id") or "").strip()
             if item_id and item_id in known:
@@ -1504,8 +1493,8 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
             if _matches_confirmed_big_qmt_submission(
                 item, request, qmt_user_order_id, known, submitted_at
             ):
-                return item
-        return None
+                matched.append(item)
+        return matched[0] if len(matched) == 1 else None
 
     async def _snapshot_order_ids(self, account: AccountContext, request: Dict[str, Any]) -> set:
         security = request.get("security") or request.get("stock") or request.get("stockcode")
@@ -2146,8 +2135,10 @@ def _order_has_order_id(order: Dict[str, Any]) -> bool:
 
 
 def _order_matches_qmt_user_order_id(order: Dict[str, Any], qmt_user_order_id: str) -> bool:
+    """核验券商回显的客户键；输入回报和预期键，返回存在精确回显且无冲突的结果。"""
     if not qmt_user_order_id:
         return False
+    identity_fields = [order.get("qmt_user_order_id"), order.get("m_strUserOrderId")]
     candidates = [
         order.get("qmt_user_order_id"),
         order.get("order_remark"),
@@ -2157,6 +2148,7 @@ def _order_matches_qmt_user_order_id(order: Dict[str, Any], qmt_user_order_id: s
     ]
     raw = order.get("raw")
     if isinstance(raw, dict):
+        identity_fields.extend([raw.get("qmt_user_order_id"), raw.get("m_strUserOrderId")])
         candidates.extend(
             [
                 raw.get("qmt_user_order_id"),
@@ -2164,6 +2156,16 @@ def _order_matches_qmt_user_order_id(order: Dict[str, Any], qmt_user_order_id: s
                 raw.get("m_strUserOrderId"),
             ]
         )
+    if any(
+        str(item).strip() != qmt_user_order_id for item in identity_fields if item not in (None, "")
+    ):
+        return False
+    # helper 可补全普通业务备注，但任何位置的非空 BT 客户键都不能相互冲突。
+    if any(
+        str(item or "").strip().startswith("BT-") and str(item).strip() != qmt_user_order_id
+        for item in candidates
+    ):
+        return False
     return any(str(item or "").strip() == qmt_user_order_id for item in candidates)
 
 
@@ -2190,6 +2192,10 @@ def _matches_confirmed_big_qmt_submission(
     order_id = str(order.get("order_id") or "").strip()
     if not order_id or order_id in known_order_ids:
         return False
+    requested_sub = _virtual_account_id(request)
+    reported_sub = _virtual_account_id(order)
+    if requested_sub and reported_sub and requested_sub != reported_sub:
+        return False
     if not _has_strong_submission_identity(order, request, qmt_user_order_id):
         return False
     if not _order_matches_place_request(order, request):
@@ -2200,7 +2206,7 @@ def _matches_confirmed_big_qmt_submission(
 def _has_strong_submission_identity(
     order: Dict[str, Any], request: Dict[str, Any], qmt_user_order_id: str
 ) -> bool:
-    """确认回报回显了强客户键，或完全相同的显式订单备注。
+    """确认强客户键真实回显；仅未使用客户键的旧调用允许精确业务备注匹配。
 
     Args:
         order: 当前轮询得到的归一化订单。
@@ -2208,11 +2214,11 @@ def _has_strong_submission_identity(
         qmt_user_order_id: 服务端由幂等键导出的客户标识。
 
     Returns:
-        bool: 客户键精确相同，或明确携带的订单备注完全相同时返回 True。
+        bool: 客户键无冲突且精确回显，或无客户键的历史调用备注完全相同时返回 True。
     """
 
-    if qmt_user_order_id and _order_matches_qmt_user_order_id(order, qmt_user_order_id):
-        return True
+    if qmt_user_order_id:
+        return _order_matches_qmt_user_order_id(order, qmt_user_order_id)
     request_remark = str(request.get("order_remark") or request.get("remark") or "").strip()
     order_remark = str(order.get("order_remark") or order.get("remark") or "").strip()
     return bool(request_remark and order_remark and request_remark == order_remark)
