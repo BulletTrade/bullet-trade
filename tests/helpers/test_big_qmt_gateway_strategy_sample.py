@@ -387,7 +387,7 @@ def test_runtime_health_reports_gateway_build_id():
 
     health = runtime.health()
 
-    assert helper.GATEWAY_BUILD_ID == "20260901_history_contract_v1"
+    assert helper.GATEWAY_BUILD_ID == "20260908_b4_fill_reconciliation_v1"
     assert health["gateway_build_id"] == helper.GATEWAY_BUILD_ID
 
 
