@@ -257,6 +257,14 @@ async def test_admin_health_refreshes_big_qmt_gateway_before_snapshot():
 
 @pytest.mark.asyncio
 async def test_big_qmt_data_adapter_normalizes_gateway_payloads():
+    """验证非本次指数历史和其他行情接口包装；无参数或外部副作用，返回断言结果。"""
+
+    def security_info(payload):
+        """按测试证券提供明确类型；输入查询参数，返回独立元数据，不访问真实服务。"""
+        if payload.get("security") == "000905.XSHG":
+            return {"display_name": "中证500", "type": "index"}
+        return {"display_name": "平安银行", "type": "stock"}
+
     client = _FakeGatewayClient(
         {
             "/data/history": {"records": [{"open": 1.0, "close": 2.0}]},
@@ -286,7 +294,7 @@ async def test_big_qmt_data_adapter_normalizes_gateway_payloads():
                 "ticks": {"000001.XSHE": {"lastPrice": 12.4, "timetag": "20260703 09:30:00"}}
             },
             "/data/trade_days": {"values": ["20260701"]},
-            "/data/security_info": {"display_name": "平安银行", "type": "stock"},
+            "/data/security_info": security_info,
             "/data/ensure_cache": {"requested": True, "security": "000001.XSHE"},
             "/data/all_securities": {"records": [{"security": "000001.XSHE", "sector": "沪深A股"}]},
             "/data/index_stocks": {"stocks": ["000001.XSHE", "000002.XSHE"]},
@@ -295,11 +303,12 @@ async def test_big_qmt_data_adapter_normalizes_gateway_payloads():
     )
     adapter = BigQmtDataAdapter(client)
 
-    history = await adapter.get_history({"security": "000001.XSHE"})
+    # 股票/ETF标准化由独立全链路测试覆盖；这里保留指数旧包装与超时契约。
+    history = await adapter.get_history({"security": "000905.XSHG"})
     assert history["dtype"] == "dataframe"
     assert history["columns"] == ["open", "close"]
     assert history["records"] == [[1.0, 2.0]]
-    assert client.timeouts[0] == ("/data/history", 120.0)
+    assert client.timeouts[-1] == ("/data/history", 120.0)
 
     snapshot = await adapter.get_snapshot({"security": "000001.XSHE"})
     assert snapshot["sid"] == "000001.XSHE"

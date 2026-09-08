@@ -1,9 +1,21 @@
+"""大QMT服务端适配器。
+
+作者：BruceLee。
+职责：接收远程数据/交易请求，协调既有HTTP helper并维持原协议。
+主要输入：ServerConfig、账户上下文、请求参数及QMT返回的原始事实。
+主要输出：标准行情wire、账户/订单信息及明确异常。
+上下游：RemoteQmtProvider/dispatcher -> 本模块 -> QMT策略helper；股票/ETF
+复权计算由纯qmt_adjustment函数完成，不依赖聚宽、不修改其他provider。
+环境约定：沿用现有helper地址、令牌及超时配置；本模块不启动QMT进程。
+"""
+
 from __future__ import annotations
 
 import asyncio
 import hashlib
 import json
 import math
+import re
 import time
 import urllib.error
 import urllib.request
@@ -12,6 +24,15 @@ from datetime import date, datetime
 from typing import Any, Dict, Iterable, List, Optional
 from uuid import uuid4
 
+import numpy as np
+import pandas as pd
+
+from bullet_trade.data.qmt_adjustment import (
+    AdjustmentError,
+    adjust_bars,
+    aggregate_bars,
+    parse_frequency,
+)
 from bullet_trade.utils.env_loader import get_env, get_env_float
 
 from ..config import ServerConfig
@@ -420,7 +441,184 @@ class BigQmtGatewayClient:
         self._last_error = message
 
 
+_HISTORY_FIELDS = ("open", "high", "low", "close", "volume", "money")
+
+
+def _history_today() -> date:
+    """获取本轮中国日期；无输入，返回 date，仅读取时钟，不依赖宿主机时区。"""
+    return pd.Timestamp.now(tz="Asia/Shanghai").date()
+
+
+def _history_timestamp(value: Any, *, end: bool = False) -> pd.Timestamp:
+    """解析行情边界；输入日期/时间及结束标识，返回北京时间无时区戳，非法抛错，无副作用。"""
+    if value is None or isinstance(value, (bool, np.bool_)) or value == 0:
+        raise AdjustmentError("行情日期不能为空或布尔值")
+    text = str(value).strip()
+    date_only = (isinstance(value, date) and not isinstance(value, datetime)) or bool(
+        re.fullmatch(r"\d{8}|\d{4}-\d{2}-\d{2}", text)
+    )
+    try:
+        if re.fullmatch(r"\d{8}", text):
+            stamp = pd.Timestamp(datetime.strptime(text, "%Y%m%d"))
+        elif re.fullmatch(r"\d{14}", text):
+            stamp = pd.Timestamp(datetime.strptime(text, "%Y%m%d%H%M%S"))
+        elif re.fullmatch(r"\d{10}|\d{13}", text):
+            stamp = pd.to_datetime(int(text), unit="ms" if len(text) == 13 else "s", utc=True)
+        else:
+            stamp = pd.Timestamp(value)
+        if pd.isna(stamp):
+            raise ValueError("空时间戳")
+        if stamp.tzinfo is not None:
+            stamp = stamp.tz_convert("Asia/Shanghai").tz_localize(None)
+        if end and date_only:
+            stamp = stamp.normalize() + pd.Timedelta(days=1) - pd.Timedelta(seconds=1)
+        return stamp
+    except (ValueError, TypeError, OverflowError) as exc:
+        raise AdjustmentError("行情日期格式无效: %s" % text) from exc
+
+
+def _history_listing_date(metadata: Dict[str, Any]) -> Optional[pd.Timestamp]:
+    """解析 QMT 上市日；输入证券元数据，返回有效日期或 None，不把零值/1970当真实原点。"""
+    value = metadata.get("start_date") or metadata.get("OpenDate")
+    if value in (None, "", 0, "0", "0.0"):
+        return None
+    try:
+        result = _history_timestamp(value).normalize()
+    except AdjustmentError:
+        return None
+    return result if result.year > 1970 else None
+
+
+def _history_price_decimals(security: str, metadata: Dict[str, Any]) -> int:
+    """确定本次股票/ETF数据位数；输入证券及详情，返回位数，不使用交易层动态报价规则。"""
+    tick = metadata.get("PriceTick")
+    if tick is not None and not isinstance(tick, bool):
+        try:
+            value = float(tick)
+            if math.isfinite(value) and value > 0:
+                for decimals in range(9):
+                    if math.isclose(value, 10.0**-decimals, rel_tol=1e-9, abs_tol=0.0):
+                        return decimals
+        except (TypeError, ValueError, OverflowError):
+            pass
+    normalized = metadata.get("qmt_security") or metadata.get("qmt_code") or security
+    code = str(normalized).split(".", 1)[0]
+    return 3 if code.startswith(("5", "15", "16")) else 2
+
+
+def _history_in_standard_scope(security: str, metadata: Dict[str, Any]) -> bool:
+    """判定本次沪深A股/ETF范围；输入请求证券与QMT详情，返回布尔值，不变更原请求。"""
+    kind = str(metadata.get("type") or "").lower()
+    normalized = metadata.get("qmt_security") or metadata.get("qmt_code") or security
+    if not isinstance(normalized, str):
+        return False
+    code, separator, market = normalized.upper().partition(".")
+    if not separator or len(code) != 6 or not code.isdigit():
+        return False
+    if market not in {"SH", "SZ", "XSHG", "XSHE"}:
+        return False
+    if kind == "etf":
+        return True
+    if kind == "stock":
+        return code.startswith("6") if market in {"SH", "XSHG"} else code.startswith(("0", "3"))
+    return False
+
+
+def _history_frame(value: Any) -> pd.DataFrame:
+    """严格解析 helper 单证券行情；输入 wire，返回独立时间索引表，坏结构/乱序/重复抛错。"""
+    if not isinstance(value, dict) or value.get("dtype") != "dataframe":
+        raise AdjustmentError("helper 未返回明确 dataframe，不能把失败当空行情")
+    columns, records = value.get("columns"), value.get("records")
+    if not isinstance(columns, list) or not isinstance(records, list):
+        raise AdjustmentError("helper 行情缺少 columns/records")
+    if len(columns) != len(set(columns)) or any(
+        not isinstance(row, (list, tuple)) or len(row) != len(columns) for row in records
+    ):
+        raise AdjustmentError("helper 行情列重复或记录长度不匹配")
+    frame = pd.DataFrame(records, columns=columns)
+    index_columns = value.get("index_columns") or []
+    if not records:
+        return pd.DataFrame(
+            columns=[col for col in columns if col not in index_columns],
+            index=pd.DatetimeIndex([], name="time"),
+            dtype=float,
+        )
+    if len(index_columns) != 1 or index_columns[0] not in frame:
+        raise AdjustmentError("helper 行情缺少单证券显式时间索引")
+    frame.index = pd.DatetimeIndex(
+        [_history_timestamp(item) for item in frame.pop(index_columns[0])], name="time"
+    )
+    if frame.index.has_duplicates or not frame.index.is_monotonic_increasing:
+        raise AdjustmentError("helper 行情时间重复或乱序")
+    return frame
+
+
+def _history_session_index(
+    days: pd.DatetimeIndex, base: str, end: pd.Timestamp
+) -> pd.DatetimeIndex:
+    """展开股票/ETF基础时间轴；输入交易日、基础周期和截止，返回标准索引，不补造交易日。"""
+    if base == "1d":
+        return pd.DatetimeIndex(days[days <= end], name="time")
+    values = []
+    for day in days:
+        values.extend(
+            pd.date_range(day + pd.Timedelta(hours=9, minutes=31), periods=120, freq="min")
+        )
+        values.extend(
+            pd.date_range(day + pd.Timedelta(hours=13, minutes=1), periods=120, freq="min")
+        )
+    index = pd.DatetimeIndex(values, name="time")
+    return index[index <= end]
+
+
+def _history_merge_auction(
+    frame: pd.DataFrame,
+    end: pd.Timestamp,
+    required_start: pd.Timestamp,
+) -> pd.DataFrame:
+    """合并所需0930竞价入0931；输入表、截止和必要最早分钟，返回副本，窗口内缺目标抛错。"""
+    result = frame.copy(deep=True)
+    auctions = result.index[(result.index.hour == 9) & (result.index.minute == 30)]
+    for stamp in auctions:
+        target = stamp + pd.Timedelta(minutes=1)
+        if target > end or target < required_start:
+            result = result.drop(index=stamp)
+            continue
+        if target not in result.index:
+            raise AdjustmentError("集合竞价缺少同日09:31目标行情: %s" % stamp.date())
+        auction = result.loc[stamp]
+        result.loc[target, "open"] = auction["open"]
+        result.loc[target, "high"] = max(auction["high"], result.loc[target, "high"])
+        result.loc[target, "low"] = min(auction["low"], result.loc[target, "low"])
+        for field_name in ("volume", "money"):
+            result.loc[target, field_name] += auction[field_name]
+        result = result.drop(index=stamp)
+    return result
+
+
+def _history_principal_frame(
+    frame: pd.DataFrame,
+    *,
+    start: Optional[pd.Timestamp],
+    count: Optional[int],
+    size: int,
+    unit: str,
+    window_start: Optional[pd.Timestamp],
+) -> pd.DataFrame:
+    """选实际参与聚合的基础行；输入候选表与窗口，返回视图，不把预取seed视为业务行情。"""
+    if unit in {"w", "mon"}:
+        result = frame.loc[frame.index >= window_start]
+        if count is not None and not result.empty:
+            periods = result.index.to_period("W-SUN" if unit == "w" else "M")
+            result = result.loc[periods.isin(periods.unique()[-count:])]
+        return result
+    result = frame.loc[frame.index >= start] if start is not None else frame
+    return result.tail(int(count) * size) if count is not None else result
+
+
 class BigQmtDataAdapter(RemoteDataAdapter):
+    """协调大QMT事实到标准行情；持有现有client，数据计算不进入交易或其他provider路径。"""
+
     def __init__(self, client: BigQmtGatewayClient) -> None:
         self.client = client
 
@@ -446,24 +644,566 @@ class BigQmtDataAdapter(RemoteDataAdapter):
             pass
 
     async def get_history(self, payload: Dict) -> Dict:
-        """下载并读取大 QMT 历史行情。
+        """读取并标准化股票/ETF行情；输入公开请求，返回原wire协议，不修改请求。
 
-        Args:
-            payload: 历史行情请求参数。
-
-        Returns:
-            Dict: qmt-remote 兼容的 DataFrame 包装。
+        本层唯一协调原价、事件、竞价和时间窗口；指数等非本次类型保持原生路径。
+        仅调用既有行情接口，helper可按既有流程补请求窗口缓存；不订阅、不交易。
+        非法数据明确抛错，已进入自算的证券绝不以原生结果兜底。
         """
+        security = payload.get("security")
+        securities = [security] if isinstance(security, str) else security
+        if not isinstance(securities, (list, tuple)) or any(
+            not isinstance(item, str) or not item.strip() for item in securities
+        ):
+            raise AdjustmentError("security 必须是证券字符串或证券列表")
+        if len(set(securities)) != len(securities):
+            raise AdjustmentError("security 列表不能重复")
+        standard_payload = dict(payload)
+        if payload.get("fq", "pre") == "pre" and payload.get("pre_factor_ref_date") is None:
+            standard_payload["pre_factor_ref_date"] = _history_today()
+        frames = {}
+        for symbol in securities:
+            metadata = _extract_dict(
+                await self.client.post("/data/security_info", {"security": symbol})
+            )
+            kind = str(metadata.get("type") or "").lower()
+            if not kind:
+                raise AdjustmentError("QMT证券元数据缺少明确类型")
+            if not _history_in_standard_scope(symbol, metadata):
+                native_payload = dict(payload, security=symbol)
+                native = await self._history_post(native_payload)
+                if isinstance(security, str):
+                    return _as_dataframe_payload(native)
+                frames[symbol] = _history_frame(native)
+            else:
+                frames[symbol] = await self._standard_history(symbol, standard_payload, metadata)
+        if isinstance(security, str):
+            result = frames[security]
+        elif not frames:
+            result = pd.DataFrame()
+        elif payload.get("panel", True):
+            result = pd.concat(frames, axis=1).swaplevel(0, 1, axis=1)
+            result.columns.names = ["field", "code"]
+        else:
+            rows = []
+            for symbol, frame in frames.items():
+                row = frame.rename_axis("time").reset_index()
+                row.insert(1, "code", symbol)
+                rows.append(row)
+            result = pd.concat(rows, ignore_index=True)
+        return dataframe_to_payload(result)
 
-        data = await self.client.post(
+    async def _history_post(self, payload: Dict[str, Any]) -> Any:
+        """沿现有长超时读取行情；输入helper载荷，返回原响应，异常传播，不增加重试。"""
+        return await self.client.post(
             "/data/history",
             payload,
             timeout_seconds=max(
-                self.client.config.timeout_seconds,
-                _BIG_QMT_HISTORY_TIMEOUT_SECONDS,
+                self.client.config.timeout_seconds, _BIG_QMT_HISTORY_TIMEOUT_SECONDS
             ),
         )
-        return _as_dataframe_payload(data)
+
+    async def _history_calendar(
+        self,
+        security: str,
+        end: pd.Timestamp,
+        *,
+        start: Optional[pd.Timestamp] = None,
+        count: Optional[int] = None,
+    ) -> pd.DatetimeIndex:
+        """读取既有交易日历；输入证券及有界日期或条数，返回有序日期，非法/重复响应抛错。"""
+        request = {"security": security, "end": end.strftime("%Y-%m-%d"), "period": "1d"}
+        if start is not None:
+            request["start"] = start.strftime("%Y-%m-%d")
+        request["count"] = count if count is not None else -1
+        data = await self.client.post("/data/trade_days", request)
+        if not isinstance(data, dict) or not isinstance(data.get("values"), list):
+            raise AdjustmentError("helper 未返回明确交易日列表")
+        days = pd.DatetimeIndex([_history_timestamp(value).normalize() for value in data["values"]])
+        if days.has_duplicates or not days.is_monotonic_increasing:
+            raise AdjustmentError("QMT交易日历重复或乱序")
+        days = days[days <= end.normalize()]
+        if start is not None:
+            days = days[days >= start.normalize()]
+        if count is not None:
+            days = days[-count:]
+        return days
+
+    async def _history_raw(
+        self,
+        security: str,
+        base: str,
+        start: pd.Timestamp,
+        end: pd.Timestamp,
+        fields: List[str],
+        *,
+        fill_data: bool = False,
+    ) -> pd.DataFrame:
+        """读取有界基础原价；输入证券、周期、边界和字段，返回独立表。
+
+        fill_data仅供已缺行时查询明确停牌事实；补齐价格不能用作真实成交价。
+        不订阅、不原生复权，helper可能下载这一明确窗口的缓存，异常传播。
+        """
+        if start > end:
+            raise AdjustmentError("基础行情依赖窗口倒置")
+        pattern = "%Y-%m-%d" if base == "1d" else "%Y-%m-%d %H:%M:%S"
+        data = await self._history_post(
+            {
+                "security": security,
+                "frequency": base,
+                "start": start.strftime(pattern),
+                "end": end.strftime(pattern),
+                "count": -1,
+                "fields": fields,
+                "fq": "none",
+                "subscribe": False,
+                "fill_data": fill_data,
+            }
+        )
+        frame = _history_frame(data)
+        if not frame.empty and not set(fields).issubset(frame.columns):
+            raise AdjustmentError(
+                "QMT基础行情缺少字段: %s" % sorted(set(fields) - set(frame.columns))
+            )
+        if base == "1d" and not frame.empty and not frame.index.equals(frame.index.normalize()):
+            raise AdjustmentError("QMT日线索引不是唯一日日期")
+        if not frame.empty and ((frame.index < start) | (frame.index > end)).any():
+            raise AdjustmentError("QMT返回了依赖窗口之外的行情")
+        for field_name in fields:
+            if frame.empty:
+                break
+            if not pd.api.types.is_numeric_dtype(frame[field_name]) or pd.api.types.is_bool_dtype(
+                frame[field_name]
+            ):
+                raise AdjustmentError("QMT字段不是数值: %s" % field_name)
+            if not np.isfinite(frame[field_name].to_numpy(dtype=float)).all():
+                raise AdjustmentError("QMT字段含非有限值: %s" % field_name)
+        if (
+            not frame.empty
+            and "suspendFlag" in frame
+            and not frame["suspendFlag"].isin([0, 1]).all()
+        ):
+            raise AdjustmentError("QMT停牌标识不是明确0/1")
+        return frame
+
+    async def _history_pause_facts(
+        self,
+        security: str,
+        days: pd.DatetimeIndex,
+    ) -> pd.DataFrame:
+        """确认缺行日期确已停牌；输入证券和缺失交易日，返回辅助日线，不采信填充价。
+
+        仅在明确小窗以fill_data=True读取suspendFlag；缺日或flag非1即抛错，
+        不把接口失败、零成交量或前收盘零值解释为停牌。
+        """
+        facts = await self._history_raw(
+            security,
+            "1d",
+            days[0],
+            days[-1],
+            ["close", "suspendFlag"],
+            fill_data=True,
+        )
+        for day in days:
+            if day not in facts.index or facts.loc[day, "suspendFlag"] != 1:
+                raise AdjustmentError("QMT缺行且没有明确停牌事实: %s" % day.date())
+        return facts
+
+    async def _history_events(
+        self,
+        security: str,
+        lower: date,
+        upper: date,
+        available: pd.DataFrame,
+        listing: Optional[pd.Timestamp],
+    ) -> List[Dict[str, Any]]:
+        """取得相关事件及前一实际收盘；输入覆盖日期、已有日线和上市日，返回完整事件，不用dr。"""
+        data = await self.client.post(
+            "/data/split_dividend",
+            {
+                "security": security,
+                "start": lower.isoformat(),
+                "end": upper.isoformat(),
+            },
+        )
+        if not isinstance(data, dict) or data.get("schema") != "big-qmt-dividend-events/v1":
+            raise AdjustmentError("QMT除权响应缺少完整事件schema")
+        if data.get("source") != "ContextInfo.get_divid_factors" or not isinstance(
+            data.get("events"), list
+        ):
+            raise AdjustmentError("QMT除权响应缺少明确来源或事件列表")
+        events = []
+        relevant = []
+        seen = set()
+        for raw_event in data["events"]:
+            if not isinstance(raw_event, dict) or "date" not in raw_event:
+                raise AdjustmentError("QMT除权事件缺少日期")
+            event_date = _history_timestamp(raw_event["date"]).date()
+            if not lower < event_date <= upper:
+                continue
+            if event_date in seen:
+                raise AdjustmentError("QMT除权事件同日重复")
+            seen.add(event_date)
+            required = {
+                "cash_per_share",
+                "gift",
+                "transfer",
+                "rights",
+                "rights_price",
+                "share_reform",
+            }
+            if not required.issubset(raw_event):
+                raise AdjustmentError("QMT除权事件字段不完整")
+            if not isinstance(raw_event["share_reform"], bool):
+                raise AdjustmentError("QMT股改标识不是布尔值")
+            if raw_event["share_reform"]:
+                raise NotImplementedError("尚不支持股改事件: %s" % event_date)
+            relevant.append((event_date, raw_event))
+        for event_date, raw_event in relevant:
+            end = pd.Timestamp(event_date) - pd.Timedelta(days=1)
+            previous = await self._history_calendar(security, end, count=1)
+            close_row = None
+            while len(previous):
+                day = previous[-1]
+                if listing is not None and day < listing:
+                    break
+                if day in available.index:
+                    close_row = available.loc[day]
+                else:
+                    support = await self._history_raw(
+                        security, "1d", day, day, ["close", "suspendFlag"]
+                    )
+                    if support.empty:
+                        await self._history_pause_facts(security, pd.DatetimeIndex([day]))
+                        close_row = pd.Series({"suspendFlag": 1.0})
+                    else:
+                        close_row = support.iloc[-1]
+                flag = close_row.get("suspendFlag")
+                if flag not in (0, 1):
+                    raise AdjustmentError("除权前收盘缺少明确停牌事实")
+                if flag == 0:
+                    break
+                previous = await self._history_calendar(
+                    security, day - pd.Timedelta(days=1), count=1
+                )
+                close_row = None
+            if close_row is None:
+                raise AdjustmentError("无法取得除权前实际交易日收盘")
+            event = dict(raw_event)
+            event["date"] = event_date.isoformat()
+            event["previous_close"] = close_row["close"]
+            event["previous_close_date"] = previous[-1].date().isoformat()
+            events.append(event)
+        return events
+
+    async def _standard_history(
+        self,
+        security: str,
+        payload: Dict[str, Any],
+        metadata: Dict[str, Any],
+    ) -> pd.DataFrame:
+        """协调单个股票/ETF标准行情；输入请求和元数据，返回新表，依赖不足抛错、不走原生兜底。"""
+        frequency = payload.get("frequency")
+        if frequency is None:
+            frequency = payload.get("period")
+        if frequency is None:
+            frequency = "1d"
+        try:
+            size, unit = parse_frequency(frequency)
+        except AdjustmentError as exc:
+            raise NotImplementedError(str(exc)) from exc
+        base = "1m" if unit == "m" else "1d"
+        simple = size == 1 and unit in {"m", "d"}
+        fields = payload.get("fields")
+        if fields is None:
+            fields = list(_HISTORY_FIELDS)
+        elif isinstance(fields, str):
+            fields = [field.strip() for field in fields.split(",") if field.strip()]
+        if (
+            not isinstance(fields, (list, tuple))
+            or not fields
+            or any(not isinstance(field, str) for field in fields)
+        ):
+            raise AdjustmentError("fields 必须是非空字段列表")
+        fields = list(fields)
+        if len(set(fields)) != len(fields):
+            raise AdjustmentError("fields 不能重复")
+        supported = set(_HISTORY_FIELDS) | ({"factor", "pre_close", "paused"} if simple else set())
+        if not set(fields).issubset(supported):
+            raise NotImplementedError(
+                "当前股票/ETF周期未支持字段: %s" % sorted(set(fields) - supported)
+            )
+        raw_mode = payload.get("fq", "pre")
+        mode = "none" if raw_mode is None else raw_mode
+        if not isinstance(mode, str) or mode not in {"none", "pre", "post"}:
+            raise NotImplementedError("股票/ETF标准行情仅支持 None/none/pre/post")
+        count = payload.get("count")
+        if count is not None and (
+            isinstance(count, bool) or not isinstance(count, (int, np.integer)) or count <= 0
+        ):
+            raise AdjustmentError("count 必须是正整数")
+        start_value = payload.get("start")
+        if start_value is None:
+            start_value = payload.get("start_date")
+        if start_value is not None and count is not None:
+            raise AdjustmentError("start 与 count 不能同时指定")
+        end_value = payload.get("end")
+        if end_value is None:
+            end_value = payload.get("end_date")
+        end = (
+            _history_timestamp(end_value, end=True)
+            if end_value is not None
+            else pd.Timestamp.now(tz="Asia/Shanghai").tz_localize(None).floor("s")
+        )
+        listing = _history_listing_date(metadata)
+        if mode == "post" and (listing is None or listing > end.normalize()):
+            raise AdjustmentError("后复权需要QMT有效上市日作为固定原点")
+        if start_value is None and count is None:
+            if listing is None:
+                raise AdjustmentError("全历史请求需要QMT有效上市日以限定历史窗口")
+            start_value = listing
+        start = _history_timestamp(start_value) if start_value is not None else None
+        if start is not None and start > end:
+            raise AdjustmentError("start 不能晚于 end")
+        reference = None
+        if mode == "pre":
+            reference = (
+                _history_timestamp(payload["pre_factor_ref_date"]).date()
+                if payload.get("pre_factor_ref_date") is not None
+                else _history_today()
+            )
+        skip_paused = bool(payload.get("skip_paused", False))
+        fill_paused = bool(payload.get("fill_paused", True))
+        decimals = _history_price_decimals(security, metadata)
+        raw_fields = list(_HISTORY_FIELDS) + ["suspendFlag"]
+        if base == "1d" and "pre_close" in fields:
+            raw_fields.append("preClose")
+        target_rows = int(count) * size if count is not None and unit in {"m", "d"} else None
+        day_count = (
+            (math.ceil(target_rows / 240) if base == "1m" else target_rows) if target_rows else None
+        )
+        window_start = start
+        if unit in {"w", "mon"}:
+            period_name = "W-SUN" if unit == "w" else "M"
+            period = (start if start is not None else end).to_period(period_name)
+            if count is not None:
+                latest_days = await self._history_calendar(security, end, count=1)
+                if latest_days.empty:
+                    return pd.DataFrame(
+                        columns=fields, index=pd.DatetimeIndex([], name="time"), dtype=float
+                    )
+                period = latest_days[-1].to_period(period_name) - (int(count) - 1)
+            window_start = period.start_time
+        previous_first = None
+        support_days = int(base == "1m" and "pre_close" in fields)
+        while True:
+            if window_start is not None:
+                days = await self._history_calendar(security, end, start=window_start.normalize())
+                if support_days:
+                    prior = await self._history_calendar(
+                        security,
+                        window_start.normalize() - pd.Timedelta(days=1),
+                        count=support_days,
+                    )
+                    days = prior.append(days)
+            else:
+                days = await self._history_calendar(security, end, count=day_count)
+            if listing is not None:
+                days = days[days >= listing]
+            if days.empty:
+                return pd.DataFrame(
+                    columns=fields, index=pd.DatetimeIndex([], name="time"), dtype=float
+                )
+            raw_start = days[0] if base == "1d" else days[0] + pd.Timedelta(hours=9, minutes=30)
+            raw_end = end.normalize() if base == "1d" else end
+            if raw_start > raw_end:
+                return pd.DataFrame(
+                    columns=fields, index=pd.DatetimeIndex([], name="time"), dtype=float
+                )
+            raw = await self._history_raw(security, base, raw_start, raw_end, raw_fields)
+            if raw.empty:
+                raw = pd.DataFrame(columns=raw_fields, index=raw.index, dtype=float)
+            expected = _history_session_index(days, base, raw_end)
+            if base == "1m":
+                without_auction = raw.loc[~((raw.index.hour == 9) & (raw.index.minute == 30))]
+                auction_scope = without_auction.reindex(expected)
+                if skip_paused and target_rows is not None:
+                    traded = without_auction.loc[without_auction["suspendFlag"] == 0]
+                    if len(traded) >= target_rows:
+                        auction_scope = traded
+                required = _history_principal_frame(
+                    auction_scope,
+                    start=start,
+                    count=count,
+                    size=size,
+                    unit=unit,
+                    window_start=window_start,
+                ).index
+                if "pre_close" in fields and len(required):
+                    required = expected[expected < required[0]][-1:].append(required)
+                required_start = required[0] if len(required) else end + pd.Timedelta(minutes=1)
+                raw = _history_merge_auction(raw, end, required_start)
+            else:
+                raw["volume"] = raw["volume"] * 100.0
+            if len(raw.index.difference(expected)):
+                raise AdjustmentError("QMT基础行情包含交易日历/时段之外的时间")
+            # 只验证真正参与本轮的时间轴；完整最新bar不因更早预取窗口的缺行失败。
+            check_frame = raw.reindex(expected)
+            if skip_paused and target_rows is not None:
+                traded = raw.loc[raw["suspendFlag"] == 0]
+                if len(traded) >= target_rows:
+                    check_frame = traded
+            checked = _history_principal_frame(
+                check_frame,
+                start=start,
+                count=count,
+                size=size,
+                unit=unit,
+                window_start=window_start,
+            ).index
+            if "pre_close" in fields and base == "1m" and len(checked):
+                checked = expected[expected < checked[0]][-1:].append(checked)
+            checked = expected[expected >= checked[0]] if len(checked) else checked
+            missing = checked.difference(raw.index)
+            if len(missing):
+                await self._history_pause_facts(
+                    security,
+                    pd.DatetimeIndex(missing.normalize().unique()),
+                )
+                raw = raw.reindex(raw.index.union(missing).sort_values())
+                raw.loc[missing, list(_HISTORY_FIELDS)] = 0.0
+                raw.loc[missing, "suspendFlag"] = 1.0
+                if "preClose" in raw:
+                    raw.loc[missing, "preClose"] = 0.0
+            eligible = raw.loc[raw["suspendFlag"] == 0] if skip_paused else raw
+            principal = _history_principal_frame(
+                eligible,
+                start=start,
+                count=count,
+                size=size,
+                unit=unit,
+                window_start=window_start,
+            )
+            selected = principal.index
+            need_predecessor = False
+            if "pre_close" in fields and base == "1m" and len(selected):
+                previous_bar = eligible.index[eligible.index < selected[0]][-1:]
+                need_predecessor = not len(previous_bar)
+                selected = previous_bar.append(selected)
+            need_seed = False
+            if (
+                fill_paused
+                and not skip_paused
+                and len(selected)
+                and raw.loc[selected[0], "suspendFlag"] == 1
+            ):
+                seed = raw.index[(raw.index < selected[0]) & (raw["suspendFlag"] == 0)][-1:]
+                need_seed = not len(seed)
+                selected = seed.append(selected)
+            need_rows = target_rows is not None and len(principal) < target_rows
+            period_count = (
+                len(principal.index.to_period(period_name).unique())
+                if count is not None and unit in {"w", "mon"}
+                else None
+            )
+            need_periods = period_count is not None and period_count < count
+            if need_rows or need_seed or need_periods or need_predecessor:
+                at_listing = listing is not None and days[0] <= listing
+                if not at_listing and days[0] != previous_first:
+                    previous_first = days[0]
+                    if need_periods:
+                        window_start = (
+                            window_start.to_period(period_name) - max(1, count - period_count)
+                        ).start_time
+                    elif window_start is None:
+                        day_count *= 2
+                    else:
+                        support_days = max(1, support_days * 2)
+                    continue
+            if len(selected):
+                dependency_gaps = expected[expected >= selected[0]].difference(raw.index)
+                if len(dependency_gaps):
+                    await self._history_pause_facts(
+                        security,
+                        pd.DatetimeIndex(dependency_gaps.normalize().unique()),
+                    )
+            raw = raw.loc[selected].copy()
+            break
+        if raw.empty:
+            return pd.DataFrame(
+                columns=fields, index=pd.DatetimeIndex([], name="time"), dtype=float
+            )
+        anchor = (
+            reference
+            if mode == "pre"
+            else listing.date() if mode == "post" else raw.index[-1].date()
+        )
+        lower = min(raw.index[0].date(), anchor)
+        upper = max(raw.index[-1].date(), anchor)
+        daily_available = raw if base == "1d" else pd.DataFrame(index=pd.DatetimeIndex([]))
+        events = (
+            await self._history_events(security, lower, upper, daily_available, listing)
+            if mode != "none" and lower < upper
+            else []
+        )
+        # 此声明只表示本轮成功查询的QMT事件集合完整交给纯函数，不伪称外部已证实历史无漏报。
+        adjusted = adjust_bars(
+            raw.loc[:, list(_HISTORY_FIELDS)],
+            events,
+            fq=mode,
+            price_decimals=decimals,
+            reference_date=reference if mode == "pre" else None,
+            post_origin_date=listing.date() if mode == "post" else None,
+            event_coverage_start=lower,
+            event_coverage_end=upper,
+            events_complete=True,
+            include_factor=True,
+        )
+        paused = raw["suspendFlag"] == 1
+        if skip_paused:
+            adjusted = adjusted.loc[~paused]
+        elif paused.any() and fill_paused:
+            prior_close = adjusted["close"].mask(paused).ffill()
+            if prior_close.loc[paused].isna().any():
+                raise AdjustmentError("停牌填充缺少前一有效收盘依赖")
+            for field_name in ("open", "high", "low", "close"):
+                adjusted.loc[paused, field_name] = prior_close.loc[paused]
+            adjusted.loc[paused, "factor"] = adjusted["factor"].mask(paused).ffill().loc[paused]
+            adjusted.loc[paused, ["volume", "money"]] = 0.0
+        elif paused.any() and not simple:
+            raise NotImplementedError("含停牌空值的多周期聚合尚未验证，不猜造其字段语义")
+        extras = pd.DataFrame(index=adjusted.index)
+        if "pre_close" in fields:
+            if base == "1d":
+                extras["pre_close"] = np.round(
+                    raw.loc[adjusted.index, "preClose"] * adjusted["factor"], decimals
+                )
+                if fill_paused and not skip_paused:
+                    extras.loc[paused, "pre_close"] = adjusted.loc[paused, "close"]
+            else:
+                closes = adjusted["close"]
+                if not fill_paused and not skip_paused:
+                    closes = closes.mask(paused)
+                extras["pre_close"] = closes.shift(1)
+        if "paused" in fields:
+            extras["paused"] = raw.loc[adjusted.index, "suspendFlag"]
+        result = aggregate_bars(
+            adjusted.loc[principal.index],
+            base_frequency=base,
+            frequency=frequency,
+            start=start,
+            end=end,
+            count=count,
+        )
+        for field_name in extras:
+            result[field_name] = extras.loc[result.index, field_name]
+        if not skip_paused and not fill_paused and paused.any():
+            empty_index = result.index.intersection(raw.index[paused])
+            empty_fields = [
+                field_name for field_name in result if mode != "none" or field_name != "factor"
+            ]
+            result.loc[empty_index, empty_fields] = np.nan
+        return result.loc[:, fields]
 
     async def get_snapshot(self, payload: Dict) -> Dict:
         security = payload.get("security")
