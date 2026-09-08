@@ -24,6 +24,7 @@ __all__ = [
     "AdjustmentError",
     "AdjustmentEvent",
     "parse_events",
+    "parse_frequency",
     "adjust_bars",
     "aggregate_bars",
 ]
@@ -62,16 +63,19 @@ def _as_date(value: Any, name: str) -> date:
     raise AdjustmentError(f"{name} 需要明确 YYYY-MM-DD 日期")
 
 
-def _decimal(value: Any, name: str, *, positive: bool = False) -> Decimal:
-    """校验有限非负数；输入值、字段名及正数要求，返回 Decimal，非法时抛错，无副作用。"""
+def _decimal(
+    value: Any, name: str, *, positive: bool = False, allow_negative: bool = False
+) -> Decimal:
+    """校验事件数值；输入值、字段名及范围许可，返回 Decimal，非法时抛错，无副作用。"""
     if isinstance(value, (bool, np.bool_)) or value is None:
         raise AdjustmentError(f"{name} 不是有效数值")
     try:
         result = Decimal(str(value))
     except (InvalidOperation, ValueError, TypeError) as exc:
         raise AdjustmentError(f"{name} 不是有效数值") from exc
-    if not result.is_finite() or result < 0 or (positive and result == 0):
-        raise AdjustmentError(f"{name} 必须是有限{'正' if positive else '非负'}数")
+    if not result.is_finite() or (result < 0 and not allow_negative) or (positive and result <= 0):
+        required = "正数" if positive else "数值" if allow_negative else "非负数"
+        raise AdjustmentError(f"{name} 必须是有限{required}")
     return result
 
 
@@ -97,8 +101,15 @@ class AdjustmentEvent:
             object.__setattr__(
                 self,
                 name,
-                _decimal(getattr(self, name), name, positive=name == "previous_close"),
+                _decimal(
+                    getattr(self, name),
+                    name,
+                    positive=name == "previous_close",
+                    allow_negative=name == "gift",
+                ),
             )
+        if self.gift <= -1:
+            raise AdjustmentError("gift 必须大于 -1，折算后份额不能为零或负数")
         if self.previous_close_date >= self.date:
             raise AdjustmentError("previous_close_date 必须早于除权日，不能用除权日 preClose")
         if not isinstance(self.share_reform, bool) or self.share_reform:
@@ -116,6 +127,8 @@ class AdjustmentEvent:
                     self.previous_close - self.cash_per_share + self.rights * self.rights_price
                 )
                 denominator = Decimal(1) + self.gift + self.transfer + self.rights
+                if denominator <= 0:
+                    raise AdjustmentError(f"{self.date} 折算后总份额必须为正")
                 reference = (numerator / denominator).quantize(
                     Decimal(1).scaleb(-price_decimals), rounding=ROUND_HALF_UP
                 )
@@ -294,22 +307,42 @@ def adjust_bars(
     return result
 
 
-def _frequency(value: str) -> Tuple[int, str]:
-    """解析明确分钟/多日周期；输入别名，返回倍数与 m/d，周月及非法值抛错，无副作用。"""
+def parse_frequency(value: str) -> Tuple[int, str]:
+    """解析周期；输入明确别名，返回倍数与 m/d/w/mon，非法或多周多月抛错，无副作用。
+
+    分钟/多日沿用行分组语义；小时换为分钟。自然周/月只接受单周期，1M 表示月，
+    不能降为 1m。调用方可复用本函数选择基础行情，不需要导入数据源或复制解析规则。
+    """
     if not isinstance(value, str):
         raise AdjustmentError("frequency 必须是明确周期字符串")
+    if value.strip() == "1M":
+        return 1, "mon"
     if re.fullmatch(r"\d+M", value.strip()):
-        raise AdjustmentError("大写 M 月周期尚未验收，不能降为小写分钟周期")
+        raise AdjustmentError("自然月只支持单月周期，不能降为小写分钟周期")
     text = value.lower().strip()
-    aliases = {"minute": "1m", "min": "1m", "daily": "1d", "day": "1d"}
+    aliases = {
+        "minute": "1m",
+        "min": "1m",
+        "daily": "1d",
+        "day": "1d",
+        "week": "1w",
+        "weekly": "1w",
+        "month": "1mon",
+        "monthly": "1mon",
+    }
     text = aliases.get(text, text)
-    match = re.fullmatch(r"([1-9]\d*)(m|d|h|min)", text)
+    match = re.fullmatch(r"([1-9]\d*)(m|d|h|min|w|mon)", text)
     if match is None:
-        raise AdjustmentError("仅支持 Nm/Nd/小时别名；自然周/月尚未验收")
+        raise AdjustmentError("仅支持 Nm/Nd/小时别名和单个自然周/月")
     size, unit = int(match.group(1)), match.group(2)
+    if unit in {"w", "mon"} and size != 1:
+        raise AdjustmentError("自然周/月只支持单周期，不能按基础行数拼接")
     if unit == "h":
         return size * 60, "m"
     return size, "m" if unit == "min" else unit
+
+
+_frequency = parse_frequency
 
 
 def _window_timestamp(value: Any, index: pd.DatetimeIndex, *, end: bool) -> pd.Timestamp:
@@ -353,18 +386,24 @@ def aggregate_bars(
     end: Any = None,
     count: Optional[int] = None,
 ) -> pd.DataFrame:
-    """按基础行分组合成行情，不推断自然交易时段或重新复权。
+    """按基础行或自然周/月合成行情，不推断自然交易时段或重新复权。
 
     输入 adjusted 必须已经逐根复权及舍入；base_frequency 仅 1m/1d，frequency 为
     同类 Nm/Nd（小时转分钟）。start 正向分组，count 从 end 取 count*倍数基础行后
     正向分组，末组不足保留；不补缺行、不合并集合竞价、不将 5d 冒充自然周线。
+    自然周/月只由 1d 构造，按中国日期的周一至周日或年月分组：先截到 end，
+    聚合后才按组末时间裁剪 start/count，start 不截断组内已提供的依赖日线。
+    自然尾组保留已形成部分，不声称已经收盘；调用方负责提供自然期起始以来的数据，
+    本函数无交易日历，不能证明源日线完整或补齐未提供的首组历史。
     返回新 DataFrame，以组末时间为索引、OHLC/量额按字段聚合、factor 取组末值。
     factor 是组末基础 bar 的乘数而非整组统一乘数。无网络或输入修改；非法契约抛错。
     """
     _validate_frame(adjusted, allow_factor=True)
-    base_size, base_unit = _frequency(base_frequency)
-    size, unit = _frequency(frequency)
-    if base_size != 1 or unit != base_unit:
+    base_size, base_unit = parse_frequency(base_frequency)
+    size, unit = parse_frequency(frequency)
+    calendar_period = unit in {"w", "mon"}
+    required_base = "d" if calendar_period else unit
+    if base_size != 1 or base_unit not in {"m", "d"} or base_unit != required_base:
         raise AdjustmentError("聚合必须由同类 1m 或 1d 基础 bar 构造")
     _validate_base_index(adjusted.index, base_unit)
     if count is not None:
@@ -377,19 +416,26 @@ def aggregate_bars(
     end_stamp = _window_timestamp(end, frame.index, end=True) if end is not None else None
     if start_stamp is not None and end_stamp is not None and start_stamp > end_stamp:
         raise AdjustmentError("start 不能晚于 end")
-    if start_stamp is not None:
+    if start_stamp is not None and not calendar_period:
         frame = frame.loc[frame.index >= start_stamp]
     if end_stamp is not None:
         frame = frame.loc[frame.index <= end_stamp]
-    if count is not None:
+    if count is not None and not calendar_period:
         frame = frame.tail(count * size)
-    if frame.empty or size == 1:
+    if frame.empty or (size == 1 and not calendar_period):
         return frame
+    if calendar_period:
+        local = (
+            frame.index.tz_convert("Asia/Shanghai") if frame.index.tz is not None else frame.index
+        )
+        local = local.tz_localize(None) if local.tz is not None else local
+        keys = local.to_period("W-SUN" if unit == "w" else "M")
+        groups = (group for _, group in frame.groupby(keys, sort=False))
+    else:
+        groups = (frame.iloc[offset : offset + size] for offset in range(0, len(frame), size))
     rows = []
     indexes = []
-    for offset in range(0, len(frame), size):
-        stop = offset + size
-        group = frame.iloc[offset:stop]
+    for group in groups:
         row = {}
         for column in frame.columns:
             values = group[column]
@@ -407,5 +453,10 @@ def aggregate_bars(
         indexes.append(group.index[-1])
     result = pd.DataFrame(rows, columns=frame.columns, index=pd.DatetimeIndex(indexes))
     result.index.name = frame.index.name
+    if calendar_period:
+        if start_stamp is not None:
+            result = result.loc[result.index >= start_stamp]
+        if count is not None:
+            result = result.tail(count)
     _validate_frame(result, allow_factor=True)
     return result

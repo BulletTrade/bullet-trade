@@ -425,7 +425,7 @@ def test_aggregate_multi_day_is_row_group_not_calendar_week():
     assert result.index[0] == pd.Timestamp("2024-05-13")
 
 
-@pytest.mark.parametrize("frequency", ["1w", "weekly", "1mon", "monthly", "0m", "5x", "1M", "12M"])
+@pytest.mark.parametrize("frequency", ["2w", "2mon", "0m", "5x", "12M"])
 def test_aggregate_rejects_unverified_frequency(frequency):
     """不支持的周期必须显式失败；输入周期字符串，期待错误，不隐式改为日线。"""
     with pytest.raises(AdjustmentError):
