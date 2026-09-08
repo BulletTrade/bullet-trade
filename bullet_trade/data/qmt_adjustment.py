@@ -81,7 +81,7 @@ def _decimal(
 
 @dataclass(frozen=True)
 class AdjustmentEvent:
-    """保存已标准化单次公司行为及前收盘事实，与纯因子函数协作，不持有外部连接。"""
+    """保存公司行为及前收盘事实；股改仅调整已提供现金、同证券份额和配股，不推算其他权益。"""
 
     date: date
     cash_per_share: Decimal
@@ -112,13 +112,16 @@ class AdjustmentEvent:
             raise AdjustmentError("gift 必须大于 -1，折算后份额不能为零或负数")
         if self.previous_close_date >= self.date:
             raise AdjustmentError("previous_close_date 必须早于除权日，不能用除权日 preClose")
-        if not isinstance(self.share_reform, bool) or self.share_reform:
-            raise AdjustmentError("不支持股改事件或不明确的 share_reform 标识")
+        if not isinstance(self.share_reform, bool):
+            raise AdjustmentError("股改 share_reform 标识必须是明确布尔值")
         if self.rights == 0 and self.rights_price != 0:
             raise AdjustmentError("无配股时 rights_price 必须明确为零")
 
     def multiplier(self, price_decimals: int) -> Decimal:
-        """计算单事件前向乘数；输入报价小数位，返回 Decimal，非正参考价抛错，无副作用。"""
+        """按已提供权益计算统一乘数；输入报价位数，返回 Decimal，非正参考价抛错，无副作用。
+
+        share_reform 保留源事实但不更换公式；未提供的权证等权益不在本计算范围内。
+        """
         _validate_decimals(price_decimals)
         try:
             with localcontext() as context:

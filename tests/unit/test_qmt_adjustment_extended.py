@@ -160,9 +160,9 @@ def test_other_negative_event_fields_remain_invalid(field):
         parse_events([_fold_event(**{field: "-0.01"})])
 
 
-@pytest.mark.parametrize("share_reform", [True, "0", "false", 0, None])
-def test_share_reform_not_silently_ignored(share_reform):
-    """股改不随折算支持而放行；输入未支持标识，断言明确异常，无副作用。"""
+@pytest.mark.parametrize("share_reform", ["0", "false", 0, None])
+def test_share_reform_requires_boolean_fact(share_reform):
+    """股改仍须明确布尔事实；输入非法标识，断言明确异常，无副作用。"""
     with pytest.raises(AdjustmentError, match="股改"):
         parse_events([_fold_event(share_reform=share_reform)])
 

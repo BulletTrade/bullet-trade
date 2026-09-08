@@ -226,13 +226,12 @@ def test_price_decimals_rejects_invalid_values(bad):
         _event(cash_per_share=11),
         _event(previous_close_date="2024-05-10"),
         _event(previous_close_date="2024-05-13"),
-        _event(share_reform=True),
         _event(share_reform="0"),
         _event(rights_price=2),
     ],
 )
 def test_invalid_event_economics_fails(event):
-    """验证非法参考价和未支持事件；输入事件映射，期待解析或计算异常，无静默降级。"""
+    """验证非法参考价和事件字段；输入事件映射，期待解析或计算异常，无静默降级。"""
     with pytest.raises(AdjustmentError):
         _adjust(events=[event])
 
