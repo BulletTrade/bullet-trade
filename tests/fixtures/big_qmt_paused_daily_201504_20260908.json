@@ -1,0 +1,25 @@
+{
+  "description": "510500真实停牌窗口；保留QMT fill_data=True事实，停牌填充价格不得作为实际成交收盘。",
+  "source_file": "debug_temp_file/qmt_paused_daily_full_201504_20260908.json",
+  "source_sha256": "9c4a8872ad38eee4522b6fc32ef680f5577cd1a44577fa1a85a6a99a60832b21",
+  "request": {
+    "security": "510500.SH", "start": "2015-04-10", "end": "2015-04-15",
+    "frequency": "1d",
+    "fields": ["open", "high", "low", "close", "volume", "money", "preClose", "suspendFlag"],
+    "fq": "none", "fill_data": true, "subscribe": false
+  },
+  "response": {
+    "dtype": "dataframe",
+    "columns": ["stime", "open", "high", "low", "close", "volume", "money", "preClose", "suspendFlag"],
+    "records": [
+      ["20150410", 2.165, 2.249, 2.151, 2.243, 376902.0, 83147159.0, 2.176, 0.0],
+      ["20150413", 2.243, 2.243, 2.243, 2.243, 0.0, 0.0, 0.0, 1.0],
+      ["20150414", 2.243, 2.243, 2.243, 2.243, 0.0, 0.0, 0.0, 1.0],
+      ["20150415", 8.1, 8.1, 7.79, 7.818, 260645.0, 206869383.0, 8.001, 0.0]
+    ],
+    "index_columns": ["stime"], "index_names": ["stime"],
+    "index_type": "Index", "index_dtypes": ["object"]
+  },
+  "calendar_source": "big_qmt_post_dependencies_20260908.json / calendars / 510500.XSHG / 2015-04-10至2015-04-15",
+  "calendar": ["20150410", "20150413", "20150414", "20150415"]
+}
