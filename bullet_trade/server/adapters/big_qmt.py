@@ -571,6 +571,30 @@ def _history_session_index(
     return index[index <= end]
 
 
+def _history_validate_values(frame: pd.DataFrame, fields: List[str]) -> None:
+    """校验所需原始数值；输入已限定范围的表和字段，返回None，坏值抛错，不修改数据。
+
+    逐值检查避免窗口外字符串污染整列dtype；不把字符串、布尔、NaN或无穷当有效行情。
+    价格量额须非负，停牌标识只能是0/1；必须在竞价合并前校验实际参与的原始bar。
+    """
+    for field_name in fields:
+        values = frame[field_name]
+        if any(
+            isinstance(value, (bool, np.bool_, complex, np.complexfloating))
+            or not pd.api.types.is_number(value)
+            for value in values
+        ):
+            raise AdjustmentError("QMT字段不是数值: %s" % field_name)
+        try:
+            numbers = values.to_numpy(dtype=float)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise AdjustmentError("QMT字段不是有效实数: %s" % field_name) from exc
+        if not np.isfinite(numbers).all() or (numbers < 0).any():
+            raise AdjustmentError("QMT字段含非有限值或负数: %s" % field_name)
+    if "suspendFlag" in fields and not frame["suspendFlag"].isin([0, 1]).all():
+        raise AdjustmentError("QMT停牌标识不是明确0/1")
+
+
 def _history_merge_auction(
     frame: pd.DataFrame,
     end: pd.Timestamp,
@@ -742,6 +766,7 @@ class BigQmtDataAdapter(RemoteDataAdapter):
         """读取有界基础原价；输入证券、周期、边界和字段，返回独立表。
 
         fill_data仅供已缺行时查询明确停牌事实；补齐价格不能用作真实成交价。
+        本方法校验wire结构和时间范围，调用方须在处理所需原始bar前校验数值。
         不订阅、不原生复权，helper可能下载这一明确窗口的缓存，异常传播。
         """
         if start > end:
@@ -769,21 +794,6 @@ class BigQmtDataAdapter(RemoteDataAdapter):
             raise AdjustmentError("QMT日线索引不是唯一日日期")
         if not frame.empty and ((frame.index < start) | (frame.index > end)).any():
             raise AdjustmentError("QMT返回了依赖窗口之外的行情")
-        for field_name in fields:
-            if frame.empty:
-                break
-            if not pd.api.types.is_numeric_dtype(frame[field_name]) or pd.api.types.is_bool_dtype(
-                frame[field_name]
-            ):
-                raise AdjustmentError("QMT字段不是数值: %s" % field_name)
-            if not np.isfinite(frame[field_name].to_numpy(dtype=float)).all():
-                raise AdjustmentError("QMT字段含非有限值: %s" % field_name)
-        if (
-            not frame.empty
-            and "suspendFlag" in frame
-            and not frame["suspendFlag"].isin([0, 1]).all()
-        ):
-            raise AdjustmentError("QMT停牌标识不是明确0/1")
         return frame
 
     async def _history_pause_facts(
@@ -804,6 +814,8 @@ class BigQmtDataAdapter(RemoteDataAdapter):
             ["close", "suspendFlag"],
             fill_data=True,
         )
+        if not facts.empty:
+            _history_validate_values(facts, ["close", "suspendFlag"])
         for day in days:
             if day not in facts.index or facts.loc[day, "suspendFlag"] != 1:
                 raise AdjustmentError("QMT缺行且没有明确停牌事实: %s" % day.date())
@@ -877,6 +889,7 @@ class BigQmtDataAdapter(RemoteDataAdapter):
                         await self._history_pause_facts(security, pd.DatetimeIndex([day]))
                         close_row = pd.Series({"suspendFlag": 1.0})
                     else:
+                        _history_validate_values(support, ["close", "suspendFlag"])
                         close_row = support.iloc[-1]
                 flag = close_row.get("suspendFlag")
                 if flag not in (0, 1):
@@ -1042,9 +1055,11 @@ class BigQmtDataAdapter(RemoteDataAdapter):
                 if "pre_close" in fields and len(required):
                     required = expected[expected < required[0]][-1:].append(required)
                 required_start = required[0] if len(required) else end + pd.Timedelta(minutes=1)
+                value_start = required_start
+                if required_start.hour == 9 and required_start.minute == 31:
+                    value_start -= pd.Timedelta(minutes=1)
+                _history_validate_values(raw.loc[raw.index >= value_start], raw_fields)
                 raw = _history_merge_auction(raw, end, required_start)
-            else:
-                raw["volume"] = raw["volume"] * 100.0
             if len(raw.index.difference(expected)):
                 raise AdjustmentError("QMT基础行情包含交易日历/时段之外的时间")
             # 只验证真正参与本轮的时间轴；完整最新bar不因更早预取窗口的缺行失败。
@@ -1064,6 +1079,8 @@ class BigQmtDataAdapter(RemoteDataAdapter):
             if "pre_close" in fields and base == "1m" and len(checked):
                 checked = expected[expected < checked[0]][-1:].append(checked)
             checked = expected[expected >= checked[0]] if len(checked) else checked
+            if base == "1d" and len(checked):
+                _history_validate_values(raw.loc[raw.index >= checked[0]], raw_fields)
             missing = checked.difference(raw.index)
             if len(missing):
                 await self._history_pause_facts(
@@ -1121,13 +1138,16 @@ class BigQmtDataAdapter(RemoteDataAdapter):
                         support_days = max(1, support_days * 2)
                     continue
             if len(selected):
+                _history_validate_values(raw.loc[raw.index >= selected[0]], raw_fields)
                 dependency_gaps = expected[expected >= selected[0]].difference(raw.index)
                 if len(dependency_gaps):
                     await self._history_pause_facts(
                         security,
                         pd.DatetimeIndex(dependency_gaps.normalize().unique()),
                     )
-            raw = raw.loc[selected].copy()
+            raw = raw.loc[selected].astype(float)
+            if base == "1d":
+                raw["volume"] = raw["volume"] * 100.0
             break
         if raw.empty:
             return pd.DataFrame(
