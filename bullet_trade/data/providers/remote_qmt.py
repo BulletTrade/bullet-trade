@@ -219,16 +219,28 @@ class RemoteQmtProvider(DataProvider):
         prefer_engine: bool = False,
         force_no_engine: bool = False,
     ) -> pd.DataFrame:
-        def _is_minute_frequency(value: str) -> bool:
+        """编码历史行情请求并恢复远端结果，不在客户端复权或聚合。
+
+        参数包含证券、起止时间、周期、字段、停牌/形状选项、复权方式及参考日；
+        prefer_engine 和 force_no_engine 保留兼容，不发送给远端。
+        返回远端协议恢复的 DataFrame；副作用仅为一次 data.history 请求，
+        请求或解码异常直接向上传播。分钟及原生 1h 的 datetime 保留时分秒。
+        """
+
+        def _keeps_intraday_time(value: str) -> bool:
+            """判断周期编码是否保留日内时间；输入周期，返回布尔值，无副作用。"""
             freq = str(value or "").strip().lower()
+            if freq == "1h":
+                return True
             if "minute" in freq or "min" in freq:
                 return True
             return freq.endswith("m") and freq[:-1].isdigit()
 
         def _str_format(date_obj):
+            """按请求周期编码 datetime；输入日期对象，返回字符串或原值，无副作用。"""
             if date_obj and isinstance(date_obj, datetime):
                 return date_obj.strftime(
-                    "%Y-%m-%d %H:%M:%S" if _is_minute_frequency(frequency) else "%Y-%m-%d"
+                    "%Y-%m-%d %H:%M:%S" if _keeps_intraday_time(frequency) else "%Y-%m-%d"
                 )
             return date_obj
 
@@ -238,8 +250,11 @@ class RemoteQmtProvider(DataProvider):
             "end": _str_format(end_date),
             "frequency": frequency,
             "fields": fields,
+            "skip_paused": skip_paused,
             "fq": fq,
             "count": count,
+            "panel": panel,
+            "fill_paused": fill_paused,
             "pre_factor_ref_date": _str_format(pre_factor_ref_date),
         }
 
