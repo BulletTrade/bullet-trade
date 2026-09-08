@@ -976,6 +976,8 @@ class BigQmtDataAdapter(RemoteDataAdapter):
                 raise AdjustmentError("全历史请求需要QMT有效上市日以限定历史窗口")
             start_value = listing
         start = _history_timestamp(start_value) if start_value is not None else None
+        if base == "1d" and start is not None:
+            start = start.normalize()
         if start is not None and start > end:
             raise AdjustmentError("start 不能晚于 end")
         reference = None

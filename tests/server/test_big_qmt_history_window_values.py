@@ -10,9 +10,14 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import numpy as np
 import pandas as pd
 import pytest
+
+from bullet_trade.data.providers.remote_qmt import _dataframe_from_payload
+from bullet_trade.server.adapters.big_qmt import BigQmtDataAdapter
 
 from test_big_qmt_history_standardization import _FakeGateway, _client, _price_request
 
@@ -158,3 +163,58 @@ def test_pause_fact_response_remains_strictly_validated(invalid):
         _price_request(
             provider, _SECURITY, frequency="1m", fq="post", end_date="2026-09-04 11:30", count=1
         )
+
+
+def _direct_window(frequency, start, end):
+    """直接测试adapter日期契约；输入周期和边界，返回解码行情，不让客户端格式化掩盖问题。"""
+    adapter = BigQmtDataAdapter(_FakeGateway())
+    wire = asyncio.run(
+        adapter.get_history(
+            {
+                "security": _SECURITY,
+                "frequency": frequency,
+                "start": start,
+                "end": end,
+                "fields": ["open", "high", "low", "close", "volume", "money"],
+                "fq": None,
+            }
+        )
+    )
+    return _dataframe_from_payload(wire)
+
+
+@pytest.mark.parametrize("frequency", ["1d", "2d", "1w", "1mon"])
+@pytest.mark.parametrize("form", ["datetime", "string", "utc_datetime"])
+@pytest.mark.parametrize("start_day", ["2026-09-02", "2026-09-04"])
+def test_daily_base_datetime_boundaries_equal_chinese_dates(frequency, form, start_day):
+    """日线及其合成只按中国日期裁剪；输入周期、时间形式和首日，无返回，与纯日期逐格相等。"""
+    start = pd.Timestamp(start_day + " 15:00", tz="Asia/Shanghai")
+    end = pd.Timestamp("2026-09-04 09:30", tz="Asia/Shanghai")
+    if form == "datetime":
+        start, end = start.tz_localize(None).to_pydatetime(), end.tz_localize(None).to_pydatetime()
+    elif form == "string":
+        start, end = start.tz_localize(None).isoformat(), end.tz_localize(None).isoformat()
+    else:
+        start, end = start.tz_convert("UTC").to_pydatetime(), end.tz_convert("UTC").to_pydatetime()
+    actual = _direct_window(frequency, start, end)
+    expected = _direct_window(frequency, start_day, "2026-09-04")
+    assert not expected.empty
+    pd.testing.assert_frame_equal(actual, expected)
+
+
+@pytest.mark.parametrize("frequency", ["1m", "5m", "60m"])
+@pytest.mark.parametrize("form", ["datetime", "string"])
+def test_minute_boundaries_keep_time_instead_of_becoming_dates(frequency, form):
+    """分钟周期不归零；输入周期和时间形式，无返回，保留11:26到11:30的五根基础分钟。"""
+    start = pd.Timestamp("2026-09-03 11:26")
+    end = pd.Timestamp("2026-09-03 11:30")
+    if form == "datetime":
+        start, end = start.to_pydatetime(), end.to_pydatetime()
+    else:
+        start, end = start.isoformat(), end.isoformat()
+    actual = _direct_window(frequency, start, end)
+    full_morning = _direct_window(frequency, "2026-09-03", end)
+    assert actual.index[-1] == pd.Timestamp("2026-09-03 11:30")
+    assert len(actual) == (5 if frequency == "1m" else 1)
+    assert actual["volume"].sum() == 4000.0
+    assert len(full_morning) > len(actual)
