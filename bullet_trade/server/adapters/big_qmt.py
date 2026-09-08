@@ -1170,8 +1170,11 @@ class BigQmtDataAdapter(RemoteDataAdapter):
                 adjusted.loc[paused, field_name] = prior_close.loc[paused]
             adjusted.loc[paused, "factor"] = adjusted["factor"].mask(paused).ffill().loc[paused]
             adjusted.loc[paused, ["volume", "money"]] = 0.0
-        elif paused.any() and not simple:
-            raise NotImplementedError("含停牌空值的多周期聚合尚未验证，不猜造其字段语义")
+        elif paused.any():
+            empty_fields = [
+                field_name for field_name in adjusted if mode != "none" or field_name != "factor"
+            ]
+            adjusted.loc[paused, empty_fields] = np.nan
         extras = pd.DataFrame(index=adjusted.index)
         if "pre_close" in fields:
             if base == "1d":
@@ -1187,6 +1190,8 @@ class BigQmtDataAdapter(RemoteDataAdapter):
                 extras["pre_close"] = closes.shift(1)
         if "paused" in fields:
             extras["paused"] = raw.loc[adjusted.index, "suspendFlag"]
+        if not skip_paused and not fill_paused and paused.any():
+            extras.loc[paused, :] = np.nan
         result = aggregate_bars(
             adjusted.loc[principal.index],
             base_frequency=base,
@@ -1197,12 +1202,6 @@ class BigQmtDataAdapter(RemoteDataAdapter):
         )
         for field_name in extras:
             result[field_name] = extras.loc[result.index, field_name]
-        if not skip_paused and not fill_paused and paused.any():
-            empty_index = result.index.intersection(raw.index[paused])
-            empty_fields = [
-                field_name for field_name in result if mode != "none" or field_name != "factor"
-            ]
-            result.loc[empty_index, empty_fields] = np.nan
         return result.loc[:, fields]
 
     async def get_snapshot(self, payload: Dict) -> Dict:

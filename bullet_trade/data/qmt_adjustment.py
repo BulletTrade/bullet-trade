@@ -177,8 +177,13 @@ def _validate_decimals(value: Any) -> None:
         raise AdjustmentError("price_decimals 必须是 0 至 8 的整数")
 
 
-def _validate_frame(frame: pd.DataFrame, *, allow_factor: bool = False) -> None:
-    """校验纯计算行情；输入表与因子列许可，返回 None，非法字段/索引/数值抛错，不修改输入。"""
+def _validate_frame(
+    frame: pd.DataFrame, *, allow_factor: bool = False, allow_nan: bool = False
+) -> None:
+    """校验行情；输入表与聚合字段/空值许可，返回None，非法索引/数值抛错，不修改输入。
+
+    allow_nan仅用于已经标准化的聚合输入；原始复权输入仍禁止缺值，无穷和负数始终非法。
+    """
     if not isinstance(frame, pd.DataFrame) or not isinstance(frame.index, pd.DatetimeIndex):
         raise AdjustmentError("行情必须是使用 DatetimeIndex 的 DataFrame")
     if frame.columns.has_duplicates or frame.index.has_duplicates or frame.index.hasnans:
@@ -195,7 +200,9 @@ def _validate_frame(frame: pd.DataFrame, *, allow_factor: bool = False) -> None:
             values.dtype
         ):
             raise AdjustmentError(f"{column} 必须是数值列")
-        if not np.isfinite(values.to_numpy(dtype=float)).all() or (values < 0).any():
+        numbers = values.to_numpy(dtype=float)
+        valid = np.isfinite(numbers) | (np.isnan(numbers) if allow_nan else False)
+        if not valid.all() or (values < 0).any():
             raise AdjustmentError(f"{column} 含非有限或负数")
         if column == "factor" and (values <= 0).any():
             raise AdjustmentError("factor 必须为正")
@@ -397,8 +404,12 @@ def aggregate_bars(
     本函数无交易日历，不能证明源日线完整或补齐未提供的首组历史。
     返回新 DataFrame，以组末时间为索引、OHLC/量额按字段聚合、factor 取组末值。
     factor 是组末基础 bar 的乘数而非整组统一乘数。无网络或输入修改；非法契约抛错。
+
+    允许调用方将已证实的停牌行标准化为NaN，但不补造/推断停牌。open/close保留首末值，
+    量额遇任意NaN传播；固定Xm/Xd的high/low在首值NaN时保留NaN，否则忽略后续NaN；
+    自然周/月high/low遇任意NaN传播。原始源缺值仍由adjust_bars严格拒绝。
     """
-    _validate_frame(adjusted, allow_factor=True)
+    _validate_frame(adjusted, allow_factor=True, allow_nan=True)
     base_size, base_unit = parse_frequency(base_frequency)
     size, unit = parse_frequency(frequency)
     calendar_period = unit in {"w", "mon"}
@@ -442,11 +453,19 @@ def aggregate_bars(
             if column == "open":
                 row[column] = values.iloc[0]
             elif column == "high":
-                row[column] = values.max()
+                row[column] = (
+                    values.max(skipna=False)
+                    if calendar_period or pd.isna(values.iloc[0])
+                    else values.max()
+                )
             elif column == "low":
-                row[column] = values.min()
+                row[column] = (
+                    values.min(skipna=False)
+                    if calendar_period or pd.isna(values.iloc[0])
+                    else values.min()
+                )
             elif column in {"volume", "money", "amount"}:
-                row[column] = values.sum()
+                row[column] = values.sum(skipna=False)
             else:
                 row[column] = values.iloc[-1]
         rows.append(row)
@@ -458,5 +477,5 @@ def aggregate_bars(
             result = result.loc[result.index >= start_stamp]
         if count is not None:
             result = result.tail(count)
-    _validate_frame(result, allow_factor=True)
+    _validate_frame(result, allow_factor=True, allow_nan=True)
     return result

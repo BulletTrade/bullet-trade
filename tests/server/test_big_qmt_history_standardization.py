@@ -477,15 +477,26 @@ def test_event_during_suspension_fills_price_and_factor_from_same_previous_bar(f
 
 
 @pytest.mark.parametrize("fq", [None, "pre", "post"])
-def test_multiday_group_with_unfilled_suspension_is_explicitly_unsupported(fq):
-    """含未填停牌的多日组不得吞NaN；输入复权方式，无返回，当前未验收组合明确报错。"""
+def test_multiday_group_with_unfilled_suspension_preserves_exact_nan_semantics(fq):
+    """含未填停牌的多日组传播空值；输入复权方式，无返回，开高低保首有效值，末收及量额为空。"""
     gateway = _FakeGateway()
     gateway.frames[(_SECURITIES[0], "1d")].loc["2026-09-03", "suspendFlag"] = 1
     provider, _ = _client(gateway)
-    with pytest.raises((ValueError, RuntimeError), match="停牌|fill_paused"):
-        _price_request(
-            provider, fq=fq, frequency="2d", start_date="2026-09-02", count=None, fill_paused=False
-        )
+    result = _price_request(
+        provider, fq=fq, frequency="2d", start_date="2026-09-02", count=None, fill_paused=False
+    )
+    first = [8.0, 8.08, 7.92] if fq == "pre" else [10.0, 10.1, 9.9]
+    final = (
+        [10.0, 10.12, 9.88, 10.0, 640.0, 8000.0]
+        if fq == "post"
+        else [8.0, 8.1, 7.9, 8.0, 800.0, 8000.0]
+    )
+    expected = pd.DataFrame(
+        [[*first, np.nan, np.nan, np.nan], final],
+        index=pd.DatetimeIndex(["2026-09-03", "2026-09-04"], name="time"),
+        columns=_FIELDS,
+    )
+    pd.testing.assert_frame_equal(result, expected, check_exact=True)
 
 
 def test_count_cross_event_group_adjusts_each_basic_bar_before_aggregation():
