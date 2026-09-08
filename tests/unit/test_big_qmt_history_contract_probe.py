@@ -194,7 +194,7 @@ def test_exclusive_output_never_connects(tmp_path, isolated_client):
     output = tmp_path / "exists.json"
     output.write_text("保留原文件", encoding="utf-8")
     assert probe.main(["--output", str(output)]) == 2
-    assert output.read_text() == "保留原文件"
+    assert output.read_text(encoding="utf-8") == "保留原文件"
     assert isolated_client.instances == []
 
 
