@@ -449,6 +449,11 @@ def _history_today() -> date:
     return pd.Timestamp.now(tz="Asia/Shanghai").date()
 
 
+def _history_now() -> pd.Timestamp:
+    """读取本轮上海时间；无输入，返回无时区秒级时间戳，仅读取时钟供分钟完成边界使用。"""
+    return pd.Timestamp.now(tz="Asia/Shanghai").tz_localize(None).floor("s")
+
+
 def _history_timestamp(value: Any, *, end: bool = False) -> pd.Timestamp:
     """解析行情边界；输入日期/时间及结束标识，返回北京时间无时区戳，非法抛错，无副作用。"""
     if value is None or isinstance(value, (bool, np.bool_)) or value == 0:
@@ -766,18 +771,20 @@ class BigQmtDataAdapter(RemoteDataAdapter):
         """读取有界基础原价；输入证券、周期、边界和字段，返回独立表。
 
         fill_data仅供已缺行时查询明确停牌事实；补齐价格不能用作真实成交价。
-        本方法校验wire结构和时间范围，调用方须在处理所需原始bar前校验数值。
+        分钟下载覆盖结束标签所在分钟的末秒，避免冷缓存缺少整分边界bar；
+        按下载窗口校验wire后裁剪至原结束边界，调用方须在处理所需bar前校验数值。
         不订阅、不原生复权，helper可能下载这一明确窗口的缓存，异常传播。
         """
         if start > end:
             raise AdjustmentError("基础行情依赖窗口倒置")
         pattern = "%Y-%m-%d" if base == "1d" else "%Y-%m-%d %H:%M:%S"
+        fetch_end = end.floor("min") + pd.Timedelta(seconds=59) if base == "1m" else end
         data = await self._history_post(
             {
                 "security": security,
                 "frequency": base,
                 "start": start.strftime(pattern),
-                "end": end.strftime(pattern),
+                "end": fetch_end.strftime(pattern),
                 "count": -1,
                 "fields": fields,
                 "fq": "none",
@@ -792,9 +799,9 @@ class BigQmtDataAdapter(RemoteDataAdapter):
             )
         if base == "1d" and not frame.empty and not frame.index.equals(frame.index.normalize()):
             raise AdjustmentError("QMT日线索引不是唯一日日期")
-        if not frame.empty and ((frame.index < start) | (frame.index > end)).any():
+        if not frame.empty and ((frame.index < start) | (frame.index > fetch_end)).any():
             raise AdjustmentError("QMT返回了依赖窗口之外的行情")
-        return frame
+        return frame.loc[frame.index <= end].copy() if base == "1m" else frame
 
     async def _history_pause_facts(
         self,
@@ -965,11 +972,8 @@ class BigQmtDataAdapter(RemoteDataAdapter):
         end_value = payload.get("end")
         if end_value is None:
             end_value = payload.get("end_date")
-        end = (
-            _history_timestamp(end_value, end=True)
-            if end_value is not None
-            else pd.Timestamp.now(tz="Asia/Shanghai").tz_localize(None).floor("s")
-        )
+        now = _history_now()
+        end = _history_timestamp(end_value, end=True) if end_value is not None else now
         listing = _history_listing_date(metadata)
         if mode == "post" and (listing is None or listing > end.normalize()):
             raise AdjustmentError("后复权需要QMT有效上市日作为固定原点")
@@ -982,6 +986,16 @@ class BigQmtDataAdapter(RemoteDataAdapter):
             start = start.normalize()
         if start is not None and start > end:
             raise AdjustmentError("start 不能晚于 end")
+        if base == "1m":
+            # 分钟标签是区间结束；即使请求今天全天，也不使用当前尚未完成的基础bar。
+            end = min(end, now).floor("min")
+            # 今日首根尚未完成时，count须从此前交易日取数，不能在今日空窗提前返回。
+            if end < end.normalize() + pd.Timedelta(hours=9, minutes=31):
+                end = end.normalize() - pd.Timedelta(minutes=1)
+            if start is not None and start > end:
+                return pd.DataFrame(
+                    columns=fields, index=pd.DatetimeIndex([], name="time"), dtype=float
+                )
         reference = None
         if mode == "pre":
             reference = (
