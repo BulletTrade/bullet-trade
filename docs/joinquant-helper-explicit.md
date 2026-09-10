@@ -2,6 +2,11 @@
 
 这份文档适合需要在聚宽策略或聚宽研究里直接调用 `bt.xxx` 的用户。
 
+第一次使用请从[已有聚宽策略：从零接入大 QMT](beginner-route-b.md)开始。教程包括 Windows 安装、端口映射、账户验证，以及同时适用于回测和模拟盘的显式分流示例。本页是接口参考。
+
+!!! warning "显式接口不自动识别回测"
+    `bt.configure()`、`bt.order()` 等直接接口不读取聚宽 `context.run_params.type`。下文简写代码适用于已明确要访问远程账户的场景；同一策略还要回测时，必须在策略中将 `simple_backtest/full_backtest` 分流到聚宽原函数，仅 `sim_trade` 走远程，账户读取、撤单也要分流。即使安装了兼容层，另外直接调用 `bt.xxx` 也不会自动获得回测保护。`sim_trade` 不能判断 QMT 账户是仿真还是实盘。
+
 策略修改方案 1 的核心是：聚宽继续运行策略，真实下单点显式改成 `bullet_trade_jq_remote_helper` 的函数。
 
 这个方案只表示“怎么改策略代码”，不是单独的网络部署方案。只要策略运行在聚宽侧，聚宽都需要能访问 `bullet-trade server` 的入口地址和端口；如果 `bullet-trade server` 跑在 QMT 那台 Windows 机器上，通常需要公网 IP、域名、端口映射，或 FRP / VPN 等可达通道。
@@ -59,7 +64,7 @@ def initialize(context):
 | 参数 | 说明 |
 | --- | --- |
 | `host` | `bullet-trade server` 地址，可以是公网 IP、内网 IP 或域名。 |
-| `port` | `bullet-trade server` 端口，默认建议 `58620`。 |
+| `port` | 聚宽实际访问的入口端口，默认 `58620`；有端口映射时填外部端口，可能不同于 server 本机监听端口。 |
 | `token` | server 端配置的访问 token。 |
 | `account_key` | 多账户配置时的账户 key；单账户可以传 `None` 或不传。 |
 | `sub_account_id` | BulletTrade 虚拟子账户 ID；不用虚拟账户时传 `None`。 |

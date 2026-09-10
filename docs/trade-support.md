@@ -2,6 +2,8 @@
 
 这页只保留最小流程：聚宽策略如何连到远程 `bullet-trade server` 做真实下单。
 
+新用户请先按[聚宽从零接入教程](beginner-route-b.md)完成环境准备和两种方案的选择。下文显式 `bt.xxx` 简写不自动识别回测；兼顾回测时必须按教程分流，不能直接用于回测交易点。
+
 聚宽侧改策略有两种策略修改方案：
 
 - [策略修改方案 1：显式调用 helper](joinquant-helper-explicit.md)：下单处写 `bt.order(...)`、`bt.order_target_value(...)`。

@@ -11,6 +11,8 @@
 - 大 QMT：另一种 QMT 数据和交易后端，通过大 QMT 策略 helper 提供能力，不直接写成 `DEFAULT_DATA_PROVIDER=big_qmt`。
 - `qmt-remote` / RemoteQMT：远程客户端数据源。它是一层协议包装，底层 server 可以接 MiniQMT，也可以接大 QMT。
 
+大 QMT 自 `0.10.0b3` 起在服务端统一标准化股票/ETF 历史行情，包括前后复权、分钟边界、停牌及自然周月；指数等范围外证券仍走原生路径，MiniQMT 算法不变。需配套更新大 QMT 网关文件，范围和升级要求见[大 QMT 更新说明](../big-qmt-server.md)。
+
 ### JQData Provider 
 
 **优点：**

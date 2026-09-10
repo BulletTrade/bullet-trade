@@ -123,7 +123,15 @@ bullet-trade --env-file .env.bigqmt server --server-type big_qmt --listen 0.0.0.
 !!! danger "不要把 58620 作为裸 TCP 直接暴露到公网"
     跨互联网访问时应使用 VPN、加密隧道，或正确配置 TLS 与 IP 白名单。`QMT_SERVER_TOKEN` 只负责身份校验，不能代替传输加密。
 
+### 0.10.0 Beta 3 更新说明
+
+本版更新大 QMT 历史行情、复权和成交认领。升级 server 的 Python 包后，还需更新大 QMT 中实际运行的网关文件，逐项保留自己的账号、端口、密码和运行配置，保留新版构建号和事件协议标识。聚宽 helper 相对 Beta 2 没有变化。
+
+股票/ETF 历史查询现在由服务端统一处理原始行情、除权事件、分钟时间轴、停牌和多周期合成；结果可能与旧版原生复权不同。QMT 未提供的权益和历史精度差异不作强行推算。完整变化与升级要求见[更新日志](https://github.com/BulletTrade/bullet-trade/blob/main/CHANGELOG.md)。
+
 ### 从 0.10.0 Beta 1 升级
+
+本节仅说明 **Beta 1 → Beta 2**，不是后续所有版本的通用升级清单。其他版本应按对应更新日志分别核对 Python 包、聚宽 helper 和大 QMT 网关文件的变更。
 
 - 升级运行 BulletTrade server 的 Python 包或源码并重启 server。
 - 聚宽运行策略需要重新上传本版 `helpers/bullet_trade_jq_remote_helper.py`，以获得 `data.history` 的 180 秒默认等待窗口。
@@ -133,6 +141,8 @@ bullet-trade --env-file .env.bigqmt server --server-type big_qmt --listen 0.0.0.
 <a id="joinquant-route"></a>
 
 ## 路线一：策略在聚宽运行
+
+第一次接入请按[已有聚宽策略：从零接入教程](beginner-route-b.md)逐步操作，其中包括安装、端口配置、只读验证，以及显式调用和函数接管两种完整示例。以下仅为显式接口的简写参考。
 
 ```mermaid
 flowchart LR
@@ -167,7 +177,9 @@ def process_initialize(context):
     )
 ```
 
-`58620` 是默认端口，不需要填写。只有服务端改过端口时，才增加 `port=新端口`。
+`58620` 是默认入口端口，可以省略。服务改端口或公网映射端口不同时，增加 `port=实际入口端口`；例如外部 `15862` 映射到本机 `58620`，聚宽填 `port=15862`。服务监听端口通过 `.env.bigqmt` 的 `QMT_SERVER_PORT` 或启动参数 `--port` 配置，后者优先。完整对应表见[教程第 3 步](beginner-route-b.md#3)。
+
+`bt.configure()` 不接管聚宽原函数，也不自动识别回测。保留 `order(...)` 等原写法需使用 `bt.install_jq_compat(...)`；显式 `bt.xxx` 兼顾回测时需在策略中分流，参见教程两种方案。
 
 查询账户和下单仍然使用 helper：
 

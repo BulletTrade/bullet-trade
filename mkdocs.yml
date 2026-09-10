@@ -14,7 +14,7 @@ nav:
   - 大 QMT（当前推荐）:
       - 两种接入方式: big-qmt-server.md
       - 本地运行策略: beginner-route-a.md
-      - 聚宽运行策略: beginner-route-b.md
+      - 聚宽从零接入教程（两种改法）: beginner-route-b.md
       - 聚宽策略改造方式: joinquant-integration-options.md
       - 显式调用 helper: joinquant-helper-explicit.md
       - 接管聚宽函数: joinquant-live-takeover-usage.md

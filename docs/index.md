@@ -16,7 +16,7 @@ BulletTrade 是一套兼容聚宽 API 的开源量化研究与交易框架。新
 
 策略继续在聚宽运行，通过互联网连接自己的 BulletTrade 服务，再由大 QMT 完成账户查询和下单。
 
-[查看聚宽路线的完整步骤](big-qmt-server.md#joinquant-route)
+[已有聚宽策略：从零接入教程（两种改法）](beginner-route-b.md)
 
 ### 本地运行策略
 

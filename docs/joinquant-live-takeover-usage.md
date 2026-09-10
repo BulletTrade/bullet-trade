@@ -2,6 +2,11 @@
 
 这份文档给已经在聚宽模拟盘运行策略、希望尽量少改策略代码的用户使用。
 
+第一次使用请从[已有聚宽策略：从零接入大 QMT](beginner-route-b.md)开始，先完成只读账户验证，再选择两种方案之一。本页用于查询接管模式的参数和兼容范围。
+
+!!! note "测试范围与使用前提"
+    当前有使用假聚宽上下文和假 Broker 的离线单元测试，覆盖回测不接管、账户读取及下单映射等；本页尚未提供真实聚宽模拟盘到 QMT 的完整验收记录，不代表任意存量策略已实测兼容。请先使用教程的账户查询示例，再在券商仿真账号验证原策略。聚宽 `sim_trade` 不能识别 QMT 账号是仿真还是实盘。
+
 目标是：**回测不使用 BulletTrade；聚宽模拟盘运行时，账户资金、持仓读取和下单函数由 BulletTrade 接管**。策略主体逻辑尽量不用改。
 
 这个方案只表示“怎么改策略代码”，不是单独的网络部署方案。只要策略运行在聚宽侧，聚宽都需要能访问 `bullet-trade server` 的入口地址和端口；如果 `bullet-trade server` 跑在 QMT 那台 Windows 机器上，通常需要公网 IP、域名、端口映射，或 FRP / VPN 等可达通道。
@@ -73,7 +78,7 @@ def process_initialize(context):
 | `globals()` | 当前策略文件的全局命名空间。helper 会替换其中的 `order`、`order_value`、`order_percent`、`order_target`、`order_target_value`、`order_target_percent` 等函数。 |
 | `context` | 聚宽传入的策略上下文。helper 用它判断当前是回测还是模拟盘，并在模拟盘接管 `context.portfolio`。 |
 | `host` | `bullet-trade server` 地址，可以是公网 IP、内网 IP 或域名。 |
-| `port` | `bullet-trade server` 端口，默认建议 `58620`。 |
+| `port` | 聚宽实际访问的入口端口，默认 `58620`；映射后的外部端口可能不同于 server 本机监听端口。 |
 | `token` | server 端配置的访问 token。 |
 | `account_key` | 多账户配置时的账户 key；单账户可以传 `None` 或不传。 |
 | `sub_account_id` | BulletTrade 虚拟子账户 ID；不用虚拟账户时传 `None`。 |
@@ -160,6 +165,9 @@ helper 会根据聚宽运行环境自动判断：
 | --- | --- |
 | 回测 `simple_backtest` / `full_backtest` | 不接管，不连接 BulletTrade，不远程下单。 |
 | 模拟盘 `sim_trade` | 接管账户状态和下单函数，真实下单发到 `bullet-trade server`。 |
+| 未识别的运行环境 | 不接管，返回 `unsupported_run_type`，保留原函数；不代表已安全接入远程。 |
+
+上述自动判断只适用于兼容层接管的同名函数。另行直接调用 `bt.order(...)` 等底层接口不受此判断保护。提前保存的原函数引用、`jqdata.order(...)` 和其他模块里的函数也不会被自动替换；安装后不要再通过导入或赋值覆盖接管函数。
 
 默认 `mirror_jq_orders=False`，所以模拟盘里不会再调用聚宽原始下单函数。聚宽页面主要用于运行策略、取平台数据和看日志；真实资金、真实持仓、真实订单以 BulletTrade / QMT 为准。
 
