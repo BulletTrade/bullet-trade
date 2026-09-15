@@ -11,6 +11,7 @@ import math
 import os
 import re
 import threading
+from contextlib import contextmanager
 from datetime import date as Date
 from datetime import datetime
 from datetime import time as Time
@@ -1971,9 +1972,35 @@ def _get_setting(key: str, default: Any = False) -> Any:
     return get_settings().options.get(key, default)
 
 
+# 回放缓冲预取的嵌套深度；非零期间暂停未来数据守卫
+_replay_prefetch_depth = 0
+
+
 def _should_avoid_future() -> bool:
     # 仅回测上下文（非 live）需要限制未来数据，研究环境无上下文时不处理
+    if _replay_prefetch_depth:
+        return False
     return bool(_current_context and not _is_live_mode() and _get_setting("avoid_future_data"))
+
+
+@contextmanager
+def internal_replay_prefetch():
+    """在回放缓冲预取期间暂停未来数据守卫。
+
+    tick 回测按日整段拉取行情再逐笔投递，拉取窗口必然覆盖回放时钟之后的时刻；
+    这不构成数据泄露，因为策略只能看到已推进到的 tick。守卫只针对策略侧查询，
+    因此预取期间临时关闭，退出后恢复。可重入。
+
+    Yields:
+        None: 作用域内 `_should_avoid_future()` 恒为 False。
+    """
+
+    global _replay_prefetch_depth
+    _replay_prefetch_depth += 1
+    try:
+        yield
+    finally:
+        _replay_prefetch_depth -= 1
 
 
 def _coerce_datetime(value: Any) -> Optional[datetime]:

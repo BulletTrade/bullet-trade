@@ -9,7 +9,8 @@
 
 主要输出:
     pytest 断言结果，确认盘前回调先于首笔 tick、handle_tick 按源时间戳稳定有序投递、
-    订阅/退订在回放时点生效、缺日中止报出代码与日期、未订阅缺口不中止。
+    订阅/退订在回放时点生效、缺日中止报出代码与日期、未订阅缺口不中止、
+    整日预取不被未来数据守卫拦下且守卫事后恢复、订单登记时刻取回放时钟。
 
 上下游关系:
     上游覆盖 `bullet_trade.core.engine` 的 tick 时间轴与 `bullet_trade.core.api` 的订阅接口；
@@ -33,7 +34,7 @@ import pytest
 from bullet_trade.core import api as core_api
 from bullet_trade.core.async_engine import AsyncBacktestEngine
 from bullet_trade.core.engine import BacktestEngine
-from bullet_trade.core.models import Context, Portfolio
+from bullet_trade.core.models import Context, Order, OrderStatus, Portfolio
 from bullet_trade.core.scheduler import unschedule_all
 from bullet_trade.data.tick_replay import TickDataMissingError, TickDayStream
 
@@ -503,3 +504,85 @@ def test_async_entry_rejects_tick_frequency():
 
     with pytest.raises(NotImplementedError):
         asyncio.run(engine.run_async(start_date="2021-06-08", end_date="2021-06-08"))
+
+
+def test_day_prefetch_not_blocked_by_future_guard(monkeypatch):
+    """整日预取的取数窗口晚于回放时钟属预期，不得被未来数据守卫拦下；预取后守卫恢复。"""
+    from bullet_trade.core.settings import reset_settings, set_option
+    from bullet_trade.data import api as data_api
+
+    reset_settings()
+    set_option("avoid_future_data", True)
+    data_api.set_current_context(_engine().context)
+
+    observed: List[tuple] = []
+
+    def fake_get_ticks(**kwargs):
+        observed.append((kwargs["start_dt"], kwargs["end_dt"], data_api._should_avoid_future()))
+        return pd.DataFrame([{"time": 20210608090000.0, "current": 17000.0}])
+
+    monkeypatch.setattr(data_api, "get_ticks", fake_get_ticks)
+
+    engine = _engine()
+    try:
+        stream = engine._load_tick_stream(CODE_A, DAY)
+    finally:
+        data_api.set_current_context(None)
+        reset_settings()
+
+    assert len(stream) == 1
+    assert observed == [
+        (datetime(2021, 6, 8, 0, 0), datetime(2021, 6, 8, 23, 59, 59), False)
+    ]
+
+
+def test_future_guard_restored_after_prefetch(monkeypatch):
+    """守卫只在预取期间暂停，退出后必须恢复拦截越界时刻。"""
+    from bullet_trade.core.exceptions import FutureDataError
+    from bullet_trade.core.settings import reset_settings, set_option
+    from bullet_trade.data import api as data_api
+
+    reset_settings()
+    set_option("avoid_future_data", True)
+    context = _engine().context
+    data_api.set_current_context(context)
+
+    monkeypatch.setattr(
+        data_api,
+        "get_ticks",
+        lambda *args, **kwargs: pd.DataFrame([{"time": 20210608090000.0, "current": 17000.0}]),
+    )
+
+    future_dt = TRADE_DAY + timedelta(days=1)
+    try:
+        with pytest.raises(FutureDataError):
+            data_api._ensure_not_future_dt(future_dt, "probe")
+
+        _engine()._load_tick_stream(CODE_A, DAY)
+
+        assert data_api._should_avoid_future() is True
+        with pytest.raises(FutureDataError):
+            data_api._ensure_not_future_dt(future_dt, "probe")
+    finally:
+        data_api.set_current_context(None)
+        reset_settings()
+
+
+def test_register_order_stamps_replay_time_once():
+    """回测下 add_time 取回放时刻，且只在首次登记时写入，避免挂单时间被后移。"""
+    engine = _engine()
+    order = Order(
+        order_id="test-order-1",
+        security=CODE_A,
+        amount=1,
+        price=17000.0,
+        status=OrderStatus.open,
+        add_time=datetime(2026, 1, 1, 12, 0),
+    )
+
+    engine._register_order(order)
+    assert order.add_time == TRADE_DAY
+
+    engine.context.current_dt = TRADE_DAY + timedelta(hours=1)
+    engine._register_order(order)
+    assert order.add_time == TRADE_DAY

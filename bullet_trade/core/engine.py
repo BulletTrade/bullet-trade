@@ -31,6 +31,7 @@ from ..data.api import get_data_provider
 from ..data.api import get_extras as _data_api_get_extras
 from ..data.api import get_price as _data_api_get_price
 from ..data.api import get_security_info, set_current_context
+from ..data.api import internal_replay_prefetch
 from ..data.tick_replay import (
     TickDataMissingError,
     TickDayStream,
@@ -1367,7 +1368,10 @@ class BacktestEngine:
         """
 
         try:
-            stream = load_tick_day(code, day)
+            # 整日预取是引擎内部行为，取数窗口覆盖回放时钟之后属预期，
+            # 策略仍只能看到已推进到的 tick，因此这里暂停未来数据守卫
+            with internal_replay_prefetch():
+                stream = load_tick_day(code, day)
         except TickDataMissingError:
             raise
         except Exception as exc:
@@ -3185,6 +3189,11 @@ class BacktestEngine:
         if not oid:
             return
         if oid not in self.orders:
+            # 创建订单时写入的是真实墙钟时间，回测下须改写成回放时刻；
+            # 只在首次登记时改写，避免跨时刻未成交订单的下单时间被后移
+            current_dt = getattr(self.context, "current_dt", None)
+            if current_dt is not None:
+                order.add_time = current_dt
             self.orders[oid] = order
 
     def _normalize_status(self, status: Optional[object]) -> Optional[str]:

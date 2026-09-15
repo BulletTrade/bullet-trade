@@ -6,6 +6,7 @@ import pytest
 from bullet_trade.core.scheduler import (
     generate_daily_schedule,
     get_market_periods,
+    get_tasks,
     get_trade_calendar,
     run_daily,
     run_monthly,
@@ -163,3 +164,20 @@ def test_monthly_force_false_drops_overflow():
     ]
     schedule = _build_schedule(dt.datetime(2024, 6, 14), calendar_days, start_date=dt.date(2024, 6, 12))
     assert dt.datetime(2024, 6, 14, 10, 0) not in schedule
+
+
+def test_daily_accepts_reference_security_and_force():
+    run_daily(lambda ctx: None, time="08:50", reference_security="LH9999.XDCE", force=False)
+    task = get_tasks()[0]
+    assert task.reference_security == "LH9999.XDCE"
+    assert task.force is False
+
+    schedule = _build_schedule(dt.datetime(2024, 6, 12, 8, 50))
+    assert dt.datetime(2024, 6, 12, 8, 50) in schedule
+
+
+def test_daily_reference_security_defaults_to_none():
+    run_daily(lambda ctx: None, "09:30")
+    task = get_tasks()[0]
+    assert task.reference_security is None
+    assert task.force is True
