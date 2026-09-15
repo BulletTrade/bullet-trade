@@ -2868,6 +2868,30 @@ def get_ticks(
         return pd.DataFrame() if df else []
 
 
+def _is_tick_replay_backtest() -> bool:
+    """判断当前是否处于 tick 回放回测。
+
+    Returns:
+        bool: 运行时引擎为回测引擎且以 tick 频率运行时为 True；其余情况为 False。
+    """
+
+    try:
+        from ..core.runtime import get_current_engine
+
+        engine = get_current_engine()
+    except Exception:
+        return False
+    if engine is None or getattr(engine, "is_live", False):
+        return False
+    checker = getattr(engine, "is_tick_backtest", None)
+    if not callable(checker):
+        return False
+    try:
+        return bool(checker())
+    except Exception:
+        return False
+
+
 def get_current_tick(
     security: str,
     dt: Optional[Union[str, datetime]] = None,
@@ -2881,6 +2905,10 @@ def get_current_tick(
     if target_dt is None:
         target_dt = datetime.now()
     target_dt = _ensure_not_future_dt(target_dt, "get_current_tick.dt")
+
+    if _is_tick_replay_backtest():
+        # tick 回放中快照只能来自回放缓冲，禁止用分钟线合成
+        return pd.DataFrame() if df else None
 
     use_price_proxy = bool(
         _current_context
@@ -2927,6 +2955,8 @@ def get_current_tick(
                 "datetime": tick_time,
                 "current": float(close_value),
                 "last_price": float(close_value),
+                "source": "minute_proxy",
+                "is_proxy": True,
             }
             return pd.DataFrame([tick]) if df else tick
         except Exception as e:

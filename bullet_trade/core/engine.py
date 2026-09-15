@@ -9,11 +9,12 @@ import inspect as _inspect
 import re
 import sys
 import time
+from dataclasses import dataclass
 from datetime import date, datetime
 from datetime import time as Time
 from datetime import timedelta
 from decimal import ROUND_HALF_UP, Decimal
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, List, Optional, Sequence, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -30,6 +31,12 @@ from ..data.api import get_data_provider
 from ..data.api import get_extras as _data_api_get_extras
 from ..data.api import get_price as _data_api_get_price
 from ..data.api import get_security_info, set_current_context
+from ..data.tick_replay import (
+    TickDataMissingError,
+    TickDayStream,
+    TickSnapshot,
+    load_tick_day,
+)
 from .futures_account import (
     LONG,
     SHORT,
@@ -41,7 +48,7 @@ from .futures_account import (
     is_futures_security,
 )
 from .globals import g, log, reset_globals
-from .models import Context, Order, OrderStatus, Portfolio, Position, Trade
+from .models import Context, Order, OrderStatus, Portfolio, Position, SecurityUnitData, Trade
 from .orders import LimitOrderStyle, MarketOrderStyle, clear_order_queue, get_order_queue
 from .scheduler import (
     generate_daily_schedule,
@@ -81,6 +88,36 @@ _DEFAULT_MARKET_BUY_PERCENT = _BASE_MARKET_SLIPPAGE / 2
 _DEFAULT_MARKET_SELL_PERCENT = -_BASE_MARKET_SLIPPAGE / 2
 
 PRE_MARKET_OFFSET = timedelta(minutes=30)
+
+_TICK_BACKTEST_FREQUENCIES: Set[str] = {"tick", "ticks"}
+
+
+def _is_tick_frequency(frequency: Any) -> bool:
+    """判断运行频率是否为 tick 回放。
+
+    Args:
+        frequency: 运行频率字符串。
+
+    Returns:
+        bool: 归一化后落在 tick 频率集合时为 True。
+    """
+
+    return str(frequency or "").strip().lower() in _TICK_BACKTEST_FREQUENCIES
+
+
+@dataclass
+class _DayRunState:
+    """单个交易日回放过程中的可变状态。
+
+    Attributes:
+        trade_day: 当前交易日（含时间的调度基准）。
+        previous_event_dt: 上一个已执行事件的时刻。
+        dividends_applied: 当日权益变动是否已处理，保证只跑一次。
+    """
+
+    trade_day: datetime
+    previous_event_dt: Optional[datetime] = None
+    dividends_applied: bool = False
 
 
 def _iter_security_code_candidates(security: Optional[str]) -> List[str]:
@@ -124,6 +161,7 @@ class BacktestEngine:
         handle_data: Optional[Callable] = None,
         before_trading_start: Optional[Callable] = None,
         after_trading_end: Optional[Callable] = None,
+        handle_tick: Optional[Callable] = None,
         process_initialize: Optional[Callable] = None,
         data_session_config: Optional[Dict[str, Any]] = None,
     ):
@@ -134,7 +172,7 @@ class BacktestEngine:
             strategy_file: 策略文件路径（与函数参数二选一）
             start_date: 回测开始日期 'YYYY-MM-DD'（可在run()中指定）
             end_date: 回测结束日期 'YYYY-MM-DD'（可在run()中指定）
-            frequency: 回测频率 ('day' or 'minute')
+            frequency: 回测频率 ('day'、'minute' 或 'tick')
             initial_cash: 初始资金（现金部分）
             benchmark: 基准标的
             log_file: 日志文件路径，默认为None（不写文件）
@@ -146,6 +184,7 @@ class BacktestEngine:
             handle_data: 每个bar调用的函数
             before_trading_start: 盘前调用的函数
             after_trading_end: 盘后调用的函数
+            handle_tick: tick 频率下每笔快照调用的函数
             process_initialize: 实盘初始化函数
             data_session_config: 回测数据会话配置，仅用于回测内的临时性能优化
         """
@@ -198,6 +237,13 @@ class BacktestEngine:
         # 期货合约规格表：乘数与最小变动价位内置，保证金率由 set_option('futures_margin_rate') 提供
         self._futures_spec_table = ContractSpecTable()
         self._futures_cost_warned = False
+
+        # tick 回放状态：订阅集合、当日事件流、最新快照
+        self.handle_tick_func: Optional[Callable] = handle_tick
+        self._tick_subscriptions: Set[str] = set()
+        self._tick_streams: Dict[str, TickDayStream] = {}
+        self._tick_snapshots: Dict[str, TickSnapshot] = {}
+        self._tick_day: Optional[date] = None
 
     @staticmethod
     def _amount_from_value(value: float, price: float) -> int:
@@ -271,6 +317,9 @@ class BacktestEngine:
                 )
                 self.after_trading_end_func = getattr(strategy_module, "after_trading_end", None)
                 self.process_initialize_func = getattr(strategy_module, "process_initialize", None)
+                self.handle_tick_func = (
+                    getattr(strategy_module, "handle_tick", None) or self.handle_tick_func
+                )
 
                 log.info("策略文件加载成功")
             else:
@@ -1038,63 +1087,332 @@ class BacktestEngine:
         timeline_set.add(close_dt)
 
         timeline = sorted(timeline_set)
-        previous_event_dt = self.context.previous_dt
-        dividends_applied = False
+        state = _DayRunState(trade_day=trade_day, previous_event_dt=self.context.previous_dt)
+        anchors = {
+            "schedule_map": schedule_map,
+            "pre_open_dt": pre_open_dt,
+            "open_dt": open_dt,
+            "close_dt": close_dt,
+            "market_periods": market_periods,
+        }
+
+        if self.is_tick_backtest():
+            self._run_tick_timeline(timeline=timeline, state=state, **anchors)
+            return
 
         for current_dt in timeline:
-            self._update_current_time(current_dt, previous_event_dt)
-            previous_event_dt = current_dt
+            self._execute_time_point(current_dt, state=state, **anchors)
 
-            if not dividends_applied:
-                try:
-                    self._apply_dividends_for_day(trade_day)
-                except Exception as e:
-                    log.warning(f"盘前分红处理失败: {e}")
-                dividends_applied = True
+    def _execute_time_point(
+        self,
+        current_dt: datetime,
+        *,
+        schedule_map: Dict[datetime, List[Any]],
+        pre_open_dt: datetime,
+        open_dt: datetime,
+        close_dt: datetime,
+        market_periods: Sequence[Tuple[Time, Time]],
+        state: _DayRunState,
+        tick_snapshot: Optional[TickSnapshot] = None,
+    ) -> None:
+        """执行时间轴上的单个时刻。
 
-            tasks = schedule_map.get(current_dt, [])
-            for task in tasks:
-                try:
-                    log.debug(f"执行定时任务: {task.func.__name__}")
-                    task.func(self.context)
-                except Exception as e:
-                    log.error(f"定时任务执行失败 {task.func.__name__}: {e}")
-                    import traceback
+        Args:
+            current_dt: 本时刻的回放时间。
+            schedule_map: 当日调度任务映射。
+            pre_open_dt: 盘前回调时刻。
+            open_dt: 开盘时刻。
+            close_dt: 收盘时刻。
+            market_periods: 当日交易时段。
+            state: 当日回放状态，跨时刻携带时钟与分红标记。
+            tick_snapshot: 本时刻投递的 tick 快照；非 tick 事件时为 None。
+        """
 
-                    log.error(traceback.format_exc())
+        self._update_current_time(current_dt, state.previous_event_dt)
+        state.previous_event_dt = current_dt
 
-            if current_dt == pre_open_dt and self.before_trading_start_func:
-                try:
-                    self.before_trading_start_func(self.context)
-                except Exception as e:
-                    log.error(f"盘前函数执行失败: {e}")
-                    import traceback
+        if not state.dividends_applied:
+            try:
+                self._apply_dividends_for_day(state.trade_day)
+            except Exception as e:
+                log.warning(f"盘前分红处理失败: {e}")
+            state.dividends_applied = True
 
-                    log.error(traceback.format_exc())
+        tasks = schedule_map.get(current_dt, [])
+        for task in tasks:
+            try:
+                log.debug(f"执行定时任务: {task.func.__name__}")
+                task.func(self.context)
+            except Exception as e:
+                log.error(f"定时任务执行失败 {task.func.__name__}: {e}")
+                import traceback
 
-            if current_dt == open_dt and self.handle_data_func:
-                try:
-                    from ..data.api import get_current_data
+                log.error(traceback.format_exc())
 
-                    data = get_current_data()
-                    self.handle_data_func(self.context, data)
-                except Exception as e:
-                    log.error(f"交易函数执行失败: {e}")
-                    import traceback
+        if current_dt == pre_open_dt and tick_snapshot is None and self.before_trading_start_func:
+            try:
+                self.before_trading_start_func(self.context)
+            except Exception as e:
+                log.error(f"盘前函数执行失败: {e}")
+                import traceback
 
-                    log.error(traceback.format_exc())
+                log.error(traceback.format_exc())
 
-            if self._is_trading_time(current_dt, market_periods):
-                self._process_orders(current_dt)
+        # 首笔 tick 可能正好落在开盘时刻，开盘回调只在调度时刻执行一次
+        if current_dt == open_dt and tick_snapshot is None and self.handle_data_func:
+            try:
+                from ..data.api import get_current_data
 
-            if current_dt == close_dt and self.after_trading_end_func:
-                try:
-                    self.after_trading_end_func(self.context)
-                except Exception as e:
-                    log.error(f"盘后函数执行失败: {e}")
-                    import traceback
+                data = get_current_data()
+                self.handle_data_func(self.context, data)
+            except Exception as e:
+                log.error(f"交易函数执行失败: {e}")
+                import traceback
 
-                    log.error(traceback.format_exc())
+                log.error(traceback.format_exc())
+
+        if tick_snapshot is not None and self.handle_tick_func:
+            try:
+                self.handle_tick_func(self.context, tick_snapshot)
+            except Exception as e:
+                log.error(f"逐笔函数执行失败: {e}")
+                import traceback
+
+                log.error(traceback.format_exc())
+
+        # tick 事件自带成交时点，不依赖分钟级交易时段判定
+        if tick_snapshot is not None or self._is_trading_time(current_dt, market_periods):
+            self._process_orders(current_dt)
+
+        if current_dt == close_dt and tick_snapshot is None and self.after_trading_end_func:
+            try:
+                self.after_trading_end_func(self.context)
+            except Exception as e:
+                log.error(f"盘后函数执行失败: {e}")
+                import traceback
+
+                log.error(traceback.format_exc())
+
+    def is_tick_backtest(self) -> bool:
+        """返回当前回测是否以 tick 频率运行。
+
+        Returns:
+            bool: frequency 归一化后属于 tick 频率时为 True。
+        """
+
+        return _is_tick_frequency(self.frequency)
+
+    def _run_tick_timeline(
+        self,
+        *,
+        timeline: List[datetime],
+        schedule_map: Dict[datetime, List[Any]],
+        pre_open_dt: datetime,
+        open_dt: datetime,
+        close_dt: datetime,
+        market_periods: Sequence[Tuple[Time, Time]],
+        state: _DayRunState,
+    ) -> None:
+        """按 min(调度时刻, 下一笔 tick) 合并推进单个交易日。
+
+        Args:
+            timeline: 已排序的调度时刻列表。
+            schedule_map: 当日调度任务映射。
+            pre_open_dt: 盘前回调时刻。
+            open_dt: 开盘时刻。
+            close_dt: 收盘时刻。
+            market_periods: 当日交易时段。
+            state: 当日回放状态。
+
+        Raises:
+            TickDataMissingError: 已订阅标的当日取不到 tick。
+        """
+
+        anchors = {
+            "schedule_map": schedule_map,
+            "pre_open_dt": pre_open_dt,
+            "open_dt": open_dt,
+            "close_dt": close_dt,
+            "market_periods": market_periods,
+        }
+        day_date = state.trade_day.date()
+        self._prepare_tick_day(day_date)
+
+        index = 0
+        while index < len(timeline):
+            next_point = timeline[index]
+            tick_code, tick_dt = self._peek_next_tick()
+            if tick_dt is not None and tick_dt < next_point:
+                self._consume_tick_event(tick_code, anchors=anchors, state=state)
+                continue
+            self._execute_time_point(next_point, state=state, **anchors)
+            self._sync_tick_subscriptions(day_date, next_point)
+            index += 1
+
+        # 调度时刻用尽后仍有 tick：说明交易时段配置盖不住行情时段，消费完并提示
+        tick_code, tick_dt = self._peek_next_tick()
+        if tick_dt is not None:
+            log.warning(
+                f"{day_date.isoformat()} 存在晚于收盘调度时刻 {close_dt} 的 tick，"
+                "请检查交易时段配置"
+            )
+            while tick_code is not None:
+                self._consume_tick_event(tick_code, anchors=anchors, state=state)
+                tick_code, _ = self._peek_next_tick()
+
+    def _consume_tick_event(
+        self,
+        tick_code: str,
+        *,
+        anchors: Dict[str, Any],
+        state: _DayRunState,
+    ) -> None:
+        """消费指定标的的下一笔 tick 并投递给策略。
+
+        Args:
+            tick_code: 事件所属标的代码。
+            anchors: 当日调度锚点集合。
+            state: 当日回放状态。
+        """
+
+        stream = self._tick_streams[tick_code]
+        snapshot = stream.advance()
+        if snapshot is None:
+            return
+        self._tick_snapshots[tick_code] = snapshot
+        self._execute_time_point(snapshot.datetime, state=state, tick_snapshot=snapshot, **anchors)
+        self._sync_tick_subscriptions(state.trade_day.date(), snapshot.datetime)
+
+    def _prepare_tick_day(self, day: date) -> None:
+        """为指定交易日预取全部已订阅标的的 tick 事件流。
+
+        Args:
+            day: 自然日；数据源单次查询上限为 24 小时，因此按日预取。
+
+        Raises:
+            TickDataMissingError: 任一已订阅标的当日缺数据。
+        """
+
+        if self._tick_day == day and self._tick_streams:
+            return
+        self._tick_day = day
+        self._tick_streams.clear()
+        self._tick_snapshots.clear()
+        for code in sorted(self._tick_subscriptions):
+            self._load_tick_stream(code, day)
+
+    def _load_tick_stream(
+        self, code: str, day: date, cutoff_dt: Optional[datetime] = None
+    ) -> TickDayStream:
+        """加载单个标的的单日 tick 事件流。
+
+        Args:
+            code: 标的代码。
+            day: 自然日。
+            cutoff_dt: 盘中新增订阅时的起投时刻，早于该时刻的 tick 不补投。
+
+        Returns:
+            TickDayStream: 已按源时间戳稳定排序的事件流。
+
+        Raises:
+            TickDataMissingError: 当日无数据或加载失败，错误信息含代码与日期。
+        """
+
+        try:
+            stream = load_tick_day(code, day)
+        except TickDataMissingError:
+            raise
+        except Exception as exc:
+            raise TickDataMissingError(
+                f"{code} 在 {day.isoformat()} 的 tick 数据加载失败: {exc}"
+            ) from exc
+        if stream is None or len(stream) == 0:
+            raise TickDataMissingError(f"{code} 在 {day.isoformat()} 缺少 tick 数据")
+        if cutoff_dt is not None:
+            stream.skip_until_dt(cutoff_dt)
+        self._tick_streams[code] = stream
+        return stream
+
+    def _sync_tick_subscriptions(self, day: date, current_dt: datetime) -> None:
+        """让订阅变更在回放时钟生效时点立即起效。
+
+        Args:
+            day: 当前交易日。
+            current_dt: 当前回放时刻，作为新增订阅的起投时间。
+
+        Raises:
+            TickDataMissingError: 新增订阅的标的当日缺数据。
+        """
+
+        for code in sorted(self._tick_subscriptions - set(self._tick_streams)):
+            self._load_tick_stream(code, day, cutoff_dt=current_dt)
+        for code in set(self._tick_streams) - self._tick_subscriptions:
+            self._tick_streams.pop(code, None)
+            self._tick_snapshots.pop(code, None)
+
+    def _peek_next_tick(self) -> Tuple[Optional[str], Optional[datetime]]:
+        """返回所有活跃事件流中最早的一笔 tick。
+
+        Returns:
+            Tuple[Optional[str], Optional[datetime]]: (标的代码, 回放时刻)；
+                全部消费完时为 (None, None)。
+        """
+
+        best_code: Optional[str] = None
+        best_time: Optional[float] = None
+        best_dt: Optional[datetime] = None
+        for code, stream in self._tick_streams.items():
+            raw_time = stream.next_time
+            if raw_time is None:
+                continue
+            # 用原始 float 时间戳比较，避免 datetime 量化后误判先后
+            if best_time is None or raw_time < best_time:
+                best_code = code
+                best_time = raw_time
+                best_dt = stream.next_dt
+        return best_code, best_dt
+
+    def get_current_tick_snapshot(self, security: str) -> Optional[TickSnapshot]:
+        """返回指定标的在回放时钟下最近可见的一笔 tick。
+
+        Args:
+            security: 标的代码。
+
+        Returns:
+            Optional[TickSnapshot]: 尚无可视 tick 或非 tick 回测时为 None。
+        """
+
+        if not self.is_tick_backtest():
+            return None
+        return self._tick_snapshots.get(security)
+
+    def register_backtest_tick_subscription(self, security: str) -> None:
+        """登记回测 tick 订阅，投递自当前回放时点起生效。
+
+        Args:
+            security: 标的代码。
+        """
+
+        if security:
+            self._tick_subscriptions.add(security)
+
+    def unregister_backtest_tick_subscription(self, security: str) -> None:
+        """注销单个标的的回测 tick 订阅。
+
+        Args:
+            security: 标的代码。
+        """
+
+        self._tick_subscriptions.discard(security)
+        self._tick_streams.pop(security, None)
+        self._tick_snapshots.pop(security, None)
+
+    def clear_backtest_tick_subscriptions(self) -> None:
+        """注销全部回测 tick 订阅并停止投递。"""
+
+        self._tick_subscriptions.clear()
+        self._tick_streams.clear()
+        self._tick_snapshots.clear()
 
     def _apply_dividends_for_day(self, trade_day: datetime):
         """开盘前处理当日生效的权益变动（分红、送转/拆分），同步持仓与现金口径。
@@ -2409,13 +2727,31 @@ class BacktestEngine:
         for order in orders:
             try:
                 self._register_order(order)
+                tick_snapshot = (
+                    self.get_current_tick_snapshot(order.security)
+                    if self.is_tick_backtest()
+                    else None
+                )
                 # 获取当前价格
-                if order.security not in current_data:
+                if order.security in current_data:
+                    security_data = current_data[order.security]
+                elif tick_snapshot is not None:
+                    # tick 回放下部分合约不在当日行情容器里，用回放快照合成最小行情
+                    security_data = SecurityUnitData(
+                        security=order.security,
+                        last_price=float(tick_snapshot.current),
+                        paused=False,
+                        source="tick_replay",
+                        source_time=tick_snapshot.datetime,
+                        bid_price1=tick_snapshot.b1_p or None,
+                        ask_price1=tick_snapshot.a1_p or None,
+                        bid_volume1=tick_snapshot.b1_v or None,
+                        ask_volume1=tick_snapshot.a1_v or None,
+                    )
+                else:
                     log.warning(f"无法获取 {order.security} 的行情数据")
                     order.status = OrderStatus.rejected
                     continue
-
-                security_data = current_data[order.security]
                 try:
                     sec_info = get_security_info(order.security)
                 except Exception:
@@ -2434,9 +2770,13 @@ class BacktestEngine:
                 current_dt = self.context.current_dt
                 # 期货无复权概念，动态复权口径会篡改撮合基准价
                 exec_fq_mode = "none" if is_futures_order else fq_mode
-                base_exec_price = self._resolve_base_exec_price(
-                    order.security, current_dt, exec_fq_mode
-                )
+                if tick_snapshot is not None:
+                    # tick 回放的成交价基准就是当前这笔快照，不能再退回 bar 价
+                    base_exec_price = float(tick_snapshot.current)
+                else:
+                    base_exec_price = self._resolve_base_exec_price(
+                        order.security, current_dt, exec_fq_mode
+                    )
 
                 current_price = (
                     float(base_exec_price)

@@ -448,15 +448,33 @@ class JQDataProvider(DataProvider):
         skip: bool = False,
         df: bool = False,
     ) -> Any:
-        return jq.get_ticks(
-            security,
-            start_dt=start_dt,
-            end_dt=end_dt,
-            count=count,
-            fields=fields,
-            skip=skip,
-            df=df,
-        )
+        # df 只影响返回形态，不参与缓存键；缓存统一存 DataFrame
+        kwargs = {
+            'security': security,
+            'end_dt': end_dt,
+            'start_dt': start_dt,
+            'count': count,
+            'fields': fields,
+            'skip': skip,
+        }
+
+        def _fetch(kw: Dict[str, Any]) -> pd.DataFrame:
+            return jq.get_ticks(
+                kw['security'],
+                start_dt=kw.get('start_dt'),
+                end_dt=kw.get('end_dt'),
+                count=kw.get('count'),
+                fields=kw.get('fields'),
+                skip=kw.get('skip', False),
+                df=True,
+            )
+
+        frame = self._cache.cached_call('get_ticks', kwargs, _fetch, result_type='df')
+        if df:
+            return frame
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            return []
+        return frame.to_records(index=False)
 
     def get_current_tick(
         self,

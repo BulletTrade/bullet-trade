@@ -81,6 +81,21 @@ def _current_live_engine():
     return None
 
 
+def _current_backtest_engine():
+    """
+    如果当前处于回测引擎环境且支持 tick 回放订阅，则返回引擎实例。
+    """
+    try:
+        engine = get_current_engine()
+    except Exception:
+        return None
+    if engine is None or getattr(engine, 'is_live', False):
+        return None
+    if not callable(getattr(engine, 'register_backtest_tick_subscription', None)):
+        return None
+    return engine
+
+
 def require_data_capabilities(
     required: Sequence[str] = (),
     optional: Sequence[str] = (),
@@ -147,6 +162,14 @@ def subscribe(security: Union[str, Sequence[str]], frequency: str) -> None:
         engine.register_tick_subscription(norm_syms, markets)
         return
 
+    backtest_engine = _current_backtest_engine()
+    if backtest_engine is not None:
+        for symbol in norm_syms:
+            backtest_engine.register_backtest_tick_subscription(symbol)
+        if markets:
+            log.debug(f"tick 回测忽略市场级订阅代码: {sorted(markets)}")
+        return
+
     provider = _remote_provider()
     if provider:
         _auto_bind_handle_tick()
@@ -208,6 +231,12 @@ def unsubscribe(security: Union[str, Sequence[str]], frequency: str) -> None:
         engine.unregister_tick_subscription(norm_syms, markets)
         return
 
+    backtest_engine = _current_backtest_engine()
+    if backtest_engine is not None:
+        for symbol in norm_syms:
+            backtest_engine.unregister_backtest_tick_subscription(symbol)
+        return
+
     with _tick_lock:
         for s in norm_syms:
             _tick_subscribed.discard(str(s))
@@ -245,6 +274,11 @@ def unsubscribe_all() -> None:
         engine.unsubscribe_all_ticks()
         return
 
+    backtest_engine = _current_backtest_engine()
+    if backtest_engine is not None:
+        backtest_engine.clear_backtest_tick_subscriptions()
+        return
+
     with _tick_lock:
         _tick_subscribed.clear()
         _xt_markets.clear()
@@ -274,6 +308,10 @@ def get_current_tick(
     engine = _current_live_engine()
     if engine and hasattr(engine, "get_current_tick_snapshot"):
         return engine.get_current_tick_snapshot(security)  # type: ignore[no-any-return]
+    backtest_engine = _current_backtest_engine()
+    if backtest_engine is not None and backtest_engine.is_tick_backtest():
+        # tick 回放只读回放缓冲：无快照即返回 None，不用分钟线合成、不取实时行情
+        return backtest_engine.get_current_tick_snapshot(security)
     return _data_get_current_tick(security, dt=dt, df=df)
 
 
