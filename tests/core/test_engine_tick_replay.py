@@ -10,7 +10,8 @@
 主要输出:
     pytest 断言结果，确认盘前回调先于首笔 tick、handle_tick 按源时间戳稳定有序投递、
     订阅/退订在回放时点生效、缺日中止报出代码与日期、未订阅缺口不中止、
-    整日预取不被未来数据守卫拦下且守卫事后恢复、订单登记时刻取回放时钟。
+    整日预取不被未来数据守卫拦下且守卫事后恢复、订单登记时刻取回放时钟、
+    市价单保护价以当前 tick 为基准。
 
 上下游关系:
     上游覆盖 `bullet_trade.core.engine` 的 tick 时间轴与 `bullet_trade.core.api` 的订阅接口；
@@ -586,3 +587,72 @@ def test_register_order_stamps_replay_time_once():
     engine.context.current_dt = TRADE_DAY + timedelta(hours=1)
     engine._register_order(order)
     assert order.add_time == TRADE_DAY
+
+
+def test_market_order_protect_price_follows_tick_basis(monkeypatch):
+    """tick 回放下市价单保护价须与撮合基准同源，bar 价与 tick 价的正常价差不得让订单被取消。"""
+    from bullet_trade.core.models import SecurityUnitData
+    from bullet_trade.core.orders import clear_order_queue
+    from bullet_trade.core.orders import order as place_order
+    from bullet_trade.data.tick_replay import TickSnapshot
+
+    stock = "000001.XSHE"
+    bar_price = 100.0
+    # 低于 bar 价 2%，超过市价单默认 1.5% 的保护带；保护价若取 bar 价就会判为越界
+    tick_price = 98.0
+
+    engine = _engine()
+    monkeypatch.setattr(
+        "bullet_trade.core.orders._trigger_order_processing", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr("bullet_trade.core.engine.get_security_info", lambda _security: {})
+    monkeypatch.setattr(engine, "_resolve_base_exec_price", lambda _s, _dt, _fq: bar_price)
+    monkeypatch.setattr(engine, "_apply_slippage_price", lambda p, _is_buy, _security: p)
+    monkeypatch.setattr(engine, "_infer_security_category", lambda _s, info=None: "stock")
+    monkeypatch.setattr(engine, "_infer_tplus_from_info", lambda info: 0)
+
+    def _bar_data():
+        return {
+            stock: SecurityUnitData(
+                security=stock,
+                last_price=bar_price,
+                high_limit=bar_price * 1.1,
+                low_limit=bar_price * 0.9,
+                paused=False,
+            )
+        }
+
+    monkeypatch.setattr("bullet_trade.data.api.get_current_data", _bar_data)
+
+    clear_order_queue()
+    try:
+        buy_order = place_order(stock, 100)
+        engine._process_orders(engine.context.current_dt)
+        assert buy_order.status == OrderStatus.filled
+        engine.context.portfolio.positions[stock].closeable_amount = 100
+        clear_order_queue()
+
+        engine._tick_snapshots[stock] = TickSnapshot(
+            code=stock,
+            datetime=TRADE_DAY + timedelta(hours=9, minutes=30),
+            time=20210608093000.0,
+            current=tick_price,
+            high=bar_price,
+            low=tick_price,
+            volume=0.0,
+            money=0.0,
+            position=0.0,
+            a1_p=tick_price,
+            a1_v=1000.0,
+            b1_p=tick_price,
+            b1_v=1000.0,
+        )
+
+        sell_order = place_order(stock, -100)
+        engine._process_orders(engine.context.current_dt)
+    finally:
+        clear_order_queue()
+        engine._tick_snapshots.clear()
+
+    assert sell_order.status == OrderStatus.filled
+    assert sell_order.price == pytest.approx(tick_price)

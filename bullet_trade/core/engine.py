@@ -9,7 +9,7 @@ import inspect as _inspect
 import re
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime
 from datetime import time as Time
 from datetime import timedelta
@@ -2809,6 +2809,12 @@ class BacktestEngine:
                     log.warning(f"无法获取 {order.security} 的行情数据")
                     order.status = OrderStatus.rejected
                     continue
+                if tick_snapshot is not None:
+                    # 撮合基准已强制取当前 tick，市价单保护价也必须同源，
+                    # 否则 bar 价与 tick 价的差距会让市价单被误判越界而取消
+                    security_data = replace(
+                        security_data, last_price=float(tick_snapshot.current)
+                    )
                 try:
                     sec_info = get_security_info(order.security)
                 except Exception:
