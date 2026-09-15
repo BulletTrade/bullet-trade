@@ -3356,6 +3356,34 @@ def get_future_contracts(
         return []
 
 
+def get_futures_info(
+    security_list: Union[str, List[str]],
+    date: Optional[Union[str, datetime]] = None,
+    fields: Optional[List[str]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    获取期货合约规格信息（合约乘数、最小变动价位、交易时段）。
+
+    Args:
+        security_list: 合约代码或代码列表
+        date: 查询日期，缺省取回测当前日
+        fields: 字段白名单，缺省为 contract_multiplier/tick_size/trade_time
+
+    Returns:
+        Dict[str, Dict[str, Any]]: 合约代码到规格字段的映射
+    """
+    _ensure_auth()
+    resolved_date = _resolve_context_date(date, default_to_context=True)
+    resolved_date = _ensure_not_future_date(resolved_date, "get_futures_info.date")
+    try:
+        result = _get_default_provider().get_futures_info(security_list, resolved_date, fields)
+    except Exception as e:
+        _raise_if_not_implemented(e)
+        log.error(f"获取期货合约规格失败: {e}")
+        return {}
+    return result if isinstance(result, dict) else {}
+
+
 def get_billboard_list(
     stock_list: Optional[List[str]] = None,
     start_date: Optional[Union[str, datetime]] = None,

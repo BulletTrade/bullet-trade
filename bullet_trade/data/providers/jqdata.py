@@ -35,6 +35,70 @@ jq.get_price_engine = _patched_get_price_engine
 
 logger = logging.getLogger(__name__)
 
+_FUTURES_INFO_FIELDS: Tuple[str, ...] = ("contract_multiplier", "tick_size", "trade_time")
+
+
+def _normalize_futures_info(
+    raw: Any, codes: List[str], fields: List[str]
+) -> Dict[str, Dict[str, Any]]:
+    """把上游合约规格返回值归一化为 {合约代码: {字段: 值}}。
+
+    Args:
+        raw: 上游原始返回，可能是嵌套 dict、pandas 对象或字符串化的脏值。
+        codes: 本次请求的合约代码列表，用于补齐缺失条目。
+        fields: 本次请求的字段列表。
+
+    Returns:
+        Dict[str, Dict[str, Any]]: 数值字段统一为 float 或 None，交易时段保留列表结构。
+    """
+
+    mapping: Dict[str, Any] = {}
+    if isinstance(raw, dict):
+        mapping = raw
+    elif hasattr(raw, "to_dict"):
+        try:
+            converted = raw.to_dict(orient="index")
+            if isinstance(converted, dict):
+                mapping = converted
+        except Exception:
+            mapping = {}
+
+    result: Dict[str, Dict[str, Any]] = {}
+    for code in codes:
+        entry = mapping.get(code)
+        if not isinstance(entry, dict):
+            entry = {}
+        normalized: Dict[str, Any] = {}
+        for field_name in fields:
+            value = entry.get(field_name)
+            if field_name in ("contract_multiplier", "tick_size"):
+                normalized[field_name] = _coerce_positive_float(value)
+            else:
+                normalized[field_name] = None if isinstance(value, str) or value is None else value
+        result[code] = normalized
+    return result
+
+
+def _coerce_positive_float(value: Any) -> Optional[float]:
+    """把合约规格数值字段转成正 float，非法或字符串化脏值返回 None。
+
+    Args:
+        value: 原始字段值。
+
+    Returns:
+        Optional[float]: 大于 0 的浮点数，否则 None。
+    """
+
+    if value is None or isinstance(value, str):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not number or number <= 0:
+        return None
+    return number
+
 
 class _FinanceColumnStub:
     def __init__(self, name: str) -> None:
@@ -567,6 +631,36 @@ class JQDataProvider(DataProvider):
     def get_future_contracts(self, underlying_symbol: str, date: Optional[Union[str, datetime]] = None) -> Any:
         query_date = date or datetime.now()
         return jq.get_future_contracts(underlying_symbol, date=query_date)
+
+    def get_futures_info(
+        self,
+        security_list: Union[str, List[str]],
+        date: Optional[Union[str, datetime]] = None,
+        fields: Optional[List[str]] = None,
+    ) -> Any:
+        """批量获取期货合约规格。
+
+        Args:
+            security_list: 合约代码或代码列表。
+            date: 查询日期，None 表示取合约自身的挂牌规格。
+            fields: 字段白名单，缺省为乘数、最小变动价位、交易时段。
+
+        Returns:
+            Dict[str, Dict[str, Any]]: 合约代码到规格字段的映射，缺失字段为 None。
+        """
+        codes = [security_list] if isinstance(security_list, str) else list(security_list or [])
+        codes = [str(c) for c in codes if c]
+        if not codes:
+            return {}
+        query_fields = list(fields) if fields else list(_FUTURES_INFO_FIELDS)
+
+        def _fetch(_params: Optional[Dict[str, Any]] = None) -> Dict[str, Dict[str, Any]]:
+            raw = jq.get_futures_info(securities=list(codes), fields=list(query_fields))
+            return _normalize_futures_info(raw, codes, query_fields)
+
+        # 合约规格是合约自身的静态属性，与查询日无关，故 date 不进缓存键
+        cache_kwargs = {"securities": sorted(codes), "fields": sorted(query_fields)}
+        return self._cache.cached_call("get_futures_info", cache_kwargs, _fetch, result_type="list_dict")
 
     def get_billboard_list(
         self,

@@ -17,7 +17,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date as Date
 from datetime import datetime
-from typing import Dict, Iterable, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Tuple
 
 from .security_id import SecurityId, SecurityIdValidationError, parse_security_id
 
@@ -129,30 +129,81 @@ def futures_product(security: str) -> str:
 
 
 class ContractSpecTable:
-    """合约规格表，支持内置规格、显式注册与保证金率覆盖。"""
+    """合约规格表，按合约代码分层解析规格并按四级优先级解析保证金率。"""
 
     def __init__(
         self,
         specs: Optional[Iterable[ContractSpec]] = None,
         margin_rate: Optional[float] = None,
         margin_rate_by_product: Optional[Mapping[str, float]] = None,
+        spec_source: Optional[Any] = None,
+        config: Optional[Any] = None,
+        load_config: bool = True,
+        enable_remote: bool = False,
     ) -> None:
         """构建规格表。
 
         Args:
-            specs: 追加或覆盖内置规格的合约规格集合。
-            margin_rate: 全局保证金率覆盖，优先级最高。
-            margin_rate_by_product: 按品种的保证金率覆盖。
+            specs: 追加或覆盖内置规格的品种级合约规格集合。
+            margin_rate: 全局保证金率覆盖，低于品种级覆盖、高于配置文件。
+            margin_rate_by_product: 按品种的保证金率覆盖，优先级最高。
+            spec_source: 注入的合约级规格来源，需实现 query_contract(security, day)。
+            config: 注入的规格配置对象，None 且 load_config 为真时惰性加载随包配置。
+            load_config: 是否加载随包发布的合约规格配置文件。
+            enable_remote: 是否允许通过数据接口解析合约规格。
 
         Returns:
             None: 仅初始化内部映射。
         """
 
-        self._specs: Dict[str, ContractSpec] = {spec.product: spec for spec in _BUILTIN_SPECS}
+        self._fallback_products: Dict[str, ContractSpec] = {spec.product: spec for spec in _BUILTIN_SPECS}
+        self._registered_products: Dict[str, ContractSpec] = {}
         for spec in specs or ():
-            self._specs[spec.product] = spec
+            self._registered_products[spec.product] = spec
+        self._contract_specs: Dict[str, ContractSpec] = {}
+        self._resolved_cache: Dict[Tuple[str, Optional[Date]], Optional[ContractSpec]] = {}
         self._margin_rate = margin_rate
         self._margin_rate_by_product = dict(margin_rate_by_product or {})
+        self._spec_source = spec_source
+        self._config = config
+        self._config_loaded = config is not None
+        self._fallback_merged = False
+        self._load_config = load_config
+        self._enable_remote = enable_remote
+
+    def _ensure_config(self) -> Optional[Any]:
+        """惰性加载规格配置，避免在无期货需求的进程里读盘。
+
+        Returns:
+            Optional[Any]: 配置对象，加载失败或未启用时返回 None。
+        """
+
+        if not self._config_loaded:
+            self._config_loaded = True
+            if self._load_config:
+                from .contract_specs import load_futures_spec_config
+
+                self._config = load_futures_spec_config()
+        if self._config is not None and not self._fallback_merged:
+            self._fallback_merged = True
+            for product, spec in self._config.fallback_specs.items():
+                self._fallback_products.setdefault(product, spec)
+        return self._config
+
+    def _source(self) -> Optional[Any]:
+        """取得合约级规格来源，必要时按当前配置构建。
+
+        Returns:
+            Optional[Any]: 来源对象，未配置时返回 None。
+        """
+
+        config = self._ensure_config()
+        if self._spec_source is None and (config is not None or self._enable_remote):
+            from .contract_specs import FuturesSpecConfig, build_spec_source
+
+            base = config if config is not None else FuturesSpecConfig()
+            self._spec_source, _ = build_spec_source(base, enable_remote=self._enable_remote)
+        return self._spec_source
 
     def register(
         self,
@@ -178,12 +229,50 @@ class ContractSpecTable:
 
         if not multiplier or float(multiplier) <= 0:
             raise ContractSpecError("合约乘数必须为正数: {0}".format(product))
-        self._specs[product.upper()] = ContractSpec(
+        self._registered_products[product.upper()] = ContractSpec(
             product=product.upper(),
             multiplier=float(multiplier),
             tick_size=None if tick_size is None else float(tick_size),
             margin_rate=None if margin_rate is None else float(margin_rate),
         )
+        self._resolved_cache.clear()
+
+    def register_contract(
+        self,
+        security: str,
+        multiplier: float,
+        tick_size: Optional[float] = None,
+        margin_rate: Optional[float] = None,
+    ) -> None:
+        """注册或更新单个合约的规格，优先级高于品种级注册。
+
+        Args:
+            security: 带交易所后缀的合约代码。
+            multiplier: 合约乘数，必须为正。
+            tick_size: 最小变动价位，None 表示该合约不归档价格。
+            margin_rate: 该合约的挂牌保证金率。
+
+        Returns:
+            None: 结果写入内部映射。
+
+        Raises:
+            ContractSpecError: 乘数不是正数，或代码是伪合约。
+        """
+
+        from .contract_specs import is_pseudo_contract
+
+        code = str(security).upper()
+        if is_pseudo_contract(code):
+            raise ContractSpecError("主力/连续/指数合约不可参与撮合，无法登记交易规格: {0}".format(code))
+        if not multiplier or float(multiplier) <= 0:
+            raise ContractSpecError("合约乘数必须为正数: {0}".format(code))
+        self._contract_specs[code] = ContractSpec(
+            product=futures_product(code),
+            multiplier=float(multiplier),
+            tick_size=None if tick_size is None else float(tick_size),
+            margin_rate=None if margin_rate is None else float(margin_rate),
+        )
+        self._resolved_cache.pop((code, None), None)
 
     def set_margin_rate(self, margin_rate: Optional[float]) -> None:
         """设置全局保证金率覆盖。
@@ -197,33 +286,106 @@ class ContractSpecTable:
 
         self._margin_rate = None if margin_rate is None else float(margin_rate)
 
-    def spec(self, security: str) -> ContractSpec:
-        """取得合约规格。
+    def set_margin_rate_by_product(self, margin_rate_by_product: Optional[Mapping[str, float]]) -> None:
+        """整体替换按品种的保证金率覆盖。
+
+        Args:
+            margin_rate_by_product: 品种到保证金率的映射，None 表示清空。
+
+        Returns:
+            None: 结果写入内部映射。
+        """
+
+        self._margin_rate_by_product = {
+            str(product).upper(): float(rate)
+            for product, rate in (margin_rate_by_product or {}).items()
+            if rate is not None and float(rate) > 0
+        }
+
+    def set_spec_source(self, spec_source: Optional[Any]) -> None:
+        """替换合约级规格来源。
+
+        Args:
+            spec_source: 实现 query_contract(security, day) 的对象，None 表示清空。
+
+        Returns:
+            None: 结果写入内部字段并清空解析缓存。
+        """
+
+        self._spec_source = spec_source
+        self._resolved_cache.clear()
+
+    def prefetch(self, securities: Iterable[str], day: Optional[Date] = None) -> None:
+        """预热一批合约的规格，减少回测循环内的远端往返。
+
+        Args:
+            securities: 合约代码集合。
+            day: 回测交易日。
+
+        Returns:
+            None: 结果由来源自行缓存。
+        """
+
+        source = self._source()
+        if source is not None:
+            source.prefetch(securities, day)
+
+    def spec(self, security: str, day: Optional[Date] = None) -> ContractSpec:
+        """取得合约规格，按 合约覆盖 > 品种注册 > 来源链 > 内置兜底 解析。
 
         Args:
             security: 期货合约代码。
+            day: 回测交易日，传递给来源链用于按日解析。
 
         Returns:
-            ContractSpec: 该品种的合约规格。
+            ContractSpec: 该合约的规格。
 
         Raises:
-            ContractSpecError: 品种未登记规格。
+            ContractSpecError: 代码是伪合约，或四层来源都未取得规格。
         """
 
-        product = futures_product(security)
-        spec = self._specs.get(product)
-        if spec is None:
+        from .contract_specs import is_pseudo_contract
+
+        code = str(security).upper()
+        if is_pseudo_contract(code):
+            raise ContractSpecError(
+                "主力/连续/指数合约（{0}）没有可撮合的合约规格，只能用于行情信号".format(code)
+            )
+        product = futures_product(code)
+        for spec in (
+            self._contract_specs.get(code),
+            self._registered_products.get(product),
+        ):
+            if spec is not None:
+                return spec
+
+        cache_key = (code, day)
+        if cache_key in self._resolved_cache:
+            cached = self._resolved_cache[cache_key]
+        else:
+            source = self._source()
+            cached = None if source is None else source.query_contract(code, day)
+            self._resolved_cache[cache_key] = cached
+        if cached is not None:
+            return cached
+
+        fallback = self._fallback_products.get(product)
+        if fallback is None:
+            self._ensure_config()
+            fallback = self._fallback_products.get(product)
+        if fallback is None:
             raise ContractSpecError(
                 "缺少品种 {0} 的合约规格（合约乘数未知），"
                 "请通过 ContractSpecTable.register 或合约规格配置补充".format(product)
             )
-        return spec
+        return fallback
 
-    def multiplier(self, security: str) -> float:
+    def multiplier(self, security: str, day: Optional[Date] = None) -> float:
         """取得合约乘数。
 
         Args:
             security: 期货合约代码。
+            day: 回测交易日。
 
         Returns:
             float: 每手对应的标的数量。
@@ -232,13 +394,14 @@ class ContractSpecTable:
             ContractSpecError: 品种未登记规格。
         """
 
-        return float(self.spec(security).multiplier)
+        return float(self.spec(security, day).multiplier)
 
-    def tick_size(self, security: str) -> Optional[float]:
+    def tick_size(self, security: str, day: Optional[Date] = None) -> Optional[float]:
         """取得最小变动价位。
 
         Args:
             security: 期货合约代码。
+            day: 回测交易日。
 
         Returns:
             Optional[float]: 未登记时返回 None。
@@ -247,27 +410,36 @@ class ContractSpecTable:
             ContractSpecError: 品种未登记规格。
         """
 
-        return self.spec(security).tick_size
+        return self.spec(security, day).tick_size
 
-    def margin_rate(self, security: str) -> float:
-        """取得保证金率，优先级为全局覆盖 > 品种覆盖 > 品种挂牌费率。
+    def margin_rate(self, security: str, day: Optional[Date] = None) -> float:
+        """取得保证金率，优先级为 品种覆盖 > 全局覆盖 > 配置分段 > 规格挂牌费率。
 
         Args:
             security: 期货合约代码。
+            day: 回测交易日，用于命中配置的生效日期分段。
 
         Returns:
             float: 大于 0 的保证金率。
 
         Raises:
-            ContractSpecError: 三个来源都未取得有效保证金率。
+            ContractSpecError: 四个来源都未取得有效保证金率。
         """
 
         product = futures_product(security)
-        for candidate in (
-            self._margin_rate,
+        candidates: List[Optional[float]] = [
             self._margin_rate_by_product.get(product),
-            self.spec(security).margin_rate,
-        ):
+            self._margin_rate,
+        ]
+        config = self._ensure_config()
+        if config is not None:
+            candidates.append(config.margin_rate(product, day))
+        try:
+            candidates.append(self.spec(security, day).margin_rate)
+        except ContractSpecError:
+            # 规格缺失属于另一类错误，此处只关心保证金率是否可得
+            candidates.append(None)
+        for candidate in candidates:
             if candidate is not None and float(candidate) > 0:
                 return float(candidate)
         raise ContractSpecError(
@@ -679,13 +851,16 @@ class FuturesAccount:
 
         return self.margin
 
-    def required_margin(self, security: str, amount: int, price: float) -> float:
+    def required_margin(
+        self, security: str, amount: int, price: float, day: Optional[Date] = None
+    ) -> float:
         """计算开仓所需保证金。
 
         Args:
             security: 合约代码。
             amount: 开仓手数，正数。
             price: 用于锁资的价格。
+            day: 交易日，用于命中保证金率的生效日期分段。
 
         Returns:
             float: 手数×价格×合约乘数×保证金率。
@@ -694,8 +869,8 @@ class FuturesAccount:
             ContractSpecError: 合约乘数或保证金率缺失。
         """
 
-        spec = self.spec_table.spec(security)
-        margin_rate = self.spec_table.margin_rate(security)
+        spec = self.spec_table.spec(security, day)
+        margin_rate = self.spec_table.margin_rate(security, day)
         return abs(amount) * float(price) * float(spec.multiplier) * margin_rate
 
     def open(
@@ -732,8 +907,9 @@ class FuturesAccount:
             raise ValueError("期货方向必须是 'long' 或 'short'，收到 {0}".format(side))
         if amount <= 0:
             raise ValueError("开仓手数必须为正数，收到 {0}".format(amount))
-        spec = self.spec_table.spec(security)
-        margin_rate = self.spec_table.margin_rate(security)
+        trade_day = trade_time.date() if isinstance(trade_time, datetime) else None
+        spec = self.spec_table.spec(security, trade_day)
+        margin_rate = self.spec_table.margin_rate(security, trade_day)
         margin = amount * float(price) * float(spec.multiplier) * margin_rate
         required = margin + float(commission)
         if required > self.cash:

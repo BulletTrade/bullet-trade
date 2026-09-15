@@ -247,8 +247,9 @@ class BacktestEngine:
         self._market_sell_percent = float(
             market_cfg.get("market_sell_price_percent", _DEFAULT_MARKET_SELL_PERCENT)
         )
-        # 期货合约规格表：乘数与最小变动价位内置，保证金率由 set_option('futures_margin_rate') 提供
-        self._futures_spec_table = ContractSpecTable()
+        # 期货合约规格表：规格按合约代码分层解析（显式注册 > 配置文件 > 远端 > 内置兜底），
+        # 保证金率由 set_option('futures_margin_rate') 与 set_option('futures_margin_rate.<品种>') 提供
+        self._futures_spec_table = ContractSpecTable(enable_remote=True)
         self._futures_cost_warned = False
 
         # tick 回放状态：订阅集合、当日事件流、最新快照
@@ -1795,7 +1796,9 @@ class BacktestEngine:
         if is_futures_security(security):
             # 行情信息在缺省口径下会给期货返回股票默认档位，规格表优先
             try:
-                spec_tick = self._futures_spec_table.tick_size(security)
+                current_dt = getattr(self.context, "current_dt", None)
+                spec_day = current_dt.date() if current_dt is not None else None
+                spec_tick = self._futures_spec_table.tick_size(security, spec_day)
                 if spec_tick and spec_tick > 0:
                     return float(spec_tick)
             except ContractSpecError as exc:
@@ -2269,6 +2272,39 @@ class BacktestEngine:
         value = get_settings().options.get("futures_margin_rate")
         return None if value is None else float(value)
 
+    def _futures_margin_rate_by_product(self) -> Dict[str, float]:
+        """读取按品种配置的期货保证金率。
+
+        set_option('futures_margin_rate.T', 0.03) 这类点号键只写入 options 字典，
+        需要在此展开，否则品种级设置永远被全局设置盖掉。
+
+        Args:
+            无。
+
+        Returns:
+            Dict[str, float]: 品种代码到保证金率的映射，非法条目被跳过。
+        """
+
+        prefix = "futures_margin_rate."
+        result: Dict[str, float] = {}
+        for key, value in (get_settings().options or {}).items():
+            if not isinstance(key, str) or not key.startswith(prefix):
+                continue
+            product = key[len(prefix) :].strip().upper()
+            if not product or not product.isalpha():
+                log.debug(f"忽略无法识别的保证金率配置项: {key}")
+                continue
+            try:
+                rate = float(value)
+            except (TypeError, ValueError):
+                log.debug(f"忽略非数值的保证金率配置项: {key}={value!r}")
+                continue
+            if rate <= 0:
+                log.debug(f"忽略非正的保证金率配置项: {key}={rate}")
+                continue
+            result[product] = rate
+        return result
+
     def _ensure_futures_account(self) -> FuturesAccount:
         """取得期货账本，并把组合现金同步为其可用资金。
 
@@ -2293,6 +2329,7 @@ class BacktestEngine:
             portfolio.futures_account = account
         account.spec_table = self._futures_spec_table
         self._futures_spec_table.set_margin_rate(self._futures_margin_rate())
+        self._futures_spec_table.set_margin_rate_by_product(self._futures_margin_rate_by_product())
         account.cash = portfolio.available_cash
         account.starting_cash = portfolio.starting_cash
         return account
@@ -2431,8 +2468,9 @@ class BacktestEngine:
             )
 
         try:
-            multiplier = account.spec_table.multiplier(security)
-            margin_rate = account.spec_table.margin_rate(security)
+            trade_day = current_dt.date()
+            multiplier = account.spec_table.multiplier(security, trade_day)
+            margin_rate = account.spec_table.margin_rate(security, trade_day)
         except ContractSpecError as exc:
             log.error(f"{security} 期货合约规格缺失，订单拒绝: {exc}")
             order.status = OrderStatus.rejected
@@ -2852,7 +2890,15 @@ class BacktestEngine:
                     continue
 
                 # 计算下单数量（普通/目标/价值）——使用 current_price 作为金额换算基准
-                amount = self._calculate_order_amount(order, current_price)
+                try:
+                    amount = self._calculate_order_amount(order, current_price)
+                except ContractSpecError as exc:
+                    log.error(f"{order.security} 期货合约规格缺失，订单拒绝: {exc}")
+                    order.status = OrderStatus.rejected
+                    if not isinstance(getattr(order, "extra", None), dict):
+                        order.extra = {}
+                    order.extra["rejection_reason"] = "futures_contract_spec_missing"
+                    continue
                 if amount == 0:
                     log.debug(f"{order.security} 无需交易")
                     order.status = OrderStatus.canceled

@@ -221,6 +221,15 @@ class DataProvider(ABC):
         """返回期货合约列表（可选实现）。"""
         raise NotImplementedError("当前数据源未实现 get_future_contracts")
 
+    def get_futures_info(
+        self,
+        security_list: Union[str, List[str]],
+        date: Optional[Union[str, datetime]] = None,
+        fields: Optional[List[str]] = None,
+    ) -> Any:
+        """返回期货合约规格信息（可选实现）。"""
+        raise NotImplementedError("当前数据源未实现 get_futures_info")
+
     def get_billboard_list(
         self,
         stock_list: Optional[List[str]] = None,

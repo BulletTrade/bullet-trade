@@ -557,3 +557,66 @@ def test_unconfigured_futures_cost_defaults_to_zero() -> None:
     assert engine.context.portfolio.available_cash == pytest.approx(
         CASH - 27000.0 * MULTIPLIER * MARGIN_RATE
     )
+
+
+def test_per_product_margin_rate_beats_global_setting() -> None:
+    """set_option('futures_margin_rate.<品种>') 应优先于全局设置。
+
+    点号键只写进 options 字典，引擎必须展开后交给规格表，
+    否则按品种降低保证金率的策略会被全局费率盖掉。
+
+    Args:
+        无。
+
+    Returns:
+        None。
+    """
+
+    reset_settings()
+    set_option("futures_margin_rate", 0.15)
+    set_option("futures_margin_rate.LH", 0.03)
+    set_order_cost(
+        OrderCost(
+            open_commission=0.000023,
+            close_commission=0.000023,
+            close_today_commission=0.0023,
+        ),
+        type="futures",
+    )
+    engine = _engine()
+    engine._ensure_futures_account()
+
+    assert engine._futures_margin_rate_by_product() == {"LH": 0.03}
+    assert engine._futures_spec_table.margin_rate(LH) == 0.03
+
+    order = _order(LH, 1, "long")
+    _fill(engine, order, 1, 27000.0)
+
+    # 单手保证金 = 27000 × 16 × 0.03 = 12960
+    assert engine.context.portfolio.available_cash == pytest.approx(
+        CASH - 27000.0 * MULTIPLIER * 0.03 - 27000.0 * MULTIPLIER * 0.000023
+    )
+
+
+def test_invalid_per_product_margin_rate_entries_are_ignored() -> None:
+    """非字母品种段、非数值与非正的保证金率配置都应被忽略而非报错。
+
+    Args:
+        无。
+
+    Returns:
+        None。
+    """
+
+    reset_settings()
+    set_option("futures_margin_rate", MARGIN_RATE)
+    set_option("futures_margin_rate.LH", 0.03)
+    set_option("futures_margin_rate.12", 0.05)
+    set_option("futures_margin_rate.CU", "abc")
+    set_option("futures_margin_rate.RB", 0)
+    engine = _engine()
+
+    assert engine._futures_margin_rate_by_product() == {"LH": 0.03}
+    engine._ensure_futures_account()
+    assert engine._futures_spec_table.margin_rate(LH) == 0.03
+    assert engine._futures_spec_table.margin_rate("RB2110.XSGE") == MARGIN_RATE
