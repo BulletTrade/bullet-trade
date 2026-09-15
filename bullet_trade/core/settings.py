@@ -90,6 +90,15 @@ def _default_order_costs() -> Dict[str, OrderCost]:
             close_commission=0.0,
             min_commission=0.0,
         ),
+        # 期货无印花税；未显式配置费率时不借用股票口径，避免凭空产生成本
+        'futures': OrderCost(
+            open_tax=0.0,
+            close_tax=0.0,
+            open_commission=0.0,
+            close_commission=0.0,
+            close_today_commission=0.0,
+            min_commission=0.0,
+        ),
     }
 
 

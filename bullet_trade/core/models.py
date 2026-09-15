@@ -10,6 +10,8 @@ from typing import Dict, Optional, Any, List
 from datetime import datetime, date
 import pandas as pd
 
+from .futures_account import LONG, SHORT, FuturesAccount
+
 
 class OrderStatus(Enum):
     """订单状态枚举
@@ -292,6 +294,8 @@ class Portfolio:
     positions: Dict[str, Position] = field(default_factory=SecurityPositionMap)
     positions_value: float = 0.0
     subportfolios: Dict[str, SubPortfolio] = field(default_factory=dict)
+    # 期货账本；为 None 时组合完全是股票/基金口径，权益计算与历史行为一致
+    futures_account: Optional[FuturesAccount] = None
 
     # 风险指标
     returns: float = 0.0  # 当日收益
@@ -314,14 +318,99 @@ class Portfolio:
                 except Exception:
                     pass
 
+    @property
+    def futures_margin(self) -> float:
+        """返回期货占用保证金合计。
+
+        Returns:
+            float: 无期货账本时为 0。
+        """
+
+        return self.futures_account.margin if self.futures_account is not None else 0.0
+
+    @property
+    def futures_floating_pnl(self) -> float:
+        """返回期货盯市浮动盈亏合计（相对上一结算价）。
+
+        Returns:
+            float: 无期货账本时为 0。
+        """
+
+        if self.futures_account is None:
+            return 0.0
+        return self.futures_account.mark_to_market_pnl
+
+    @property
+    def long_positions(self) -> Dict[str, Any]:
+        """返回多头持仓视图，键为标的代码。
+
+        Returns:
+            Dict[str, Any]: 股票多头 Position 与期货多头 FuturesPosition 的合并视图。
+        """
+
+        result: Dict[str, Any] = {
+            security: position
+            for security, position in self.positions.items()
+            if getattr(position, "side", LONG) == LONG
+        }
+        if self.futures_account is not None:
+            for position in self.futures_account.iter_positions():
+                if position.side == LONG:
+                    result[position.security] = position
+        return result
+
+    @property
+    def short_positions(self) -> Dict[str, Any]:
+        """返回空头持仓视图，键为标的代码。
+
+        Returns:
+            Dict[str, Any]: 股票空头 Position 与期货空头 FuturesPosition 的合并视图。
+        """
+
+        result: Dict[str, Any] = {
+            security: position
+            for security, position in self.positions.items()
+            if getattr(position, "side", LONG) == SHORT
+        }
+        if self.futures_account is not None:
+            for position in self.futures_account.iter_positions():
+                if position.side == SHORT:
+                    result[position.security] = position
+        return result
+
     def update_value(self):
         """更新账户总价值"""
         self.positions_value = sum(pos.value for pos in self.positions.values())
-        self.total_value = self.available_cash + self.positions_value + self.locked_cash
+        futures_value = 0.0
+        if self.futures_account is not None:
+            # 期货以占用保证金计入持仓价值，浮动项按盯市口径单独加入权益
+            self.positions_value += self.futures_account.margin
+            futures_value = self.futures_account.mark_to_market_pnl
+        self.total_value = (
+            self.available_cash + self.positions_value + self.locked_cash + futures_value
+        )
 
         # 更新子账户
         for subportfolio in self.subportfolios.values():
             subportfolio.update_value()
+
+        self._sync_futures_subportfolio()
+
+    def _sync_futures_subportfolio(self) -> None:
+        """把期货账本口径同步到 futures 子账户，供策略按子账户读取。
+
+        Returns:
+            None: 无期货账本或无 futures 子账户时不做任何事。
+        """
+
+        if self.futures_account is None:
+            return
+        subportfolio = self.subportfolios.get("futures")
+        if subportfolio is None:
+            return
+        subportfolio.available_cash = self.futures_account.cash
+        subportfolio.positions_value = self.futures_account.margin
+        subportfolio.total_value = self.futures_account.total_value
 
 
 @dataclass

@@ -27,8 +27,19 @@ jq = None
 
 from ..core.exceptions import FutureDataError
 from ..data.api import get_data_provider
+from ..data.api import get_extras as _data_api_get_extras
 from ..data.api import get_price as _data_api_get_price
 from ..data.api import get_security_info, set_current_context
+from .futures_account import (
+    LONG,
+    SHORT,
+    ContractSpecError,
+    ContractSpecTable,
+    FuturesAccount,
+    InsufficientMarginError,
+    OverCloseError,
+    is_futures_security,
+)
 from .globals import g, log, reset_globals
 from .models import Context, Order, OrderStatus, Portfolio, Position, Trade
 from .orders import LimitOrderStyle, MarketOrderStyle, clear_order_queue, get_order_queue
@@ -184,6 +195,9 @@ class BacktestEngine:
         self._market_sell_percent = float(
             market_cfg.get("market_sell_price_percent", _DEFAULT_MARKET_SELL_PERCENT)
         )
+        # 期货合约规格表：乘数与最小变动价位内置，保证金率由 set_option('futures_margin_rate') 提供
+        self._futures_spec_table = ContractSpecTable()
+        self._futures_cost_warned = False
 
     @staticmethod
     def _amount_from_value(value: float, price: float) -> int:
@@ -854,6 +868,11 @@ class BacktestEngine:
             except Exception as ex:
                 log.debug(f"T+1 解锁失败: {ex}")
 
+            try:
+                self._on_futures_day_start()
+            except Exception as ex:
+                log.debug(f"期货日内口径复位失败: {ex}")
+
             log.info(f"\n{'=' * 60}")
             log.info(f"交易日: {trade_day.strftime('%Y-%m-%d')} ({i+1}/{len(trade_days)})")
             if self.context.previous_date:
@@ -866,6 +885,12 @@ class BacktestEngine:
 
             # 先更新收盘价与持仓市值，再记录每日数据，避免“日志总值≠CSV总值”的错位
             self._update_positions()
+
+            # 期货日终结算：盯市入现金、保证金结转到结算价、到期合约了结
+            try:
+                self._settle_futures_day(trade_day)
+            except Exception as ex:
+                log.warning(f"期货日终结算失败: {ex}")
 
             # 记录每日数据（使用最新的收盘价与持仓市值）
             self._record_daily()
@@ -1189,6 +1214,9 @@ class BacktestEngine:
     def _get_order_cost_config(self, security: str) -> OrderCost:
         info = get_security_info(security)
         category = self._infer_security_category(security, info)
+        if category != "futures" and is_futures_security(security):
+            # 数据源未分类的合约按代码后缀归入期货，避免套用股票印花税
+            category = "futures"
         settings = get_settings()
         type_hint = str(info.get("type") or category).lower()
         order_cost = settings.order_cost_overrides.get(f"{category}_{security}")
@@ -1372,6 +1400,7 @@ class BacktestEngine:
         """按最小报价单位处理价格：
         - 股票: 0.01
         - 基金/ETF/货基: 0.001
+        - 期货: 取合约规格表的最小变动价位，规格缺失时不归档直接返回原价
         方向规则：is_buy=True 向上取整，is_buy=False 向下取整，is_buy=None 四舍五入到最近档位。
         """
         step = self._tick_step_for_security(security)
@@ -1393,6 +1422,23 @@ class BacktestEngine:
         self, security: str, info: Optional[Dict[str, Any]] = None, category: Optional[str] = None
     ) -> float:
         """返回标的对应的最小报价步长。"""
+        if is_futures_security(security):
+            # 行情信息在缺省口径下会给期货返回股票默认档位，规格表优先
+            try:
+                spec_tick = self._futures_spec_table.tick_size(security)
+                if spec_tick and spec_tick > 0:
+                    return float(spec_tick)
+            except ContractSpecError as exc:
+                log.debug(f"{security} 合约规格表无最小变动价位: {exc}")
+            info = info if info is not None else get_security_info(security)
+            try:
+                tick_size = info.get("tick_size")
+                if isinstance(tick_size, (int, float)) and tick_size > 0:
+                    return float(tick_size)
+            except Exception:
+                pass
+            # 步长未知时不归档，避免用错误档位改动成交价
+            return 0.0
         if info is None:
             info = get_security_info(security)
         if category is None:
@@ -1840,6 +1886,486 @@ class BacktestEngine:
             log.debug(f"检查 {security} 停牌状态失败: {e}")
             return False  # 获取失败时不阻断处理
 
+    def _futures_margin_rate(self) -> Optional[float]:
+        """读取策略配置的期货保证金率。
+
+        Args:
+            无。
+
+        Returns:
+            Optional[float]: set_option('futures_margin_rate') 的值；未配置时为 None。
+        """
+
+        value = get_settings().options.get("futures_margin_rate")
+        return None if value is None else float(value)
+
+    def _ensure_futures_account(self) -> FuturesAccount:
+        """取得期货账本，并把组合现金同步为其可用资金。
+
+        组合的 available_cash 是含股票与期货的唯一权威现金口径，
+        账本现金只在撮合与结算期间作为工作副本，操作结束后回写。
+
+        Args:
+            无。
+
+        Returns:
+            FuturesAccount: 与组合现金对齐的期货账本。
+        """
+
+        portfolio = self.context.portfolio
+        account = portfolio.futures_account
+        if account is None:
+            account = FuturesAccount(
+                cash=portfolio.available_cash,
+                starting_cash=portfolio.starting_cash,
+                spec_table=self._futures_spec_table,
+            )
+            portfolio.futures_account = account
+        account.spec_table = self._futures_spec_table
+        self._futures_spec_table.set_margin_rate(self._futures_margin_rate())
+        account.cash = portfolio.available_cash
+        account.starting_cash = portfolio.starting_cash
+        return account
+
+    def _futures_contract_end_date(self, security: str) -> Optional[date]:
+        """解析合约最后交易日，用于到期了结。
+
+        Args:
+            security: 期货合约代码。
+
+        Returns:
+            Optional[date]: 最后交易日；数据源未提供或解析失败时为 None。
+        """
+
+        try:
+            info = get_security_info(security)
+        except Exception as exc:
+            log.debug(f"{security} 合约信息获取失败: {exc}")
+            return None
+        getter = getattr(info, "get", None)
+        raw = getter("end_date") if callable(getter) else getattr(info, "end_date", None)
+        if raw is None:
+            return None
+        if isinstance(raw, datetime):
+            return raw.date()
+        if isinstance(raw, date):
+            return raw
+        try:
+            parsed = pd.to_datetime(raw)
+        except Exception:
+            return None
+        return None if pd.isna(parsed) else parsed.date()
+
+    def _calculate_futures_commission(
+        self,
+        cost_config: OrderCost,
+        action: str,
+        lots: int,
+        notional_per_lot: float,
+        today_lots: int,
+    ) -> float:
+        """按成交金额计算期货手续费；期货没有印花税。
+
+        Args:
+            cost_config: 期货费用配置。
+            action: 'open' 或 'close'。
+            lots: 成交手数。
+            notional_per_lot: 单手成交金额（成交价×合约乘数）。
+            today_lots: 平仓中按平今费率计费的手数，开仓传 0。
+
+        Returns:
+            float: 四舍五入到分并满足最低佣金的手续费。
+        """
+
+        if action == "open":
+            commission = notional_per_lot * lots * cost_config.open_commission
+        else:
+            yesterday_lots = max(0, lots - today_lots)
+            commission = notional_per_lot * (
+                yesterday_lots * cost_config.close_commission
+                + today_lots * cost_config.close_today_commission
+            )
+        commission = self._round_half_up(commission, 2)
+        if cost_config.min_commission > 0:
+            commission = max(commission, self._round_half_up(cost_config.min_commission, 2))
+        return commission
+
+    @staticmethod
+    def _split_futures_close_lots(position, lots: int, pindex: int, close_today: bool) -> int:
+        """计算本次平仓中按平今费率计费的手数。
+
+        Args:
+            position: 被平的期货持仓。
+            lots: 平仓手数。
+            pindex: 0 表示先平昨仓，1 表示先平今仓。
+            close_today: True 表示整笔按平今计费。
+
+        Returns:
+            int: 今仓手数。
+        """
+
+        if close_today:
+            return lots
+        if pindex == 1:
+            return min(lots, position.today_amount)
+        return max(0, lots - position.yesterday_amount)
+
+    def _execute_futures_fill(
+        self,
+        order: Order,
+        lots: int,
+        action: str,
+        side: str,
+        is_buy: bool,
+        trade_price: float,
+        fund_check_price: float,
+        current_dt: datetime,
+    ) -> None:
+        """按期货口径撮合一笔订单。
+
+        与股票路径的差异：不做一手取整与最小申报量约束，按保证金而非全额锁资，
+        允许无持仓开空，超量平仓与合约规格缺失一律拒单，且不收印花税。
+
+        Args:
+            order: 待撮合订单。
+            lots: 意图手数，正数。
+            action: 'open' 或 'close'。
+            side: 'long' 或 'short'。
+            is_buy: 买卖方向；开多/平空为买，开空/平多为卖。
+            trade_price: 撮合成交价。
+            fund_check_price: 用于锁资的价格（限价优先）。
+            current_dt: 当前回放时刻。
+
+        Returns:
+            None: 结果写入订单状态、账本、组合现金与成交记录。
+        """
+
+        portfolio = self.context.portfolio
+        account = self._ensure_futures_account()
+        security = order.security
+        if not isinstance(getattr(order, "extra", None), dict):
+            order.extra = {}
+        extra = order.extra
+        extra["order_price"] = float(fund_check_price)
+        extra.setdefault("requested_order_price", float(fund_check_price))
+
+        cost_config = self._get_order_cost_config(security)
+        if (
+            not self._futures_cost_warned
+            and cost_config.open_commission <= 0
+            and cost_config.close_commission <= 0
+        ):
+            self._futures_cost_warned = True
+            log.warning(
+                "未配置期货手续费（set_order_cost(..., type='futures')），本次回测按零成本撮合"
+            )
+
+        try:
+            multiplier = account.spec_table.multiplier(security)
+            margin_rate = account.spec_table.margin_rate(security)
+        except ContractSpecError as exc:
+            log.error(f"{security} 期货合约规格缺失，订单拒绝: {exc}")
+            order.status = OrderStatus.rejected
+            extra["rejection_reason"] = "futures_contract_spec_missing"
+            return
+
+        lots = int(lots)
+        if lots <= 0:
+            order.status = OrderStatus.canceled
+            return
+
+        notional_per_lot = float(trade_price) * multiplier
+        commission = 0.0
+        end_date = self._futures_contract_end_date(security)
+
+        if action == "open":
+            if end_date is not None and current_dt.date() > end_date:
+                log.warning(
+                    f"{security} 已过最后交易日 {end_date}，开仓订单拒绝"
+                )
+                order.status = OrderStatus.rejected
+                extra["rejection_reason"] = "futures_contract_expired"
+                return
+            margin_per_lot = float(fund_check_price) * multiplier * margin_rate
+            unit_cost = margin_per_lot + notional_per_lot * cost_config.open_commission
+            if unit_cost <= 0:
+                log.error(f"{security} 单手保证金与手续费非正数，无法撮合")
+                order.status = OrderStatus.rejected
+                extra["rejection_reason"] = "invalid_futures_unit_cost"
+                return
+            affordable = int(account.cash // unit_cost)
+            if affordable < lots:
+                log.info(f"{security} 保证金不足，手数由 {lots} 缩至 {affordable}")
+                lots = affordable
+            # 最低佣金会抬高单手成本，闭式解后再做有限次修正
+            for _ in range(3):
+                if lots <= 0:
+                    break
+                commission = self._calculate_futures_commission(
+                    cost_config, "open", lots, notional_per_lot, 0
+                )
+                if lots * margin_per_lot + commission <= account.cash + 1e-9:
+                    break
+                lots -= 1
+            if lots <= 0:
+                log.warning(
+                    f"{security} 可用资金 {account.cash:.2f} 不足以支付单手保证金，订单拒绝"
+                )
+                order.status = OrderStatus.rejected
+                extra["rejection_reason"] = "insufficient_margin"
+                return
+            commission = self._calculate_futures_commission(
+                cost_config, "open", lots, notional_per_lot, 0
+            )
+            try:
+                account.open(
+                    security,
+                    side,
+                    lots,
+                    float(trade_price),
+                    commission=commission,
+                    trade_time=current_dt,
+                    end_date=end_date,
+                )
+            except (InsufficientMarginError, ContractSpecError) as exc:
+                log.warning(f"{security} 开仓失败，订单拒绝: {exc}")
+                order.status = OrderStatus.rejected
+                extra["rejection_reason"] = "insufficient_margin"
+                return
+        else:
+            position = account.get_position(security, side)
+            if position is None or position.amount <= 0:
+                log.warning(f"{security} 无 {side} 持仓，平仓订单拒绝")
+                order.status = OrderStatus.rejected
+                extra["rejection_reason"] = "no_futures_position"
+                return
+            if lots > position.amount:
+                log.warning(
+                    f"{security} {side} 平仓 {lots} 手超过持仓 {position.amount} 手，订单拒绝"
+                )
+                order.status = OrderStatus.rejected
+                extra["rejection_reason"] = "over_close"
+                return
+            if order.close_today and lots > position.today_amount:
+                log.warning(
+                    f"{security} 平今 {lots} 手超过今仓 {position.today_amount} 手，订单拒绝"
+                )
+                order.status = OrderStatus.rejected
+                extra["rejection_reason"] = "close_today_exceeds_today_lots"
+                return
+            today_lots = self._split_futures_close_lots(
+                position, lots, int(getattr(order, "pindex", 0)), bool(order.close_today)
+            )
+            commission = self._calculate_futures_commission(
+                cost_config, "close", lots, notional_per_lot, today_lots
+            )
+            try:
+                account.close(
+                    security,
+                    side,
+                    lots,
+                    float(trade_price),
+                    commission=commission,
+                    trade_time=current_dt,
+                    close_today=bool(order.close_today),
+                )
+            except (OverCloseError, ContractSpecError) as exc:
+                log.warning(f"{security} 平仓失败，订单拒绝: {exc}")
+                order.status = OrderStatus.rejected
+                extra["rejection_reason"] = "over_close"
+                return
+
+        portfolio.available_cash = account.cash
+
+        self._trade_seq += 1
+        self.trades.append(
+            Trade(
+                order_id=order.order_id,
+                security=security,
+                amount=lots if is_buy else -lots,
+                price=float(trade_price),
+                time=current_dt,
+                commission=commission,
+                tax=0.0,
+                trade_id=f"T{self._trade_seq:08d}",
+            )
+        )
+
+        order.price = float(trade_price)
+        order.amount = lots
+        order.filled = lots
+        order.is_buy = is_buy
+        order.action = action
+        order.status = OrderStatus.filled
+        extra["fill_price"] = float(trade_price)
+        extra["commission"] = commission
+        extra["multiplier"] = multiplier
+        portfolio.update_value()
+        log.info(
+            f"期货{'开仓' if action == 'open' else '平仓'}{'多' if side == LONG else '空'} "
+            f"{security}: {lots} 手, 成交价 {trade_price}, 手续费 {commission:.2f}, "
+            f"占用保证金 {account.margin:.2f}, 权益 {portfolio.total_value:.2f}"
+        )
+
+    def _mark_futures_positions(self) -> None:
+        """按当日收盘价标记期货持仓，供缺结算价时仍有可解释的估值。
+
+        Args:
+            无。
+
+        Returns:
+            None: 结果写入账本各持仓的 last_price。
+        """
+
+        account = getattr(self.context.portfolio, "futures_account", None)
+        if account is None or not account.positions:
+            return
+        prices: Dict[str, float] = {}
+        for position in account.iter_positions():
+            try:
+                df = api_get_price(
+                    security=position.security,
+                    end_date=self.context.current_dt,
+                    frequency="daily",
+                    fields=["close"],
+                    count=1,
+                    fq="none",
+                )
+                close_price = self._extract_single_close(df, position.security)
+                if close_price is not None and close_price > 0:
+                    prices[position.security] = close_price
+            except Exception as exc:
+                log.debug(f"{position.security} 期货收盘价标记失败: {exc}")
+        account.mark_prices(prices)
+
+    @staticmethod
+    def _extract_single_close(df: pd.DataFrame, security: str) -> Optional[float]:
+        """从单行行情结果中取出收盘价。
+
+        Args:
+            df: get_price 返回的最后一根日线。
+            security: 标的代码，用于匹配多级列。
+
+        Returns:
+            Optional[float]: 有效收盘价；缺失或非正数时为 None。
+        """
+
+        if df is None or df.empty:
+            return None
+        row = df.iloc[-1]
+        candidates: List[Any] = []
+        if "close" in df.columns:
+            candidates.append(row["close"])
+        if security in df.columns:
+            candidates.append(row[security])
+        if isinstance(df.columns, pd.MultiIndex) and ("close", security) in df.columns:
+            candidates.append(row[("close", security)])
+        for value in candidates:
+            try:
+                if pd.notna(value) and float(value) > 0:
+                    return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _fetch_futures_settlement_prices(
+        self, securities: Sequence[str], trade_day: datetime
+    ) -> Dict[str, float]:
+        """取当日结算价；缺值不做任何替代，由账本记录为 missing_settlement。
+
+        Args:
+            securities: 需要结算价的合约列表。
+            trade_day: 结算日。
+
+        Returns:
+            Dict[str, float]: 合约到结算价的映射，缺值不出现在结果中。
+        """
+
+        if not securities:
+            return {}
+        day = trade_day.date() if isinstance(trade_day, datetime) else trade_day
+        try:
+            df = _data_api_get_extras(
+                info="futures_sett_price",
+                security_list=list(securities),
+                start_date=day,
+                end_date=day,
+                df=True,
+            )
+        except Exception as exc:
+            log.warning(f"获取期货结算价失败: {exc}")
+            return {}
+        prices: Dict[str, float] = {}
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return prices
+        row = df.iloc[-1]
+        for security in securities:
+            value: Any = None
+            if security in df.columns:
+                value = row[security]
+            elif isinstance(df.columns, pd.MultiIndex):
+                for column in df.columns:
+                    if security in tuple(column):
+                        value = row[column]
+                        break
+            try:
+                if value is not None and pd.notna(value) and float(value) > 0:
+                    prices[security] = float(value)
+            except (TypeError, ValueError):
+                continue
+        return prices
+
+    def _settle_futures_day(self, trade_day: datetime) -> None:
+        """日终结算：盯市变动入现金、保证金结转到结算价、到期合约了结。
+
+        Args:
+            trade_day: 当前交易日。
+
+        Returns:
+            None: 结果写入账本、组合现金与每日权益。
+        """
+
+        portfolio = self.context.portfolio
+        account = portfolio.futures_account
+        if account is None or not account.positions:
+            return
+        account.cash = portfolio.available_cash
+        securities = [position.security for position in account.iter_positions()]
+        settlement_prices = self._fetch_futures_settlement_prices(securities, trade_day)
+        result = account.settle_day(settlement_prices, day=trade_day.date())
+        portfolio.available_cash = account.cash
+        if result.missing_settlement:
+            log.warning(
+                f"以下合约缺当日结算价，保持上一基准不做替代估值: "
+                f"{', '.join(result.missing_settlement)}"
+            )
+        for record in result.delivered:
+            log.info(
+                f"合约到期了结: {record[0]} {record[1]} {record[2]} 手 "
+                f"@ 结算价 {record[3]}, 盯市 {record[4]:.2f}"
+            )
+        portfolio.update_value()
+        log.debug(
+            f"期货日终结算: 盯市 {result.variation_margin:.2f}, "
+            f"结算后保证金 {result.margin:.2f}"
+        )
+
+    def _on_futures_day_start(self) -> None:
+        """新交易日复位期货当日累计口径。
+
+        Args:
+            无。
+
+        Returns:
+            None: 结果写入账本当日字段。
+        """
+
+        account = getattr(self.context.portfolio, "futures_account", None)
+        if account is None:
+            return
+        account.cash = self.context.portfolio.available_cash
+        account.on_day_start()
+
     def _process_orders(self, current_dt: datetime):
         """处理订单队列"""
         orders = get_order_queue()
@@ -1895,6 +2421,10 @@ class BacktestEngine:
                 except Exception:
                     sec_info = {}
                 security_category = self._infer_security_category(order.security, sec_info)
+                # 数据源可能不给合约分类，代码本身的交易所后缀作为兜底判据
+                is_futures_order = security_category == "futures" or is_futures_security(
+                    order.security
+                )
                 if security_data.paused:
                     log.warning(f"{order.security} 停牌，订单取消")
                     order.status = OrderStatus.canceled
@@ -1902,7 +2432,11 @@ class BacktestEngine:
 
                 # 解析执行价基准（封装逻辑便于维护与测试）
                 current_dt = self.context.current_dt
-                base_exec_price = self._resolve_base_exec_price(order.security, current_dt, fq_mode)
+                # 期货无复权概念，动态复权口径会篡改撮合基准价
+                exec_fq_mode = "none" if is_futures_order else fq_mode
+                base_exec_price = self._resolve_base_exec_price(
+                    order.security, current_dt, exec_fq_mode
+                )
 
                 current_price = (
                     float(base_exec_price)
@@ -1924,6 +2458,17 @@ class BacktestEngine:
                 # 先按方向取绝对值，后续统一为正数处理
                 is_buy = amount > 0
                 intended_amount = abs(amount)
+                futures_action = "open" if amount > 0 else "close"
+                futures_side = str(getattr(order, "side", LONG) or LONG).lower()
+                if is_futures_order:
+                    # 期货：数量符号表示开/平，买卖方向由开平与多空共同决定
+                    if futures_side not in (LONG, SHORT):
+                        log.warning(
+                            f"{order.security} 期货订单方向非法: {futures_side}，订单拒绝"
+                        )
+                        order.status = OrderStatus.rejected
+                        continue
+                    is_buy = bool(getattr(order, "is_buy", (futures_action == "open")))
 
                 # 根据证券分类确定价格精度：stock=2位小数，fund/money_market_fund=3位小数
                 price_decimals = 2 if security_category == "stock" else 3
@@ -2027,6 +2572,22 @@ class BacktestEngine:
                 except Exception as exc:
                     log.debug(f"{order.security} 成交价边界裁剪失败: {exc}")
                 trade_price = self._round_to_tick(trade_price, order.security, is_buy=None)
+
+                if is_futures_order:
+                    # 期货不走 A股一手取整/印花税/可卖持仓口径，单独撮合
+                    self._execute_futures_fill(
+                        order=order,
+                        lots=intended_amount,
+                        action=futures_action,
+                        side=futures_side,
+                        is_buy=is_buy,
+                        trade_price=float(trade_price),
+                        fund_check_price=float(
+                            limit_price if limit_price is not None else trade_price
+                        ),
+                        current_dt=current_dt,
+                    )
+                    continue
 
                 # 买入前资金检查：按“可下单量上限”缩量 + 一手取整 + 最小申报量
                 final_amount = intended_amount
@@ -2320,6 +2881,9 @@ class BacktestEngine:
             and not hasattr(order, "_is_target_amount")
             and not hasattr(order, "_is_target_value")
         ):
+            if is_futures_security(order.security):
+                # 期货：符号表示开/平，买卖方向另由 side 决定
+                return order.amount if order.action == "open" else -order.amount
             return order.amount if order.is_buy else -order.amount
 
         # 目标数量订单
@@ -2350,41 +2914,43 @@ class BacktestEngine:
 
     def _update_positions(self):
         """更新持仓价格（使用收盘价）"""
-        if not self.context.portfolio.positions:
-            return
+        portfolio = self.context.portfolio
+        if portfolio.positions:
+            for security in list(portfolio.positions.keys()):
+                try:
+                    df = api_get_price(
+                        security=security,
+                        end_date=self.context.current_dt,
+                        frequency="daily",
+                        fields=["close"],
+                        count=1,
+                        fq="none",
+                    )
+                    if df.empty:
+                        continue
 
-        for security in list(self.context.portfolio.positions.keys()):
-            try:
-                df = api_get_price(
-                    security=security,
-                    end_date=self.context.current_dt,
-                    frequency="daily",
-                    fields=["close"],
-                    count=1,
-                    fq="none",
-                )
-                if df.empty:
-                    continue
+                    last_row = df.iloc[-1]
+                    close_price = None
+                    if "close" in df.columns:
+                        close_price = last_row["close"]
+                    elif security in df.columns:
+                        close_price = last_row[security]
+                    elif ("close", security) in df.columns:
+                        close_price = last_row[("close", security)]
+                    else:
+                        log.error(f"{security} 无法匹配收盘价列，列={list(df.columns)}")
+                        continue
 
-                last_row = df.iloc[-1]
-                close_price = None
-                if "close" in df.columns:
-                    close_price = last_row["close"]
-                elif security in df.columns:
-                    close_price = last_row[security]
-                elif ("close", security) in df.columns:
-                    close_price = last_row[("close", security)]
-                else:
-                    log.error(f"{security} 无法匹配收盘价列，列={list(df.columns)}")
-                    continue
+                    if pd.notna(close_price) and close_price > 0:
+                        price = self._normalize_split_day_close_price(
+                            security, float(close_price)
+                        )
+                        portfolio.positions[security].update_price(price)
+                except Exception as e:
+                    log.debug(f"更新{security}价格失败: {e}")
 
-                if pd.notna(close_price) and close_price > 0:
-                    price = self._normalize_split_day_close_price(security, float(close_price))
-                    self.context.portfolio.positions[security].update_price(price)
-            except Exception as e:
-                log.debug(f"更新{security}价格失败: {e}")
-
-        self.context.portfolio.update_value()
+        self._mark_futures_positions()
+        portfolio.update_value()
 
     def _record_daily(self):
         """记录每日数据"""
@@ -2401,6 +2967,12 @@ class BacktestEngine:
             "returns": portfolio.total_value - base_total_value,
             "returns_pct": (portfolio.total_value / base_total_value - 1) * 100,
         }
+
+        futures_account = portfolio.futures_account
+        if futures_account is not None:
+            record["futures_margin"] = futures_account.margin
+            record["futures_pnl"] = futures_account.mark_to_market_pnl
+            record["futures_lots"] = sum(p.amount for p in futures_account.iter_positions())
 
         benchmark_price = self._resolve_benchmark_close(self.context.current_dt)
         if benchmark_price is not None and benchmark_price > 0:
@@ -2441,6 +3013,26 @@ class BacktestEngine:
                     "acc_avg_cost": pos.acc_avg_cost,
                     "price": pos.price,
                     "value": pos.value,
+                }
+            )
+
+        futures_account = portfolio.futures_account
+        if futures_account is None:
+            return
+        for position in futures_account.iter_positions():
+            self.daily_positions.append(
+                {
+                    "date": current_dt,
+                    "code": position.security,
+                    "amount": position.amount,
+                    "closeable_amount": position.closeable_amount,
+                    "avg_cost": position.open_price,
+                    "acc_avg_cost": position.prev_settlement,
+                    "price": position.last_price,
+                    "value": position.margin_held,
+                    "side": position.side,
+                    "today_amount": position.today_amount,
+                    "yesterday_amount": position.yesterday_amount,
                 }
             )
 

@@ -24,6 +24,7 @@ from functools import partial
 from typing import Any, Dict, Iterator, List, Optional, Union
 
 from .globals import log
+from .futures_account import is_futures_security
 from .models import Order, OrderStatus, OrderStyle
 from .runtime import get_current_engine, process_orders_now
 from .settings import get_settings
@@ -575,6 +576,12 @@ def order(
 
     normalized_side = _normalize_order_side(side)
     normalized_pindex = _normalize_close_priority(pindex)
+    action = "open" if amount > 0 else "close"
+    if is_futures_security(security):
+        # 期货：开多/平空为买，开空/平多为卖
+        is_buy = (action == "open") == (normalized_side == "long")
+    else:
+        is_buy = amount > 0
 
     if style is not None:
         resolved_style: object = style
@@ -593,8 +600,8 @@ def order(
         price=price if price is not None else 0.0,
         status=OrderStatus.open,
         add_time=datetime.now(),
-        is_buy=(amount > 0),
-        action="open" if amount > 0 else "close",
+        is_buy=is_buy,
+        action=action,
         side=normalized_side,
         pindex=normalized_pindex,
         close_today=bool(close_today),
