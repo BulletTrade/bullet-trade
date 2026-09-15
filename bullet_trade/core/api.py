@@ -13,7 +13,9 @@ from .runtime import get_current_engine
 # 导入设置函数
 from .settings import (
     set_benchmark, set_order_cost, set_commission, set_universe, set_slippage, set_option,
-    OrderCost, PerTrade, FixedSlippage, PriceRelatedSlippage, StepRelatedSlippage
+    set_subportfolios, get_subportfolio_configs,
+    OrderCost, PerTrade, SubPortfolioConfig,
+    FixedSlippage, PriceRelatedSlippage, StepRelatedSlippage
 )
 
 # 导入订单函数
@@ -642,7 +644,9 @@ __all__ = [
     
     # 设置函数
     'set_benchmark', 'set_order_cost', 'set_commission', 'set_universe', 'set_slippage', 'set_option',
-    'OrderCost', 'PerTrade', 'FixedSlippage', 'PriceRelatedSlippage', 'StepRelatedSlippage',
+    'set_subportfolios', 'get_subportfolio_configs',
+    'OrderCost', 'PerTrade', 'SubPortfolioConfig',
+    'FixedSlippage', 'PriceRelatedSlippage', 'StepRelatedSlippage',
     
     # 订单函数
     'order', 'order_value', 'order_target', 'order_target_value', 'cancel_order', 'cancel_all_orders',

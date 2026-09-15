@@ -6,7 +6,7 @@
 
 from dataclasses import dataclass
 from datetime import date as Date
-from typing import Optional, Dict, Any, Iterable
+from typing import Optional, Dict, Any, Iterable, List, Sequence, Union
 
 
 @dataclass
@@ -155,6 +155,19 @@ class StepRelatedSlippage:
 
 
 @dataclass
+class SubPortfolioConfig:
+    """
+    子账户配置
+
+    Attributes:
+        cash: 该子账户初始可用资金
+        type: 子账户类型（'stock'|'futures' 等）
+    """
+    cash: float = 0.0
+    type: str = 'stock'
+
+
+@dataclass
 class PerTrade:
     """聚宽兼容：按买入/卖出费率和最小佣金设置股票费用。"""
     buy_cost: float = 0.0003
@@ -171,6 +184,7 @@ class StrategySettings:
         self.slippage: Optional[FixedSlippage] = None  # 滑点
         self.slippage_map: Dict[str, Any] = {}  # 兼容聚宽的新滑点配置
         self.order_cost_overrides: Dict[str, OrderCost] = {}  # 代码级费用覆盖
+        self.subportfolios: List[SubPortfolioConfig] = []  # 子账户配置
         self.options: Dict[str, Any] = {
             'use_real_price': False,  # 是否使用真实价格（动态复权）
             'avoid_future_data': False,  # 是否避免未来数据
@@ -187,6 +201,7 @@ class StrategySettings:
         self.slippage = None
         self.slippage_map = {}
         self.order_cost_overrides = {}
+        self.subportfolios = []
         self.options = {
             'use_real_price': False,
             'avoid_future_data': False,
@@ -321,6 +336,34 @@ def set_option(key: str, value: Any):
     _settings.options[key] = value
 
 
+def set_subportfolios(configs: Sequence[Union['SubPortfolioConfig', Dict[str, Any]]]):
+    """
+    设置子账户
+
+    Args:
+        configs: 子账户配置列表，元素可为 SubPortfolioConfig 或 {'cash', 'type'} 字典
+    """
+    normalized: List[SubPortfolioConfig] = []
+    for config in configs or []:
+        if isinstance(config, SubPortfolioConfig):
+            normalized.append(config)
+        elif isinstance(config, dict):
+            normalized.append(
+                SubPortfolioConfig(
+                    cash=float(config.get('cash', 0.0) or 0.0),
+                    type=str(config.get('type', 'stock') or 'stock'),
+                )
+            )
+        else:
+            raise TypeError("subportfolios 元素必须是 SubPortfolioConfig 或 {'cash','type'} 字典")
+    _settings.subportfolios = normalized
+
+
+def get_subportfolio_configs() -> List['SubPortfolioConfig']:
+    """获取子账户配置列表"""
+    return list(_settings.subportfolios)
+
+
 def get_settings() -> StrategySettings:
     """获取设置实例"""
     return _settings
@@ -332,8 +375,9 @@ def reset_settings():
 
 
 __all__ = [
-    'OrderCost', 'PerTrade',
+    'OrderCost', 'PerTrade', 'SubPortfolioConfig',
     'FixedSlippage', 'PriceRelatedSlippage', 'StepRelatedSlippage',
     'set_benchmark', 'set_order_cost', 'set_commission', 'set_universe', 'set_slippage', 'set_option',
+    'set_subportfolios', 'get_subportfolio_configs',
     'get_settings', 'reset_settings'
 ]

@@ -48,7 +48,18 @@ from .futures_account import (
     is_futures_security,
 )
 from .globals import g, log, reset_globals
-from .models import Context, Order, OrderStatus, Portfolio, Position, SecurityUnitData, Trade
+from .models import (
+    CompatOrderStatus,
+    Context,
+    Order,
+    OrderStatus,
+    OrderStyle,
+    Portfolio,
+    Position,
+    SecurityUnitData,
+    SubPortfolio,
+    Trade,
+)
 from .orders import LimitOrderStyle, MarketOrderStyle, clear_order_queue, get_order_queue
 from .scheduler import (
     generate_daily_schedule,
@@ -64,6 +75,7 @@ from .settings import (
     PriceRelatedSlippage,
     StepRelatedSlippage,
     get_settings,
+    get_subportfolio_configs,
     reset_settings,
 )
 
@@ -390,11 +402,13 @@ class BacktestEngine:
             PerTrade,
             PriceRelatedSlippage,
             StepRelatedSlippage,
+            SubPortfolioConfig,
             set_benchmark,
             set_commission,
             set_option,
             set_order_cost,
             set_slippage,
+            set_subportfolios,
             set_universe,
         )
 
@@ -421,6 +435,8 @@ class BacktestEngine:
         module.set_universe = set_universe
         module.set_slippage = set_slippage
         module.set_option = set_option
+        module.set_subportfolios = set_subportfolios
+        module.SubPortfolioConfig = SubPortfolioConfig
         module.OrderCost = OrderCost
         module.PerTrade = PerTrade
         module.FixedSlippage = FixedSlippage
@@ -455,6 +471,17 @@ class BacktestEngine:
         module.run_weekly = run_weekly
         module.run_monthly = run_monthly
         module.unschedule_all = unschedule_all
+
+        # 注入数据模型与订单状态别名（策略常直接引用这些名字做判断）
+        module.OrderStatus = CompatOrderStatus
+        module.OrderStyle = OrderStyle
+        module.Context = Context
+        module.Portfolio = Portfolio
+        module.SubPortfolio = SubPortfolio
+        module.Position = Position
+        module.Order = Order
+        module.Trade = Trade
+        module.SecurityUnitData = SecurityUnitData
 
         # 注入 record 函数（模拟聚宽，用于自定义绘图数据）
         def record(**kwargs):
@@ -567,10 +594,17 @@ class BacktestEngine:
         # 设置/参数 API
         jq_mod.set_benchmark = set_benchmark
         jq_mod.set_order_cost = set_order_cost
+        jq_mod.set_commission = set_commission
+        jq_mod.set_universe = set_universe
         jq_mod.set_slippage = set_slippage
         jq_mod.set_option = set_option
+        jq_mod.set_subportfolios = set_subportfolios
+        jq_mod.SubPortfolioConfig = SubPortfolioConfig
         jq_mod.OrderCost = OrderCost
+        jq_mod.PerTrade = PerTrade
         jq_mod.FixedSlippage = FixedSlippage
+        jq_mod.PriceRelatedSlippage = PriceRelatedSlippage
+        jq_mod.StepRelatedSlippage = StepRelatedSlippage
         # 研究文件读写
         jq_mod.read_file = _read_file
         jq_mod.write_file = _write_file
@@ -596,6 +630,17 @@ class BacktestEngine:
         jq_mod.unsubscribe = _unsubscribe
         jq_mod.unsubscribe_all = _unsubscribe_all
         jq_mod.get_current_tick = _get_current_tick
+        jq_mod.require_data_capabilities = _require_data_capabilities
+        # 数据模型与订单状态别名
+        jq_mod.OrderStatus = CompatOrderStatus
+        jq_mod.OrderStyle = OrderStyle
+        jq_mod.Context = Context
+        jq_mod.Portfolio = Portfolio
+        jq_mod.SubPortfolio = SubPortfolio
+        jq_mod.Position = Position
+        jq_mod.Order = Order
+        jq_mod.Trade = Trade
+        jq_mod.SecurityUnitData = SecurityUnitData
         # 注入并注册
         sys.modules["jqdata"] = jq_mod
         module.jqdata = jq_mod
@@ -796,6 +841,9 @@ class BacktestEngine:
 
                 log.error(traceback.format_exc())
                 raise
+
+        # 策略可能在 initialize 中声明子账户，需在 Portfolio 建好后补建视图
+        self._apply_subportfolio_config()
 
         # 根据 extras 覆盖 g.xxx（在策略初始化后、process_initialize 前执行）
         try:
@@ -2394,6 +2442,8 @@ class BacktestEngine:
 
         notional_per_lot = float(trade_price) * multiplier
         commission = 0.0
+        # 开仓口径下订单均价即成交价，平仓分支会改写成平仓前的持仓开仓价
+        avg_cost = float(trade_price)
         end_date = self._futures_contract_end_date(security)
 
         if action == "open":
@@ -2477,6 +2527,7 @@ class BacktestEngine:
             commission = self._calculate_futures_commission(
                 cost_config, "close", lots, notional_per_lot, today_lots
             )
+            avg_cost = float(position.open_price)
             try:
                 account.close(
                     security,
@@ -2515,6 +2566,8 @@ class BacktestEngine:
         order.is_buy = is_buy
         order.action = action
         order.status = OrderStatus.filled
+        order.avg_cost = avg_cost
+        order.commission = float(commission)
         extra["fill_price"] = float(trade_price)
         extra["commission"] = commission
         extra["multiplier"] = multiplier
@@ -3026,6 +3079,8 @@ class BacktestEngine:
                 commission = self._round_half_up(commission, 2)
                 tax = self._round_half_up(tax, 2)
                 total_cost = self._round_half_up(trade_value + commission + tax, 2)
+                # 买入口径下订单均价即成交价，卖出分支会改写成卖出前的持仓成本
+                avg_cost = float(trade_price)
 
                 if is_buy:
                     # 委托时锁定资金（含费用）
@@ -3066,6 +3121,7 @@ class BacktestEngine:
                 else:
                     # 卖出：检查并执行
                     position = self.context.portfolio.positions[order.security]
+                    avg_cost = float(getattr(position, "avg_cost", 0.0) or 0.0)
                     # 增加资金（卖出释放资金，不需锁定）
                     self.context.portfolio.available_cash += self._round_half_up(
                         (trade_value - commission - tax), 2
@@ -3101,6 +3157,8 @@ class BacktestEngine:
                 order.amount = trade_amount if is_buy else -trade_amount
                 order.status = OrderStatus.filled
                 order.filled = trade_amount
+                order.avg_cost = avg_cost
+                order.commission = float(commission + tax)
                 try:
                     extra = getattr(order, "extra", None)
                     if extra is None:
@@ -3770,3 +3828,48 @@ def _apply_initial_positions(self):
 
 # 绑定到类
 BacktestEngine._apply_initial_positions = _apply_initial_positions
+
+
+def _apply_subportfolio_config(self):
+    """按策略声明的子账户配置重建 portfolio.subportfolios 视图。
+
+    Returns:
+        None: 未声明子账户时保持默认 stock 子账户不变。
+    """
+
+    configs = get_subportfolio_configs()
+    if not configs:
+        return
+
+    portfolio = self.context.portfolio
+    rebuilt: Dict[str, SubPortfolio] = {}
+    declared_cash = 0.0
+    for index, config in enumerate(configs):
+        account_type = str(config.type or "stock")
+        key = account_type if account_type not in rebuilt else f"{account_type}_{index}"
+        previous = portfolio.subportfolios.get(account_type)
+        cash = float(config.cash or 0.0)
+        declared_cash += cash
+        rebuilt[key] = SubPortfolio(
+            type=account_type,
+            available_cash=cash,
+            transferable_cash=cash,
+            total_value=cash,
+            positions=dict(previous.positions) if previous is not None else {},
+        )
+
+    portfolio.subportfolios = rebuilt
+    portfolio.update_value()
+
+    # 现金池仍以 portfolio.available_cash 为准，子账户只是视图，不做拆分
+    if abs(declared_cash - float(portfolio.available_cash)) > 1e-6:
+        log.warning(
+            "子账户声明现金合计 %.2f 与组合可用资金 %.2f 不一致，"
+            "回测仍以组合现金池为准，不按子账户拆分资金",
+            declared_cash,
+            float(portfolio.available_cash),
+        )
+
+
+# 绑定到类
+BacktestEngine._apply_subportfolio_config = _apply_subportfolio_config

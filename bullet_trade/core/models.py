@@ -39,6 +39,25 @@ class OrderStatus(Enum):
     held = "held"
 
 
+class CompatOrderStatus:
+    """兼容口径的订单状态别名集合。
+
+    属性直接指向原生枚举成员，因此与引擎写入的 order.status 比较结果一致。
+    差异只在 held：该口径下 held 表示订单已完成，对应原生 filled；
+    原生 held（挂起）不在此暴露，避免两种语义混用。
+    """
+
+    new = OrderStatus.new
+    open = OrderStatus.open
+    filling = OrderStatus.filling
+    partly_canceled = OrderStatus.partly_canceled
+    canceling = OrderStatus.canceling
+    filled = OrderStatus.filled
+    canceled = OrderStatus.canceled
+    rejected = OrderStatus.rejected
+    held = OrderStatus.filled
+
+
 class OrderStyle(Enum):
     """下单方式枚举"""
 
@@ -459,6 +478,8 @@ class Order:
         close_today: 是否按平今费率计费；仅对期货平仓有意义
         style: 下单方式
         extra: 扩展字段（券商特有信息，如备注/策略名）
+        avg_cost: 买入/开仓时为成交均价；卖出/平仓时为本笔成交前的持仓成本
+        commission: 本笔订单产生的交易费用合计（佣金、税费等）
     """
 
     order_id: str
@@ -476,6 +497,8 @@ class Order:
     style: object = OrderStyle.market
     wait_timeout: Optional[float] = None
     extra: Dict[str, Any] = field(default_factory=dict)
+    avg_cost: float = 0.0
+    commission: float = 0.0
 
 
 @dataclass
@@ -498,6 +521,7 @@ class SecurityUnitData:
         ask_price1: 卖一价；行情源未提供时为 None
         bid_volume1: 买一量；行情源未提供时为 None
         ask_volume1: 卖一量；行情源未提供时为 None
+        day_open: 当日开盘价；行情源未提供或当前为分钟 bar 时为 0.0
     """
 
     security: str
@@ -518,6 +542,7 @@ class SecurityUnitData:
     display_name: str = ""
     price_tick: float = 0.01
     day_trading: bool = False
+    day_open: float = 0.0
 
     @property
     def is_paused(self) -> bool:

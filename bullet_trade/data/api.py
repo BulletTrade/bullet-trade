@@ -1817,6 +1817,8 @@ class BacktestCurrentData:
                     high_limit=high_limit,
                     low_limit=low_limit,
                     paused=paused,
+                    # 分钟 bar 的 open 是当分钟开盘价，不能当作当日开盘价
+                    day_open=0.0 if use_minute else float(open_price or 0.0),
                 )
             else:
                 data = SecurityUnitData(security=security, last_price=0.0)
@@ -1936,6 +1938,7 @@ class LiveCurrentData:
                 display_name=str(snap.get("display_name") or snap.get("short_name") or ""),
                 price_tick=float(snap.get("price_tick") or 0.01),
                 day_trading=bool(snap.get("day_trading", False)),
+                day_open=_optional_float(snap.get("day_open", snap.get("open"))) or 0.0,
             )
         else:
             if requires_live:
