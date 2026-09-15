@@ -1,6 +1,6 @@
 # Tick 订阅与行情接收指南
 
-面向实盘/远程使用者的 Tick 使用说明，覆盖订阅、接收、取消以及当前实现限制。
+面向实盘/远程使用者的 Tick 订阅说明，以及面向回测的历史逐笔回放说明；覆盖订阅、接收、取消、tick 频率回测与当前实现限制。
 
 ## Tick 订阅架构
 
@@ -197,9 +197,93 @@
 - `unsubscribe([...], 'tick')`：取消部分订阅；`unsubscribe_all()`：全部取消。对远程模式会减少 LiveEngine 轮询列表。
 - `get_current_tick('000001.XSHE')`：即时拉取一次快照（同样经 server 的 `data.snapshot` 拉取），不依赖订阅状态，可在调试时验证连通性。
 
+## tick 频率回测（历史逐笔回放）
+
+回测引擎支持 `frequency='tick'`，用历史逐笔数据驱动策略，事件语义与实盘 tick 投递保持一致。
+
+```python
+from bullet_trade.core.engine import BacktestEngine
+
+engine = BacktestEngine(
+    strategy_file="strategy.py",
+    start_date="2024-01-02",
+    end_date="2024-01-31",
+    frequency="tick",          # 也接受 "ticks"
+    initial_cash=1_000_000,
+)
+result = engine.run()
+```
+
+CLI 的 `--frequency` 目前只接受 `day` / `minute`，tick 回测需通过 Python 入口启动。
+
+### 事件模型
+
+- 调度时点与逐笔事件合并进**同一条时间轴**，按数据源的原始 float64 时间戳排序后依次执行，不做二次换算，避免同一秒内多笔 tick 顺序漂移。
+- `before_trading_start` / `handle_data` / `after_trading_end` 只在**非 tick 事件**的锚点时刻触发。首笔或末笔 tick 可能正好落在这些时刻，加这层条件才不会重复触发。
+- 每笔 tick 触发一次 `handle_tick(context, tick)`；`tick` 为 `TickSnapshot`，字段与实盘快照一致（`current` / `high` / `low` / `volume` / `money` / `position` / 买卖一档价量 / `datetime` / 原始 `time`）。
+- 策略侧读取当前快照用 `get_current_tick(code)`，返回回放缓冲里的最新一笔，不是实时行情。
+
+### 订阅门控
+
+- 只有已 `subscribe(code, 'tick')` 的合约才会投递；未订阅的合约即使有数据也不进入时间轴。
+- 盘前（`before_trading_start` 内）订阅当日即生效；**盘中新增订阅不回填**当日更早的 tick，从订阅时刻之后开始投递。
+- `unsubscribe(code, 'tick')` 停止单个合约投递，其余合约不受影响；`unsubscribe_all()` 停止全部投递。
+- 未订阅合约的数据缺口不会中止回测；已订阅合约缺当日数据才会失败（见下）。
+
+### 数据获取与失败行为
+
+- 按自然日**整段预取**当日全部已订阅合约，落到本地 parquet 缓存（缓存目录由 `DATA_CACHE_DIR` 控制），tick 循环内不再同步访问上游。
+- 已订阅合约在某交易日缺 tick 数据时抛 `TickDataMissingError`，错误信息含合约代码与日期。**不会静默降级**为分钟线/日线代理，也**不会回落**到实时行情接口。
+- `avoid_future_data=True` 时，策略侧查询仍受未来数据守卫约束，读不到回放时钟之后的数据。引擎的整日预取属内部行为，取数窗口必然覆盖回放时钟之后的时刻——这不构成泄露，因为策略只能看到已推进到的那一笔；守卫只在预取期间暂停，预取结束立即恢复。
+
+### 回放合成行情与代理标识
+
+tick 回放下，若合约不在当日 bar 行情容器里，引擎会用当前回放快照合成一份最小行情供撮合与查询使用，并打上代理标识：
+
+| 字段 | 值 |
+| --- | --- |
+| `source` | `"tick_replay"` |
+| `source_time` | 该笔快照的回放时刻 |
+| `last_price` | 该笔快照的最新价 |
+| `bid_price1` / `ask_price1` / `bid_volume1` / `ask_volume1` | 快照买卖一档，缺值为 `None` |
+
+策略可用 `get_current_data()[code].source == "tick_replay"` 区分「真实 bar 行情」与「回放合成行情」。合成行情**不含** `high_limit` / `low_limit` / `paused` 等只有 bar 才提供的字段语义，依赖涨跌停或停牌判断的逻辑需自行取数。
+
+撮合基准与市价单保护价都以**当前这笔 tick** 为准：tick 模式下即使 bar 行情容器里有该合约，其最新价也会被切到当前快照，避免 bar 价与 tick 价的价差把市价单误判为越界而取消。
+
+### 订单与时间戳
+
+- 回测下 `Order.add_time` 是**回放时刻**，不是运行回测时的墙钟时间；同一订单只在首次登记时写入，跨时刻未成交的挂单下单时间不会被后移。
+- 回测撮合为全成或拒单/取消，不产生部分成交。
+
+### 期货回放要点
+
+- 日终按**结算价**盯市，盯市变动结转进现金，浮动盈亏每日归零；保证金同步结转到结算价基准。
+- 缺当日结算价时记录为 `missing_settlement` 并告警，保持上一基准，**不做替代估值**。
+- 合约乘数与最小变动价位取自内置规格表；保证金率与手续费率不由数据源提供，必须显式配置，缺失时显式失败：
+
+```python
+from bullet_trade.core.settings import OrderCost, set_option, set_order_cost
+
+set_option('futures_margin_rate', 0.14)
+set_order_cost(
+    OrderCost(open_commission=0.000023, close_commission=0.000023,
+              close_today_commission=0.0023, min_commission=0),
+    type='futures',
+)
+```
+
+- 平今费率按**拆分出的今仓手数**计费：`close_today=True` 时整笔按平今；否则 `pindex=1` 先平今仓（今仓手数 = min(平仓手数, 今仓库存)），`pindex=0` 先平昨仓（今仓手数 = 平仓手数 − 昨仓库存，下限 0）。因此当日开的仓即使不传 `close_today=True` 也会落到今仓并按平今费率计费；`Order.close_today` 字段只反映策略的请求，不代表实际计费口径。
+- 期货持仓记在期货账本里，`portfolio.positions` 可能为空而 `portfolio.futures_margin` 非零；多空视图用 `portfolio.long_positions` / `short_positions` 读取。
+
+### 不支持的场景
+
+- `AsyncBacktestEngine`（异步孪生引擎）不支持 tick 频率，以 `frequency='tick'` 启动会在入口显式报错。
+
 ## 已知限制与测试现状
+- CLI 的 `--frequency` 尚未开放 `tick`，tick 回测只能通过 Python 入口启动。
 - 推送链路与 LiveEngine 脱节：远程模式的订阅不会触发 server 端的 tick 推送，而是客户端每隔 `tick_sync_interval` 主动拉取；标的较多时延迟与带宽占用上升。
 - 未实现 Throttler/压缩/批量：server 端对订阅数仅做上限校验，没有批量聚合或压缩，极端高频场景需要谨慎。
 - 全市场订阅仅限本地 xtdata；`allow_full_market` 配置未在 server 侧生效。
 - 自动补价/停牌检测仅在下单时发生，tick 本身不含这些标志。
-- 测试覆盖：存在 LiveEngine 订阅限额与快照读取的单测（见 `tests/core/test_live_engine.py`），但没有覆盖远程 server 的 tick 订阅/推送、重连、全市场等场景；建议实盘前手工验证。
+- 测试覆盖：实盘侧有 LiveEngine 订阅限额与快照读取的单测（见 `tests/core/test_live_engine.py`）；回测侧有 tick 回放事件循环、订阅门控、缺数据失败、未来数据守卫边界与市价单保护价基准的单测（见 `tests/core/test_engine_tick_replay.py`），期货账本与撮合见 `tests/core/test_futures_account.py`、`tests/core/test_engine_futures_matching.py`。远程 server 的 tick 订阅/推送、重连、全市场等场景仍未覆盖，建议实盘前手工验证。
