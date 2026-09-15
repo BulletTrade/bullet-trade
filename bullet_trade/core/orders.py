@@ -489,6 +489,44 @@ def _validate_live_order_request(requires_realtime_snapshot: bool) -> None:
         validator(requires_realtime_snapshot)
 
 
+def _normalize_order_side(side: Any) -> str:
+    """归一化并校验下单方向。
+
+    Args:
+        side: 调用方给出的方向，接受 'long'/'short' 及其大小写变体。
+
+    Returns:
+        str: 小写方向文本。
+
+    Raises:
+        ValueError: 方向不是 'long' 或 'short'。
+    """
+
+    text = str(side).strip().lower()
+    if text not in ("long", "short"):
+        raise ValueError("side 只能是 'long' 或 'short'，收到 {0!r}".format(side))
+    return text
+
+
+def _normalize_close_priority(pindex: Any) -> int:
+    """归一化并校验平仓优先级。
+
+    Args:
+        pindex: 0 表示先平昨仓再平今仓，1 表示先平今仓。
+
+    Returns:
+        int: 0 或 1。
+
+    Raises:
+        ValueError: pindex 不是 0 或 1。
+    """
+
+    value = int(pindex)
+    if value not in (0, 1):
+        raise ValueError("pindex 只能是 0 或 1，收到 {0!r}".format(pindex))
+    return value
+
+
 def order(
     security: str,
     amount: int,
@@ -496,6 +534,9 @@ def order(
     style: Optional[Union[OrderStyle, MarketOrderStyle, LimitOrderStyle]] = None,
     wait_timeout: Optional[float] = None,
     extra: Optional[Dict[str, Any]] = None,
+    side: str = "long",
+    pindex: int = 0,
+    close_today: bool = False,
 ) -> Optional[Order]:
     """
     按股数下单
@@ -510,9 +551,15 @@ def order(
             >0 同步等待指定秒数；0 异步立即返回。
             回测模式下此参数无效。
         extra: 传给 live broker 的订单扩展字段，例如 order_remark / strategy_name。
+        side: 开仓方向，'long' 或 'short'；股票只允许 'long'。
+        pindex: 平仓优先级，0 先平昨仓再平今仓，1 先平今仓。
+        close_today: 是否强制按平今费率计费；仅对期货平仓有意义。
 
     Returns:
         Order对象，如果下单失败返回None
+
+    Raises:
+        ValueError: side 或 pindex 取值非法。
 
     Side Effects:
         原子追加全局订单队列、注册 Engine 快照，并可触发撮合或
@@ -525,6 +572,9 @@ def order(
     if amount == 0:
         log.warning(f"下单数量为0，忽略订单: {security}")
         return None
+
+    normalized_side = _normalize_order_side(side)
+    normalized_pindex = _normalize_close_priority(pindex)
 
     if style is not None:
         resolved_style: object = style
@@ -544,6 +594,10 @@ def order(
         status=OrderStatus.open,
         add_time=datetime.now(),
         is_buy=(amount > 0),
+        action="open" if amount > 0 else "close",
+        side=normalized_side,
+        pindex=normalized_pindex,
+        close_today=bool(close_today),
         style=resolved_style,
         wait_timeout=wait_timeout,
     )
@@ -556,7 +610,8 @@ def order(
     enqueued = _enqueue_order(order_obj)
     _register_order_snapshot(order_obj)
     log.debug(
-        f"创建订单: {security}, 数量: {amount}, 风格: {_describe_order_style(resolved_style)}, "
+        f"创建订单: {security}, 数量: {amount}, 开平: {order_obj.action}, 方向: {normalized_side}, "
+        f"风格: {_describe_order_style(resolved_style)}, "
         f"价格: {_format_order_price(_resolve_log_price(price, resolved_style))}"
     )
     if enqueued:

@@ -365,6 +365,9 @@ class Order:
         add_time: 下单时间
         is_buy: 是否买入
         action: 交易类型（'open' or 'close'）
+        side: 开仓方向（'long' or 'short'）；股票恒为 'long'
+        pindex: 平仓优先级，0 表示先平昨仓再平今仓，1 表示先平今仓
+        close_today: 是否按平今费率计费；仅对期货平仓有意义
         style: 下单方式
         extra: 扩展字段（券商特有信息，如备注/策略名）
     """
@@ -378,6 +381,9 @@ class Order:
     add_time: Optional[datetime] = None
     is_buy: bool = True
     action: str = "open"
+    side: str = "long"
+    pindex: int = 0
+    close_today: bool = False
     style: object = OrderStyle.market
     wait_timeout: Optional[float] = None
     extra: Dict[str, Any] = field(default_factory=dict)
