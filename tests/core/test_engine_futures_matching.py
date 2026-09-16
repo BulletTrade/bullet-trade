@@ -773,3 +773,61 @@ def test_nan_price_is_not_a_valid_exec_price() -> None:
     assert engine._positive_price_or_none(27000.0) == pytest.approx(27000.0)
     # 有效性判别本身也要拦下 NaN
     assert not (nan > 0)
+
+
+def test_target_value_order_sizes_before_futures_account_exists(monkeypatch) -> None:
+    """首个期货目标单必须能成交，不能因账本尚未建立而拿不到保证金率。
+
+    保证金率是在建立期货账本时才从 set_option 同步进合约规格表的，
+    而目标单要先按保证金预算反解手数。同步若晚于尺寸计算，策略的
+    第一笔调仓就会整批被拒，回测全程零成交。
+
+    Args:
+        monkeypatch: pytest 夹具，用于隔离行情与合约信息访问。
+
+    Returns:
+        None。
+    """
+
+    from bullet_trade.core.models import SecurityUnitData
+    from bullet_trade.core.orders import clear_order_queue
+    from bullet_trade.core.orders import order_target_value
+
+    price = 27000.0
+    engine = _engine()
+    assert engine.context.portfolio.futures_account is None
+
+    monkeypatch.setattr(
+        "bullet_trade.core.orders._trigger_order_processing", lambda *a, **k: None
+    )
+    monkeypatch.setattr("bullet_trade.core.engine.get_security_info", lambda _s: {})
+    monkeypatch.setattr(engine, "_resolve_base_exec_price", lambda _s, _dt, _fq: price)
+    monkeypatch.setattr(engine, "_apply_slippage_price", lambda p, _b, _s: p)
+    monkeypatch.setattr(engine, "_infer_security_category", lambda _s, info=None: "futures")
+    monkeypatch.setattr(
+        "bullet_trade.data.api.get_current_data",
+        lambda: {
+            LH: SecurityUnitData(
+                security=LH,
+                last_price=price,
+                high_limit=price * 1.1,
+                low_limit=price * 0.9,
+                paused=False,
+            )
+        },
+    )
+
+    clear_order_queue()
+    try:
+        created = order_target_value(LH, 200_000.0, side="long")
+        engine._process_orders(engine.context.current_dt)
+    finally:
+        clear_order_queue()
+
+    assert created is not None
+    assert created.status == OrderStatus.filled
+    # int(200000 / 27000 / 0.14 / 16) = 3 手
+    assert created.filled == 3
+    account = engine.context.portfolio.futures_account
+    assert account is not None
+    assert account.get_position(LH, "long").amount == 3

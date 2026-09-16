@@ -2915,6 +2915,10 @@ class BacktestEngine:
                     continue
 
                 # 计算下单数量（普通/目标/价值）——使用 current_price 作为金额换算基准
+                if is_futures_order:
+                    # 目标单要按保证金预算反解手数，而保证金率是在建账本时才从
+                    # set_option 同步进规格表的，必须早于尺寸计算完成
+                    self._ensure_futures_account()
                 try:
                     amount = self._calculate_order_amount(order, current_price)
                 except ContractSpecError as exc:
