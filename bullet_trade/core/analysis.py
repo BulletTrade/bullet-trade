@@ -336,6 +336,39 @@ def plot_positions(results: Dict[str, Any], save_path: str = None, show_plots: b
         plt.close(fig)
 
 
+_SPEC_TABLE_FOR_MULTIPLIER = None
+
+
+def _trade_multiplier(security: str) -> float:
+    """取得成交对应合约的乘数，用于把价差换算成金额。
+
+    期货盈亏必须乘上合约乘数才是金额，账本侧一直如此计算；指标侧若漏乘，
+    手续费相对毛利会被放大乘数倍，价格小幅波动的回合会被误判为亏损。
+
+    Args:
+        security: 成交对应的标的代码。
+
+    Returns:
+        float: 合约乘数；非期货标的或规格解析失败时为 1.0，股票口径不变。
+    """
+
+    global _SPEC_TABLE_FOR_MULTIPLIER
+    if not security:
+        return 1.0
+    try:
+        from .futures_account import ContractSpecTable, is_futures_security
+
+        if not is_futures_security(security):
+            return 1.0
+        if _SPEC_TABLE_FOR_MULTIPLIER is None:
+            _SPEC_TABLE_FOR_MULTIPLIER = ContractSpecTable()
+        multiplier = float(_SPEC_TABLE_FOR_MULTIPLIER.multiplier(security))
+        return multiplier if multiplier > 0 else 1.0
+    except Exception:
+        # 指标层不因规格缺失而中断，退化为股票口径
+        return 1.0
+
+
 def _compute_trade_win_stats(trades: List[Dict[str, Any]]) -> Dict[str, float]:
     """按成交（卖出）口径统计交易胜率与次数。"""
     # 统一访问器
@@ -395,7 +428,7 @@ def _compute_trade_win_stats(trades: List[Dict[str, Any]]) -> Dict[str, float]:
             s['avg'] = (total / s['qty']) if s['qty'] > 0 else 0.0
         elif amt < 0:
             sell_qty = abs(amt)
-            pnl = (price - s['avg']) * sell_qty - commission - tax
+            pnl = (price - s['avg']) * sell_qty * _trade_multiplier(code) - commission - tax
             if pnl > 1e-12:
                 win += 1
             elif pnl < -1e-12:
@@ -478,8 +511,8 @@ def _compute_trade_profit_loss_ratio(trades: List[Dict[str, Any]]) -> float:
         elif amt < 0:
             # 卖出：计算盈亏
             sell_qty = abs(amt)
-            # 盈亏 = (卖出价 - 成本价) * 数量 - 手续费 - 印花税
-            pnl = (price - s['avg']) * sell_qty - commission - tax
+            # 盈亏 = (卖出价 - 成本价) * 数量 * 合约乘数 - 手续费 - 印花税
+            pnl = (price - s['avg']) * sell_qty * _trade_multiplier(code) - commission - tax
             if pnl > 0:
                 total_profit += pnl
             else:
