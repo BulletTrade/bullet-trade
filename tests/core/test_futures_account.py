@@ -188,6 +188,27 @@ def test_settlement_marks_to_market_and_rolls_today_lots():
     assert result.missing_settlement == ()
 
 
+def test_new_lots_are_marked_from_open_price_not_previous_settlement():
+    account = make_account()
+    account.open(LH, "long", 1, 27000.0)
+    account.settle_day({LH: 27300.0}, day=dt.date(2021, 4, 1))
+    equity_before = account.total_value  # 1004800
+
+    # 次日在 28000 加仓 1 手，盯市基准按手数合并 = (27300+28000)/2 = 27650
+    account.open(LH, "long", 1, 28000.0)
+    position = account.get_position(LH, "long")
+    assert position.prev_settlement == pytest.approx(27650.0)
+    # 保证金仍只按成交价冻结 = 28000 × 16 × 0.14 = 62720
+    assert account.cash == pytest.approx(equity_before - 61152.0 - 62720.0)
+
+    result = account.settle_day({LH: 28000.0}, day=dt.date(2021, 4, 2))
+    # 昨仓盯市 (28000-27300)×16 = 11200；今仓盯市 0
+    assert result.variation_margin == pytest.approx(11200.0)
+    # 保证金追加 = 2×28000×16×0.14 - (61152+62720) = 1568
+    assert account.cash == pytest.approx(equity_before - 61152.0 - 62720.0 + 11200.0 - 1568.0)
+    assert account.total_value == pytest.approx(equity_before + 11200.0)
+
+
 def test_next_day_close_uses_settlement_as_cash_base():
     account = make_account()
     account.open(LH, "long", 1, 27000.0)

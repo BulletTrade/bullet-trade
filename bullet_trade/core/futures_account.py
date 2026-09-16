@@ -599,12 +599,19 @@ class FuturesPosition:
             float: 本次开仓新增占用的保证金。
         """
 
-        total_cost = self.open_price * self.amount + price * amount
+        old_amount = self.amount
+        total_cost = self.open_price * old_amount + price * amount
         self.amount += amount
         self.today_amount += amount
         self.open_price = total_cost / self.amount if self.amount else 0.0
         if self.prev_settlement <= 0:
             self.prev_settlement = price
+        else:
+            # 新增手数的盯市起点是成交价，不是上一结算价；不合并会让当日结算
+            # 把 (成交价 - 上一结算价) 当成浮动盈亏计入权益。
+            self.prev_settlement = (
+                self.prev_settlement * old_amount + price * amount
+            ) / self.amount
         added_margin = amount * float(price) * self.multiplier * self.margin_rate
         self.margin_held += added_margin
         self.update_price(price)
