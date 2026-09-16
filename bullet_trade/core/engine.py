@@ -1780,11 +1780,14 @@ class BacktestEngine:
             return price
         import math
 
-        ticks = price / step
+        # 先消除浮点尾差：226.45 / 0.05 == 4528.999999999999，直接取整会白丢一个档位。
+        # 档位数量级最大约 5 万，尾差约 1e-11，而真实的档位内偏移不小于 1e-4，
+        # 按 9 位小数归零安全；此前各分支自带的 1e-12 绝对容差在该量级下不够用。
+        ticks = round(price / step, 9)
         if is_buy is True:
-            ticks_rounded = math.ceil(ticks - 1e-12)
+            ticks_rounded = math.ceil(ticks)
         elif is_buy is False:
-            ticks_rounded = math.floor(ticks + 1e-12)
+            ticks_rounded = math.floor(ticks)
         elif is_futures_security(security):
             # 向下截断：四舍五入会在卖出侧白送半个档位，
             # 并让成交价随滑点落点在档位内的位置左右跳一档

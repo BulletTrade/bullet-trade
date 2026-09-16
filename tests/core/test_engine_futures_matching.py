@@ -750,6 +750,36 @@ def test_round_to_tick_keeps_fine_price_grid() -> None:
     assert engine._round_to_tick(10.126, "000001.XSHE") == pytest.approx(10.13)
 
 
+def test_round_to_tick_survives_float_residue_on_grid_price() -> None:
+    """已落在档位上的价格不能被浮点尾差挤到下一档。
+
+    451.78 / 0.02 在二进制下是 22588.999999999996。档位数量级到几万时
+    尾差约 1e-11，各分支原先自带的 1e-12 绝对容差兜不住，向下取整会白丢
+    一个档位，把合法报价 451.78 变成 451.76。
+
+    Args:
+        无。
+
+    Returns:
+        None。
+    """
+
+    engine = _engine()
+    gold = "AU2308.XSGE"
+
+    assert engine._tick_step_for_security(gold) == 0.02
+    assert 451.78 / 0.02 != 22589.0  # 前提：这个价格确实带浮点尾差
+    # 三个分支都不得跨档
+    assert engine._round_to_tick(451.78, gold) == pytest.approx(451.78)
+    assert engine._round_to_tick(451.78, gold, is_buy=True) == pytest.approx(451.78)
+    assert engine._round_to_tick(451.78, gold, is_buy=False) == pytest.approx(451.78)
+    # 档内的真实偏移仍按规则处理：451.79 落在 451.78 与 451.80 之间
+    assert engine._round_to_tick(451.79, gold) == pytest.approx(451.78)
+    assert engine._round_to_tick(451.79, gold, is_buy=True) == pytest.approx(451.80)
+    # 股票 0.01 档位同样存在尾差（10.13 / 0.01 == 1012.9999999999999），口径不变
+    assert engine._round_to_tick(10.13, "000001.XSHE") == pytest.approx(10.13)
+
+
 def test_nan_price_is_not_a_valid_exec_price() -> None:
     """合约退市后行情给的是 NaN 行，NaN 不能被当成撮合基准价。
 
