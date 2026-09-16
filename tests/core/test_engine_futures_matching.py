@@ -727,8 +727,9 @@ def test_target_value_sizing_uses_margin_not_notional() -> None:
 def test_round_to_tick_keeps_fine_price_grid() -> None:
     """归档小数位由步长推导，0.005 档位不能被压成 2 位小数。
 
-    T 的最小变动价位是 0.005：100.123 四舍五入到最近档位是 100.125，
-    按 2 位小数会得到 100.13，那不是合法报价。
+    T 的最小变动价位是 0.005：未指定方向时期货按档位向下截断，
+    100.123 落在 100.12 与 100.125 之间，截断得到 100.12；
+    按 2 位小数归档会得到 100.13，那不是 0.005 网格上的合法报价。
 
     Args:
         无。
@@ -741,7 +742,7 @@ def test_round_to_tick_keeps_fine_price_grid() -> None:
     treasury = "T2109.CCFX"
 
     assert engine._tick_step_for_security(treasury) == 0.005
-    assert engine._round_to_tick(100.123, treasury) == pytest.approx(100.125)
+    assert engine._round_to_tick(100.123, treasury) == pytest.approx(100.12)
     assert engine._round_to_tick(100.124, treasury, is_buy=True) == pytest.approx(100.125)
     assert engine._round_to_tick(100.126, treasury, is_buy=False) == pytest.approx(100.125)
     # 生猪档位 5.0 与股票档位 0.01 不受影响

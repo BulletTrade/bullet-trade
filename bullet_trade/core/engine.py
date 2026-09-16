@@ -1772,7 +1772,8 @@ class BacktestEngine:
         - 股票: 0.01
         - 基金/ETF/货基: 0.001
         - 期货: 取合约规格表的最小变动价位，规格缺失时不归档直接返回原价
-        方向规则：is_buy=True 向上取整，is_buy=False 向下取整，is_buy=None 四舍五入到最近档位。
+        方向规则：is_buy=True 向上取整，is_buy=False 向下取整，is_buy=None 期货按档位向下截断、
+        其余标的四舍五入到最近档位。
         """
         step = self._tick_step_for_security(security)
         if step <= 0:
@@ -1784,6 +1785,10 @@ class BacktestEngine:
             ticks_rounded = math.ceil(ticks - 1e-12)
         elif is_buy is False:
             ticks_rounded = math.floor(ticks + 1e-12)
+        elif is_futures_security(security):
+            # 向下截断：四舍五入会在卖出侧白送半个档位，
+            # 并让成交价随滑点落点在档位内的位置左右跳一档
+            ticks_rounded = math.floor(ticks)
         else:
             # 四舍五入到最近 tick
             ticks_rounded = math.floor(ticks + 0.5)
