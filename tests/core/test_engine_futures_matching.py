@@ -620,3 +620,156 @@ def test_invalid_per_product_margin_rate_entries_are_ignored() -> None:
     engine._ensure_futures_account()
     assert engine._futures_spec_table.margin_rate(LH) == 0.03
     assert engine._futures_spec_table.margin_rate("RB2110.XSGE") == MARGIN_RATE
+
+
+def test_lots_from_margin_value_truncates() -> None:
+    """期货目标价值是保证金预算，手数向下取整且可手算。
+
+    LH 单手保证金 = 27000 × 16 × 0.14 = 60480；
+    预算 200000 → int(200000 / 27000 / 0.14 / 16) = 3 手，
+    预算 121000 → 2 手，不足一手的余量不补整。
+
+    Args:
+        无。
+
+    Returns:
+        None。
+    """
+
+    engine = _engine()
+    engine._ensure_futures_account()
+
+    assert engine._lots_from_margin_value(LH, 200_000.0, 27000.0) == 3
+    assert engine._lots_from_margin_value(LH, 121_000.0, 27000.0) == 2
+    assert engine._lots_from_margin_value(LH, 60_479.0, 27000.0) == 0
+    assert engine._lots_from_margin_value(LH, 100_000.0, 0.0) == 0
+
+
+def test_lots_from_margin_value_uses_per_product_rate() -> None:
+    """按品种调低的保证金率应放大同一预算能开的手数。
+
+    T 乘数 10000、价 100：全局 0.15 时单手保证金 150000，预算 1000000 够 6 手；
+    品种覆盖为 0.03 后单手 30000，同一预算够 33 手。
+
+    Args:
+        无。
+
+    Returns:
+        None。
+    """
+
+    treasury = "T2109.CCFX"
+    reset_settings()
+    set_option("futures_margin_rate", 0.15)
+    engine = _engine()
+    engine._ensure_futures_account()
+    assert engine._lots_from_margin_value(treasury, 1_000_000.0, 100.0) == 6
+
+    set_option("futures_margin_rate.T", 0.03)
+    engine._ensure_futures_account()
+    assert engine._lots_from_margin_value(treasury, 1_000_000.0, 100.0) == 33
+
+
+def test_target_amount_reads_futures_ledger_by_side() -> None:
+    """目标单的当前持仓必须按方向从期货账本读取。
+
+    期货持仓不在组合的 positions 字典里，若按股票口径读取会恒为 0，
+    每次目标单都变成从零开仓，换月时旧合约永远平不掉。
+
+    Args:
+        无。
+
+    Returns:
+        None。
+    """
+
+    engine = _engine()
+    account = engine._ensure_futures_account()
+    assert engine._current_held_amount(LH, "long") == 0
+
+    account.open(LH, "long", 3, 27000.0, trade_time=datetime(2021, 4, 6, 9, 30))
+    assert engine._current_held_amount(LH, "long") == 3
+    assert engine._current_held_amount(LH, "short") == 0
+
+    order = _order(LH, 0, "long")
+    order._is_target_amount = True
+    order._target_amount = 0
+    # 目标 0 手、当前 3 手 → 需要平掉 3 手，符号为负表示平仓
+    assert engine._calculate_order_amount(order, 27000.0) == -3
+
+
+def test_target_value_sizing_uses_margin_not_notional() -> None:
+    """目标价值按保证金预算换算，不能按 值/价 的股票口径放大。
+
+    预算 200000、价 27000：股票口径会得到 7 股，
+    期货口径是 int(200000 / (27000×16×0.14)) = 3 手。
+
+    Args:
+        无。
+
+    Returns:
+        None。
+    """
+
+    engine = _engine()
+    engine._ensure_futures_account()
+
+    order = _order(LH, 0, "long")
+    order._is_target_value = True
+    order._target_value = 200_000.0
+    assert engine._calculate_order_amount(order, 27000.0) == 3
+
+    account = engine.context.portfolio.futures_account
+    account.open(LH, "long", 3, 27000.0, trade_time=datetime(2021, 4, 6, 9, 30))
+    assert engine._calculate_order_amount(order, 27000.0) == 0
+
+
+def test_round_to_tick_keeps_fine_price_grid() -> None:
+    """归档小数位由步长推导，0.005 档位不能被压成 2 位小数。
+
+    T 的最小变动价位是 0.005：100.123 四舍五入到最近档位是 100.125，
+    按 2 位小数会得到 100.13，那不是合法报价。
+
+    Args:
+        无。
+
+    Returns:
+        None。
+    """
+
+    engine = _engine()
+    treasury = "T2109.CCFX"
+
+    assert engine._tick_step_for_security(treasury) == 0.005
+    assert engine._round_to_tick(100.123, treasury) == pytest.approx(100.125)
+    assert engine._round_to_tick(100.124, treasury, is_buy=True) == pytest.approx(100.125)
+    assert engine._round_to_tick(100.126, treasury, is_buy=False) == pytest.approx(100.125)
+    # 生猪档位 5.0 与股票档位 0.01 不受影响
+    assert engine._round_to_tick(27001.0, LH) == pytest.approx(27000.0)
+    assert engine._round_to_tick(10.126, "000001.XSHE") == pytest.approx(10.13)
+
+
+def test_nan_price_is_not_a_valid_exec_price() -> None:
+    """合约退市后行情给的是 NaN 行，NaN 不能被当成撮合基准价。
+
+    NaN 在布尔上下文为真、且 `NaN <= 0` 为假，两处惯用判别都会放行，
+    必须显式识别后按"取不到价"处理。
+
+    Args:
+        无。
+
+    Returns:
+        None。
+    """
+
+    engine = _engine()
+    nan = float("nan")
+
+    assert engine._positive_price_or_none(nan) is None
+    assert engine._positive_price_or_none(None) is None
+    assert engine._positive_price_or_none(0.0) is None
+    assert engine._positive_price_or_none(-1.5) is None
+    assert engine._positive_price_or_none("bad") is None
+    assert engine._positive_price_or_none(27000.0) == pytest.approx(27000.0)
+    # 有效性判别本身也要拦下 NaN
+    assert not (nan > 0)

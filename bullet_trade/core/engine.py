@@ -1787,7 +1787,9 @@ class BacktestEngine:
         else:
             # 四舍五入到最近 tick
             ticks_rounded = math.floor(ticks + 0.5)
-        return round(ticks_rounded * step, 3 if step == 0.001 else 2)
+        # 小数位由步长推导：写死 2 位会把 0.005 这类档位压平成非法价格
+        decimals = max(0, -Decimal(str(step)).as_tuple().exponent)
+        return round(ticks_rounded * step, decimals)
 
     def _tick_step_for_security(
         self, security: str, info: Optional[Dict[str, Any]] = None, category: Optional[str] = None
@@ -2054,6 +2056,28 @@ class BacktestEngine:
         except Exception:
             pass
 
+    @staticmethod
+    def _positive_price_or_none(value: Any) -> Optional[float]:
+        """把行情取值归一化为可用的正价格。
+
+        合约退市后行情返回的是 NaN 行，而 NaN 在布尔上下文里为真，
+        `value or 0.0` 会把 NaN 原样放行，因此必须显式判别。
+
+        Args:
+            value: 行情字段原始取值。
+
+        Returns:
+            Optional[float]: 大于 0 的有限价格；NaN、None、非正数一律返回 None。
+        """
+
+        try:
+            number = float(value)
+        except (TypeError, ValueError):
+            return None
+        if number != number or number <= 0:
+            return None
+        return number
+
     def _resolve_base_exec_price(
         self, security: str, current_dt: datetime, fq_mode: str
     ) -> Optional[float]:
@@ -2097,7 +2121,7 @@ class BacktestEngine:
                 )
                 if not dfp.empty:
                     rowp = dfp.iloc[-1]
-                    return float(rowp.get("open") or 0.0)
+                    return self._positive_price_or_none(rowp.get("open"))
             elif t and (Time(9, 31) <= t < Time(15, 0)):
                 dfp = api_get_price(
                     security=security,
@@ -2109,7 +2133,7 @@ class BacktestEngine:
                 )
                 if not dfp.empty:
                     rowp = dfp.iloc[-1]
-                    return float(rowp.get("close") or 0.0)
+                    return self._positive_price_or_none(rowp.get("close"))
             else:
                 dfp = api_get_price(
                     security=security,
@@ -2121,7 +2145,7 @@ class BacktestEngine:
                 )
                 if not dfp.empty:
                     rowp = dfp.iloc[-1]
-                    return float(rowp.get("close") or 0.0)
+                    return self._positive_price_or_none(rowp.get("close"))
         except Exception:
             return None
         return None
@@ -2884,7 +2908,8 @@ class BacktestEngine:
                     if base_exec_price and base_exec_price > 0
                     else security_data.last_price
                 )
-                if current_price <= 0:
+                if not current_price > 0:
+                    # NaN 同样落在这里：NaN <= 0 为假，不能用来判别价格有效性
                     log.warning(f"{order.security} 价格无效: {current_price}")
                     order.status = OrderStatus.rejected
                     continue
@@ -2917,7 +2942,7 @@ class BacktestEngine:
                         )
                         order.status = OrderStatus.rejected
                         continue
-                    is_buy = bool(getattr(order, "is_buy", (futures_action == "open")))
+                    is_buy = (futures_action == "open") == (futures_side == LONG)
 
                 # 根据证券分类确定价格精度：stock=2位小数，fund/money_market_fund=3位小数
                 price_decimals = 2 if security_category == "stock" else 3
@@ -3331,6 +3356,66 @@ class BacktestEngine:
             result[trade_id] = trade
         return result
 
+    def _current_held_amount(self, security: str, side: str) -> int:
+        """取得目标单口径下的当前持仓数量。
+
+        期货持仓不在组合的 positions 字典里，必须按方向从期货账本读取，
+        否则每次目标单都被当成从零开仓，换月时旧合约永远平不掉。
+
+        Args:
+            security: 标的代码。
+            side: 期货持仓方向，'long' 或 'short'；股票忽略该参数。
+
+        Returns:
+            int: 当前持有数量，无持仓时为 0。
+        """
+
+        portfolio = self.context.portfolio
+        if is_futures_security(security):
+            account = portfolio.futures_account
+            if account is None:
+                return 0
+            position = account.get_position(security, side)
+            return int(position.amount) if position is not None else 0
+        position = portfolio.positions.get(security)
+        return int(position.total_amount) if position is not None else 0
+
+    def _lots_from_margin_value(
+        self, security: str, value: float, price: float, day: Optional[date] = None
+    ) -> int:
+        """把保证金预算换算成期货手数。
+
+        期货目标价值的口径是占用保证金而非合约全额：
+        手数 = int(预算 / 价格 / 保证金率 / 合约乘数)。
+        向下取整是刻意的，预算不足一手时为 0，不做四舍五入补整。
+
+        Args:
+            security: 合约代码。
+            value: 保证金预算。
+            price: 用于换算的价格。
+            day: 交易日，用于命中保证金率的生效日期分段。
+
+        Returns:
+            int: 目标手数，非负。
+
+        Raises:
+            ContractSpecError: 合约乘数或保证金率缺失。
+        """
+
+        if not price or price <= 0:
+            return 0
+        resolved_day = day
+        if resolved_day is None:
+            current_dt = getattr(self.context, "current_dt", None)
+            resolved_day = current_dt.date() if current_dt is not None else None
+        spec_table = self._futures_spec_table
+        multiplier = spec_table.multiplier(security, resolved_day)
+        margin_rate = spec_table.margin_rate(security, resolved_day)
+        if multiplier <= 0 or margin_rate <= 0:
+            return 0
+        # 除法顺序与目标价值口径的定义一致，先合并成单手保证金会改变截断结果
+        return int(float(value) / float(price) / margin_rate / multiplier)
+
     def _calculate_order_amount(self, order, current_price: float) -> int:
         """计算订单实际数量"""
         # 普通订单
@@ -3347,22 +3432,20 @@ class BacktestEngine:
 
         # 目标数量订单
         if hasattr(order, "_is_target_amount") and order._is_target_amount:
-            target = order._target_amount
-            current = 0
-            if order.security in self.context.portfolio.positions:
-                current = self.context.portfolio.positions[order.security].total_amount
-            return target - current
+            side = str(getattr(order, "side", LONG) or LONG).lower()
+            return int(order._target_amount) - self._current_held_amount(order.security, side)
 
         # 目标价值订单
         if hasattr(order, "_is_target_value") and order._is_target_value:
+            side = str(getattr(order, "side", LONG) or LONG).lower()
             target_value = float(order._target_value)
-            current_amount = 0
-            if order.security in self.context.portfolio.positions:
-                position = self.context.portfolio.positions[order.security]
-                current_amount = int(position.total_amount)
-
-            target_amount = self._amount_from_value(target_value, current_price)
-            return target_amount - current_amount
+            if is_futures_security(order.security):
+                target_amount = self._lots_from_margin_value(
+                    order.security, target_value, current_price
+                )
+            else:
+                target_amount = self._amount_from_value(target_value, current_price)
+            return target_amount - self._current_held_amount(order.security, side)
 
         # 按价值订单
         if hasattr(order, "_target_value"):

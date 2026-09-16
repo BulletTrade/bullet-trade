@@ -812,22 +812,31 @@ def order_target(
     price: Optional[float] = None,
     style: Optional[Union[OrderStyle, MarketOrderStyle, LimitOrderStyle]] = None,
     wait_timeout: Optional[float] = None,
+    side: str = "long",
+    pindex: int = 0,
+    close_today: bool = False,
 ) -> Optional[Order]:
     """
     目标股数下单（调整持仓到目标数量）
 
     Args:
         security: 标的代码
-        amount: 目标股数
+        amount: 目标股数；期货为目标手数
         price: 委托价格，None表示市价单
         style: 下单方式或市价参数（策略覆写）
         wait_timeout: 实盘下单等待超时（秒）；
             None（默认）使用全局 TRADE_MAX_WAIT_TIME（默认16秒）；
             >0 同步等待指定秒数；0 异步立即返回。
             回测模式下此参数无效。
+        side: 期货持仓方向，'long' 或 'short'；股票只允许 'long'。
+        pindex: 平仓优先级，0 先平昨仓再平今仓，1 先平今仓。
+        close_today: 是否强制按平今费率计费；仅对期货平仓有意义。
 
     Returns:
         Optional[Order]: 已入队的目标股数订单。
+
+    Raises:
+        ValueError: side 或 pindex 取值非法。
 
     Side Effects:
         原子追加全局订单队列、注册 Engine 快照，并可触发后续处理。
@@ -835,6 +844,9 @@ def order_target(
     if isinstance(price, (MarketOrderStyle, LimitOrderStyle)):
         style = price
         price = None
+
+    normalized_side = _normalize_order_side(side)
+    normalized_pindex = _normalize_close_priority(pindex)
 
     if style is not None:
         resolved_style: object = style
@@ -853,6 +865,9 @@ def order_target(
         status=OrderStatus.open,
         add_time=datetime.now(),
         is_buy=True,
+        side=normalized_side,
+        pindex=normalized_pindex,
+        close_today=bool(close_today),
         style=resolved_style,
         wait_timeout=wait_timeout,
     )
@@ -865,7 +880,8 @@ def order_target(
     enqueued = _enqueue_order(order_obj)
     _register_order_snapshot(order_obj)
     log.debug(
-        f"创建订单（目标股数）: {security}, 目标数量: {amount}, 风格: {_describe_order_style(resolved_style)}, "
+        f"创建订单（目标股数）: {security}, 目标数量: {amount}, 方向: {normalized_side}, "
+        f"风格: {_describe_order_style(resolved_style)}, "
         f"价格: {_format_order_price(_resolve_log_price(price, resolved_style))}"
     )
     if enqueued:
@@ -880,22 +896,31 @@ def order_target_value(
     price: Optional[float] = None,
     style: Optional[Union[OrderStyle, MarketOrderStyle, LimitOrderStyle]] = None,
     wait_timeout: Optional[float] = None,
+    side: str = "long",
+    pindex: int = 0,
+    close_today: bool = False,
 ) -> Optional[Order]:
     """
     目标价值下单（调整持仓到目标价值）
 
     Args:
         security: 标的代码
-        value: 目标价值
+        value: 目标价值；期货为占用保证金预算，按 价×手数×乘数×保证金率 反解手数
         price: 委托价格，None表示市价单
         style: 下单方式或市价参数（策略覆写）
         wait_timeout: 实盘下单等待超时（秒）；
             None（默认）使用全局 TRADE_MAX_WAIT_TIME（默认16秒）；
             >0 同步等待指定秒数；0 异步立即返回。
             回测模式下此参数无效。
+        side: 期货持仓方向，'long' 或 'short'；股票只允许 'long'。
+        pindex: 平仓优先级，0 先平昨仓再平今仓，1 先平今仓。
+        close_today: 是否强制按平今费率计费；仅对期货平仓有意义。
 
     Returns:
         Optional[Order]: 已入队的目标价值订单。
+
+    Raises:
+        ValueError: side 或 pindex 取值非法。
 
     Side Effects:
         原子追加全局订单队列、注册 Engine 快照，并可触发后续处理。
@@ -903,6 +928,9 @@ def order_target_value(
     if isinstance(price, (MarketOrderStyle, LimitOrderStyle)):
         style = price
         price = None
+
+    normalized_side = _normalize_order_side(side)
+    normalized_pindex = _normalize_close_priority(pindex)
 
     if style is not None:
         resolved_style: object = style
@@ -921,6 +949,9 @@ def order_target_value(
         status=OrderStatus.open,
         add_time=datetime.now(),
         is_buy=True,
+        side=normalized_side,
+        pindex=normalized_pindex,
+        close_today=bool(close_today),
         style=resolved_style,
         wait_timeout=wait_timeout,
     )
@@ -933,7 +964,8 @@ def order_target_value(
     enqueued = _enqueue_order(order_obj)
     _register_order_snapshot(order_obj)
     log.debug(
-        f"创建订单（目标价值）: {security}, 目标价值 {value}, 风格: {_describe_order_style(resolved_style)}, "
+        f"创建订单（目标价值）: {security}, 目标价值 {value}, 方向: {normalized_side}, "
+        f"风格: {_describe_order_style(resolved_style)}, "
         f"价格: {_format_order_price(_resolve_log_price(price, resolved_style))}"
     )
     if enqueued:
