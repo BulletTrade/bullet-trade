@@ -403,6 +403,8 @@ class SecurityUnitData:
         ask_price1: 卖一价；行情源未提供时为 None
         bid_volume1: 买一量；行情源未提供时为 None
         ask_volume1: 卖一量；行情源未提供时为 None
+        query_completed_time: 行情查询完成时间；行情源未提供时为 None
+        feed_health: 行情源健康证据；行情源未提供时为 None
     """
 
     security: str
@@ -423,6 +425,8 @@ class SecurityUnitData:
     display_name: str = ""
     price_tick: float = 0.01
     day_trading: bool = False
+    query_completed_time: Optional[datetime] = None
+    feed_health: Optional[Dict[str, Any]] = None
 
     @property
     def is_paused(self) -> bool:
