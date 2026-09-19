@@ -1853,7 +1853,9 @@ def _query_trade_days(context_info: Any, payload: Dict[str, Any]) -> Dict[str, A
             if df is None and isinstance(history, dict) and history:
                 df = list(history.values())[0]
             values = _dataframe_index_values(df)
-        return _ok({"dtype": "list", "values": [str(item) for item in values]}, payload.get("request_id"))
+        # 主路径与回退路径统一用 _date_digits 规范成 YYYYMMDD，避免 str(Timestamp)
+        # 产生 'YYYY-MM-DD 00:00:00' 这类带时分秒字符串导致下游只读检查误判。
+        return _ok({"dtype": "list", "values": [_date_digits(item) for item in values]}, payload.get("request_id"))
     except QmtApiUnavailable as exc:
         LOGGER.exception("get_trading_dates unavailable: %s", exc)
         return _error("QMT_API_NOT_READY", str(exc), payload.get("request_id"))
