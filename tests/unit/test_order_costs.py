@@ -71,11 +71,17 @@ class OrderCostTestProvider(DataProvider):
 def provider():
     prices = {
         "511880.XSHG": {"open": 1.00215, "close": 1.00215},
+        "511010.XSHG": {"open": 102.1, "close": 102.1},
+        "517520.XSHG": {"open": 1.2, "close": 1.2},
+        "518880.XSHG": {"open": 6.2, "close": 6.2},
         "159949.XSHE": {"open": 1.2345, "close": 1.2345},
         "601318.XSHG": {"open": 77.9, "close": 77.9},
     }
     info = {
         "511880.XSHG": {"type": "fund", "subtype": "money_market_fund"},
+        "511010.XSHG": {"type": "fund", "subtype": "etf"},
+        "517520.XSHG": {"type": "fund", "subtype": "etf"},
+        "518880.XSHG": {"type": "fund", "subtype": "etf"},
         "159949.XSHE": {"type": "fund", "subtype": "etf"},
         "601318.XSHG": {"type": "stock"},
     }
@@ -223,6 +229,66 @@ def test_tplus1_rollover_and_same_day_sell_limit(provider):
     order("601318.XSHG", -700)
     trade = engine.trades[-1]
     assert trade.amount == -400
+    set_current_engine(None)
+    data_api.set_current_context(None)
+    clear_order_queue()
+
+
+@pytest.mark.parametrize("security", ("159949.XSHE", "517520.XSHG"))
+def test_stock_etf_buy_is_sellable_only_after_rollover(provider, security):
+    """验证普通股票 ETF 与 517520 买入当日不可卖、次交易日可卖。
+
+    Args:
+        provider: 注入固定行情与证券信息的测试数据源。
+        security: 待验证的普通股票 ETF 代码。
+
+    Returns:
+        None: 回测买入、当日卖出限制和跨日解锁断言通过后结束。
+    """
+
+    engine = _setup_engine(datetime(2021, 1, 4, 9, 31))
+    order(security, 200)
+    position = engine.context.portfolio.positions[security]
+    assert position.total_amount == 200
+    assert position.closeable_amount == 0
+
+    trades_after_buy = len(engine.trades)
+    order(security, -200)
+    assert len(engine.trades) == trades_after_buy
+    assert position.total_amount == 200
+
+    engine.context.current_dt = datetime(2021, 1, 5, 9, 30)
+    engine._rollover_tplus_for_new_day()
+    assert position.closeable_amount == 200
+
+    order(security, -200)
+    assert engine.trades[-1].amount == -200
+    assert security not in engine.context.portfolio.positions
+    set_current_engine(None)
+    data_api.set_current_context(None)
+    clear_order_queue()
+
+
+@pytest.mark.parametrize("security", ("518880.XSHG", "511010.XSHG", "511880.XSHG"))
+def test_explicit_tplus_zero_fund_is_sellable_on_buy_day(provider, security):
+    """验证金、债和现金类明确 T+0 品种在回测买入当日仍可卖。
+
+    Args:
+        provider: 注入固定行情与证券信息的测试数据源。
+        security: 待验证的明确 T+0 基金代码。
+
+    Returns:
+        None: 当日买卖成交断言通过后结束。
+    """
+
+    engine = _setup_engine(datetime(2021, 1, 4, 9, 31))
+    order(security, 200)
+    position = engine.context.portfolio.positions[security]
+    assert position.closeable_amount == 200
+
+    order(security, -200)
+    assert engine.trades[-1].amount == -200
+    assert security not in engine.context.portfolio.positions
     set_current_engine(None)
     data_api.set_current_context(None)
     clear_order_queue()
