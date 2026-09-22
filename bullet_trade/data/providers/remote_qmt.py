@@ -324,7 +324,15 @@ class RemoteQmtProvider(DataProvider):
             return {}
         value = resp.get("value")
         if isinstance(value, dict) and value:
-            return value
+            result = dict(value)
+            result.update(
+                {
+                    key: item
+                    for key, item in resp.items()
+                    if key not in {"dtype", "value"} and item is not None
+                }
+            )
+            return result
         return {
             key: item
             for key, item in resp.items()
