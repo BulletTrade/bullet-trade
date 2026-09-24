@@ -123,7 +123,7 @@ bullet-trade --env-file .env.bigqmt server --server-type big_qmt --listen 0.0.0.
 !!! danger "不要把 58620 作为裸 TCP 直接暴露到公网"
     跨互联网访问时应使用 VPN、加密隧道，或正确配置 TLS 与 IP 白名单。`QMT_SERVER_TOKEN` 只负责身份校验，不能代替传输加密。
 
-### 历史行情停牌语义（dev，未发布）
+### 0.10.0 历史行情停牌语义
 
 `get_price` 默认仍为 `skip_paused=False, fill_paused=True`，`attribute_history` 默认仍跳过整日停牌。
 

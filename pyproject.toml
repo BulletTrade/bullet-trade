@@ -18,7 +18,7 @@ keywords = [
     "joinquant", "algotrading", "stock trading", "live trading"
 ]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Financial and Insurance Industry",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",

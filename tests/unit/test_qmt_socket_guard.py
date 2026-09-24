@@ -64,12 +64,18 @@ def _run_loop(loop: asyncio.AbstractEventLoop, app: ServerApplication) -> None:
         None。
 
     Side Effects:
-        设置当前线程事件循环并启动 server。
+        设置当前线程事件循环并启动 server，结束时回收服务任务并关闭循环。
     """
 
     asyncio.set_event_loop(loop)
-    loop.create_task(app.start())
-    loop.run_forever()
+    task = loop.create_task(app.start())
+    try:
+        loop.run_forever()
+    finally:
+        task.cancel()
+        loop.run_until_complete(asyncio.gather(task, return_exceptions=True))
+        loop.close()
+        asyncio.set_event_loop(None)
 
 
 def _install_fake_xtquant(monkeypatch, trader_cls) -> None:
