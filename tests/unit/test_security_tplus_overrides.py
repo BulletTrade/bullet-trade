@@ -9,7 +9,7 @@
 主要输入:
     bullet_trade/config/security_overrides.json。
 主要输出:
-    pytest 断言，确保 19 个目标品种为 T+0，510610 为 T+1。
+    pytest 断言，确保普通股票 ETF 默认为 T+1，明确列出的金、债、现金等品种保持 T+0。
 上下游关系:
     上游是 bullet-trade 证券配置；下游由 AIStocks Gateway V2 账本读取代码级规则。
 关键约定:
@@ -95,6 +95,100 @@ def test_510610_is_explicitly_tplus_one() -> None:
 
     assert rule["tplus"] == 1
     assert "白银" not in str(rule.get("name") or "")
+
+
+def test_stock_etf_defaults_and_517520_are_tplus_one() -> None:
+    """验证普通股票 ETF 默认值及 517520 的代码规则均为 T+1。
+
+    Returns:
+        None: 分类默认值与代码级规则断言通过后结束。
+    """
+
+    config_path = (
+        Path(__file__).resolve().parents[2] / "bullet_trade" / "config" / "security_overrides.json"
+    )
+    payload = json.loads(config_path.read_text(encoding="utf-8"))
+
+    assert payload["by_category"]["fund"]["tplus"] == 1
+    assert payload["by_code"]["517520.XSHG"]["tplus"] == 1
+
+
+@pytest.mark.parametrize(
+    ("security", "base_info", "expected_tplus"),
+    (
+        ("159949.XSHE", {"type": "fund", "subtype": "etf"}, 1),
+        ("517520.XSHG", {"type": "etf"}, 1),
+        ("518880.XSHG", {"type": "etf"}, 0),
+        ("511010.XSHG", {"type": "etf"}, 0),
+        ("511880.XSHG", {"type": "fund", "subtype": "money_market_fund"}, 0),
+    ),
+)
+def test_data_api_resolves_default_and_explicit_tplus_rules(
+    security: str,
+    base_info: Dict[str, Any],
+    expected_tplus: int,
+) -> None:
+    """验证真实元数据合并入口解析普通 ETF 与明确 T+0 例外。
+
+    Args:
+        security: 聚宽格式证券代码。
+        base_info: 数据源返回的基础证券元数据。
+        expected_tplus: 合并后期望的 T+ 值。
+
+    Returns:
+        None: 元数据规则断言通过后结束。
+    """
+
+    data_api.reset_security_overrides()
+    info = data_api._merge_overrides(security, base_info)
+
+    assert info["tplus"] == expected_tplus
+
+
+def test_programmatic_override_still_takes_effect() -> None:
+    """验证 set_security_overrides 的显式调用仍可完整替换默认规则。
+
+    Returns:
+        None: 显式覆盖断言通过后结束，并恢复文件默认配置。
+    """
+
+    try:
+        data_api.set_security_overrides(
+            {
+                "by_category": {"fund": {"tplus": 0}},
+                "by_prefix": {},
+                "by_code": {},
+            }
+        )
+
+        info = data_api._merge_overrides("159949.XSHE", {"type": "fund", "subtype": "etf"})
+
+        assert info["tplus"] == 0
+    finally:
+        data_api.reset_security_overrides()
+
+
+def test_versioned_remote_rule_keeps_priority_over_local_defaults() -> None:
+    """验证带版本的远端生效规则继续优先于本地分类和代码默认值。
+
+    Returns:
+        None: 远端字段优先级断言通过后结束。
+    """
+
+    data_api.reset_security_overrides()
+    info = data_api._merge_overrides(
+        "517520.XSHG",
+        {
+            "type": "etf",
+            "rule_version": "remote-v2",
+            "category": "fund",
+            "tplus": 0,
+            "slippage": 0.0,
+        },
+    )
+
+    assert info["tplus"] == 0
+    assert info["slippage"] == 0.0
 
 
 @pytest.mark.parametrize(

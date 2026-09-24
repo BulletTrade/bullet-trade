@@ -45,7 +45,7 @@
 
   "by_category": {
     "money_market_fund": { "tplus": 0, "slippage": 0.0, "tick_decimals": 3 },
-    "fund":              { "tplus": 0, "slippage": 0.00246, "tick_decimals": 3 },
+    "fund":              { "tplus": 1, "slippage": 0.00246, "tick_decimals": 3 },
     "stock":             { "tplus": 1, "slippage": 0.00246, "tick_decimals": 2 }
   },
 
@@ -104,6 +104,7 @@
     "511990.XSHG": { "name": "华宝添益ETF", "category": "money_market_fund", "tplus": 0, "slippage": 0.0 },
     
     "510610.XSHG": { "name": "上证能源ETF", "category": "fund", "tplus": 1 },
+    "517520.XSHG": { "name": "黄金产业股票ETF", "category": "fund", "tplus": 1, "_comment": "跟踪黄金产业股票指数，属于股票ETF，按T+1处理" },
     "513030.XSHG": { "name": "德国DAX30ETF", "category": "fund", "tplus": 0 },
     "513050.XSHG": { "name": "中概互联网ETF", "category": "fund", "tplus": 0 },
     "510900.XSHG": { "name": "H股ETF", "category": "fund", "tplus": 0 },

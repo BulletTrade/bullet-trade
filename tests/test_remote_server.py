@@ -1204,6 +1204,42 @@ def test_remote_data_provider_security_info_supports_flat_response():
     assert info["type"] == "etf"
 
 
+def test_remote_data_provider_security_info_preserves_wrapped_rule_version():
+    """验证 dtype/value 响应中的规则字段与顶层版本一起透传。"""
+    from bullet_trade.data.providers.remote_qmt import RemoteQmtProvider
+
+    provider = object.__new__(RemoteQmtProvider)
+
+    class _FakeConnection:
+        """返回带顶层版本号的证券规则封装响应。"""
+
+        def request(self, action, payload):
+            """校验调用动作并返回测试规则。
+
+            Args:
+                action: 远端动作名称。
+                payload: 远端请求参数。
+
+            Returns:
+                dict: dtype/value 封装的版本化证券规则。
+            """
+            assert action == "data.security_info"
+            assert payload["security"] == "511880.XSHG"
+            return {
+                "dtype": "dict",
+                "value": {"category": "money_market_fund", "cash_tool": True},
+                "rule_version": "a" * 64,
+            }
+
+    provider._connection = _FakeConnection()
+
+    info = provider.get_security_info("511880.XSHG")
+
+    assert info["category"] == "money_market_fund"
+    assert info["cash_tool"] is True
+    assert info["rule_version"] == "a" * 64
+
+
 def test_remote_data_provider_routes_live_current_contract():
     """验证实时当前行情只路由正式 action，并原样透传服务端字段。"""
 

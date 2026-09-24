@@ -11,6 +11,7 @@ import math
 import os
 import re
 import threading
+import time
 from contextlib import contextmanager
 from datetime import date as Date
 from datetime import datetime
@@ -302,6 +303,8 @@ def _bind_sdk_fallback(provider: DataProvider, provider_name: str) -> None:
 _provider: Optional[DataProvider] = None
 _auth_attempted = False
 _security_info_cache: Dict[Any, "SecurityInfo"] = {}
+_security_info_cache_refreshed_at: Dict[Any, float] = {}
+_VERSIONED_SECURITY_INFO_TTL_SECONDS = 60.0
 _security_overrides_loaded = False
 _security_overrides: Dict[str, Any] = {}
 
@@ -350,7 +353,8 @@ def set_data_provider(provider: Union[DataProvider, str], **provider_kwargs) -> 
     设置当前数据提供者。
     支持直接传入 DataProvider 实例，或传入 provider 名称（如 'jqdata'、'tushare'、'miniqmt'）。
     """
-    global _provider, _auth_attempted, _security_info_cache, _cache_forced_off_warned
+    global _provider, _auth_attempted, _security_info_cache, _security_info_cache_refreshed_at
+    global _cache_forced_off_warned
     global _pending_default_provider_name
     if isinstance(provider, DataProvider):
         selected_provider = provider
@@ -366,6 +370,7 @@ def set_data_provider(provider: Union[DataProvider, str], **provider_kwargs) -> 
         _auth_attempted = False
         _pending_default_provider_name = None
         _security_info_cache = {}
+        _security_info_cache_refreshed_at = {}
         _cache_forced_off_warned = False
         _maybe_disable_cache_for_live(selected_provider)
         try:
@@ -384,7 +389,8 @@ def reload_data_provider_from_env(provider_name: Optional[str] = None) -> None:
     仅刷新配置不会创建 provider 或建立远程连接；显式 provider_name 会作为下一次
     默认 provider 初始化的覆盖值使用。
     """
-    global _provider, _auth_attempted, _security_info_cache, _cache_forced_off_warned
+    global _provider, _auth_attempted, _security_info_cache, _security_info_cache_refreshed_at
+    global _cache_forced_off_warned
     global _pending_default_provider_name
     with _provider_init_lock:
         _provider = None
@@ -395,6 +401,7 @@ def reload_data_provider_from_env(provider_name: Optional[str] = None) -> None:
             _normalize_provider_name(provider_name) if provider_name else None
         )
         _security_info_cache = {}
+        _security_info_cache_refreshed_at = {}
         _cache_forced_off_warned = False
 
 
@@ -518,6 +525,7 @@ def set_security_overrides(overrides: Dict[str, Any]) -> None:
     _security_overrides = overrides or {}
     _security_overrides_loaded = True
     _security_info_cache.clear()
+    _security_info_cache_refreshed_at.clear()
 
 
 def reset_security_overrides() -> None:
@@ -526,10 +534,29 @@ def reset_security_overrides() -> None:
     _security_overrides = {}
     _security_overrides_loaded = False
     _security_info_cache.clear()
+    _security_info_cache_refreshed_at.clear()
 
 
 def _merge_overrides(security: str, base_info: Dict[str, Any]) -> Dict[str, Any]:
     """将配置覆盖项合并到基础元信息中。支持分类默认与按代码覆盖。"""
+    remote_rule_fields: Dict[str, Any] = {}
+    if base_info.get("rule_version"):
+        protected_fields = {
+            "category",
+            "tplus",
+            "cash_tool",
+            "fee_policy",
+            "slippage",
+            "tick_decimals",
+            "price_decimals",
+            "tick_size",
+            "price_tick",
+        }
+        remote_rule_fields = {
+            key: value
+            for key, value in base_info.items()
+            if key in protected_fields and value is not None
+        }
     _load_security_overrides_if_needed()
     if not _security_overrides:
         return base_info
@@ -585,6 +612,9 @@ def _merge_overrides(security: str, base_info: Dict[str, Any]) -> Dict[str, Any]
                 break
     if isinstance(code_over, dict):
         out.update({k: v for k, v in code_over.items() if v is not None})
+
+    # 带版本的远端元数据代表服务端已经解析出的生效规则；JSON 仅补足其他默认字段。
+    out.update(remote_rule_fields)
 
     return out
 
@@ -2009,7 +2039,9 @@ class LiveCurrentData:
                 paused=paused,
                 source_time=snap.get("source_time"),
                 received_time=snap.get("received_time"),
+                query_completed_time=snap.get("query_completed_time"),
                 age_seconds=snap.get("age_seconds"),
+                feed_health=snap.get("feed_health"),
                 source=snap.get("source"),
                 bid_price1=_optional_float(snap.get("bid_price1")),
                 ask_price1=_optional_float(snap.get("ask_price1")),
@@ -2211,9 +2243,25 @@ def _coerce_date(value: Any) -> Optional[Date]:
 
 
 def _normalize_security_info(security: str, raw_info: Any) -> Dict[str, Any]:
+    """规范证券元数据，并兼容远端 ``dtype/value`` 字典封装。
+
+    Args:
+        security: 调用方请求的证券代码。
+        raw_info: 数据源返回的字典、封装字典或属性对象。
+
+    Returns:
+        Dict[str, Any]: 字段清洗和日期转换后的证券元数据。
+    """
     normalized: Dict[str, Any] = {}
     if isinstance(raw_info, dict):
-        normalized.update({k: v for k, v in raw_info.items() if v is not None})
+        value = raw_info.get("value")
+        if "dtype" in raw_info and isinstance(value, dict):
+            normalized.update({k: v for k, v in value.items() if v is not None})
+            normalized.update(
+                {k: v for k, v in raw_info.items() if k not in {"dtype", "value"} and v is not None}
+            )
+        else:
+            normalized.update({k: v for k, v in raw_info.items() if v is not None})
     else:
         for attr in (
             "type",
@@ -2240,29 +2288,27 @@ def _normalize_security_info(security: str, raw_info: Any) -> Dict[str, Any]:
     return normalized
 
 
-def get_security_info(security: str, date: Optional[Union[str, datetime]] = None) -> SecurityInfo:
+def _get_security_info_from_provider(
+    provider: DataProvider,
+    security: str,
+    resolved_date: Optional[Date],
+) -> Tuple[Any, bool]:
+    """调用当前 provider 获取证券元数据，并执行证券后缀兼容重试。
+
+    Args:
+        provider: 当前已认证的数据提供者。
+        security: 调用方请求的证券代码。
+        resolved_date: 经过未来数据检查的查询日期。
+
+    Returns:
+        Tuple[Any, bool]: 原始元数据与是否成功取得非空结果。
+
+    Side Effects:
+        可能发起 provider 查询；失败时记录调试日志，不向兼容层抛出异常。
     """
-    获取标的的基础信息（如类型、子类型），结果会缓存。
-    若当前数据源不支持，返回空对象。
-    """
-    if not security:
-        return SecurityInfo("", {})
-
-    resolved_date = _resolve_context_date(date, default_to_context=True)
-    resolved_date = _ensure_not_future_date(resolved_date, "get_security_info.date")
-    cache_key = (security, resolved_date)
-
-    cached = _security_info_cache.get(cache_key)
-    if cached is not None:
-        return cached
-
-    provider = _ensure_auth()
-
     info_fn = getattr(provider, "get_security_info", None)
     if not callable(info_fn):
-        empty = SecurityInfo(security, {})
-        _security_info_cache[cache_key] = empty
-        return empty
+        return {}, False
 
     try:
         raw_info = None
@@ -2279,15 +2325,57 @@ def get_security_info(security: str, date: Optional[Union[str, datetime]] = None
             except Exception as inner_exc:
                 if idx >= len(candidates) - 1 or not _is_security_lookup_error(inner_exc):
                     raise
+        return raw_info, bool(raw_info)
     except Exception as exc:
         log.debug(f"获取{security}基本信息失败: {exc}")
-        raw_info = {}
+        return {}, False
+
+
+def get_security_info(security: str, date: Optional[Union[str, datetime]] = None) -> SecurityInfo:
+    """
+    获取标的的基础信息（如类型、子类型），结果会缓存。
+    若当前数据源不支持，返回空对象。
+    """
+    if not security:
+        return SecurityInfo("", {})
+
+    resolved_date = _resolve_context_date(date, default_to_context=True)
+    resolved_date = _ensure_not_future_date(resolved_date, "get_security_info.date")
+    cache_key = (security, resolved_date)
+
+    cached = _security_info_cache.get(cache_key)
+    if cached is not None:
+        refreshed_at = _security_info_cache_refreshed_at.get(cache_key)
+        is_current_versioned_rule = bool(cached.get("rule_version")) and date is None
+        if not is_current_versioned_rule:
+            return cached
+        if (
+            refreshed_at is not None
+            and time.monotonic() - refreshed_at < _VERSIONED_SECURITY_INFO_TTL_SECONDS
+        ):
+            return cached
+
+    provider = _ensure_auth()
+    if not callable(getattr(provider, "get_security_info", None)):
+        empty = SecurityInfo(security, {})
+        _security_info_cache[cache_key] = empty
+        _security_info_cache_refreshed_at.pop(cache_key, None)
+        return empty
+    raw_info, fetched = _get_security_info_from_provider(provider, security, resolved_date)
+    if cached is not None and not fetched:
+        # 刷新失败时保留最近一次服务端生效规则，避免静默切回本地 JSON 版本。
+        _security_info_cache_refreshed_at[cache_key] = time.monotonic()
+        return cached
 
     normalized = _normalize_security_info(security, raw_info)
     # 应用配置覆盖（分类/tplus/slippage等）
     normalized = _merge_overrides(security, normalized)
     info_obj = SecurityInfo(security, normalized)
     _security_info_cache[cache_key] = info_obj
+    if info_obj.get("rule_version") and date is None:
+        _security_info_cache_refreshed_at[cache_key] = time.monotonic()
+    else:
+        _security_info_cache_refreshed_at.pop(cache_key, None)
     return info_obj
 
 
