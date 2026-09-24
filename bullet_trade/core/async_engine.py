@@ -16,7 +16,7 @@ from datetime import datetime, date, time as Time
 import pandas as pd
 import time as python_time
 
-from .engine import BacktestEngine, PRE_MARKET_OFFSET
+from .engine import BacktestEngine, PRE_MARKET_OFFSET, _is_tick_frequency
 from .event_loop import EventLoop
 from .event_bus import EventBus, EventPriority
 from .async_scheduler import AsyncScheduler, OverlapStrategy
@@ -186,6 +186,11 @@ class AsyncBacktestEngine(BacktestEngine):
             self.initial_cash = capital_base
         if frequency:
             self.frequency = frequency
+        if _is_tick_frequency(self.frequency):
+            # 异步日循环未接入 tick 合并事件流，跑下去会静默漏掉逐笔事件
+            raise NotImplementedError(
+                "异步回测不支持 tick 频率，请使用同步回测入口（use_async=False）运行 tick 回放"
+            )
         
         # 设置事件框架
         self._setup_event_framework()

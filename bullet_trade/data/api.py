@@ -11,6 +11,7 @@ import math
 import os
 import re
 import threading
+from contextlib import contextmanager
 from datetime import date as Date
 from datetime import datetime
 from datetime import time as Time
@@ -19,7 +20,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
 
-from ..core.exceptions import FutureDataError, UserError
+from ..core.exceptions import BacktestDataError, FutureDataError, UserError
 from ..core.globals import log
 from ..core.models import SecurityUnitData
 from ..core.settings import get_settings
@@ -435,6 +436,25 @@ def _is_live_mode() -> bool:
         return bool(_current_context and getattr(_current_context, "run_params", {}).get("is_live"))
     except Exception:
         return False
+
+
+def _raise_strict_backtest_data_error(
+    error: Exception, security: Any, end_date: Any
+) -> None:
+    """严格回放保留读取故障，策略自行捕获异常也不能清除运行失效状态。"""
+    if (
+        _current_context is None
+        or _is_live_mode()
+        or not getattr(_current_context, "_strict_backtest_data", False)
+    ):
+        return
+    failure = getattr(_current_context, "_backtest_data_error", None)
+    if failure is None:
+        failure = BacktestDataError(
+            f"Historical price read failed: security={security}, time={end_date}"
+        )
+        _current_context._backtest_data_error = failure
+    raise failure from error
 
 
 def _disable_cache_for_provider(provider: Optional[DataProvider]) -> None:
@@ -1817,12 +1837,15 @@ class BacktestCurrentData:
                     high_limit=high_limit,
                     low_limit=low_limit,
                     paused=paused,
+                    # 分钟 bar 的 open 是当分钟开盘价，不能当作当日开盘价
+                    day_open=0.0 if use_minute else float(open_price or 0.0),
                 )
             else:
                 data = SecurityUnitData(security=security, last_price=0.0)
                 log.debug(f"{security}无数据")
 
         except Exception as e:
+            _raise_strict_backtest_data_error(e, security, current_dt)
             log.debug(f"获取{security}数据失败: {e}")
             data = SecurityUnitData(security=security, last_price=0.0)
 
@@ -1865,6 +1888,66 @@ def _optional_float(value: Any) -> Optional[float]:
     except (TypeError, ValueError):
         return None
     return result if math.isfinite(result) else None
+
+
+class _TickReplaySecurityUnitData(SecurityUnitData):
+    """日开盘元数据不可用时，只在读取该字段时报告缺口。"""
+
+    def __getattribute__(self, name: str) -> Any:
+        value = super().__getattribute__(name)
+        if name == "day_open" and value is None:
+            from .tick_replay import TickDataMissingError
+
+            raise TickDataMissingError(f"{self.security} 缺少已预取的当日开盘价 day_open")
+        return value
+
+
+class TickReplayCurrentData:
+    """当前行情只读已发布的当日快照，不访问日线、分钟线或实时数据。"""
+
+    def __init__(self, context: Any, engine: Any) -> None:
+        self._context = context
+        self._engine = engine
+        self._requested: Dict[str, None] = {}
+
+    def __getitem__(self, security: str) -> SecurityUnitData:
+        self._requested[security] = None
+        snapshot = self._engine.get_current_tick_snapshot(security)
+        current_dt = self._context.current_dt
+        if (
+            snapshot is None
+            or snapshot.datetime.date() != current_dt.date()
+            or snapshot.datetime > current_dt
+        ):
+            return _TickReplaySecurityUnitData(
+                security=security, source="tick_replay", day_open=None
+            )
+
+        # 同一时刻可能发布多笔行情；每次取当前快照，不能按 datetime 缓存。
+        price = _optional_float(snapshot.current)
+        return _TickReplaySecurityUnitData(
+            security=security,
+            last_price=price if price is not None and price > 0 else 0.0,
+            source="tick_replay",
+            source_time=snapshot.datetime,
+            bid_price1=_optional_float(snapshot.b1_p) or None,
+            ask_price1=_optional_float(snapshot.a1_p) or None,
+            bid_volume1=_optional_float(snapshot.b1_v),
+            ask_volume1=_optional_float(snapshot.a1_v),
+            day_open=self._engine.get_tick_day_open(security),
+        )
+
+    def __contains__(self, security: str) -> bool:
+        return self[security].last_price > 0
+
+    def keys(self):
+        return self._requested.keys()
+
+    def items(self):
+        return {security: self[security] for security in list(self._requested)}.items()
+
+    def values(self):
+        return {security: self[security] for security in list(self._requested)}.values()
 
 
 class LiveCurrentData:
@@ -1936,6 +2019,7 @@ class LiveCurrentData:
                 display_name=str(snap.get("display_name") or snap.get("short_name") or ""),
                 price_tick=float(snap.get("price_tick") or 0.01),
                 day_trading=bool(snap.get("day_trading", False)),
+                day_open=_optional_float(snap.get("day_open", snap.get("open"))) or 0.0,
             )
         else:
             if requires_live:
@@ -1968,9 +2052,35 @@ def _get_setting(key: str, default: Any = False) -> Any:
     return get_settings().options.get(key, default)
 
 
+# 回放缓冲预取的嵌套深度；非零期间暂停未来数据守卫
+_replay_prefetch_depth = 0
+
+
 def _should_avoid_future() -> bool:
     # 仅回测上下文（非 live）需要限制未来数据，研究环境无上下文时不处理
+    if _replay_prefetch_depth:
+        return False
     return bool(_current_context and not _is_live_mode() and _get_setting("avoid_future_data"))
+
+
+@contextmanager
+def internal_replay_prefetch():
+    """在回放缓冲预取期间暂停未来数据守卫。
+
+    tick 回测按日整段拉取行情再逐笔投递，拉取窗口必然覆盖回放时钟之后的时刻；
+    这不构成数据泄露，因为策略只能看到已推进到的 tick。守卫只针对策略侧查询，
+    因此预取期间临时关闭，退出后恢复。可重入。
+
+    Yields:
+        None: 作用域内 `_should_avoid_future()` 恒为 False。
+    """
+
+    global _replay_prefetch_depth
+    _replay_prefetch_depth += 1
+    try:
+        yield
+    finally:
+        _replay_prefetch_depth -= 1
 
 
 def _coerce_datetime(value: Any) -> Optional[datetime]:
@@ -2266,13 +2376,18 @@ def get_price(
         fill_paused: 是否填充停牌数据
 
     Returns:
-        DataFrame。真实价格模式重试时保留同一复权参考日；普通取数失败仍记录日志并返回空表。
+        DataFrame。重试时保留同一复权参考日；宽松模式取数失败仍返回空表。
 
     Raises:
         FutureDataError: 当 avoid_future_data=True 时访问未来数据
+        BacktestDataError: 严格回放中的历史行情读取失败
     """
     # 确保数据提供者已认证
-    _ensure_auth()
+    try:
+        _ensure_auth()
+    except Exception as exc:
+        _raise_strict_backtest_data_error(exc, security, end_date)
+        raise
 
     # 警告：panel=True 已废弃，与聚宽官方保持一致
     # 聚宽官方提示：不建议继续使用panel（panel将在pandas未来版本不再支持，将来升级pandas后，您的策略会失败）
@@ -2363,20 +2478,24 @@ def get_price(
     # 限制 end_date 不超过当前时间
     end_date = min(end_date, current_dt)
 
-    session_price = _try_get_price_from_backtest_session(
-        security=security,
-        start_date=start_date,
-        end_date=end_date,
-        frequency=frequency,
-        fields=fields,
-        skip_paused=skip_paused,
-        fq=fq,
-        count=count,
-        panel=panel,
-        fill_paused=fill_paused,
-        use_real_price=use_real_price,
-        force_no_engine=force_no_engine,
-    )
+    try:
+        session_price = _try_get_price_from_backtest_session(
+            security=security,
+            start_date=start_date,
+            end_date=end_date,
+            frequency=frequency,
+            fields=fields,
+            skip_paused=skip_paused,
+            fq=fq,
+            count=count,
+            panel=panel,
+            fill_paused=fill_paused,
+            use_real_price=use_real_price,
+            force_no_engine=force_no_engine,
+        )
+    except Exception as exc:
+        _raise_strict_backtest_data_error(exc, security, end_date)
+        raise
     if session_price is not None:
         return session_price
 
@@ -2436,6 +2555,8 @@ def get_price(
                 raw_df = _coerce_price_result_to_dataframe(result)
                 final = _make_compatible_dataframe(raw_df, fields)
         except Exception as e:
+            if isinstance(e, NotImplementedError):
+                _raise_strict_backtest_data_error(e, security, end_date)
             _raise_if_not_implemented(e)
             log.warning(f"真实价格模式调用失败: {e}，保留复权基准日重试")
             final = None
@@ -2484,6 +2605,7 @@ def get_price(
             final = _make_compatible_dataframe(df, fields)
 
     except Exception as e:
+        _raise_strict_backtest_data_error(e, security, end_date)
         _raise_if_not_implemented(e)
         log.error(f"获取价格数据失败: {e}")
         return _build_empty_price_frame(security, fields)
@@ -2678,7 +2800,7 @@ def attribute_history(
     count: int,
     unit: str = "1d",
     fields: Optional[List[str]] = None,
-    skip_paused: bool = False,
+    skip_paused: bool = True,
     df: bool = True,
     fq: str = "pre",
 ) -> Union[pd.DataFrame, Dict]:
@@ -2720,6 +2842,8 @@ def attribute_history(
             fq=fq,
             count=count,
         )
+    except BacktestDataError:
+        raise
     except Exception as e:
         _raise_if_not_implemented(e)
         log.error(f"获取历史数据失败: {e}")
@@ -2868,6 +2992,30 @@ def get_ticks(
         return pd.DataFrame() if df else []
 
 
+def _is_tick_replay_backtest() -> bool:
+    """判断当前是否处于 tick 回放回测。
+
+    Returns:
+        bool: 运行时引擎为回测引擎且以 tick 频率运行时为 True；其余情况为 False。
+    """
+
+    try:
+        from ..core.runtime import get_current_engine
+
+        engine = get_current_engine()
+    except Exception:
+        return False
+    if engine is None or getattr(engine, "is_live", False):
+        return False
+    checker = getattr(engine, "is_tick_backtest", None)
+    if not callable(checker):
+        return False
+    try:
+        return bool(checker())
+    except Exception:
+        return False
+
+
 def get_current_tick(
     security: str,
     dt: Optional[Union[str, datetime]] = None,
@@ -2881,6 +3029,10 @@ def get_current_tick(
     if target_dt is None:
         target_dt = datetime.now()
     target_dt = _ensure_not_future_dt(target_dt, "get_current_tick.dt")
+
+    if _is_tick_replay_backtest():
+        # tick 回放中快照只能来自回放缓冲，禁止用分钟线合成
+        return pd.DataFrame() if df else None
 
     use_price_proxy = bool(
         _current_context
@@ -2927,6 +3079,8 @@ def get_current_tick(
                 "datetime": tick_time,
                 "current": float(close_value),
                 "last_price": float(close_value),
+                "source": "minute_proxy",
+                "is_proxy": True,
             }
             return pd.DataFrame([tick]) if df else tick
         except Exception as e:
@@ -3296,6 +3450,34 @@ def get_future_contracts(
         return []
 
 
+def get_futures_info(
+    security_list: Union[str, List[str]],
+    date: Optional[Union[str, datetime]] = None,
+    fields: Optional[List[str]] = None,
+) -> Dict[str, Dict[str, Any]]:
+    """
+    获取期货合约规格信息（合约乘数、最小变动价位、交易时段）。
+
+    Args:
+        security_list: 合约代码或代码列表
+        date: 查询日期，缺省取回测当前日
+        fields: 字段白名单，缺省为 contract_multiplier/tick_size/trade_time
+
+    Returns:
+        Dict[str, Dict[str, Any]]: 合约代码到规格字段的映射
+    """
+    _ensure_auth()
+    resolved_date = _resolve_context_date(date, default_to_context=True)
+    resolved_date = _ensure_not_future_date(resolved_date, "get_futures_info.date")
+    try:
+        result = _get_default_provider().get_futures_info(security_list, resolved_date, fields)
+    except Exception as e:
+        _raise_if_not_implemented(e)
+        log.error(f"获取期货合约规格失败: {e}")
+        return {}
+    return result if isinstance(result, dict) else {}
+
+
 def get_billboard_list(
     stock_list: Optional[List[str]] = None,
     start_date: Optional[Union[str, datetime]] = None,
@@ -3397,6 +3579,11 @@ def get_current_data() -> Any:
                 return []
 
         return EmptyCurrentData()
+
+    if _is_tick_replay_backtest():
+        from ..core.runtime import get_current_engine
+
+        return TickReplayCurrentData(_current_context, get_current_engine())
 
     return (
         LiveCurrentData(_current_context)

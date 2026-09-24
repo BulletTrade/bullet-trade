@@ -10,6 +10,8 @@ from typing import Dict, Optional, Any, List
 from datetime import datetime, date
 import pandas as pd
 
+from .futures_account import LONG, SHORT, FuturesAccount
+
 
 class OrderStatus(Enum):
     """订单状态枚举
@@ -35,6 +37,25 @@ class OrderStatus(Enum):
     canceled = "canceled"
     rejected = "rejected"
     held = "held"
+
+
+class CompatOrderStatus:
+    """兼容口径的订单状态别名集合。
+
+    属性直接指向原生枚举成员，因此与引擎写入的 order.status 比较结果一致。
+    差异只在 held：该口径下 held 表示订单已完成，对应原生 filled；
+    原生 held（挂起）不在此暴露，避免两种语义混用。
+    """
+
+    new = OrderStatus.new
+    open = OrderStatus.open
+    filling = OrderStatus.filling
+    partly_canceled = OrderStatus.partly_canceled
+    canceling = OrderStatus.canceling
+    filled = OrderStatus.filled
+    canceled = OrderStatus.canceled
+    rejected = OrderStatus.rejected
+    held = OrderStatus.filled
 
 
 class OrderStyle(Enum):
@@ -292,6 +313,8 @@ class Portfolio:
     positions: Dict[str, Position] = field(default_factory=SecurityPositionMap)
     positions_value: float = 0.0
     subportfolios: Dict[str, SubPortfolio] = field(default_factory=dict)
+    # 期货账本；为 None 时组合完全是股票/基金口径，权益计算与历史行为一致
+    futures_account: Optional[FuturesAccount] = None
 
     # 风险指标
     returns: float = 0.0  # 当日收益
@@ -314,14 +337,99 @@ class Portfolio:
                 except Exception:
                     pass
 
+    @property
+    def futures_margin(self) -> float:
+        """返回期货占用保证金合计。
+
+        Returns:
+            float: 无期货账本时为 0。
+        """
+
+        return self.futures_account.margin if self.futures_account is not None else 0.0
+
+    @property
+    def futures_floating_pnl(self) -> float:
+        """返回期货盯市浮动盈亏合计（相对上一结算价）。
+
+        Returns:
+            float: 无期货账本时为 0。
+        """
+
+        if self.futures_account is None:
+            return 0.0
+        return self.futures_account.mark_to_market_pnl
+
+    @property
+    def long_positions(self) -> Dict[str, Any]:
+        """返回多头持仓视图，键为标的代码。
+
+        Returns:
+            Dict[str, Any]: 股票多头 Position 与期货多头 FuturesPosition 的合并视图。
+        """
+
+        result: Dict[str, Any] = {
+            security: position
+            for security, position in self.positions.items()
+            if getattr(position, "side", LONG) == LONG
+        }
+        if self.futures_account is not None:
+            for position in self.futures_account.iter_positions():
+                if position.side == LONG:
+                    result[position.security] = position
+        return result
+
+    @property
+    def short_positions(self) -> Dict[str, Any]:
+        """返回空头持仓视图，键为标的代码。
+
+        Returns:
+            Dict[str, Any]: 股票空头 Position 与期货空头 FuturesPosition 的合并视图。
+        """
+
+        result: Dict[str, Any] = {
+            security: position
+            for security, position in self.positions.items()
+            if getattr(position, "side", LONG) == SHORT
+        }
+        if self.futures_account is not None:
+            for position in self.futures_account.iter_positions():
+                if position.side == SHORT:
+                    result[position.security] = position
+        return result
+
     def update_value(self):
         """更新账户总价值"""
         self.positions_value = sum(pos.value for pos in self.positions.values())
-        self.total_value = self.available_cash + self.positions_value + self.locked_cash
+        futures_value = 0.0
+        if self.futures_account is not None:
+            # 期货以占用保证金计入持仓价值，浮动项按盯市口径单独加入权益
+            self.positions_value += self.futures_account.margin
+            futures_value = self.futures_account.mark_to_market_pnl
+        self.total_value = (
+            self.available_cash + self.positions_value + self.locked_cash + futures_value
+        )
 
         # 更新子账户
         for subportfolio in self.subportfolios.values():
             subportfolio.update_value()
+
+        self._sync_futures_subportfolio()
+
+    def _sync_futures_subportfolio(self) -> None:
+        """把期货账本口径同步到 futures 子账户，供策略按子账户读取。
+
+        Returns:
+            None: 无期货账本或无 futures 子账户时不做任何事。
+        """
+
+        if self.futures_account is None:
+            return
+        subportfolio = self.subportfolios.get("futures")
+        if subportfolio is None:
+            return
+        subportfolio.available_cash = self.futures_account.cash
+        subportfolio.positions_value = self.futures_account.margin
+        subportfolio.total_value = self.futures_account.total_value
 
 
 @dataclass
@@ -338,6 +446,9 @@ class Trade:
         commission: 手续费
         tax: 印花税
         trade_id: 成交记录ID
+        action: 期货开平标记，旧记录为 None
+        side: 期货持仓方向，旧记录为 None
+        multiplier: 本次期货成交使用的实际合约乘数，旧记录为 None
     """
 
     order_id: str
@@ -348,6 +459,14 @@ class Trade:
     commission: float = 0.0
     tax: float = 0.0
     trade_id: str = ""
+    action: Optional[str] = None
+    side: Optional[str] = None
+    multiplier: Optional[float] = None
+    realized_pnl_gross: Optional[float] = None
+    realized_pnl_net: Optional[float] = None
+    allocated_entry_fees: Optional[float] = None
+    allocated_distributions: Optional[float] = None
+    pnl_basis_status: Optional[str] = None
 
 
 @dataclass
@@ -365,8 +484,13 @@ class Order:
         add_time: 下单时间
         is_buy: 是否买入
         action: 交易类型（'open' or 'close'）
+        side: 开仓方向（'long' or 'short'）；股票恒为 'long'
+        pindex: 平仓优先级，0 表示先平昨仓再平今仓，1 表示先平今仓
+        close_today: 是否按平今费率计费；仅对期货平仓有意义
         style: 下单方式
         extra: 扩展字段（券商特有信息，如备注/策略名）
+        avg_cost: 买入/开仓时为成交均价；卖出/平仓时为本笔成交前的持仓成本
+        commission: 本笔订单产生的交易费用合计（佣金、税费等）
     """
 
     order_id: str
@@ -378,9 +502,14 @@ class Order:
     add_time: Optional[datetime] = None
     is_buy: bool = True
     action: str = "open"
+    side: str = "long"
+    pindex: int = 0
+    close_today: bool = False
     style: object = OrderStyle.market
     wait_timeout: Optional[float] = None
     extra: Dict[str, Any] = field(default_factory=dict)
+    avg_cost: float = 0.0
+    commission: float = 0.0
 
 
 @dataclass
@@ -403,6 +532,7 @@ class SecurityUnitData:
         ask_price1: 卖一价；行情源未提供时为 None
         bid_volume1: 买一量；行情源未提供时为 None
         ask_volume1: 卖一量；行情源未提供时为 None
+        day_open: 当日开盘价；行情源未提供或当前为分钟 bar 时为 0.0
     """
 
     security: str
@@ -423,6 +553,7 @@ class SecurityUnitData:
     display_name: str = ""
     price_tick: float = 0.01
     day_trading: bool = False
+    day_open: float = 0.0
 
     @property
     def is_paused(self) -> bool:

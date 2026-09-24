@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "description": "期货合约规格与保证金率的离线配置层。合约乘数与最小变动价位以合约代码为键解析，因为同一品种不同月份合约的报价单位可以不同；保证金率以品种为键并支持按生效日期分段。本文件的优先级低于策略显式注册与 set_option 覆盖，高于代码内置兜底。",
+  "margin_rate": {
+    "default": null,
+    "by_product": {},
+    "schema": {
+      "by_product.<PRODUCT>": "浮点数，或 {\"rate\": 浮点数, \"effective\": [{\"start\": \"YYYY-MM-DD\", \"rate\": 浮点数}]}",
+      "effective": "按 start 升序匹配，取最后一个 start <= 交易日的分段；未命中时回落到 rate"
+    }
+  },
+  "contract_overrides": {},
+  "contract_overrides_schema": {
+    "<CODE>.<EXCHANGE>": "{\"multiplier\": 浮点数, \"tick_size\": 浮点数或 null, \"margin_rate\": 浮点数或 null, \"reason\": \"说明\"}",
+    "note": "仅在远端规格不可达、或需要为特定合约钉住口径时使用；tick_size 置 null 表示离线时该合约显式失败，不猜测报价单位"
+  },
+  "offline_fallback_specs": {
+    "T": {
+      "exchange": "CCFX",
+      "multiplier": 10000.0,
+      "tick_size": 0.005,
+      "reason": "十年期国债期货未登记在代码内置规格表中，远端不可达时按交易所公开合约文本兜底"
+    }
+  }
+}

@@ -117,7 +117,7 @@ class CacheManager:
     def _normalize_params(self, kwargs: Dict[str, Any]) -> Dict[str, Any]:
         params: Dict[str, Any] = {}
         for k, v in kwargs.items():
-            if k in ("start_date", "end_date", "date", "pre_factor_ref_date"):
+            if k in ("start_date", "end_date", "date", "pre_factor_ref_date", "start_dt", "end_dt"):
                 params[k] = self._normalize_temporal(v)
             elif k in ("fields",):
                 if v is None:
@@ -172,6 +172,12 @@ class CacheManager:
 
         if has_count:
             return self.expire_days
+
+        # tick/bars 用 end_dt 表达窗口，不带 date 参数，需单独判定历史区间
+        end_dt = self._to_date(params.get("end_dt")) if params.get("end_dt") else None
+        if end_dt is not None:
+            return None if end_dt < today else self.expire_days
+
         if date_single is None or (date_single and date_single >= today):
             return self.expire_days
         if end_date is None or (end_date and end_date >= today):

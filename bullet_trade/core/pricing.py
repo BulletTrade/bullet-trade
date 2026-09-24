@@ -8,6 +8,8 @@ import json
 import os
 from typing import Optional, Tuple, Any, Dict
 
+from .futures_account import is_futures_security
+
 
 def _split_security(security: str) -> Tuple[str, str]:
     parts = security.split(".")
@@ -151,7 +153,14 @@ def get_min_price_step(security: str, price: float) -> float:
     """
     根据标的和当前价格推断最小价差（tick size）。
     规则参考交易所公开信息，覆盖主板/创业板/ETF/北交所等常见场景。
+
+    返回 0.0 表示档位未知，调用方应跳过按档位归档而不是退回某个默认档位。
     """
+    if is_futures_security(security):
+        # 期货档位随品种和上市时间变化，只能由合约规格表按合约解析；
+        # 这里给 0.01 会把国债期货 0.005 这类细档位压平成非法报价
+        return 0.0
+
     code, market = _split_security(security)
     price = float(price) if price and price > 0 else 1.0
 

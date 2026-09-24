@@ -9,7 +9,9 @@ jqdata 兼容模块
 
 # 从 bullet_trade 核心模块导入所有API
 from bullet_trade.core.api import *  # noqa: F401,F403
+from bullet_trade.core.models import CompatOrderStatus as OrderStatus  # noqa: F401
 from bullet_trade.core.orders import MarketOrderStyle, LimitOrderStyle  # 显式导出市价/限价样式
+
 
 # 策略辅助：打印持仓/打印DataFrame（供策略便捷使用）
 from bullet_trade.utils.strategy_helpers import (
@@ -50,6 +52,7 @@ __all__ = [
     
     # 设置相关
     'set_benchmark', 'set_option', 'set_slippage', 'set_order_cost', 'set_commission', 'set_universe',
+    'set_subportfolios', 'SubPortfolioConfig',
     
     # 数据API
     'get_price', 'history', 'attribute_history', 'get_bars', 'get_ticks', 'get_current_tick',

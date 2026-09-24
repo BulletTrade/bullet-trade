@@ -18,6 +18,18 @@ def test_min_price_step_a_share_brackets():
     _assert_close(pricing.get_min_price_step("600000.XSHG", 0.8), 0.001)
 
 
+def test_min_price_step_unknown_for_futures():
+    """期货档位由合约规格表按合约解析，pricing 不猜档位。"""
+    for security in ("T2109.CCFX", "IF2407.CCFX", "RB2201.XSGE", "AU1606.XSGE"):
+        assert pricing.get_min_price_step(security, 100.0) == 0.0
+
+
+def test_clamp_price_to_trade_bounds_keeps_fine_futures_grid():
+    """国债期货 0.005 档位上的成交价不能被重新压到 0.01 网格。"""
+    price = pricing.clamp_price_to_trade_bounds("T2006.CCFX", 101.085, 101.035, None, None, True)
+    _assert_close(price, 101.085)
+
+
 def test_price_bounds_mainboard():
     buy_upper, sell_lower = pricing.compute_price_bounds("600000.XSHG", 10.0, 0.01)
     _assert_close(buy_upper, 10.2)

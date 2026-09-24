@@ -106,7 +106,7 @@ version = {attr = "bullet_trade.__version__.__version__"}
 
 [tool.setuptools.package-data]
 "bullet_trade.reporting" = ["templates/*.html"]
-"bullet_trade" = ["notebook/**/*.ipynb", "notebook/**/*.md", "contracts/**/*.json"]
+"bullet_trade" = ["notebook/**/*.ipynb", "notebook/**/*.md", "contracts/**/*.json", "config/**/*.json"]
 "bullet_trade.integrations.huaxin" = [
     "native_src/CMakeLists.txt",
     "native_src/include/bt_huaxin_bridge.h",

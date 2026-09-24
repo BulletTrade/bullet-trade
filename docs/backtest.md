@@ -339,6 +339,85 @@ bullet-trade report --input backtest_results/demo --format html
 
 报告文件（HTML/PNG）可直接复用到站点或 MR 截图。
 
+## 期货合约规格与保证金率
+
+期货回测比股票多依赖三类参数：**合约乘数**、**最小变动价位**、**保证金率**。乘数错一位会直接把盈亏和保证金放大十倍，因此这三项缺失时引擎显式失败，不退回隐含默认值。
+
+### 规格解析顺序
+
+合约规格按**合约代码**解析，而不是按品种。同一品种不同月份合约的报价单位可以不同（黄金期货在 2019 年内就从 0.05 元/克改为 0.02 元/克，两批合约还并存了 11 个月），按品种 + 生效日期无法表达这种情况。
+
+解析按下面的顺序取第一个命中项：
+
+1. 合约级显式覆盖 —— `ContractSpecTable.register_contract()`，或配置文件的 `contract_overrides`
+2. 品种级显式登记 —— `ContractSpecTable.register()`，或构造时传入的 `specs=`
+3. 外部配置文件 —— `bullet_trade/config/futures_contract_specs.json`
+4. 远端数据源 —— `get_futures_info()`，按批查询并落本地缓存
+5. 代码内置兜底表 —— 覆盖常见品种，配置文件的 `offline_fallback_specs` 会并入这一层
+
+日期维度只对**保证金率**有意义（交易所会调整挂牌费率），乘数与最小变动价位是合约自身的静态属性。
+
+### 外部配置文件
+
+`bullet_trade/config/futures_contract_specs.json` 是离线配置层，优先级低于策略显式登记与 `set_option` 覆盖，高于内置兜底表：
+
+```json
+{
+  "version": 1,
+  "margin_rate": {
+    "default": null,
+    "by_product": {
+      "T": {
+        "rate": 0.02,
+        "effective": [
+          {"start": "2020-01-01", "rate": 0.02},
+          {"start": "2023-06-01", "rate": 0.03}
+        ]
+      }
+    }
+  },
+  "contract_overrides": {
+    "AU1910.XSGE": {"multiplier": 1000.0, "tick_size": 0.05, "reason": "该合约沿用旧报价单位"}
+  },
+  "offline_fallback_specs": {
+    "T": {"exchange": "CCFX", "multiplier": 10000.0, "tick_size": 0.005}
+  }
+}
+```
+
+- `by_product.<品种>` 可以直接写浮点数，也可以写 `{rate, effective}`；`effective` 按 `start` 升序匹配，取最后一个 `start <= 交易日` 的分段，都不满足时回落到 `rate`。
+- `contract_overrides` 里的 `tick_size` 置 `null` 表示离线时该合约显式失败，而不是猜一个报价单位。
+- 文件缺失或损坏只告警并退化为空配置，不中断回测。
+- 规格来源是可替换的：实现 `ContractSpecSource` 协议（`query_contract` / `prefetch`）即可接入自有数据库或文件，通过 `ContractSpecTable.set_spec_source()` 注入。
+
+### 保证金率优先级
+
+从高到低：
+
+1. **按品种覆盖** —— `set_option('futures_margin_rate.T', 0.03)`
+2. **全局覆盖** —— `set_option('futures_margin_rate', 0.15)`
+3. **配置文件** —— `margin_rate.by_product`（含生效日期分段）与 `margin_rate.default`
+4. **合约规格自带** —— 规格里的 `margin_rate` 字段
+
+按品种覆盖优先于全局覆盖。只设置全局值时所有品种共用该值；同时设置两者时，被点名的品种走自己的费率，其余品种走全局值。
+
+### 期货目标单的手数口径
+
+`order_target_value(contract, value, side='long')` 里的 `value` 是**占用保证金预算**，不是合约名义价值。手数按下式向下截断：
+
+```
+手数 = int(value / 价格 / 保证金率 / 合约乘数)
+```
+
+除法顺序与上式一致，先合并成「单手保证金」再除会改变截断结果。预算不足一手时得到 0 手，订单被取消 —— 小资金跑多品种时这是常见现象，不是缺陷。
+
+`order_target(contract, amount, side=...)` 的 `amount` 是目标手数，当前持仓按 `side` 从期货账本读取；`side` 缺省为 `'long'`，做空要显式传 `'short'`。
+
+### 两条限制
+
+- **主力/连续/指数合约不可撮合**：代码里数字段为 `8888`、`9999`、`88`、`99`、`0000`、`00` 的伪合约（如 `CU8888.XSGE`、`IF9999.CCFX`）只能用于取行情信号，进入下单或规格查询路径会直接报错。要下单必须先用 `get_dominant_future()` 拿到具体月份合约。
+- **规格缺失即拒单**：解析不出乘数或保证金率时订单被拒并记录 `futures_contract_spec_missing`，不会用默认值静默成交。
+
 ## 常见问题
 
 ### 中文字体

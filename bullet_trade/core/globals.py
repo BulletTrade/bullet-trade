@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 from logging.handlers import RotatingFileHandler
+from string import Formatter
 from typing import Any, Optional
 from datetime import datetime
 
@@ -353,36 +354,57 @@ class Logger:
         kwargs["extra"] = extra
         return kwargs
 
+    def _emit(self, level: int, msg: Any, args: tuple, kwargs: dict):
+        """统一格式化参数，避免各输出处理器重复插值或丢失记录。"""
+        if not self.logger.isEnabledFor(level):
+            return
+        message = str(msg)
+        if args:
+            rendered = None
+            if "%" in message:
+                try:
+                    rendered = logging.LogRecord(
+                        self.logger.name, level, "", 0, message, args, None
+                    ).getMessage()
+                except (TypeError, ValueError, KeyError, OverflowError):
+                    pass
+            if rendered is None and "{" in message:
+                try:
+                    if any(field is not None for _, field, _, _ in Formatter().parse(message)):
+                        rendered = message.format(*args)
+                except (IndexError, KeyError, TypeError, ValueError, AttributeError):
+                    pass
+            if rendered is None:
+                rendered = " ".join([message] + [str(arg) for arg in args])
+            message = rendered
+        self.logger.log(
+            level, self._format_message(message), **self._with_log_extra(kwargs)
+        )
+
 
     def debug(self, msg: str, *args, **kwargs):
         """输出DEBUG级别日志"""
-        kwargs = self._with_log_extra(kwargs)
-        self.logger.debug(self._format_message(msg), *args, **kwargs)
+        self._emit(logging.DEBUG, msg, args, kwargs)
     
     def info(self, msg: str, *args, **kwargs):
         """输出INFO级别日志"""
-        kwargs = self._with_log_extra(kwargs)
-        self.logger.info(self._format_message(msg), *args, **kwargs)
+        self._emit(logging.INFO, msg, args, kwargs)
     
     def warn(self, msg: str, *args, **kwargs):
         """输出WARNING级别日志"""
-        kwargs = self._with_log_extra(kwargs)
-        self.logger.warning(self._format_message(msg), *args, **kwargs)
+        self._emit(logging.WARNING, msg, args, kwargs)
     
     def warning(self, msg: str, *args, **kwargs):
         """输出WARNING级别日志（别名）"""
-        kwargs = self._with_log_extra(kwargs)
-        self.logger.warning(self._format_message(msg), *args, **kwargs)
+        self._emit(logging.WARNING, msg, args, kwargs)
     
     def error(self, msg: str, *args, **kwargs):
         """输出ERROR级别日志"""
-        kwargs = self._with_log_extra(kwargs)
-        self.logger.error(self._format_message(msg), *args, **kwargs)
+        self._emit(logging.ERROR, msg, args, kwargs)
     
     def critical(self, msg: str, *args, **kwargs):
         """输出CRITICAL级别日志"""
-        kwargs = self._with_log_extra(kwargs)
-        self.logger.critical(self._format_message(msg), *args, **kwargs)
+        self._emit(logging.CRITICAL, msg, args, kwargs)
     
     def set_level(self, module: str, level: str):
         """
