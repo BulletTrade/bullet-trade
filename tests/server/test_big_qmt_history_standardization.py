@@ -219,9 +219,8 @@ class _FakeGateway:
         assert frequency in {"1m", "1d"}, "多周期必须从基础行情合成"
         frame = self.frames[(security, frequency)]
         frame = frame.loc[(frame.index >= lower) & (frame.index <= upper)].copy()
-        if payload.get("fill_data") is True:
+        if payload.get("fill_data") is True and frequency == "1d":
             # 只为缺轴查询提供明确的日线停牌事实，填充值不能变成真实前收盘。
-            assert frequency == "1d"
             assert set(payload.get("fields") or []) <= {"close", "preClose", "suspendFlag"}
             days = pd.bdate_range(max(lower.normalize(), pd.Timestamp(self.start_date)), upper)
             existing = set(frame.index)
@@ -231,7 +230,8 @@ class _FakeGateway:
                     frame.loc[day, "suspendFlag"] = self.suspension_facts.get((security, day), 0)
                     frame.loc[day, ["close", "preClose"]] = 99.0
         else:
-            assert payload.get("fill_data") is False
+            # 未配置分钟暂停事实时，fill_data=True 仍不能凭空补出有效停牌记录。
+            assert payload.get("fill_data") is False or frequency == "1m"
         if payload.get("count") is not None and payload["count"] > 0:
             frame = frame.tail(payload["count"])
         requested = payload.get("fields") or frame.columns.tolist()

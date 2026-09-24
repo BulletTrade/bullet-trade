@@ -193,12 +193,11 @@ class _MinuteReplayGateway:
         assert payload.get("fq") == "none", "不得拿QMT/JQ原生复权价格或因子作输入"
         assert payload.get("subscribe") is False
         assert lower is not None and upper is not None
-        if payload.get("fill_data"):
-            # 缺行反例只允许查询真实日线标记，返回原事实，绝不制造停牌或填充价。
-            assert payload["frequency"] == "1d"
+        if payload.get("fill_data") and payload["frequency"] == "1d":
+            # 缺行反例返回原事实，绝不制造日线或分钟停牌事实及填充价。
             assert set(payload["fields"]).issubset({"close", "preClose", "suspendFlag"})
         else:
-            assert payload.get("fill_data") is False
+            assert payload.get("fill_data") is False or payload["frequency"] == "1m"
         daily = payload["frequency"] == "1d"
         frame = (self.daily if daily else self.minutes)[security]
         if not daily:

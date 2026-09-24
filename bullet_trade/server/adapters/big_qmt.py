@@ -828,6 +828,79 @@ class BigQmtDataAdapter(RemoteDataAdapter):
                 raise AdjustmentError("QMT缺行且没有明确停牌事实: %s" % day.date())
         return facts
 
+    async def _history_complete_minute_gaps(
+        self,
+        security: str,
+        raw: pd.DataFrame,
+        missing: pd.DatetimeIndex,
+        end: pd.Timestamp,
+    ) -> pd.DataFrame:
+        """补齐已确认暂停的分钟；输入证券、原价、缺轴和截止，返回独立行情表。
+
+        日线 flag=1 表示整日停牌，沿用后续 skip/fill 处理；其余缺轴须有原生
+        分钟 flag=1 且零量额。盘中暂停使用当日已可见成交价格，公开 paused=0。
+        不采信 helper 合成价，不读取截止后的复牌价；缺事实、价格或矛盾数据抛错。
+        仅在缺轴时额外读取有界行情，可能预热 helper 缓存，不修改输入或交易状态。
+        """
+        days = pd.DatetimeIndex(missing.normalize().unique())
+        daily = await self._history_raw(
+            security, "1d", days[0], days[-1], ["close", "suspendFlag"], fill_data=True
+        )
+        _history_validate_values(daily, ["close", "suspendFlag"])
+        if len(days.difference(daily.index)):
+            raise AdjustmentError("QMT缺行且没有明确停牌事实: 缺少日线状态")
+        full_days = daily.index[daily["suspendFlag"] == 1]
+        if ((raw["suspendFlag"] == 0) & raw.index.normalize().isin(full_days)).any():
+            raise AdjustmentError("QMT整日停牌事实与原始成交分钟矛盾")
+        partial = missing[~missing.normalize().isin(full_days)]
+        result = raw.reindex(raw.index.union(missing).sort_values()).copy()
+        result.loc[missing, list(_HISTORY_FIELDS)] = 0.0
+        result.loc[missing, "suspendFlag"] = 1.0
+        if not len(partial):
+            return result
+        facts = await self._history_raw(
+            security,
+            "1m",
+            partial[0],
+            end,
+            list(_HISTORY_FIELDS) + ["suspendFlag"],
+            fill_data=True,
+        )
+        if len(partial.difference(facts.index)):
+            raise AdjustmentError("QMT缺行且没有明确停牌事实: 缺少分钟状态")
+        if len(raw.index[raw.index >= partial[0]].difference(facts.index)):
+            raise AdjustmentError("QMT填充查询缺少已有成交分钟")
+        _history_validate_values(facts, list(_HISTORY_FIELDS) + ["suspendFlag"])
+        if (facts.loc[partial, "suspendFlag"] != 1).any():
+            raise AdjustmentError("QMT缺行且没有明确停牌事实: 分钟未标记暂停")
+        if (facts.loc[partial, ["volume", "money"]] != 0).any().any():
+            raise AdjustmentError("QMT暂停分钟包含成交量额")
+        overlap = raw.index.intersection(facts.index)
+        # 09:31 可能已经合并集合竞价，不能直接与未合并的 native bar 比较量价。
+        comparable = overlap[~((overlap.hour == 9) & (overlap.minute == 31))]
+        columns = list(_HISTORY_FIELDS) + ["suspendFlag"]
+        if (
+            not np.array_equal(
+                raw.loc[comparable, columns].to_numpy(), facts.loc[comparable, columns].to_numpy()
+            )
+            or (raw.loc[overlap, "suspendFlag"] != facts.loc[overlap, "suspendFlag"]).any()
+        ):
+            raise AdjustmentError("QMT填充查询与原始分钟事实矛盾")
+        for day in partial.normalize().unique():
+            stamps = partial[partial.normalize() == day]
+            visible = raw.loc[(raw.index.normalize() == day) & (raw["suspendFlag"] == 0)]
+            if visible.empty:
+                raise AdjustmentError("盘中停牌填充缺少截止时间内可见成交价格: %s" % day.date())
+            positions = visible.index.get_indexer(stamps, method="ffill")
+            seeds = visible.iloc[np.maximum(positions, 0)]
+            _history_validate_values(seeds, columns)
+            prices = np.where(positions < 0, seeds["open"], seeds["close"])
+            result.loc[stamps, ["open", "high", "low", "close"]] = np.repeat(
+                prices[:, None], 4, axis=1
+            )
+            result.loc[stamps, "suspendFlag"] = 0.0
+        return result
+
     async def _history_events(
         self,
         security: str,
@@ -1100,7 +1173,10 @@ class BigQmtDataAdapter(RemoteDataAdapter):
             if base == "1d" and len(checked):
                 _history_validate_values(raw.loc[raw.index >= checked[0]], raw_fields)
             missing = checked.difference(raw.index)
-            if len(missing):
+            source_raw = raw
+            if len(missing) and base == "1m":
+                raw = await self._history_complete_minute_gaps(security, raw, missing, raw_end)
+            elif len(missing):
                 await self._history_pause_facts(
                     security,
                     pd.DatetimeIndex(missing.normalize().unique()),
@@ -1158,7 +1234,14 @@ class BigQmtDataAdapter(RemoteDataAdapter):
             if len(selected):
                 _history_validate_values(raw.loc[raw.index >= selected[0]], raw_fields)
                 dependency_gaps = expected[expected >= selected[0]].difference(raw.index)
-                if len(dependency_gaps):
+                if len(dependency_gaps) and base == "1m":
+                    raw = await self._history_complete_minute_gaps(
+                        security,
+                        source_raw,
+                        expected[expected >= selected[0]].difference(source_raw.index),
+                        raw_end,
+                    )
+                elif len(dependency_gaps):
                     await self._history_pause_facts(
                         security,
                         pd.DatetimeIndex(dependency_gaps.normalize().unique()),

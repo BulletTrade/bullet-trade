@@ -23,6 +23,40 @@
 
 ## 对比方式
 
+### 可重复执行的停牌历史样本
+
+固定用例在 `tests/price_pause_contract.py`，不使用当前日期，不从被测数据反推预期。
+任意具有 `get_price(**kwargs)` 的数据源均可复用 `CASES` 和 `assert_pause_contract`。
+
+| 固定样本 | 类型及事件 | 查询窗口 | 预期 |
+| --- | --- | --- | --- |
+| `000929.XSHE` | 深市股票；2026-06-15 整日停牌 | 2026-06-12 至 06-16 日线 | 默认 3 行，停牌日 9.48、零量额、paused=1；跳停牌后 2 行 |
+| `000929.XSHE` | 同一整日停牌事件 | 2026-06-15 09:30–15:00，1m | 默认 240 行；不填充时保留 240 行 NaN；跳停牌后 0 行 |
+| `513100.XSHG` | QDII ETF；2026-09-24 开盘暂停至 10:30 | 当日 09:30–15:00，1m；另测 count=200 | 240 行或最后 200 行；09:31–10:30 为 2.308、零量额、paused=0 |
+
+共 19 个固定请求：三个场景分别验证省略参数及 `skip_paused × fill_paused` 四组合；ETF 另验证四组 `count=200`。均使用 `fq=None` 固定原始价，避免未来分红改变前复权基准；复权与未来数据边界另由 BigQMT 专项测试覆盖。
+
+在核心库目录执行（使用现有数据源环境配置，不写入测试文件）：
+
+```bash
+# 离线：QMT 冻结原价经过真实适配器，并运行共享停牌契约
+python -m pytest tests/server/test_big_qmt_pause_semantics.py tests/unit/test_price_pause_contract_reference.py -q
+
+# 在线：同一组预期验证任意已注册 provider，可一次指定多个
+python -m pytest tests/unit/test_price_pause_contract_live.py -m requires_network --live-providers=jqdata,qmt-remote -q
+
+# 镜像尚未覆盖 513100 的固定日期时，可明确只选择已覆盖的股票样本
+python -m pytest tests/unit/test_price_pause_contract_live.py -m requires_network --live-providers=jqdata -k stock_full_pause -q
+```
+
+普通 pytest 默认排除联网测试。认证失败、缺历史覆盖、未支持停牌参数均应失败，不自动跳过或换日期。`qmt-remote` 必须指向待验证版本的 server；选择测试子集不等于全套验收。
+
+断言严格比较完整时间轴、字段、停牌段量价/空值、paused，以及正常成交行有限非负。空表索引类型允许聚宽的普通空 Index。此组测试只证明停牌契约对齐，正常成交分钟的所有量价逐格等价仍需另行对账。
+
+000929 基准由 RPC 和镜像交叉核对；513100 当天基准来自 RPC，2026-09-24 检查时镜像仅覆盖至 09-17。冻结行情文件、原始参数及来源随测试保留；基准更新必须记录原因，不能仅为使测试通过而修改预期。
+
+### 通用比对项目
+
 | 接口类型 | 对比方式 | 典型断言 |
 | --- | --- | --- |
 | 原始日线/分钟线 | 与 JQData/MiniQMT 数值对账 | OHLC 在价格容忍度内，volume/money 单位一致 |
