@@ -1416,13 +1416,27 @@ class JQDataProvider(DataProvider):
         securities = [security] if isinstance(security, str) else list(security)
         if not securities:
             return data
-        decimals_map = {str(code): self._resolve_price_decimals(str(code)) for code in securities}
+        from ...core.futures_account import is_futures_security
+
+        def preserve_index_precision(code: str) -> bool:
+            # 合成指数没有可交易价位，保留来源精度用于信号计算。
+            symbol = str(code).split(".", 1)[0]
+            return (
+                symbol.endswith("8888")
+                and symbol[:-4].isalpha()
+                and is_futures_security(str(code))
+            )
+
+        decimals_map = {
+            str(code): None if preserve_index_precision(str(code)) else self._resolve_price_decimals(str(code))
+            for code in securities
+        }
         price_fields = {str(f) for f in self._PRICE_SCALE_FIELDS}
         result_df = data.copy()
         cols = result_df.columns
         if isinstance(cols, pd.MultiIndex):
             for field, code in cols:
-                if str(field) in price_fields:
+                if str(field) in price_fields and not preserve_index_precision(str(code)):
                     dec = decimals_map.get(str(code), 2)
                     try:
                         result_df[(field, code)] = result_df[(field, code)].round(dec)
@@ -1431,6 +1445,8 @@ class JQDataProvider(DataProvider):
             return result_df
         if "code" in result_df.columns:
             for code, dec in decimals_map.items():
+                if dec is None:
+                    continue
                 mask = result_df["code"] == code
                 if not mask.any():
                     continue
@@ -1439,6 +1455,8 @@ class JQDataProvider(DataProvider):
                         result_df.loc[mask, field] = result_df.loc[mask, field].round(dec)
             return result_df
         dec = decimals_map.get(str(securities[0]), 2)
+        if dec is None:
+            return result_df
         for field in price_fields:
             if field in result_df.columns:
                 result_df[field] = result_df[field].round(dec)

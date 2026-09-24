@@ -446,6 +446,9 @@ class Trade:
         commission: 手续费
         tax: 印花税
         trade_id: 成交记录ID
+        action: 期货开平标记，旧记录为 None
+        side: 期货持仓方向，旧记录为 None
+        multiplier: 本次期货成交使用的实际合约乘数，旧记录为 None
     """
 
     order_id: str
@@ -456,6 +459,14 @@ class Trade:
     commission: float = 0.0
     tax: float = 0.0
     trade_id: str = ""
+    action: Optional[str] = None
+    side: Optional[str] = None
+    multiplier: Optional[float] = None
+    realized_pnl_gross: Optional[float] = None
+    realized_pnl_net: Optional[float] = None
+    allocated_entry_fees: Optional[float] = None
+    allocated_distributions: Optional[float] = None
+    pnl_basis_status: Optional[str] = None
 
 
 @dataclass

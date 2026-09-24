@@ -19,10 +19,11 @@ def test_attribute_history_daily_excludes_current_day(monkeypatch):
     monkeypatch.setattr(data_api, "_current_context", context, raising=False)
     monkeypatch.setattr(data_api, "get_price", _fake_get_price, raising=False)
 
-    data_api.attribute_history("000001.XSHE", 5, "1d", ["close"], skip_paused=True)
+    data_api.attribute_history("000001.XSHE", 5, "1d", ["close"])
 
     assert captured["frequency"] == "daily"
     assert captured["end_date"] == context.current_dt - timedelta(days=1)
+    assert captured["skip_paused"] is True
 
 
 @pytest.mark.unit
@@ -41,3 +42,20 @@ def test_attribute_history_minute_includes_current_minute(monkeypatch):
 
     assert captured["frequency"] == "minute"
     assert captured["end_date"] == context.current_dt + timedelta(minutes=1)
+
+
+@pytest.mark.unit
+def test_attribute_history_explicitly_keeps_paused_bars(monkeypatch):
+    captured = {}
+    context = SimpleNamespace(current_dt=datetime(2025, 9, 3, 10, 0, 0))
+
+    def _fake_get_price(**kwargs):
+        captured.update(kwargs)
+        return pd.DataFrame({"close": [1.0]})
+
+    monkeypatch.setattr(data_api, "_current_context", context, raising=False)
+    monkeypatch.setattr(data_api, "get_price", _fake_get_price, raising=False)
+
+    data_api.attribute_history("000001.XSHE", 5, "1d", ["close"], skip_paused=False)
+
+    assert captured["skip_paused"] is False

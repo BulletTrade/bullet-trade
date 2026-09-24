@@ -827,6 +827,9 @@ def test_target_value_order_sizes_before_futures_account_exists(monkeypatch) -> 
     price = 27000.0
     engine = _engine()
     assert engine.context.portfolio.futures_account is None
+    monkeypatch.setattr(engine, "_resolve_futures_daily_bar", lambda *args: (
+        {"volume": 100., "high": price * 1.1, "low": price * 0.9}, None,
+    ))
 
     monkeypatch.setattr(
         "bullet_trade.core.orders._trigger_order_processing", lambda *a, **k: None
@@ -862,3 +865,269 @@ def test_target_value_order_sizes_before_futures_account_exists(monkeypatch) -> 
     account = engine.context.portfolio.futures_account
     assert account is not None
     assert account.get_position(LH, "long").amount == 3
+
+
+def test_intraday_mark_moves_variation_into_portfolio_cash(monkeypatch) -> None:
+    """调度任务前按 bar 价重估：盯市进现金、保证金结转、组合现金与账本同步。
+
+    Args:
+        monkeypatch: pytest 夹具，用于把撮合基准价固定为可手算的值。
+
+    Returns:
+        None。
+    """
+
+    engine = _engine()
+    _fill(engine, _order(LH, 1, "long"), 1, 27000.0)
+    portfolio = engine.context.portfolio
+    cash_before = portfolio.available_cash
+    monkeypatch.setattr(engine, "_resolve_base_exec_price", lambda _s, _dt, _fq: 27300.0)
+
+    engine._mark_futures_intraday(datetime(2021, 4, 6, 9, 35))
+
+    account = portfolio.futures_account
+    # 盯市 (27300-27000)×16 = 4800 进现金，保证金追加 300×16×0.14 = 672
+    assert portfolio.available_cash == pytest.approx(cash_before + 4800.0 - 672.0)
+    assert account.cash == pytest.approx(portfolio.available_cash)
+    assert account.get_position(LH, "long").prev_settlement == pytest.approx(27300.0)
+    assert account.margin == pytest.approx(27300.0 * MULTIPLIER * MARGIN_RATE)
+    # 权益等于按新价估值：1000000 - 开仓手续费 + 4800
+    assert portfolio.total_value == pytest.approx(
+        CASH - 27000.0 * MULTIPLIER * 0.000023 + 4800.0, abs=0.01
+    )
+
+
+def test_intraday_mark_without_price_keeps_previous_basis(monkeypatch) -> None:
+    """取不到 bar 价时不做任何替代估值，账本与现金逐位不变。
+
+    Args:
+        monkeypatch: pytest 夹具，用于让基准价解析返回 None。
+
+    Returns:
+        None。
+    """
+
+    engine = _engine()
+    _fill(engine, _order(LH, 1, "long"), 1, 27000.0)
+    portfolio = engine.context.portfolio
+    cash_before = portfolio.available_cash
+    monkeypatch.setattr(engine, "_resolve_base_exec_price", lambda _s, _dt, _fq: None)
+
+    engine._mark_futures_intraday(datetime(2021, 4, 6, 9, 35))
+
+    assert portfolio.available_cash == pytest.approx(cash_before)
+    assert portfolio.futures_account.get_position(LH, "long").prev_settlement == pytest.approx(
+        27000.0
+    )
+
+
+def test_intraday_mark_is_noop_without_positions() -> None:
+    """无期货账本或无持仓时重估必须安全空转，不得建账本或改现金。
+
+    Args:
+        无。
+
+    Returns:
+        None。
+    """
+
+    engine = _engine()
+    assert engine.context.portfolio.futures_account is None
+    engine._mark_futures_intraday(datetime(2021, 4, 6, 9, 35))
+    assert engine.context.portfolio.futures_account is None
+    assert engine.context.portfolio.available_cash == pytest.approx(CASH)
+
+    _fill(engine, _order(LH, 1, "long"), 1, 27000.0)
+    engine.context.portfolio.futures_account.close(LH, "long", 1, 27000.0)
+    cash_before = engine.context.portfolio.available_cash
+    engine._mark_futures_intraday(datetime(2021, 4, 6, 9, 35))
+    assert engine.context.portfolio.available_cash == pytest.approx(cash_before)
+
+
+def _run_target_value_order(engine, monkeypatch, bar_volume, calls=None):
+    """在隔离行情下跑一张期货目标价值单，返回该订单。
+
+    Args:
+        engine: 回测引擎。
+        monkeypatch: pytest 夹具。
+        bar_volume: 合成日 K 的成交量，None 表示缺少撮合日 K。
+        calls: 可选列表，用于记录成交量解析是否被调用。
+
+    Returns:
+        Order: 撮合后的订单对象。
+    """
+
+    from bullet_trade.core.models import SecurityUnitData
+    from bullet_trade.core.orders import clear_order_queue, order_target_value
+
+    price = 27000.0
+
+    def _fake_bar_volume(_security, _dt):
+        if calls is not None:
+            calls.append(_security)
+        if bar_volume is None:
+            return None, "futures_daily_bar_missing"
+        return {"volume": bar_volume, "high": price * 1.1, "low": price * 0.9}, None
+
+    monkeypatch.setattr(
+        "bullet_trade.core.orders._trigger_order_processing", lambda *a, **k: None
+    )
+    monkeypatch.setattr("bullet_trade.core.engine.get_security_info", lambda _s: {})
+    monkeypatch.setattr(engine, "_resolve_base_exec_price", lambda _s, _dt, _fq: price)
+    monkeypatch.setattr(engine, "_apply_slippage_price", lambda p, _b, _s: p)
+    monkeypatch.setattr(engine, "_infer_security_category", lambda _s, info=None: "futures")
+    monkeypatch.setattr(engine, "_resolve_futures_daily_bar", _fake_bar_volume)
+    monkeypatch.setattr(
+        "bullet_trade.data.api.get_current_data",
+        lambda: {
+            LH: SecurityUnitData(
+                security=LH,
+                last_price=price,
+                high_limit=price * 1.1,
+                low_limit=price * 0.9,
+                paused=False,
+            )
+        },
+    )
+
+    clear_order_queue()
+    try:
+        created = order_target_value(LH, 200_000.0, side="long")
+        engine._process_orders(engine.context.current_dt)
+    finally:
+        clear_order_queue()
+    return created
+
+
+def test_zero_daily_volume_cancels_futures_order(monkeypatch) -> None:
+    """日成交量为 0 时整单取消：无成交记录、无手续费、持仓与现金不变。
+
+    Args:
+        monkeypatch: pytest 夹具。
+
+    Returns:
+        None。
+    """
+
+    engine = _engine()
+    order = _run_target_value_order(engine, monkeypatch, 0.0)
+
+    assert order.status == OrderStatus.canceled
+    assert order.extra["cancel_reason"] == "futures_daily_volume_zero"
+    assert order.extra["requested_amount"] == 3
+    assert engine.trades == []
+    assert engine.context.portfolio.futures_account.positions == {}
+    assert engine.context.portfolio.available_cash == pytest.approx(CASH)
+
+
+def test_insufficient_daily_volume_fills_partially_then_cancels(monkeypatch) -> None:
+    """成交量只够 2 手时应成交 2 手、剩余 1 手撤单，不留挂单。
+
+    Args:
+        monkeypatch: pytest 夹具。
+
+    Returns:
+        None。
+    """
+
+    engine = _engine()
+    order = _run_target_value_order(engine, monkeypatch, 2.0)
+
+    account = engine.context.portfolio.futures_account
+    assert order.filled == 2
+    assert order.status == OrderStatus.canceled
+    assert order.extra["cancel_reason"] == "insufficient_volume"
+    assert order.extra["requested_amount"] == 3
+    assert account.get_position(LH, "long").amount == 2
+    assert len(engine.trades) == 1
+    assert engine.trades[-1].amount == 2
+    # 手续费只按成交的 2 手计收
+    commission = 2 * 27000.0 * MULTIPLIER * 0.000023
+    assert engine.trades[-1].commission == pytest.approx(commission, abs=0.01)
+    assert engine.context.portfolio.available_cash == pytest.approx(
+        CASH - 2 * 27000.0 * MULTIPLIER * MARGIN_RATE - commission, abs=0.01
+    )
+
+
+def test_sufficient_daily_volume_behaves_as_before(monkeypatch) -> None:
+    """成交量充足时撮合结果与未加约束前逐位相同。
+
+    Args:
+        monkeypatch: pytest 夹具。
+
+    Returns:
+        None。
+    """
+
+    engine = _engine()
+    order = _run_target_value_order(engine, monkeypatch, 10.0)
+
+    assert order.status == OrderStatus.filled
+    assert order.filled == 3
+    assert "cancel_reason" not in order.extra
+    assert engine.context.portfolio.futures_account.get_position(LH, "long").amount == 3
+
+
+def test_missing_daily_bar_cancels_without_claiming_a_fill(monkeypatch) -> None:
+    """缺少撮合日 K 时明确撤单，不把未知成交量解释为不限量。"""
+    engine = _engine()
+    order = _run_target_value_order(engine, monkeypatch, None)
+    assert order.status == OrderStatus.canceled
+    assert order.filled == 0
+    assert order.extra["cancel_reason"] == "futures_daily_bar_missing"
+    assert not engine.trades
+    assert engine.context.portfolio.available_cash == CASH
+
+
+def test_tick_backtest_skips_bar_volume_cap(monkeypatch) -> None:
+    """tick 回放没有 bar 概念，快照里的量是当日累计，不得当作本笔可吃掉的量。
+
+    Args:
+        monkeypatch: pytest 夹具。
+
+    Returns:
+        None。
+    """
+
+    engine = _engine()
+    engine.frequency = "tick"
+    from bullet_trade.data.tick_replay import TickSnapshot
+
+    engine._tick_day = engine.context.current_dt.date()
+    engine._tick_snapshots[LH] = TickSnapshot(
+        code=LH, datetime=engine.context.current_dt, time=20210406093000.,
+        current=27000., high=27000., low=27000., volume=0., money=0.,
+        position=0., a1_p=27000., a1_v=0., b1_p=27000., b1_v=0.,
+    )
+    calls: list = []
+    order = _run_target_value_order(engine, monkeypatch, 0.0, calls=calls)
+
+    assert calls == []
+    assert order.status == OrderStatus.filled
+    assert order.filled == 3
+
+
+def test_internal_daily_bar_does_not_disable_strategy_future_guard(monkeypatch) -> None:
+    """撮合读取完整日 K 后，策略查询仍受回放时钟限制。"""
+    import pandas as pd
+    import bullet_trade.data.api as data_api
+    from bullet_trade.core.exceptions import FutureDataError
+
+    engine = _engine()
+    data_api.set_current_context(engine.context)
+    set_option("avoid_future_data", True)
+    def fetch(**kwargs):
+        assert data_api._should_avoid_future() is False
+        return pd.DataFrame({"volume": [12.], "high": [28000.], "low": [26000.]},
+                            index=pd.to_datetime(["2021-04-06"]))
+    monkeypatch.setattr("bullet_trade.core.engine.api_get_price", fetch)
+    try:
+        bar, reason = engine._resolve_futures_daily_bar(LH, engine.context.current_dt)
+        assert bar == {"volume": 12., "high": 28000., "low": 26000.}
+        assert reason is None
+        assert data_api._should_avoid_future() is True
+        with pytest.raises(FutureDataError):
+            data_api.get_price(LH, end_date=engine.context.current_dt, frequency="daily",
+                               fields=["volume", "high", "low"], count=1)
+    finally:
+        data_api.set_current_context(None)

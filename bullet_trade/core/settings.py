@@ -6,7 +6,7 @@
 
 from dataclasses import dataclass
 from datetime import date as Date
-from typing import Optional, Dict, Any, Iterable, List, Sequence, Union
+from typing import Optional, Dict, Any, Iterable, List, Sequence, Set, Union
 
 
 @dataclass
@@ -181,6 +181,9 @@ class StrategySettings:
     def __init__(self):
         self.benchmark: Optional[str] = None  # 基准
         self.order_cost: Dict[str, OrderCost] = _default_order_costs()  # 不同类型的交易费用
+        self.explicit_order_cost_types: Set[str] = set()
+        self.order_cost_sequence: Dict[str, int] = {}
+        self._order_cost_sequence_counter = 0
         self.slippage: Optional[FixedSlippage] = None  # 滑点
         self.slippage_map: Dict[str, Any] = {}  # 兼容聚宽的新滑点配置
         self.order_cost_overrides: Dict[str, OrderCost] = {}  # 代码级费用覆盖
@@ -198,6 +201,9 @@ class StrategySettings:
         """重置所有设置"""
         self.benchmark = None
         self.order_cost = _default_order_costs()
+        self.explicit_order_cost_types = set()
+        self.order_cost_sequence = {}
+        self._order_cost_sequence_counter = 0
         self.slippage = None
         self.slippage_map = {}
         self.order_cost_overrides = {}
@@ -235,10 +241,14 @@ def set_order_cost(order_cost: OrderCost, type: str = 'stock', ref: Optional[str
         type: 交易类型（'stock', 'fund', 'futures'等）
         ref: 代码级覆盖（如 '601318.XSHG'）
     """
+    _settings._order_cost_sequence_counter += 1
+    key = f'{type}_{ref}' if ref else type
+    _settings.order_cost_sequence[key] = _settings._order_cost_sequence_counter
     if ref:
         _settings.order_cost_overrides[f'{type}_{ref}'] = order_cost
     else:
         _settings.order_cost[type] = order_cost
+        _settings.explicit_order_cost_types.add(type)
 
 
 def set_commission(per_trade: PerTrade):
@@ -331,8 +341,14 @@ def set_option(key: str, value: Any):
             - 'order_match_mode': 下单撮合模式（'bar_end'|'immediate'）
             - 'match_by_signal': 限价资金检查使用信号价(True)或撮合价(False)
             - 'fq_ref_date': 前复权参考日期（datetime.date）
+            - 'equity_cash_budget': 现金证券买入预算，'fees_included' 含费或 'notional' 仅本金
+            - 'equity_cash_decimals': 现金证券结算精度，2 按分舍入或 None 保留原始精度
         value: 选项值
     """
+    if key == 'equity_cash_budget' and value not in ('fees_included', 'notional'):
+        raise ValueError("equity_cash_budget 必须为 'fees_included' 或 'notional'")
+    if key == 'equity_cash_decimals' and value is not None and (type(value) is not int or value != 2):
+        raise ValueError("equity_cash_decimals 必须为 2 或 None")
     _settings.options[key] = value
 
 

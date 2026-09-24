@@ -36,7 +36,7 @@ from bullet_trade.core import api as core_api
 from bullet_trade.core.async_engine import AsyncBacktestEngine
 from bullet_trade.core.engine import BacktestEngine
 from bullet_trade.core.models import Context, Order, OrderStatus, Portfolio
-from bullet_trade.core.scheduler import unschedule_all
+from bullet_trade.core.scheduler import run_daily, unschedule_all
 from bullet_trade.data.tick_replay import TickDataMissingError, TickDayStream
 
 CODE_A = "LH2109.XDCE"
@@ -79,7 +79,7 @@ def _stamps(day: date, seconds_offsets, base_price: float = 17000.0):
 
 
 @pytest.fixture(autouse=True)
-def _clean_scheduler():
+def _clean_scheduler(monkeypatch):
     """每个用例前后清空全局调度任务，避免相互串扰。
 
     Args:
@@ -90,6 +90,7 @@ def _clean_scheduler():
     """
 
     unschedule_all()
+    monkeypatch.setattr("bullet_trade.core.engine.api_get_price", lambda **kwargs: pd.DataFrame())
     yield
     unschedule_all()
 
@@ -186,6 +187,67 @@ def test_handle_tick_receives_every_tick_in_stable_source_order(monkeypatch):
 
     # 同时间戳保持源内先后：200.0 在 250.0 之前
     assert prices == [100.0, 200.0, 250.0, 300.0]
+
+
+def test_scheduled_task_runs_once_with_multiple_ticks_at_same_time(monkeypatch):
+    """一个定时事件与多笔同刻行情相遇时，任务只运行一次。"""
+    engine = _engine()
+    events = []
+    run_daily(lambda context: events.append("scheduled"), time="09:00")
+    engine.handle_tick_func = lambda context, tick: events.append(tick.code)
+    _patch_loader(
+        monkeypatch,
+        {
+            CODE_A: _stream(CODE_A, _stamps(DAY, [0, 0])),
+            CODE_B: _stream(CODE_B, _stamps(DAY, [0])),
+        },
+    )
+    engine.register_backtest_tick_subscription(CODE_A)
+    engine.register_backtest_tick_subscription(CODE_B)
+
+    engine._run_trading_day(TRADE_DAY, MARKET_PERIODS)
+
+    assert events == ["scheduled", CODE_A, CODE_A, CODE_B]
+
+
+def test_close_event_observes_last_ticks_from_all_subscriptions(monkeypatch):
+    """收盘定时任务与盘后回调都必须观察到同刻最后一笔行情。"""
+    engine = _engine()
+    events = []
+
+    def observe_close(context):
+        events.append(
+            (
+                "scheduled_close",
+                core_api.get_current_tick(CODE_A).current,
+                core_api.get_current_tick(CODE_B).current,
+            )
+        )
+
+    run_daily(observe_close, time="15:00")
+    engine.handle_tick_func = lambda context, tick: events.append((tick.code, tick.current))
+    engine.after_trading_end_func = lambda context: events.append(("after",))
+    _patch_loader(
+        monkeypatch,
+        {
+            CODE_A: _stream(CODE_A, [(20210608150000.0, 200.0)]),
+            CODE_B: _stream(
+                CODE_B, [(20210608150000.0, 300.0), (20210608150000.0, 301.0)]
+            ),
+        },
+    )
+    engine.register_backtest_tick_subscription(CODE_A)
+    engine.register_backtest_tick_subscription(CODE_B)
+
+    engine._run_trading_day(TRADE_DAY, MARKET_PERIODS)
+
+    assert events == [
+        (CODE_A, 200.0),
+        (CODE_B, 300.0),
+        (CODE_B, 301.0),
+        ("scheduled_close", 200.0, 301.0),
+        ("after",),
+    ]
 
 
 def test_merged_timeline_interleaves_two_subscribed_codes(monkeypatch):
@@ -349,6 +411,298 @@ def test_get_current_tick_returns_none_for_unsubscribed_code(monkeypatch):
     engine._run_trading_day(TRADE_DAY, MARKET_PERIODS)
 
     assert seen == [None]
+
+
+def test_current_data_uses_each_published_tick_without_provider_calls(monkeypatch):
+    """当前行情跟随同刻多笔快照更新，盘前及未订阅标的不得用 bar 补价。"""
+    from bullet_trade.core.settings import set_option
+    from bullet_trade.data import api as data_api
+
+    engine = _engine()
+    set_option("avoid_future_data", True)
+    observations = []
+    containers = []
+    provider_calls = []
+
+    def reject_provider():
+        provider_calls.append(True)
+        raise AssertionError("回放当前行情不得访问数据源")
+
+    monkeypatch.setattr(data_api, "_get_default_provider", reject_provider)
+
+    def before(context):
+        data = data_api.get_current_data()
+        containers.append(data)
+        observations.append(("before", data[CODE_A].last_price, CODE_A in data))
+
+    def handle_tick(context, tick):
+        data = containers[0]
+        quote = data[CODE_A]
+        observations.append(
+            (quote.last_price, quote.source, quote.source_time, data[CODE_B].last_price)
+        )
+
+    engine.before_trading_start_func = before
+    engine.handle_tick_func = handle_tick
+    _patch_loader(
+        monkeypatch,
+        {CODE_A: _stream(CODE_A, [(20210608090001.0, 110.0), (20210608090001.0, 115.0)])},
+    )
+    engine.register_backtest_tick_subscription(CODE_A)
+
+    engine._run_trading_day(TRADE_DAY, MARKET_PERIODS)
+
+    tick_dt = datetime(2021, 6, 8, 9, 0, 1)
+    assert observations == [
+        ("before", 0.0, False),
+        (110.0, "tick_replay", tick_dt, 0.0),
+        (115.0, "tick_replay", tick_dt, 0.0),
+    ]
+    assert provider_calls == []
+
+
+def test_current_data_hides_snapshots_outside_current_day_and_clock(monkeypatch):
+    """缓存的过日或未到达快照不能在当前行情里变成可成交价格。"""
+    from bullet_trade.core.runtime import set_current_engine
+    from bullet_trade.data import api as data_api
+
+    monkeypatch.setattr(
+        data_api, "_get_default_provider", lambda: pytest.fail("回放当前行情不得访问数据源")
+    )
+    engine = _engine()
+    engine.context.current_dt = datetime(2021, 6, 8, 9, 0)
+    set_current_engine(engine)
+    data_api.set_current_context(engine.context)
+    quote = _stream(CODE_A, [(20210608090001.0, 110.0)]).advance()
+    engine._tick_snapshots[CODE_A] = quote
+    data = data_api.get_current_data()
+
+    assert data[CODE_A].last_price == 0.0
+    assert CODE_A not in data
+    engine.context.current_dt = datetime(2021, 6, 8, 9, 0, 1)
+    assert data[CODE_A].last_price == 110.0
+    engine.context.current_dt = datetime(2021, 6, 9, 9, 0)
+    assert data[CODE_A].last_price == 0.0
+
+
+def test_day_open_is_prefetched_before_ticks_and_revealed_with_first_snapshot(monkeypatch):
+    """真实日开盘价单独预取，首笔行情价与日开盘价不同也不得混用。"""
+    from bullet_trade.core.settings import set_option
+    from bullet_trade.data import api as data_api
+
+    engine = _engine()
+    set_option("avoid_future_data", True)
+    calls = []
+    observations = []
+
+    def daily_open(**kwargs):
+        calls.append((engine._tick_delivery_started, kwargs))
+        return pd.DataFrame({"open": [105.0]}, index=pd.to_datetime([DAY]))
+
+    def before(context):
+        core_api.subscribe(CODE_A, "tick")
+        with pytest.raises(TickDataMissingError, match="day_open"):
+            data_api.get_current_data()[CODE_A].day_open
+        observations.append("before_open_hidden")
+
+    def handle_tick(context, tick):
+        quote = data_api.get_current_data()[CODE_A]
+        observations.append((quote.last_price, quote.day_open))
+
+    monkeypatch.setattr("bullet_trade.core.engine.api_get_price", daily_open)
+    engine.before_trading_start_func = before
+    engine.handle_tick_func = handle_tick
+    _patch_loader(
+        monkeypatch,
+        {CODE_A: _stream(CODE_A, [(20210608090001.0, 110.0), (20210608090002.0, 115.0)])},
+    )
+
+    engine._run_trading_day(TRADE_DAY, MARKET_PERIODS)
+
+    assert observations == ["before_open_hidden", (110.0, 105.0), (115.0, 105.0)]
+    assert calls == [
+        (
+            False,
+            {
+                "security": CODE_A,
+                "start_date": DAY,
+                "end_date": DAY,
+                "frequency": "daily",
+                "fields": ["open"],
+                "fq": "none",
+            },
+        )
+    ]
+    assert data_api._should_avoid_future() is True
+
+
+@pytest.mark.parametrize("cached_before_ticks", [False, True])
+def test_intraday_subscription_never_fetches_day_open_from_upstream(monkeypatch, cached_before_ticks):
+    """投递开始后只能复用已预取开盘价，缺失时显式失败而不查询日线。"""
+    from bullet_trade.data import api as data_api
+
+    engine = _engine()
+    queries = []
+    observed = []
+
+    def daily_open(**kwargs):
+        queries.append(kwargs["security"])
+        return pd.DataFrame({"open": [105.0]}, index=pd.to_datetime([DAY]))
+
+    def handle_tick(context, tick):
+        if tick.code == CODE_A:
+            core_api.subscribe(CODE_B, "tick")
+        else:
+            observed.append(data_api.get_current_data()[CODE_B].day_open)
+
+    monkeypatch.setattr("bullet_trade.core.engine.api_get_price", daily_open)
+    engine.handle_tick_func = handle_tick
+    engine.register_backtest_tick_subscription(CODE_A)
+    if cached_before_ticks:
+        engine.register_backtest_tick_subscription(CODE_B)
+        engine.before_trading_start_func = lambda context: core_api.unsubscribe(CODE_B, "tick")
+    _patch_loader(
+        monkeypatch,
+        {
+            CODE_A: _stream(CODE_A, [(20210608090001.0, 110.0)]),
+            CODE_B: _stream(CODE_B, [(20210608090002.0, 115.0)]),
+        },
+    )
+
+    if cached_before_ticks:
+        engine._run_trading_day(TRADE_DAY, MARKET_PERIODS)
+        assert observed == [105.0]
+        assert queries == [CODE_A, CODE_B]
+    else:
+        with pytest.raises(TickDataMissingError, match="day_open"):
+            engine._run_trading_day(TRADE_DAY, MARKET_PERIODS)
+        assert observed == []
+        assert queries == [CODE_A]
+
+
+def test_missing_day_open_in_scheduled_callback_aborts_replay(monkeypatch):
+    """定时回调读取缺失元数据必须让回放失败，不能只写日志后继续。"""
+    from bullet_trade.data import api as data_api
+
+    engine = _engine()
+    run_daily(lambda context: data_api.get_current_data()[CODE_A].day_open, time="09:01")
+    _patch_loader(monkeypatch, {CODE_A: _stream(CODE_A, [(20210608090001.0, 110.0)])})
+    engine.register_backtest_tick_subscription(CODE_A)
+
+    with pytest.raises(TickDataMissingError, match="day_open"):
+        engine._run_trading_day(TRADE_DAY, MARKET_PERIODS)
+
+
+def test_tick_order_can_fill_without_reading_unavailable_day_open(monkeypatch):
+    """不依赖日开盘价的订单仍可按有效 tick 成交，撮合不能隐式读取缺失字段。"""
+    from bullet_trade.core.orders import order as place_order
+    from bullet_trade.data import api as data_api
+
+    stock = "000001.XSHE"
+    engine = _engine()
+    engine._update_current_time(datetime(2021, 6, 8, 9), None)
+    engine._tick_day = DAY
+    engine._tick_snapshots[stock] = _stream(stock, [(20210608090000.0, 100.0)]).advance()
+    monkeypatch.setattr(
+        "bullet_trade.core.orders._trigger_order_processing", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr("bullet_trade.core.engine.get_security_info", lambda _security: {})
+    monkeypatch.setattr(engine, "_apply_slippage_price", lambda price, *args: price)
+    monkeypatch.setattr(engine, "_infer_security_category", lambda *args, **kwargs: "stock")
+    monkeypatch.setattr(engine, "_infer_tplus_from_info", lambda info: 0)
+    monkeypatch.setattr(
+        data_api, "_get_default_provider", lambda: pytest.fail("撮合不得用数据源补价")
+    )
+
+    placed = place_order(stock, 100)
+    engine._process_orders(engine.context.current_dt)
+
+    assert placed.status == OrderStatus.filled
+    assert placed.price == 100.0
+    with pytest.raises(TickDataMissingError, match="day_open"):
+        data_api.get_current_data()[stock].day_open
+
+
+def test_tick_callback_observes_current_futures_equity(monkeypatch):
+    """无定时任务的逐笔回调也应先更新权益，并保留今仓数量。"""
+    from bullet_trade.core.futures_account import ContractSpecTable, FuturesAccount
+
+    engine = _engine()
+    account = FuturesAccount(
+        cash=CASH,
+        spec_table=ContractSpecTable(margin_rate=0.14, load_config=False, enable_remote=False),
+    )
+    position = account.open(CODE_A, "long", 1, 100.0, trade_time=TRADE_DAY)
+    engine.context.portfolio.futures_account = account
+    engine.context.portfolio.available_cash = account.cash
+    engine.context.portfolio.update_value()
+    observations = []
+
+    def reject_bar(*args, **kwargs):
+        raise AssertionError("逐笔估值不得访问 bar")
+
+    monkeypatch.setattr(engine, "_resolve_base_exec_price", reject_bar)
+    engine.handle_tick_func = lambda context, tick: observations.append(
+        (context.portfolio.total_value, position.last_price, position.today_amount)
+    )
+    _patch_loader(monkeypatch, {CODE_A: _stream(CODE_A, [(20210608090001.0, 110.0)])})
+    engine.register_backtest_tick_subscription(CODE_A)
+
+    engine._run_trading_day(TRADE_DAY, MARKET_PERIODS)
+
+    assert observations == [(pytest.approx(CASH + 160.0), 110.0, 1)]
+
+
+def test_first_tick_applies_dated_margin_rate_without_settling_price_changes(monkeypatch):
+    """费率生效首笔行情补冻保证金，后续价格变化只影响权益且不重设结算价。"""
+    from bullet_trade.core.contract_specs import FuturesSpecConfig, MarginRateRule
+    from bullet_trade.core.futures_account import ContractSpecTable, FuturesAccount
+
+    config = FuturesSpecConfig(
+        margin_rules={
+            "LH": MarginRateRule(product="LH", rate=0.10, effective=((DAY, 0.20),)),
+        },
+    )
+    account = FuturesAccount(
+        cash=CASH,
+        spec_table=ContractSpecTable(config=config, load_config=False, enable_remote=False),
+    )
+    previous_day = DAY - timedelta(days=1)
+    position = account.open(
+        CODE_A, "long", 1, 27000.0, trade_time=TRADE_DAY - timedelta(days=1)
+    )
+    account.settle_day({CODE_A: 27000.0}, day=previous_day)
+    engine = _engine()
+    engine.context.portfolio.futures_account = account
+    engine.context.portfolio.available_cash = account.cash
+    engine.context.portfolio.update_value()
+    observations = []
+
+    def handle_tick(context, tick):
+        observations.append(
+            (
+                context.portfolio.available_cash,
+                account.margin,
+                context.portfolio.total_value,
+                position.prev_settlement,
+                position.margin_rate,
+                position.today_amount,
+            )
+        )
+
+    engine.handle_tick_func = handle_tick
+    _patch_loader(
+        monkeypatch,
+        {CODE_A: _stream(CODE_A, [(20210608090001.0, 27000.0), (20210608090002.0, 28000.0)])},
+    )
+    engine.register_backtest_tick_subscription(CODE_A)
+
+    engine._run_trading_day(TRADE_DAY, MARKET_PERIODS)
+
+    assert observations == [
+        (pytest.approx(CASH - 86400.0), 86400.0, CASH, 27000.0, 0.20, 0),
+        (pytest.approx(CASH - 86400.0), 86400.0, CASH + 16000.0, 27000.0, 0.20, 0),
+    ]
 
 
 def test_tick_query_cannot_reach_past_replay_clock(monkeypatch):
@@ -626,12 +980,17 @@ def test_market_order_protect_price_follows_tick_basis(monkeypatch):
 
     clear_order_queue()
     try:
+        engine.context.current_dt = TRADE_DAY + timedelta(hours=9)
+        engine._tick_snapshots[stock] = _stream(
+            stock, [(20210608090000.0, bar_price)]
+        ).advance()
         buy_order = place_order(stock, 100)
         engine._process_orders(engine.context.current_dt)
         assert buy_order.status == OrderStatus.filled
         engine.context.portfolio.positions[stock].closeable_amount = 100
         clear_order_queue()
 
+        engine.context.current_dt = TRADE_DAY + timedelta(hours=9, minutes=30)
         engine._tick_snapshots[stock] = TickSnapshot(
             code=stock,
             datetime=TRADE_DAY + timedelta(hours=9, minutes=30),

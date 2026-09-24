@@ -23,5 +23,8 @@ class UserError(Exception):
     pass
 
 
-__all__ = ['FutureDataError', 'UserError']
+class BacktestDataError(RuntimeError):
+    """严格回放所需行情不可用，当前运行不得继续撮合。"""
 
+
+__all__ = ['FutureDataError', 'UserError', 'BacktestDataError']

@@ -18,6 +18,7 @@ from bullet_trade.core.futures_account import (
     futures_product,
     is_futures_security,
 )
+from bullet_trade.core.contract_specs import FuturesSpecConfig, MarginRateRule
 
 LH = "LH2109.XDCE"
 CASH = 1_000_000.0
@@ -158,6 +159,21 @@ def test_partial_close_keeps_average_price():
     assert position.open_price == pytest.approx(27000.0)
 
 
+@pytest.mark.parametrize("side, execution_price", [("long", 1007.0), ("short", 1013.0)])
+def test_partial_close_slippage_does_not_reprice_remaining_lots(side, execution_price):
+    account = make_account()
+    account.open(LH, side, 4, 1000.0)
+    account.mark_to_market({LH: 1010.0})
+    equity_before = account.total_value
+
+    account.close(LH, side, 1, execution_price, commission=2.0)
+
+    position = account.get_position(LH, side)
+    assert position.amount == 3
+    assert position.last_price == pytest.approx(1010.0)
+    assert account.total_value == pytest.approx(equity_before - 3.0 * MULTIPLIER - 2.0)
+
+
 def test_over_close_rejected():
     account = make_account()
     account.open(LH, "long", 1, 27000.0)
@@ -275,3 +291,250 @@ def test_summary_snapshot_fields():
     assert snapshot["floating_pnl"] == pytest.approx(0.0)
     assert snapshot["total_value"] == pytest.approx(CASH - 9.94)
     assert snapshot["position_count"] == 1.0
+
+
+def test_intraday_mark_moves_variation_into_cash():
+    account = make_account()
+    account.open(LH, "long", 1, 27000.0)
+    # 单手保证金 60480，盯市前权益 = 939520 + 60480 = 1000000
+    result = account.mark_to_market({LH: 27300.0})
+    # 盯市 = (27300-27000)×16 = 4800；保证金结转到 27300 需追加 (300)×16×0.14 = 672
+    assert result.variation_margin == pytest.approx(4800.0)
+    assert result.margin == pytest.approx(61152.0)
+    assert result.missing_price == ()
+    assert account.cash == pytest.approx(CASH - 60480.0 + 4800.0 - 672.0)
+    position = account.get_position(LH, "long")
+    assert position.prev_settlement == pytest.approx(27300.0)
+    assert position.margin_held == pytest.approx(61152.0)
+    # 盯市基准结转到重估价后，权益里的浮动项归零（已进现金）；
+    # 相对开仓均价的展示口径浮盈仍保留
+    assert account.mark_to_market_pnl == pytest.approx(0.0)
+    assert account.floating_pnl == pytest.approx(4800.0)
+    # 权益与只更新最新价、不搬现金的 mark_prices 口径相同：1000000 + 4800
+    assert account.total_value == pytest.approx(CASH + 4800.0)
+
+
+def test_intraday_mark_short_direction_sign():
+    account = make_account()
+    account.open(LH, "short", 1, 27000.0)
+    result = account.mark_to_market({LH: 26700.0})
+    # 空头盯市 = (26700-27000)×16×(-1) = 4800；保证金结转释放 300×16×0.14 = 672
+    assert result.variation_margin == pytest.approx(4800.0)
+    assert result.margin == pytest.approx(59808.0)
+    assert account.cash == pytest.approx(CASH - 60480.0 + 4800.0 + 672.0)
+    assert account.total_value == pytest.approx(CASH + 4800.0)
+
+
+def test_intraday_mark_without_price_keeps_previous_basis():
+    account = make_account()
+    account.open(LH, "long", 1, 27000.0)
+    cash_before = account.cash
+    result = account.mark_to_market({})
+    assert result.missing_price == (LH,)
+    assert result.variation_margin == pytest.approx(0.0)
+    assert account.cash == pytest.approx(cash_before)
+    assert account.get_position(LH, "long").prev_settlement == pytest.approx(27000.0)
+
+
+def test_intraday_mark_keeps_today_lots():
+    """盘中重估不是日切，当日开仓手数必须保留，否则当天平仓会被按平昨计费。"""
+
+    account = make_account()
+    account.open(LH, "long", 2, 27000.0)
+    account.mark_to_market({LH: 27300.0})
+    position = account.get_position(LH, "long")
+    assert position.today_amount == 2
+    assert position.yesterday_amount == 0
+    # 只有日终结算才结转今昨仓
+    account.settle_day({LH: 27300.0}, day=dt.date(2021, 4, 1))
+    assert position.today_amount == 0
+    assert position.yesterday_amount == 2
+
+
+def test_intraday_mark_is_additive_with_settlement():
+    """盯市变动对区间可加：盘中重估不得改变日终的结算基准与现金净变动。"""
+
+    def build(with_mark: bool) -> FuturesAccount:
+        account = make_account()
+        account.open(LH, "long", 1, 27000.0)
+        account.settle_day({LH: 27300.0}, day=dt.date(2021, 4, 1))
+        account.on_day_start()
+        if with_mark:
+            # (27500-27300)×16 = 3200 进现金，保证金追加 200×16×0.14 = 448
+            account.mark_to_market({LH: 27500.0})
+            assert account.cash == pytest.approx(943648.0 + 3200.0 - 448.0)
+        account.settle_day({LH: 27600.0}, day=dt.date(2021, 4, 2))
+        return account
+
+    marked, plain = build(True), build(False)
+    assert marked.cash == pytest.approx(plain.cash)
+    assert marked.margin == pytest.approx(plain.margin)
+    assert marked.total_value == pytest.approx(plain.total_value)
+    assert marked.get_position(LH, "long").prev_settlement == pytest.approx(
+        plain.get_position(LH, "long").prev_settlement
+    )
+    # 27300 → 27600 共 (300)×16 = 4800 盯市，与是否盘中重估无关
+    assert marked.cash == pytest.approx(943648.0 + 4800.0 - 672.0)
+
+
+def test_intraday_mark_is_additive_with_close():
+    """盘中重估后平仓，现金与已实现盈亏应与不重估路径逐值相同。"""
+
+    def build(with_mark: bool) -> FuturesAccount:
+        account = make_account()
+        account.open(LH, "long", 1, 27000.0)
+        account.settle_day({LH: 27300.0}, day=dt.date(2021, 4, 1))
+        if with_mark:
+            account.mark_to_market({LH: 27500.0})
+        account.close(LH, "long", 1, 27600.0)
+        return account
+
+    marked, plain = build(True), build(False)
+    # 已实现盈亏始终相对开仓均价 = (27600-27000)×16
+    assert marked.realized_pnl == pytest.approx(9600.0)
+    assert marked.cash == pytest.approx(plain.cash)
+    assert marked.cash == pytest.approx(943648.0 + 61152.0 + 4800.0)
+    assert marked.positions == {}
+
+
+@pytest.mark.parametrize("side", ["long", "short"])
+def test_default_partial_close_preserves_today_lots_for_next_close(side):
+    account = make_account()
+    account.open(LH, side, 1, 27000.0)
+    account.settle_day({LH: 27000.0}, day=dt.date(2021, 4, 1))
+    account.open(LH, side, 1, 27000.0)
+
+    account.close(LH, side, 1, 27000.0, commission=9.94)
+    position = account.get_position(LH, side)
+    assert position.amount == 1
+    assert position.today_amount == 1
+    assert position.yesterday_amount == 0
+
+    account.close(LH, side, 1, 27000.0, commission=993.60, close_today=True)
+    assert account.positions == {}
+    assert account.commission_paid == pytest.approx(1003.54)
+    assert account.cash == pytest.approx(CASH - 1003.54)
+    assert account.realized_pnl == pytest.approx(0.0)
+
+
+@pytest.mark.parametrize("side", ["long", "short"])
+def test_explicit_today_lots_controls_successive_partial_closes(side):
+    account = make_account()
+    account.open(LH, side, 2, 27000.0)
+    account.settle_day({LH: 27000.0}, day=dt.date(2021, 4, 1))
+    account.open(LH, side, 2, 27000.0)
+
+    account.close(LH, side, 1, 27000.0, today_lots=1)
+    position = account.get_position(LH, side)
+    assert (position.today_amount, position.yesterday_amount) == (1, 2)
+    account.close(LH, side, 2, 27000.0, today_lots=1)
+    assert (position.today_amount, position.yesterday_amount) == (0, 1)
+    account.close(LH, side, 1, 27000.0, today_lots=0)
+    assert account.positions == {}
+    assert account.cash == pytest.approx(CASH)
+
+
+@pytest.mark.parametrize(
+    "lots,today_lots,close_today,error",
+    [
+        (1, -1, False, ValueError),
+        (1, 2, False, ValueError),
+        (1, 0.5, False, ValueError),
+        (1, 0, True, ValueError),
+        (2, 2, False, OverCloseError),
+        (2, 0, False, OverCloseError),
+    ],
+)
+def test_invalid_close_allocation_does_not_change_account(lots, today_lots, close_today, error):
+    account = make_account()
+    account.open(LH, "long", 1, 27000.0)
+    account.settle_day({LH: 27000.0}, day=dt.date(2021, 4, 1))
+    account.open(LH, "long", 1, 27000.0)
+    position = account.get_position(LH, "long")
+    before_summary = account.summary()
+    before_position = vars(position).copy()
+
+    with pytest.raises(error):
+        account.close(
+            LH, "long", lots, 28000.0, commission=20.0,
+            today_lots=today_lots, close_today=close_today,
+        )
+
+    assert account.summary() == before_summary
+    assert vars(position) == before_position
+
+
+def make_dated_margin_account():
+    config = FuturesSpecConfig(
+        margin_rules={
+            "LH": MarginRateRule(
+                product="LH",
+                rate=0.10,
+                effective=(
+                    (dt.date(2021, 4, 2), 0.20),
+                    (dt.date(2021, 4, 5), 0.05),
+                ),
+            ),
+        },
+    )
+    return FuturesAccount(
+        cash=CASH,
+        spec_table=ContractSpecTable(config=config, load_config=False),
+    )
+
+
+@pytest.mark.parametrize("method", ["settle_day", "mark_to_market"])
+def test_dated_margin_rate_updates_existing_long_and_short_positions(method):
+    account = make_dated_margin_account()
+    for side in ("long", "short"):
+        account.open(LH, side, 1, 27000.0, trade_time=dt.datetime(2021, 4, 1, 10))
+    assert account.margin == pytest.approx(86400.0)
+    revalue = getattr(account, method)
+
+    revalue({LH: 27000.0}, day=dt.date(2021, 4, 2))
+    assert account.margin == pytest.approx(172800.0)
+    assert account.cash == pytest.approx(CASH - 172800.0)
+    assert account.total_value == pytest.approx(CASH)
+    for position in account.iter_positions():
+        assert position.margin_rate == pytest.approx(0.20)
+        assert position.today_amount == (1 if method == "mark_to_market" else 0)
+
+    revalue({LH: 27000.0}, day=dt.date(2021, 4, 5))
+    assert account.margin == pytest.approx(43200.0)
+    assert account.cash == pytest.approx(CASH - 43200.0)
+    assert account.total_value == pytest.approx(CASH)
+    for position in account.iter_positions():
+        assert position.margin_rate == pytest.approx(0.05)
+
+    account.close(LH, "long", 1, 27000.0)
+    account.close(LH, "short", 1, 27000.0)
+    assert account.cash == pytest.approx(CASH)
+
+
+@pytest.mark.parametrize("method", ["settle_day", "mark_to_market"])
+def test_dated_margin_missing_price_keeps_position_and_cash(method):
+    account = make_dated_margin_account()
+    position = account.open(LH, "long", 1, 27000.0, trade_time=dt.datetime(2021, 4, 1, 10))
+    before_cash = account.cash
+    before_position = vars(position).copy()
+
+    result = getattr(account, method)({}, day=dt.date(2021, 4, 2))
+
+    missing_field = "missing_settlement" if method == "settle_day" else "missing_price"
+    assert getattr(result, missing_field) == (LH,)
+    assert account.cash == before_cash
+    assert vars(position) == before_position
+
+
+@pytest.mark.parametrize("method", ["settle_day", "mark_to_market"])
+def test_revaluation_without_day_keeps_effective_margin_rate(method):
+    account = make_dated_margin_account()
+    position = account.open(LH, "long", 1, 27000.0, trade_time=dt.datetime(2021, 4, 2, 10))
+    before_cash = account.cash
+
+    getattr(account, method)({LH: 27000.0})
+
+    assert position.margin_rate == pytest.approx(0.20)
+    assert account.margin == pytest.approx(86400.0)
+    assert account.cash == before_cash
+    assert account.total_value == pytest.approx(CASH)

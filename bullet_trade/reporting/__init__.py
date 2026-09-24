@@ -275,7 +275,7 @@ def _build_chart_images(df: pd.DataFrame, meta: Optional[Dict[str, Any]] = None)
 
     charts["equity"] = _figure_to_data_url(_build_equity_figure(df, meta or {}))
     charts["excess"] = _figure_to_data_url(_build_excess_figure(df, meta or {}))
-    charts["drawdown"] = _figure_to_data_url(_build_drawdown_figure(df))
+    charts["drawdown"] = _figure_to_data_url(_build_drawdown_figure(df, meta or {}))
     charts["monthly_heatmap"] = _figure_to_data_url(_build_monthly_heatmap_figure(df))
     return charts
 
@@ -331,9 +331,10 @@ def _build_excess_figure(df: pd.DataFrame, meta: Dict[str, Any]):
     return fig
 
 
-def _build_drawdown_figure(df: pd.DataFrame):
+def _build_drawdown_figure(df: pd.DataFrame, meta: Optional[Dict[str, Any]] = None):
     fig, ax = plt.subplots(figsize=(10, 4))
-    cummax = df["total_value"].cummax()
+    initial_value = core_analysis._initial_equity_value(df, (meta or {}).get("initial_total_value"))
+    cummax = df["total_value"].cummax().clip(lower=initial_value)
     drawdown = (df["total_value"] - cummax) / cummax * 100
     ax.fill_between(df.index, drawdown, 0, color="#d62728", alpha=0.3)
     ax.plot(df.index, drawdown, color="#d62728", linewidth=2)

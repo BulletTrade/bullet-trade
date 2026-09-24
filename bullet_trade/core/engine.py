@@ -6,6 +6,7 @@
 
 import importlib.util
 import inspect as _inspect
+import math
 import re
 import sys
 import time
@@ -26,7 +27,7 @@ import pandas as pd
 # except Exception:
 jq = None
 
-from ..core.exceptions import FutureDataError
+from ..core.exceptions import BacktestDataError, FutureDataError
 from ..data.api import get_data_provider
 from ..data.api import get_extras as _data_api_get_extras
 from ..data.api import get_price as _data_api_get_price
@@ -177,6 +178,7 @@ class BacktestEngine:
         handle_tick: Optional[Callable] = None,
         process_initialize: Optional[Callable] = None,
         data_session_config: Optional[Dict[str, Any]] = None,
+        strict_data: bool = False,
     ):
         """
         初始化回测引擎
@@ -200,6 +202,7 @@ class BacktestEngine:
             handle_tick: tick 频率下每笔快照调用的函数
             process_initialize: 实盘初始化函数
             data_session_config: 回测数据会话配置，仅用于回测内的临时性能优化
+            strict_data: 历史读取故障或必需持仓价格缺失时终止回放，默认保留宽松行为
         """
         self.strategy_file = strategy_file
         self.start_date = pd.to_datetime(start_date) if start_date else None
@@ -231,6 +234,7 @@ class BacktestEngine:
         self.initial_positions = initial_positions or None
         self.algorithm_id = algorithm_id
         self.data_session_config = data_session_config or None
+        self.strict_data = bool(strict_data)
         # 新增：收益计算基准（首次总资产）
         self.start_total_value: Optional[float] = None
         # 新增：回测运行耗时（秒）
@@ -251,6 +255,8 @@ class BacktestEngine:
         # 保证金率由 set_option('futures_margin_rate') 与 set_option('futures_margin_rate.<品种>') 提供
         self._futures_spec_table = ContractSpecTable(enable_remote=True)
         self._futures_cost_warned = False
+        self._futures_daily_bars: Dict[Tuple[str, date], Dict[str, float]] = {}
+        self._futures_tick_margin_days: Set[Tuple[str, str, date]] = set()
 
         # tick 回放状态：订阅集合、当日事件流、最新快照
         self.handle_tick_func: Optional[Callable] = handle_tick
@@ -258,6 +264,8 @@ class BacktestEngine:
         self._tick_streams: Dict[str, TickDayStream] = {}
         self._tick_snapshots: Dict[str, TickSnapshot] = {}
         self._tick_day: Optional[date] = None
+        self._tick_day_open_prices: Dict[str, float] = {}
+        self._tick_delivery_started = False
 
     @staticmethod
     def _amount_from_value(value: float, price: float) -> int:
@@ -796,6 +804,7 @@ class BacktestEngine:
             ),
             current_dt=self.start_date,
         )
+        self.context._strict_backtest_data = self.strict_data
 
         # 设置当前上下文（用于数据API）
         set_current_context(self.context)
@@ -991,6 +1000,7 @@ class BacktestEngine:
             except Exception as ex:
                 log.warning(f"期货日终结算失败: {ex}")
 
+            self._raise_if_backtest_data_error()
             # 记录每日数据（使用最新的收盘价与持仓市值）
             self._record_daily()
 
@@ -1118,6 +1128,8 @@ class BacktestEngine:
         """执行单个交易日的调度与撮合流程。"""
         if not market_periods:
             raise ValueError("交易时段配置不能为空")
+        self.context._strict_backtest_data = self.strict_data
+        self._raise_if_backtest_data_error()
 
         resolver = lambda _ref=None: market_periods
         schedule_map = generate_daily_schedule(
@@ -1179,6 +1191,7 @@ class BacktestEngine:
         """
 
         self._update_current_time(current_dt, state.previous_event_dt)
+        self._raise_if_backtest_data_error()
         state.previous_event_dt = current_dt
 
         if not state.dividends_applied:
@@ -1187,26 +1200,50 @@ class BacktestEngine:
             except Exception as e:
                 log.warning(f"盘前分红处理失败: {e}")
             state.dividends_applied = True
+            self._raise_if_backtest_data_error()
 
-        tasks = schedule_map.get(current_dt, [])
+        # 调度与逐笔行情是不同事件，同刻行情不能再次触发已运行的任务。
+        tasks = schedule_map.get(current_dt, []) if tick_snapshot is None else []
+        has_callback = bool(tasks) or (
+            tick_snapshot is None
+            and (
+                (current_dt == open_dt and self.handle_data_func)
+                or (current_dt == close_dt and self.after_trading_end_func)
+            )
+        )
+        if has_callback and current_dt >= open_dt and not self.is_tick_backtest():
+            self._mark_non_futures_intraday(current_dt)
+        if tasks or tick_snapshot is not None:
+            # 策略读取权益之前，先反映当前已发布的行情。
+            try:
+                self._mark_futures_intraday(current_dt, tick_snapshot)
+            except Exception as exc:
+                log.warning(f"期货盘中重估失败: {exc}")
+            self._raise_if_backtest_data_error()
         for task in tasks:
             try:
                 log.debug(f"执行定时任务: {task.func.__name__}")
                 task.func(self.context)
+            except (TickDataMissingError, BacktestDataError):
+                raise
             except Exception as e:
                 log.error(f"定时任务执行失败 {task.func.__name__}: {e}")
                 import traceback
 
                 log.error(traceback.format_exc())
+            self._raise_if_backtest_data_error()
 
         if current_dt == pre_open_dt and tick_snapshot is None and self.before_trading_start_func:
             try:
                 self.before_trading_start_func(self.context)
+            except (TickDataMissingError, BacktestDataError):
+                raise
             except Exception as e:
                 log.error(f"盘前函数执行失败: {e}")
                 import traceback
 
                 log.error(traceback.format_exc())
+            self._raise_if_backtest_data_error()
 
         # 首笔 tick 可能正好落在开盘时刻，开盘回调只在调度时刻执行一次
         if current_dt == open_dt and tick_snapshot is None and self.handle_data_func:
@@ -1215,33 +1252,79 @@ class BacktestEngine:
 
                 data = get_current_data()
                 self.handle_data_func(self.context, data)
+            except (TickDataMissingError, BacktestDataError):
+                raise
             except Exception as e:
                 log.error(f"交易函数执行失败: {e}")
                 import traceback
 
                 log.error(traceback.format_exc())
+            self._raise_if_backtest_data_error()
 
         if tick_snapshot is not None and self.handle_tick_func:
             try:
                 self.handle_tick_func(self.context, tick_snapshot)
+            except (TickDataMissingError, BacktestDataError):
+                raise
             except Exception as e:
                 log.error(f"逐笔函数执行失败: {e}")
                 import traceback
 
                 log.error(traceback.format_exc())
+            self._raise_if_backtest_data_error()
 
         # tick 事件自带成交时点，不依赖分钟级交易时段判定
         if tick_snapshot is not None or self._is_trading_time(current_dt, market_periods):
+            self._raise_if_backtest_data_error()
             self._process_orders(current_dt)
 
         if current_dt == close_dt and tick_snapshot is None and self.after_trading_end_func:
             try:
                 self.after_trading_end_func(self.context)
+            except (TickDataMissingError, BacktestDataError):
+                raise
             except Exception as e:
                 log.error(f"盘后函数执行失败: {e}")
                 import traceback
 
                 log.error(traceback.format_exc())
+            self._raise_if_backtest_data_error()
+
+    def _raise_if_backtest_data_error(self) -> None:
+        """即使策略捕获了取数异常，也不得让已失效的回放继续成交。"""
+        error = getattr(self.context, "_backtest_data_error", None)
+        if error is not None:
+            raise error
+
+    def _fail_required_price(self, security: str, current_dt: datetime) -> None:
+        """严格模式保留首个必需价格故障；宽松模式继续沿用原有估值。"""
+        if not self.strict_data:
+            return
+        error = BacktestDataError(
+            f"Required position price unavailable: security={security}, time={current_dt}"
+        )
+        if getattr(self.context, "_backtest_data_error", None) is None:
+            self.context._backtest_data_error = error
+        self._raise_if_backtest_data_error()
+
+    def _mark_non_futures_intraday(self, current_dt: datetime) -> None:
+        """用已可见的成交价格口径重估现金证券，盘中不读取当日收盘价。"""
+        portfolio = self.context.portfolio
+        updates = {}
+        for security, position in portfolio.positions.items():
+            if is_futures_security(security) or position.total_amount <= 0:
+                continue
+            price = self._resolve_base_exec_price(security, current_dt, "none")
+            self._raise_if_backtest_data_error()
+            if price is None or not math.isfinite(price) or price <= 0:
+                self._fail_required_price(security, current_dt)
+                continue
+            price = self._normalize_split_day_close_price(security, price)
+            updates[security] = price
+        # 完整收齐本次估值后再写入，避免缺一只价格时留下半更新的组合。
+        for security, price in updates.items():
+            portfolio.positions[security].update_price(price)
+        portfolio.update_value()
 
     def is_tick_backtest(self) -> bool:
         """返回当前回测是否以 tick 频率运行。
@@ -1292,7 +1375,9 @@ class BacktestEngine:
         while index < len(timeline):
             next_point = timeline[index]
             tick_code, tick_dt = self._peek_next_tick()
-            if tick_dt is not None and tick_dt < next_point:
+            if tick_dt is not None and (
+                tick_dt < next_point or tick_dt == next_point == close_dt
+            ):
                 self._consume_tick_event(tick_code, anchors=anchors, state=state)
                 continue
             self._execute_time_point(next_point, state=state, **anchors)
@@ -1329,6 +1414,7 @@ class BacktestEngine:
         snapshot = stream.advance()
         if snapshot is None:
             return
+        self._tick_delivery_started = True
         self._tick_snapshots[tick_code] = snapshot
         self._execute_time_point(snapshot.datetime, state=state, tick_snapshot=snapshot, **anchors)
         self._sync_tick_subscriptions(state.trade_day.date(), snapshot.datetime)
@@ -1348,6 +1434,8 @@ class BacktestEngine:
         self._tick_day = day
         self._tick_streams.clear()
         self._tick_snapshots.clear()
+        self._tick_day_open_prices.clear()
+        self._tick_delivery_started = False
         for code in sorted(self._tick_subscriptions):
             self._load_tick_stream(code, day)
 
@@ -1384,7 +1472,49 @@ class BacktestEngine:
         if cutoff_dt is not None:
             stream.skip_until_dt(cutoff_dt)
         self._tick_streams[code] = stream
+        if code not in self._tick_day_open_prices and not self._tick_delivery_started:
+            self._prefetch_tick_day_open(code, day)
         return stream
+
+    def _prefetch_tick_day_open(self, code: str, day: date) -> None:
+        """首笔投递前预取真实日开盘价；不读取当日收盘等尚未形成的字段。"""
+
+        try:
+            with internal_replay_prefetch():
+                frame = api_get_price(
+                    security=code,
+                    start_date=day,
+                    end_date=day,
+                    frequency="daily",
+                    fields=["open"],
+                    fq="none",
+                )
+            if not isinstance(frame, pd.DataFrame) or frame.empty:
+                return
+            stamps = pd.to_datetime(
+                frame["time"] if "time" in frame.columns else frame.index,
+                errors="coerce",
+            )
+            rows = frame.loc[np.asarray(pd.DatetimeIndex(stamps).date == day)]
+            if rows.empty:
+                return
+            row = rows.iloc[-1]
+            for column in (("open", code), (code, "open"), "open"):
+                if column not in row.index:
+                    continue
+                price = self._positive_price_or_none(row[column])
+                if price is not None:
+                    self._tick_day_open_prices[code] = price
+                    return
+        except Exception as exc:
+            log.warning(f"{code} 在 {day.isoformat()} 的日开盘价预取失败: {exc}")
+
+    def get_tick_day_open(self, security: str) -> Optional[float]:
+        """返回已预取的当日开盘价；缺失时由策略行情读取明确报错。"""
+
+        if self._tick_day != self.context.current_dt.date():
+            return None
+        return self._tick_day_open_prices.get(security)
 
     def _sync_tick_subscriptions(self, day: date, current_dt: datetime) -> None:
         """让订阅变更在回放时钟生效时点立即起效。
@@ -1590,6 +1720,34 @@ class BacktestEngine:
             category = "futures"
         settings = get_settings()
         type_hint = str(info.get("type") or category).lower()
+        if category in ("fund", "money_market_fund"):
+            subtype = str(info.get("subtype") or "").lower()
+            if subtype in ("mmf", "money"):
+                subtype = "money_market_fund"
+            types = []
+            if category == "money_market_fund":
+                types.append(category)
+            types.extend(kind for kind in (subtype, type_hint) if kind and kind != "fund")
+            types.append("fund")
+            types = list(dict.fromkeys(types))
+
+            def configured_keys(kind, security_ref=None):
+                # 同义名称只参与回测选择，持久化键保持调用者原有拼写。
+                aliases = ("money_market_fund", "mmf", "money") if kind in (
+                    "money_market_fund", "mmf", "money"
+                ) else (kind,)
+                keys = [f"{alias}_{security_ref}" if security_ref else alias for alias in aliases]
+                return sorted(keys, key=lambda key: settings.order_cost_sequence.get(key, 0), reverse=True)
+
+            for kind in types:
+                for key in configured_keys(kind, security):
+                    override = settings.order_cost_overrides.get(key)
+                    if override is not None:
+                        return override
+            for kind in types:
+                for key in configured_keys(kind):
+                    if key in settings.explicit_order_cost_types:
+                        return settings.order_cost[key]
         order_cost = settings.order_cost_overrides.get(f"{category}_{security}")
         if not order_cost:
             order_cost = settings.order_cost_overrides.get(f"{type_hint}_{security}")
@@ -1764,6 +1922,11 @@ class BacktestEngine:
     def _round_half_up(value: float, decimals: int) -> float:
         q = Decimal(10) ** -decimals
         return float(Decimal(str(value)).quantize(q, rounding=ROUND_HALF_UP))
+
+    def _round_equity_cash(self, value: float) -> float:
+        """按现金证券结算精度处理费用、扣款、回款及分派。"""
+        decimals = get_settings().options.get("equity_cash_decimals", 2)
+        return float(value) if decimals is None else self._round_half_up(value, decimals)
 
     def _round_to_tick(
         self, price: float, security: str, *, is_buy: Optional[bool] = None
@@ -2017,7 +2180,7 @@ class BacktestEngine:
         use_pre = bool(split_ratio and abs(split_ratio - 1.0) > 1e-9)
         amount_for_dividend = pre_event_amount if use_pre else pos.total_amount
         cash_in = (amount_for_dividend / base_lot) * net_bonus if base_lot else 0.0
-        cash_in = self._round_half_up(cash_in, 2)
+        cash_in = self._round_equity_cash(cash_in)
         if cash_in <= 0:
             return
 
@@ -2128,6 +2291,7 @@ class BacktestEngine:
                     fq=fq_mode,
                 )
                 if not dfp.empty:
+                    self._assert_price_row_visible(dfp, security, current_dt, daily=True)
                     rowp = dfp.iloc[-1]
                     return self._positive_price_or_none(rowp.get("open"))
             elif t and (Time(9, 31) <= t < Time(15, 0)):
@@ -2140,6 +2304,7 @@ class BacktestEngine:
                     fq=fq_mode,
                 )
                 if not dfp.empty:
+                    self._assert_price_row_visible(dfp, security, current_dt, daily=False)
                     rowp = dfp.iloc[-1]
                     return self._positive_price_or_none(rowp.get("close"))
             else:
@@ -2152,11 +2317,107 @@ class BacktestEngine:
                     fq=fq_mode,
                 )
                 if not dfp.empty:
+                    self._assert_price_row_visible(dfp, security, current_dt, daily=True)
                     rowp = dfp.iloc[-1]
                     return self._positive_price_or_none(rowp.get("close"))
         except Exception:
             return None
         return None
+
+    def _assert_price_row_visible(
+        self, frame: pd.DataFrame, security: str, current_dt: datetime, *, daily: bool
+    ) -> None:
+        """严格模式核对返回行时间；日开盘字段按交易日期判断可见性。"""
+        if not self.strict_data or frame.empty:
+            return
+        source_time = None
+        if "time" in frame.columns:
+            source_time = pd.to_datetime(frame.iloc[-1]["time"])
+        elif isinstance(frame.index, pd.DatetimeIndex):
+            source_time = frame.index[-1]
+        if source_time is None or pd.isna(source_time):
+            return
+        now = pd.Timestamp(current_dt)
+        source_time = pd.Timestamp(source_time)
+        if daily:
+            future = source_time.date() > now.date()
+        else:
+            if source_time.tzinfo is not None and now.tzinfo is None:
+                now = now.tz_localize(source_time.tzinfo)
+            elif source_time.tzinfo is None and now.tzinfo is not None:
+                source_time = source_time.tz_localize(now.tzinfo)
+            future = source_time > now
+        if future:
+            error = BacktestDataError(
+                f"Future price row: security={security}, source_time={source_time}, time={current_dt}"
+            )
+            if getattr(self.context, "_backtest_data_error", None) is None:
+                self.context._backtest_data_error = error
+            self._raise_if_backtest_data_error()
+
+    def _resolve_futures_daily_bar(
+        self, security: str, current_dt: datetime
+    ) -> Tuple[Optional[Dict[str, float]], Optional[str]]:
+        """读取市价撮合专用日 K，不写入策略可见的当前行情。
+
+        日成交量为每张市价单的独立上限。日期、价格区间或成交量无法
+        验证时返回明确原因；有效日 K 按合约和日期缓存在引擎内。
+        """
+
+        day = current_dt.date()
+        key = (security, day)
+        if key in self._futures_daily_bars:
+            return self._futures_daily_bars[key], None
+        try:
+            with internal_replay_prefetch():
+                frame = api_get_price(
+                    security=security,
+                    start_date=day,
+                    end_date=day,
+                    frequency="daily",
+                    fields=["volume", "high", "low"],
+                    fq="none",
+                )
+        except BacktestDataError:
+            raise
+        except Exception as exc:
+            log.debug(f"{security} 撮合日 K 取数失败: {exc}")
+            return None, "futures_daily_bar_unavailable"
+        if not isinstance(frame, pd.DataFrame) or frame.empty:
+            return None, "futures_daily_bar_missing"
+        try:
+            if isinstance(frame.columns, pd.MultiIndex):
+                columns = [(field, security) for field in ("volume", "high", "low")]
+                if not all(column in frame.columns for column in columns):
+                    return None, "futures_daily_bar_invalid"
+                frame = frame.loc[:, columns].copy()
+                frame.columns = [column[0] for column in columns]
+            elif "code" in frame.columns:
+                frame = frame.loc[frame["code"] == security]
+            if frame.empty:
+                return None, "futures_daily_bar_missing"
+            stamp_values = (
+                frame["time"] if "time" in frame.columns else
+                frame["date"] if "date" in frame.columns else frame.index
+            )
+            stamps = pd.DatetimeIndex(pd.to_datetime(stamp_values, errors="coerce"))
+            frame = frame.loc[np.asarray(stamps.date == day)]
+            if frame.empty:
+                return None, "futures_daily_bar_date_mismatch"
+            if len(frame) != 1:
+                return None, "futures_daily_bar_invalid"
+            bar = {field: float(frame.iloc[0][field]) for field in ("volume", "high", "low")}
+            if (
+                not all(np.isfinite(value) for value in bar.values())
+                or bar["volume"] < 0
+                or bar["low"] <= 0
+                or bar["high"] < bar["low"]
+            ):
+                return None, "futures_daily_bar_invalid"
+        except (KeyError, TypeError, ValueError, OverflowError):
+            return None, "futures_daily_bar_invalid"
+        self._futures_daily_bars[key] = bar
+        return bar, None
 
     def _load_corporate_actions(
         self, code: str, start_date: datetime.date, end_date: datetime.date
@@ -2413,7 +2674,7 @@ class BacktestEngine:
             today_lots: 平仓中按平今费率计费的手数，开仓传 0。
 
         Returns:
-            float: 四舍五入到分并满足最低佣金的手续费。
+            float: 按配置计算并满足最低佣金的原始金额；展示层决定小数位。
         """
 
         if action == "open":
@@ -2424,9 +2685,8 @@ class BacktestEngine:
                 yesterday_lots * cost_config.close_commission
                 + today_lots * cost_config.close_today_commission
             )
-        commission = self._round_half_up(commission, 2)
         if cost_config.min_commission > 0:
-            commission = max(commission, self._round_half_up(cost_config.min_commission, 2))
+            commission = max(commission, cost_config.min_commission)
         return commission
 
     @staticmethod
@@ -2611,6 +2871,7 @@ class BacktestEngine:
                     commission=commission,
                     trade_time=current_dt,
                     close_today=bool(order.close_today),
+                    today_lots=today_lots,
                 )
             except (OverCloseError, ContractSpecError) as exc:
                 log.warning(f"{security} 平仓失败，订单拒绝: {exc}")
@@ -2631,6 +2892,9 @@ class BacktestEngine:
                 commission=commission,
                 tax=0.0,
                 trade_id=f"T{self._trade_seq:08d}",
+                action=action,
+                side=side,
+                multiplier=multiplier,
             )
         )
 
@@ -2682,6 +2946,71 @@ class BacktestEngine:
             except Exception as exc:
                 log.debug(f"{position.security} 期货收盘价标记失败: {exc}")
         account.mark_prices(prices)
+
+    def _mark_futures_intraday(
+        self, current_dt: datetime, tick_snapshot: Optional[TickSnapshot] = None
+    ) -> None:
+        """派发调度任务前把期货持仓重估到当前时刻的价格。
+
+        期货是逐日盯市的，盘中持仓浮盈浮亏会实时改变可用资金。若不在调度任务前重估，
+        按权益比例下单的策略拿到的是上一收盘口径的权益，预算会系统性偏小。
+        重估只结转保证金计收基准，不做日切，因此不改变当日已实现盈亏与平今平昨判定。
+
+        Args:
+            current_dt: 当前回放时刻。
+            tick_snapshot: 当前 tick 快照；非 tick 事件时为 None。
+
+        Returns:
+            None: 结果写入账本持仓与组合现金。
+        """
+
+        portfolio = self.context.portfolio
+        account = getattr(portfolio, "futures_account", None)
+        if account is None or not account.positions:
+            return
+        prices: Dict[str, float] = {}
+        for position in account.iter_positions():
+            price: Optional[float] = None
+            if self.is_tick_backtest():
+                snapshot = self.get_current_tick_snapshot(position.security)
+                if snapshot is not None:
+                    price = self._positive_price_or_none(snapshot.current)
+            else:
+                price = self._resolve_base_exec_price(position.security, current_dt, "none")
+            if price is not None:
+                prices[position.security] = price
+        if not prices:
+            return
+        account.cash = portfolio.available_cash
+        if tick_snapshot is not None:
+            # 每笔行情只刷新估值，保留结算基准和现金，避免反复现金结转的尾差。
+            for position in account.iter_positions():
+                key = (position.security, position.side, current_dt.date())
+                if position.security not in prices or key in self._futures_tick_margin_days:
+                    continue
+                rate = account.spec_table.margin_rate(position.security, current_dt.date())
+                if rate != position.margin_rate:
+                    # 日期费率变化仍须即时补退保证金；以已有基准换算，不结转浮盈。
+                    required = position.margin_held * rate / position.margin_rate
+                    account.cash -= required - position.margin_held
+                    position.margin_held = required
+                    position.margin_rate = rate
+                self._futures_tick_margin_days.add(key)
+            account.mark_prices(prices)
+            portfolio.available_cash = account.cash
+            portfolio.update_value()
+            return
+        result = account.mark_to_market(prices, day=current_dt.date())
+        portfolio.available_cash = account.cash
+        portfolio.update_value()
+        if result.missing_price:
+            log.debug(
+                f"盘中重估缺价，保持上一基准: {', '.join(result.missing_price)}"
+            )
+        log.debug(
+            f"期货盘中重估: 盯市 {result.variation_margin:.2f}, "
+            f"重估后保证金 {result.margin:.2f}"
+        )
 
     @staticmethod
     def _extract_single_close(df: pd.DataFrame, security: str) -> Optional[float]:
@@ -2813,6 +3142,7 @@ class BacktestEngine:
 
     def _process_orders(self, current_dt: datetime):
         """处理订单队列"""
+        self._raise_if_backtest_data_error()
         orders = get_order_queue()
         if not orders:
             return
@@ -2828,17 +3158,24 @@ class BacktestEngine:
 
         # 目标类订单预处理：若同一标的存在目标订单，取消其之前未完成订单，避免重复与超额
         try:
-            last_target_index: Dict[str, int] = {}
+            last_target_index: Dict[Tuple[str, str], int] = {}
+            def target_key(queued_order):
+                side = (
+                    str(getattr(queued_order, "side", LONG) or LONG)
+                    if is_futures_security(queued_order.security) else LONG
+                )
+                return queued_order.security, side
             for idx, o in enumerate(orders):
                 is_target = (
                     hasattr(o, "_is_target_amount") and getattr(o, "_is_target_amount")
                 ) or (hasattr(o, "_is_target_value") and getattr(o, "_is_target_value"))
                 if is_target:
-                    last_target_index[o.security] = idx
+                    last_target_index[target_key(o)] = idx
             if last_target_index:
                 new_orders = []
                 for idx, o in enumerate(orders):
-                    if o.security in last_target_index and idx < last_target_index[o.security]:
+                    key = target_key(o)
+                    if key in last_target_index and idx < last_target_index[key]:
                         # 取消旧订单
                         if o.status == OrderStatus.open:
                             o.status = OrderStatus.canceled
@@ -2859,6 +3196,13 @@ class BacktestEngine:
                     if self.is_tick_backtest()
                     else None
                 )
+                if self.is_tick_backtest() and tick_snapshot is None:
+                    order.status = OrderStatus.rejected
+                    if not isinstance(order.extra, dict):
+                        order.extra = {}
+                    order.extra["rejection_reason"] = "tick_snapshot_unavailable"
+                    log.warning(f"{order.security} 尚无可见回放快照，订单拒绝")
+                    continue
                 # 获取当前价格
                 if order.security in current_data:
                     security_data = current_data[order.security]
@@ -2879,7 +3223,7 @@ class BacktestEngine:
                     log.warning(f"无法获取 {order.security} 的行情数据")
                     order.status = OrderStatus.rejected
                     continue
-                if tick_snapshot is not None:
+                if tick_snapshot is not None and security_data.source != "tick_replay":
                     # 撮合基准已强制取当前 tick，市价单保护价也必须同源，
                     # 否则 bar 价与 tick 价的差距会让市价单被误判越界而取消
                     security_data = replace(
@@ -2955,6 +3299,41 @@ class BacktestEngine:
                         order.status = OrderStatus.rejected
                         continue
                     is_buy = (futures_action == "open") == (futures_side == LONG)
+                    # 目标单的意图由持仓差额确定，后续即使未成交也需保留。
+                    order.action = futures_action
+                    order.side = futures_side
+                    order.is_buy = is_buy
+
+                # Bar 行情没有委托簿，触及单边涨跌停时不能假定市价单有对手盘。
+                # Tick 回放按可见盘口撮合；期货使用自己的成交量检查。
+                if not is_futures_order and tick_snapshot is None:
+                    boundary = getattr(
+                        security_data, "high_limit" if is_buy else "low_limit", None
+                    )
+                    try:
+                        boundary = float(boundary)
+                    except (TypeError, ValueError):
+                        boundary = 0.0
+                    if math.isfinite(boundary) and boundary > 0:
+                        boundary = self._round_to_tick(boundary, order.security)
+                        at_limit = (
+                            current_price >= boundary - 1e-9
+                            if is_buy
+                            else current_price <= boundary + 1e-9
+                        )
+                        if at_limit:
+                            if not isinstance(order.extra, dict):
+                                order.extra = {}
+                            order.amount = amount
+                            order.extra["cancel_reason"] = (
+                                "price_at_upper_limit" if is_buy else "price_at_lower_limit"
+                            )
+                            order.status = OrderStatus.canceled
+                            log.info(
+                                f"{order.security} 当前价 {current_price:.3f} "
+                                f"触及单边涨跌停价 {boundary:.3f}，订单未成交"
+                            )
+                            continue
 
                 # 根据证券分类确定价格精度：stock=2位小数，fund/money_market_fund=3位小数
                 price_decimals = 2 if security_category == "stock" else 3
@@ -2974,7 +3353,9 @@ class BacktestEngine:
                     price_label = "保护价"
                     if style_obj.limit_price is not None:
                         limit_price = float(style_obj.limit_price)
-                    else:
+                    elif is_futures_order or (
+                        style_obj.buy_price_percent if is_buy else style_obj.sell_price_percent
+                    ) is not None:
                         try:
                             percent = pricing.resolve_market_percent(
                                 style_obj,
@@ -3059,8 +3440,56 @@ class BacktestEngine:
                     log.debug(f"{order.security} 成交价边界裁剪失败: {exc}")
                 trade_price = self._round_to_tick(trade_price, order.security, is_buy=None)
 
+                self._raise_if_backtest_data_error()
                 if is_futures_order:
                     # 期货不走 A股一手取整/印花税/可卖持仓口径，单独撮合
+                    requested_lots = intended_amount
+                    # 日 K 量价检查仅用于非 tick 市价单；限价单仍沿用上方
+                    # 当前价穿价判断，尚未实现挂起订单的逐 bar 成交量模型。
+                    bar_volume = None
+                    if not self.is_tick_backtest() and (
+                        style_obj is None or style_obj == OrderStyle.market
+                        or isinstance(style_obj, MarketOrderStyle)
+                    ):
+                        daily_bar, cancel_reason = self._resolve_futures_daily_bar(
+                            order.security, current_dt
+                        )
+                        if daily_bar is not None:
+                            bar_volume = daily_bar["volume"]
+                            if bar_volume == 0:
+                                cancel_reason = "futures_daily_volume_zero"
+                            elif not daily_bar["low"] <= current_price <= daily_bar["high"]:
+                                cancel_reason = "futures_price_outside_daily_range"
+                        if cancel_reason is not None:
+                            if not isinstance(getattr(order, "extra", None), dict):
+                                order.extra = {}
+                            order.extra["requested_amount"] = requested_lots
+                            order.extra["cancel_reason"] = cancel_reason
+                            order.status = OrderStatus.canceled
+                            log.warning(
+                                f"{order.security} {current_dt.date()} 市价单未成交: "
+                                f"{cancel_reason}，委托 {requested_lots} 手取消"
+                            )
+                            continue
+                    if bar_volume is not None and requested_lots > bar_volume:
+                        intended_amount = int(bar_volume)
+                        if not isinstance(getattr(order, "extra", None), dict):
+                            order.extra = {}
+                        order.extra["requested_amount"] = requested_lots
+                        order.extra["cancel_reason"] = "insufficient_volume"
+                        if intended_amount <= 0:
+                            log.warning(
+                                f"{order.security} 日成交量上限为 {bar_volume:.0f} 手，"
+                                f"无法成交 {requested_lots} 手，订单取消"
+                            )
+                            order.status = OrderStatus.canceled
+                            continue
+                        log.warning(
+                            f"{order.security} 日成交量上限为 {bar_volume:.0f} 手，"
+                            f"委托 {requested_lots} 手未完全成交，剩余 "
+                            f"{requested_lots - intended_amount} 手取消"
+                        )
+                    self._raise_if_backtest_data_error()
                     self._execute_futures_fill(
                         order=order,
                         lots=intended_amount,
@@ -3073,6 +3502,12 @@ class BacktestEngine:
                         ),
                         current_dt=current_dt,
                     )
+                    if (
+                        order.filled < requested_lots
+                        and order.status == OrderStatus.filled
+                    ):
+                        # 成交部分照实记录，未成交部分按撤单收尾，不留挂单
+                        order.status = OrderStatus.canceled
                     continue
 
                 # 买入前资金检查：按“可下单量上限”缩量 + 一手取整 + 最小申报量
@@ -3108,22 +3543,36 @@ class BacktestEngine:
                     close_tax_rate = 0.001
                     min_commission = 5.0
 
+                cash_budget = settings.options.get("equity_cash_budget", "fees_included")
+                order.extra["equity_cash_budget"] = cash_budget
+                order.extra["equity_cash_decimals"] = settings.options.get("equity_cash_decimals", 2)
+
+                def buy_cash_required(quantity, price):
+                    notional = quantity * price
+                    if cash_budget == "notional":
+                        return self._round_equity_cash(notional)
+                    fee = self._round_equity_cash(max(notional * open_comm_rate, min_commission))
+                    tax_amount = self._round_equity_cash(notional * open_tax_rate)
+                    return self._round_equity_cash(notional + fee + tax_amount)
+
                 if is_buy:
-                    # 买入：计算可下单量上限，考虑最小佣金与锁定资金
+                    # 按实际结算规则搜索可负担整手，最低佣金不与比例佣金重复预留。
                     available_for_buy = max(
                         0.0,
                         self.context.portfolio.available_cash - self.context.portfolio.locked_cash,
                     )
-                    effective_cash = max(0.0, available_for_buy - min_commission)
-                    denom = fund_check_price * (1.0 + open_comm_rate + open_tax_rate)
-                    aval_amount = int(effective_cash // denom) if denom > 0 else 0
-                    if aval_amount <= 0:
-                        log.warning(f"{order.security} 资金不足，最小费用后可用现金为 {effective_cash:.2f}")
-                        order.status = OrderStatus.rejected
-                        continue
-                    if aval_amount < final_amount:
-                        log.info(f"{order.security} 缩量至可下单上限: {aval_amount}")
-                        final_amount = aval_amount
+                    low_lots, high_lots = 0, final_amount // min_trade_size
+                    while low_lots < high_lots:
+                        middle_lots = (low_lots + high_lots + 1) // 2
+                        required = buy_cash_required(middle_lots * min_trade_size, fund_check_price)
+                        if required <= available_for_buy + 1e-9:
+                            low_lots = middle_lots
+                        else:
+                            high_lots = middle_lots - 1
+                    affordable_amount = low_lots * min_trade_size
+                    if affordable_amount < final_amount:
+                        log.info(f"{order.security} 缩量至可下单上限: {affordable_amount}")
+                        final_amount = affordable_amount
                 else:
                     # 卖出：缩量为可卖出数量
                     pos = self.context.portfolio.positions.get(order.security)
@@ -3145,8 +3594,8 @@ class BacktestEngine:
                         order.status = OrderStatus.canceled
                         continue
                 else:
-                    # 如果剩余的股数超过一手，但卖出订单不足一手，则取消卖出订单（如果剩余股数不足一手，则允许碎股卖出）
-                    if pos.closeable_amount >= min_trade_size:
+                    # 全部可卖持仓可一次处理尾数；部分减仓仍按整手申报。
+                    if final_amount < pos.closeable_amount:
                         final_amount = (final_amount // min_trade_size) * min_trade_size
                         if final_amount < min_trade_size:
                             log.debug(
@@ -3155,8 +3604,7 @@ class BacktestEngine:
                             order.status = OrderStatus.canceled
                             continue
                     else:
-                        log.debug(f"{order.security} 可卖持仓 {final_amount} 不足一手，允许碎股卖出")
-                        final_amount = final_amount
+                        log.debug(f"{order.security} 一次卖出全部可卖持仓 {final_amount}")
 
                 trade_amount = final_amount
                 trade_value = trade_price * trade_amount
@@ -3168,17 +3616,17 @@ class BacktestEngine:
                 else:
                     commission = max(trade_value * close_comm_rate, min_commission)
                     tax = trade_value * close_tax_rate
-                # 金额类按“分”四舍五入
-                commission = self._round_half_up(commission, 2)
-                tax = self._round_half_up(tax, 2)
-                total_cost = self._round_half_up(trade_value + commission + tax, 2)
+                commission = self._round_equity_cash(commission)
+                tax = self._round_equity_cash(tax)
+                total_cost = self._round_equity_cash(trade_value + commission + tax)
                 # 买入口径下订单均价即成交价，卖出分支会改写成卖出前的持仓成本
                 avg_cost = float(trade_price)
 
                 if is_buy:
                     # 委托时锁定资金（含费用）
                     self.context.portfolio.locked_cash += total_cost
-                    if total_cost > (self.context.portfolio.available_cash):
+                    required_cash = buy_cash_required(trade_amount, trade_price)
+                    if required_cash > available_for_buy + 1e-9:
                         # 双重保障：若仍不足则拒绝并回滚锁定
                         log.warning(
                             f"{order.security} 资金不足: 需要 {total_cost:.2f}, 可用 {self.context.portfolio.available_cash:.2f}"
@@ -3216,8 +3664,8 @@ class BacktestEngine:
                     position = self.context.portfolio.positions[order.security]
                     avg_cost = float(getattr(position, "avg_cost", 0.0) or 0.0)
                     # 增加资金（卖出释放资金，不需锁定）
-                    self.context.portfolio.available_cash += self._round_half_up(
-                        (trade_value - commission - tax), 2
+                    self.context.portfolio.available_cash += self._round_equity_cash(
+                        trade_value - commission - tax
                     )
 
                     # 更新持仓
@@ -3262,6 +3710,7 @@ class BacktestEngine:
                     pass
 
             except Exception as e:
+                self._raise_if_backtest_data_error()
                 log.error(f"处理订单失败: {order.security}, 错误: {e}")
                 order.status = OrderStatus.rejected
 
@@ -3481,8 +3930,12 @@ class BacktestEngine:
                         fq="none",
                     )
                     if df.empty:
+                        self._fail_required_price(security, self.context.current_dt)
                         continue
 
+                    self._assert_price_row_visible(
+                        df, security, self.context.current_dt, daily=True
+                    )
                     last_row = df.iloc[-1]
                     close_price = None
                     if "close" in df.columns:
@@ -3493,17 +3946,24 @@ class BacktestEngine:
                         close_price = last_row[("close", security)]
                     else:
                         log.error(f"{security} 无法匹配收盘价列，列={list(df.columns)}")
+                        self._fail_required_price(security, self.context.current_dt)
                         continue
 
-                    if pd.notna(close_price) and close_price > 0:
+                    if pd.notna(close_price) and math.isfinite(close_price) and close_price > 0:
                         price = self._normalize_split_day_close_price(
                             security, float(close_price)
                         )
                         portfolio.positions[security].update_price(price)
+                    else:
+                        self._fail_required_price(security, self.context.current_dt)
+                except BacktestDataError:
+                    raise
                 except Exception as e:
                     log.debug(f"更新{security}价格失败: {e}")
+                    self._fail_required_price(security, self.context.current_dt)
 
         self._mark_futures_positions()
+        self._raise_if_backtest_data_error()
         portfolio.update_value()
 
     def _record_daily(self):
@@ -3609,7 +4069,7 @@ class BacktestEngine:
                 # 通过当前数据提供者直接获取（不经过包装，避免未来数据检测），一次性加载全区间收盘价
                 data = provider.get_price(
                     security=candidate,
-                    start_date=self.start_date,
+                    start_date=self.start_date - timedelta(days=32),
                     end_date=self.end_date,
                     frequency="daily",
                     fields=["close"],
@@ -3618,6 +4078,9 @@ class BacktestEngine:
                     last_error = ValueError(f"标的{candidate}返回空数据")
                     continue
                 self.benchmark_data = data
+                previous_close = self._resolve_benchmark_close(self.start_date - timedelta(days=1))
+                if previous_close is not None and previous_close > 0:
+                    self._benchmark_base_price = previous_close
                 if candidate != benchmark:
                     log.info(f"基准代码兼容成功: {benchmark} -> {candidate}")
                 return
@@ -3737,30 +4200,35 @@ class BacktestEngine:
 
         df.set_index("date", inplace=True)
 
+        from .equity_statistics import annotate_equity_trade_pnls
+
+        annotate_equity_trade_pnls(self.trades, self.events, self.initial_positions)
+        base_total = float(self.start_total_value if self.start_total_value is not None else self.initial_cash)
+
         # 计算日收益率
         df["daily_returns"] = df["total_value"].pct_change()
+        df.iloc[0, df.columns.get_loc("daily_returns")] = float(df["total_value"].iloc[0]) / base_total - 1.0
 
         # 基本统计
-        total_returns = (df["total_value"].iloc[-1] / self.initial_cash - 1) * 100
+        total_returns = (df["total_value"].iloc[-1] / base_total - 1) * 100
         trading_days = len(df)
         years = trading_days / 250
         annual_returns = (
-            (pow(df["total_value"].iloc[-1] / self.initial_cash, 1 / years) - 1) * 100
+            (pow(df["total_value"].iloc[-1] / base_total, 1 / years) - 1) * 100
             if years > 0
             else 0
         )
 
         # 最大回撤
-        cummax = df["total_value"].expanding().max()
+        cummax = df["total_value"].expanding().max().clip(lower=base_total)
         drawdown = (df["total_value"] - cummax) / cummax * 100
         max_drawdown = drawdown.min()
 
-        # 夏普比率（假设无风险利率为3%）
-        risk_free_rate = 0.03 / 250
-        excess_returns = df["daily_returns"] - risk_free_rate
+        # 摘要与详细指标统一采用250日波动率、4%无风险收益和复合年化。
+        volatility = df["daily_returns"].std() * np.sqrt(250)
         sharpe_ratio = (
-            np.sqrt(250) * excess_returns.mean() / excess_returns.std()
-            if excess_returns.std() > 0
+            (annual_returns / 100.0 - 0.04) / volatility
+            if volatility > 0
             else 0
         )
 
@@ -3834,6 +4302,9 @@ class BacktestEngine:
                 "run_started_at": self.run_started_at,
                 "run_finished_at": self.run_finished_at,
                 "benchmark": get_settings().benchmark,
+                "benchmark_base_price": self._benchmark_base_price,
+                "performance_convention": {"annual_days": 250, "risk_free_rate": 0.04, "sharpe": "cagr_minus_risk_free_over_volatility", "initial_day_included": True},
+                "equity_trade_pnl_convention": "net_with_actual_distributions_and_allocated_entry_exit_fees",
                 "initial_total_value": float(
                     self.start_total_value
                     if self.start_total_value is not None

@@ -621,7 +621,11 @@ class FuturesPosition:
         return added_margin
 
     def apply_close(
-        self, amount: int, price: float, trade_time: Optional[datetime]
+        self,
+        amount: int,
+        price: float,
+        trade_time: Optional[datetime],
+        today_lots: Optional[int] = None,
     ) -> Tuple[float, float, float]:
         """按平仓成交更新持仓。
 
@@ -629,12 +633,14 @@ class FuturesPosition:
             amount: 平仓手数，正数。
             price: 成交价。
             trade_time: 成交时间。
+            today_lots: 本次实际平今手数；未提供时先平昨仓，再平今仓。
 
         Returns:
             Tuple[float, float, float]: 相对开仓均价的盈亏、释放的保证金、相对上一结算价的盯市盈亏。
 
         Raises:
-            OverCloseError: 平仓手数超过持仓。
+            OverCloseError: 平仓分配超过对应今仓或昨仓。
+            ValueError: 平今手数不是非负整数或超过本次平仓总数。
         """
 
         if amount > self.amount:
@@ -643,12 +649,29 @@ class FuturesPosition:
                     self.security, self.side, amount, self.amount
                 )
             )
+        closed_today = (
+            max(0, amount - self.yesterday_amount)
+            if today_lots is None
+            else int(today_lots)
+        )
+        if (
+            (today_lots is not None and closed_today != today_lots)
+            or closed_today < 0
+            or closed_today > amount
+        ):
+            raise ValueError("平今手数必须为 0 到本次平仓总数之间的整数")
+        if closed_today > self.today_amount or amount - closed_today > self.yesterday_amount:
+            raise OverCloseError(
+                "{0} {1} 平仓分配超过可用今昨仓: 平今 {2} / 今仓 {3}, 平昨 {4} / 昨仓 {5}".format(
+                    self.security, self.side, closed_today, self.today_amount,
+                    amount - closed_today, self.yesterday_amount,
+                )
+            )
         pnl = (price - self.open_price) * amount * self.multiplier * self.direction
         variation = (
             (float(price) - self.prev_settlement) * amount * self.multiplier * self.direction
         )
         released = self.margin_held * amount / self.amount
-        closed_today = min(amount, self.today_amount)
         self.today_amount -= closed_today
         self.amount -= amount
         self.margin_held -= released
@@ -656,9 +679,38 @@ class FuturesPosition:
             self.open_price = 0.0
             self.today_amount = 0
             self.margin_held = 0.0
-        self.update_price(price)
+        # 成交价可能含滑点；部分平仓不能用它重估仍持有的手数。
+        # 剩余仓位保留撮合前的市场标记价，下一次行情/结算再刷新。
         self.last_trade_time = trade_time
         return pnl, released, variation
+
+    def mark(self, price: float) -> Tuple[float, float]:
+        """按盘中价格盯市，把保证金计收基准结转到该价，但不做日切。
+
+        与 settle() 的算术完全相同，唯一区别是不重置 today_amount：当日开仓手数
+        是区分平今/平昨手续费的依据，盘中重估把它清零会让当天稍后的平仓被按平昨
+        计费。日终仍由 settle() 按官方结算价收尾，盯市变动对区间可加，故日终状态
+        与不做盘中重估时逐值相同。
+
+        Args:
+            price: 盘中重估价。
+
+        Returns:
+            Tuple[float, float]: 盯市变动盈亏、保证金计收基准变化（正数表示需追加）。
+        """
+
+        variation = (
+            (float(price) - self.prev_settlement)
+            * self.amount
+            * self.multiplier
+            * self.direction
+        )
+        required = self.amount * float(price) * self.multiplier * self.margin_rate
+        margin_delta = required - self.margin_held
+        self.margin_held = required
+        self.prev_settlement = float(price)
+        self.update_price(price)
+        return variation, margin_delta
 
     def settle(self, settlement_price: float) -> Tuple[float, float]:
         """按结算价盯市，并把保证金计收基准结转到结算价。
@@ -731,6 +783,21 @@ class SettlementResult:
     margin: float = 0.0
     delivered: Tuple[Tuple[str, str, int, float, float], ...] = ()
     missing_settlement: Tuple[str, ...] = ()
+
+
+@dataclass
+class MarkResult:
+    """一次盘中重估的结果。
+
+    Attributes:
+        variation_margin: 全账户本次盯市变动合计。
+        margin: 重估后的保证金占用。
+        missing_price: 取不到价格的持仓合约，保持原基准不做替代估值。
+    """
+
+    variation_margin: float = 0.0
+    margin: float = 0.0
+    missing_price: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -954,6 +1021,7 @@ class FuturesAccount:
         commission: float = 0.0,
         trade_time: Optional[datetime] = None,
         close_today: bool = False,
+        today_lots: Optional[int] = None,
     ) -> CloseResult:
         """平仓并释放保证金，现金按盯市口径变动。
 
@@ -964,7 +1032,8 @@ class FuturesAccount:
             price: 成交价。
             commission: 手续费。
             trade_time: 成交时间。
-            close_today: 是否按平今计费，仅影响记录与费用口径。
+            close_today: 是否全部平今；为真时平今手数必须等于本次平仓总数。
+            today_lots: 撮合计费采用的平今手数；未提供且非全部平今时先平昨仓。
 
         Returns:
             CloseResult: 释放保证金、盯市盈亏、已实现盈亏与现金变动。
@@ -981,8 +1050,12 @@ class FuturesAccount:
         position = self.positions.get((security, side))
         if position is None or position.amount <= 0:
             raise OverCloseError("{0} 无 {1} 持仓，不能平仓 {2} 手".format(security, side, amount))
+        if close_today:
+            if today_lots is not None and today_lots != int(amount):
+                raise ValueError("全部平今时，平今手数必须等于本次平仓总数")
+            today_lots = int(amount)
         realized, released, variation = position.apply_close(
-            int(amount), float(price), trade_time
+            int(amount), float(price), trade_time, today_lots=today_lots
         )
         cash_delta = released + variation - float(commission)
         self.cash += cash_delta
@@ -1020,6 +1093,43 @@ class FuturesAccount:
             if price is not None:
                 position.update_price(float(price))
 
+    def mark_to_market(
+        self, prices: Mapping[str, float], day: Optional[Date] = None
+    ) -> MarkResult:
+        """盘中重估：盯市变动入现金、保证金结转到重估价，不做日切、不做到期了结。
+
+        Args:
+            prices: 合约到重估价的映射；缺价的合约不做任何替代估值。
+            day: 交易日，用于刷新有价持仓的有效保证金率；未提供时保留原费率。
+
+        Returns:
+            MarkResult: 盯市合计、重估后保证金与缺价合约。
+        """
+
+        # 先解析全部有价持仓的费率，任一规格失败时不留下部分重估的账本。
+        margin_rates = {
+            position.security: self.spec_table.margin_rate(position.security, day)
+            for position in self.positions.values()
+            if day is not None and prices.get(position.security) is not None
+        }
+        variation_total = 0.0
+        missing = []
+        for position in self.positions.values():
+            price = prices.get(position.security)
+            if price is None:
+                missing.append(position.security)
+                continue
+            position.margin_rate = margin_rates.get(position.security, position.margin_rate)
+            variation, margin_delta = position.mark(float(price))
+            variation_total += variation
+            # 现金吸收盯市变动与保证金重算差额，保证重估本身不改变权益
+            self.cash += variation - margin_delta
+        return MarkResult(
+            variation_margin=variation_total,
+            margin=self.margin,
+            missing_price=tuple(dict.fromkeys(missing)),
+        )
+
     def settle_day(
         self,
         settlement_prices: Mapping[str, float],
@@ -1029,13 +1139,19 @@ class FuturesAccount:
 
         Args:
             settlement_prices: 合约到当日结算价的映射。
-            day: 结算日，用于判定最后交易日。
+            day: 结算日，用于刷新有价持仓的有效保证金率及判定最后交易日。
+                未提供时保留原费率。
 
         Returns:
             SettlementResult: 盯市合计、结算后保证金、到期了结记录与缺结算价合约。
             缺结算价的持仓不做任何替代估值，保持原基准并出现在 missing_settlement 中。
         """
 
+        margin_rates = {
+            position.security: self.spec_table.margin_rate(position.security, day)
+            for position in self.positions.values()
+            if day is not None and settlement_prices.get(position.security) is not None
+        }
         variation_total = 0.0
         delivered = []
         delivered_keys = []
@@ -1046,6 +1162,7 @@ class FuturesAccount:
             if settlement is None:
                 missing.append(position.security)
                 continue
+            position.margin_rate = margin_rates.get(position.security, position.margin_rate)
             variation, margin_delta = position.settle(float(settlement))
             variation_total += variation
             # 现金吸收盯市变动与保证金重算差额，保证结算本身不改变权益
@@ -1112,6 +1229,7 @@ __all__ = [
     "FuturesAccount",
     "FuturesPosition",
     "InsufficientMarginError",
+    "MarkResult",
     "OverCloseError",
     "SettlementResult",
     "futures_product",
