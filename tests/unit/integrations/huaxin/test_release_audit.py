@@ -1036,7 +1036,9 @@ def test_sensitive_json_depth_and_placeholder_prefix_fail_closed(tmp_path: Path)
         无；深度异常产生解析失败码，非精确占位值返回 False。
     """
 
-    deep_json = ("[" * 1_500 + "0" + "]" * 1_500).encode()
+    # 其他依赖可能提高进程递归上限，样本必须仍触发真实 JSON 解码深度异常。
+    depth = sys.getrecursionlimit() + 100
+    deep_json = ("[" * depth + "0" + "]" * depth).encode()
     wheel = _write_wheel(
         tmp_path,
         extra_files={"bullet_trade/integrations/huaxin/deep.json": deep_json},

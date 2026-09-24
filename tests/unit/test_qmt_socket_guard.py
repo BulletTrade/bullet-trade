@@ -963,7 +963,8 @@ async def test_qmt_broker_without_accounts_does_not_disable_data_guard(monkeypat
 
 
 @pytest.mark.unit
-def test_qmt_health_reports_unavailable_without_hiding_features():
+@pytest.mark.asyncio
+async def test_qmt_health_reports_unavailable_without_hiding_features():
     """验证 QMT 不可用时 health 暴露状态，但 features 保持兼容。
 
     Args:
@@ -1089,10 +1090,15 @@ def test_remote_connection_can_health_check_when_qmt_unavailable():
         accounts=[AccountConfig(key="default", account_id="demo")],
     )
     router = AccountRouter(config.accounts)
-    app = ServerApplication(
-        config, router, AdapterBundle(data_adapter=data_adapter, broker_adapter=None)
-    )
     loop = asyncio.new_event_loop()
+
+    async def build_application():
+        """在服务循环中构造应用；无输入，返回测试实例，与真实 CLI 的异步入口一致。"""
+        return ServerApplication(
+            config, router, AdapterBundle(data_adapter=data_adapter, broker_adapter=None)
+        )
+
+    app = loop.run_until_complete(build_application())
     thread = threading.Thread(target=_run_loop, args=(loop, app), daemon=True)
     thread.start()
     asyncio.run_coroutine_threadsafe(app.wait_started(), loop).result(timeout=5)
