@@ -154,7 +154,7 @@ class EasyTdxProvider(DataProvider):
             code.endswith((".XSHE", ".SZ")) and code_part.startswith("399")
         ):
             return "index"
-        if code_part.startswith(("15", "16", "18", "50", "51")):
+        if code_part.startswith(("15", "16", "18", "50", "51", "56", "58")):
             return "fund"
         return "stock"
 

@@ -368,6 +368,8 @@ def test_daily_host_reselection_and_bounded_failover(monkeypatch):
     "security,value,expected",
     [
         ("513100.XSHG", 2.3340001106262207, 2.334),
+        ("588000.SH", 1.6430000066757202, 1.643),
+        ("561300.XSHG", 1.1230000257492065, 1.123),
         ("000001.XSHE", 10.100000381469727, 10.10),
     ],
 )
