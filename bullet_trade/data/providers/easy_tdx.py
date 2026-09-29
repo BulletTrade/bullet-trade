@@ -1,6 +1,7 @@
 """
 easy_tdx 通达信在线数据源适配器
 
+作者: BruceLee
 文件职责：通过 easy_tdx SDK 直连通达信在线行情服务器，提供聚宽兼容行情接口。
 主要输入：聚宽或通达信风格证券代码、日期范围、频率、字段、复权参数。
 主要输出：K 线 DataFrame、交易日、证券列表、实时快照和有限的除权除息事件。
@@ -11,6 +12,7 @@ easy_tdx 通达信在线数据源适配器
 from __future__ import annotations
 
 import importlib
+import logging
 import math
 import os
 from datetime import date as Date
@@ -19,8 +21,13 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import pandas as pd
+import numpy as np
+
+from ..qmt_adjustment import AdjustmentEvent
 
 from .base import DataProvider
+
+__all__ = ["EasyTdxProvider"]
 
 _MARKET_SZ = 0
 _MARKET_SH = 1
@@ -66,7 +73,17 @@ _ADJUST_MAP: Dict[Optional[str], int] = {
     "hfq": 2,
 }
 _DEFAULT_PRICE_FIELDS = ["open", "close", "high", "low", "volume", "money"]
-_PRICE_FIELDS = {"open", "close", "high", "low", "avg", "price", "high_limit", "low_limit"}
+_PRICE_FIELDS = {
+    "open",
+    "close",
+    "high",
+    "low",
+    "avg",
+    "price",
+    "high_limit",
+    "low_limit",
+}
+logger = logging.getLogger(__name__)
 _STUB_NAMES: Dict[str, str] = {
     "000001.XSHE": "平安银行",
     "600519.XSHG": "贵州茅台",
@@ -80,7 +97,7 @@ class EasyTdxProvider(DataProvider):
     """通达信在线行情数据源，负责把 easy_tdx 输出转换为聚宽兼容格式。"""
 
     name: str = "easy_tdx"
-    requires_live_data: bool = False
+    requires_live_data: bool = True
     _MAX_DAILY_FETCH = 50000
     _MAX_INTRADAY_FETCH = 50000
 
@@ -93,11 +110,14 @@ class EasyTdxProvider(DataProvider):
         self._use_stub = self._parse_bool(
             self.config.get("use_stub") or os.getenv("EASY_TDX_USE_STUB")
         )
+        self.requires_live_data = not self._use_stub
         self._client: Optional[Any] = self.config.get("client")
         self._connected = bool(self._client is not None)
         self._easy_tdx: Optional[Any] = self.config.get("easy_tdx")
         self._mac_client_cls: Optional[Any] = self.config.get("mac_client_cls")
         self._tdx_client_cls: Optional[Any] = self.config.get("tdx_client_cls")
+        self._selected_day = datetime.now().date()
+        self._failed_host = None
 
     @staticmethod
     def _parse_bool(value: Any) -> bool:
@@ -181,7 +201,9 @@ class EasyTdxProvider(DataProvider):
         return mapping.get(str(frequency).lower(), 1)
 
     @staticmethod
-    def _format_timestamp(value: Optional[Union[str, datetime, Date]]) -> Optional[pd.Timestamp]:
+    def _format_timestamp(
+        value: Optional[Union[str, datetime, Date]],
+    ) -> Optional[pd.Timestamp]:
         """把日期参数转换为 Timestamp。"""
         if value is None:
             return None
@@ -223,8 +245,10 @@ class EasyTdxProvider(DataProvider):
 
     @staticmethod
     def _ensure_config_dir() -> None:
-        """确保 easy_tdx 默认配置目录存在，避免自动选主机保存配置失败。"""
-        Path.home().joinpath(".easy_tdx").mkdir(parents=True, exist_ok=True)
+        """无输入，创建 SDK 实际配置目录；返回 None，仅产生目录创建副作用。"""
+        Path(os.getenv("EASY_TDX_CONFIG_DIR") or Path.home() / ".easy_tdx").mkdir(
+            parents=True, exist_ok=True
+        )
 
     def auth(
         self,
@@ -246,19 +270,45 @@ class EasyTdxProvider(DataProvider):
         try:
             self._ensure_config_dir()
             if target_host:
-                self._client = client_cls(host=target_host, port=target_port, timeout=self._timeout)
+                self._client = client_cls(
+                    host=target_host,
+                    port=target_port,
+                    timeout=self._timeout,
+                    auto_reconnect=False,
+                )
             elif hasattr(client_cls, "from_best_host"):
-                self._client = client_cls.from_best_host(port=target_port, timeout=self._timeout)
+                options = {
+                    "port": target_port,
+                    "timeout": self._timeout,
+                    "auto_reconnect": False,
+                }
+                if self._failed_host:
+                    from easy_tdx.config import get_mac_hosts
+
+                    options["hosts"] = [h for h in get_mac_hosts() if h != self._failed_host]
+                    if not options["hosts"]:
+                        raise RuntimeError("easy_tdx 没有其他候选行情服务器")
+                self._client = client_cls.from_best_host(**options)
             else:
                 self._client = client_cls(port=target_port, timeout=self._timeout)
             connect = getattr(self._client, "connect", None)
             if callable(connect):
                 connect()
             self._connected = True
+            self._selected_day = datetime.now().date()
+            logger.info(
+                "easy_tdx selected_host=%s reason=%s",
+                getattr(self._client, "_host", target_host),
+                "failover" if self._failed_host else "startup_or_new_day",
+            )
+            self._failed_host = None
         except Exception as exc:
             self._client = None
             self._connected = False
-            message = "EasyTdxProvider 连接通达信行情服务器失败；真实模式不会自动返回假行情，" "如仅做离线测试请显式传入 use_stub=True"
+            message = (
+                "EasyTdxProvider 连接通达信行情服务器失败；真实模式不会自动返回假行情，"
+                "如仅做离线测试请显式传入 use_stub=True"
+            )
             raise RuntimeError(message) from exc
 
     def _ensure_client(self) -> Optional[Any]:
@@ -266,9 +316,43 @@ class EasyTdxProvider(DataProvider):
         if self._use_stub:
             self._connected = True
             return None
+        if (
+            not self._host
+            and not self.config.get("client")
+            and self._connected
+            and self._selected_day != datetime.now().date()
+        ):
+            self.close()
         if not self._connected:
             self.auth()
         return self._client
+
+    def close(self) -> None:
+        """无输入，关闭本 provider 的连接并清除连接状态；返回 None，不影响其他进程。"""
+        client, self._client = self._client, None
+        self._connected = False
+        close = getattr(client, "close", None)
+        if callable(close):
+            close()
+
+    def _call(self, method: str, *args: Any, **kwargs: Any) -> Any:
+        """调用只读行情方法；输入方法与参数，返回 SDK 结果，失联最多换址一次后抛错。
+
+        自动模式从原候选名单排除失败 IP 后重选；固定 host 保持显式配置。
+        每次只重试网络错误，不重试参数、数据解析或策略错误。
+        """
+        client = self._ensure_client()
+        try:
+            return getattr(client, method)(*args, **kwargs)
+        except Exception as exc:
+            network_error = isinstance(exc, (ConnectionError, TimeoutError, OSError))
+            network_error = network_error or type(exc).__name__ == "TdxConnectionError"
+            if not network_error or self._host or self.config.get("client"):
+                raise
+            self._failed_host = getattr(client, "_host", None)
+            self.close()
+            self.auth()
+            return getattr(self._client, method)(*args, **kwargs)
 
     def _resolve_fetch_count(
         self,
@@ -279,15 +363,25 @@ class EasyTdxProvider(DataProvider):
         count: Optional[int],
     ) -> int:
         """根据日期范围和 count 估算通达信请求条数。"""
+        bars = self._bars_per_day(frequency)
+        end_ts = self._format_timestamp(end_date)
+        now = pd.Timestamp.now()
+        offset_days = (
+            max((now.normalize() - end_ts.normalize()).days, 0) if end_ts is not None else 0
+        )
+        cap = self._MAX_INTRADAY_FETCH if bars > 1 else self._MAX_DAILY_FETCH
         if count is not None:
-            return max(int(count), 1)
+            # SDK count 从最新向过去取，必须覆盖当前至历史截止日之间的数据。
+            return min(
+                max(int(count), 1) + offset_days * bars + (5 * bars if offset_days else 0),
+                cap,
+            )
         start_ts = self._format_timestamp(start_date)
-        end_ts = self._format_timestamp(end_date) or pd.Timestamp.now()
+        end_ts = max(end_ts or now, now)
         if start_ts is None:
             return 800 if frequency != "daily" else 3000
         fetch_end = max(end_ts, pd.Timestamp.now())
         days = max((fetch_end - start_ts).days + 1, 1)
-        bars = self._bars_per_day(frequency)
         estimated = max(int(math.ceil(days * 0.75)) * bars + bars * 5, bars)
         cap = self._MAX_INTRADAY_FETCH if bars > 1 else self._MAX_DAILY_FETCH
         return min(max(estimated, 100 if bars == 1 else bars * 10), cap)
@@ -310,7 +404,8 @@ class EasyTdxProvider(DataProvider):
         fetcher = getattr(client, "get_stock_kline", None)
         if not callable(fetcher):
             raise RuntimeError("easy_tdx MacClient 未提供 get_stock_kline 方法")
-        raw = fetcher(
+        raw = self._call(
+            "get_stock_kline",
             market=market,
             code=code,
             period=period,
@@ -320,10 +415,17 @@ class EasyTdxProvider(DataProvider):
             adjust=adjust,
         )
         df = self._normalize_kline_frame(raw, fields)
+        # Mac K 线的指数成交量单位与股票/ETF 不同；统一到聚宽的股数口径。
+        if self._infer_jq_security_type(security) == "index" and "volume" in df:
+            df["volume"] = df["volume"] * 100.0
+        # SDK 用 float32 解码价格，按证券报价精度消除二进制尾差，不改变行情含义。
+        decimals = 3 if self._infer_jq_security_type(security) == "fund" else 2
+        for field in _PRICE_FIELDS.intersection(df.columns):
+            df[field] = pd.to_numeric(df[field], errors="coerce").round(decimals)
         df = self._filter_by_date(df, start_date=start_date, end_date=end_date)
         if count is not None and not df.empty:
             df = df.tail(int(count))
-        return df
+        return df.reindex(columns=fields)
 
     def _fetch_daily_raw_for_factor(self, client: Any, security: str) -> pd.DataFrame:
         """读取未复权日线，用于按除权除息事件构造累计复权因子。"""
@@ -331,7 +433,8 @@ class EasyTdxProvider(DataProvider):
         fetcher = getattr(client, "get_stock_kline", None)
         if not callable(fetcher):
             raise RuntimeError("easy_tdx MacClient 未提供 get_stock_kline 方法")
-        raw = fetcher(
+        raw = self._call(
+            "get_stock_kline",
             market=market,
             code=code,
             period=self._resolve_period("daily"),
@@ -411,11 +514,11 @@ class EasyTdxProvider(DataProvider):
             return default
 
     def _fetch_xdxr_events(self, security: str) -> pd.DataFrame:
-        """读取通达信除权除息事件表，失败时返回空表。"""
+        """输入证券，返回事件表；读取失败抛错，无事件才返回空表，产生只读网络请求。"""
         try:
             client_cls = self._resolve_tdx_client_cls()
-        except Exception:
-            return pd.DataFrame()
+        except Exception as exc:
+            raise RuntimeError("easy_tdx 除权接口不可用") from exc
         market, code = self.jq_to_tdx(security)
         client = None
         try:
@@ -427,8 +530,8 @@ class EasyTdxProvider(DataProvider):
             if callable(connect):
                 connect()
             records = client.get_xdxr_info(market, code)
-        except Exception:
-            return pd.DataFrame()
+        except Exception as exc:
+            raise RuntimeError("easy_tdx 除权事件读取失败") from exc
         finally:
             if client is not None:
                 try:
@@ -436,8 +539,10 @@ class EasyTdxProvider(DataProvider):
                 except Exception:
                     pass
         df = pd.DataFrame(records).copy()
-        if df.empty or "date" not in df.columns:
+        if df.empty:
             return pd.DataFrame()
+        if "date" not in df.columns:
+            raise RuntimeError("easy_tdx 除权事件缺少日期")
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
         df.dropna(subset=["date"], inplace=True)
         if "category" in df.columns:
@@ -454,8 +559,8 @@ class EasyTdxProvider(DataProvider):
         if preclose <= 0:
             return 1.0
         cash = self._as_float(event.get("fenhong"), 0.0)
-        bonus_ratio = self._as_float(event.get("songzhuangu"), 0.0) / 10.0
-        rights_ratio = self._as_float(event.get("peigu"), 0.0) / 10.0
+        bonus_ratio = self._as_float(event.get("songzhuangu"), 0.0)
+        rights_ratio = self._as_float(event.get("peigu"), 0.0)
         rights_price = self._as_float(event.get("peigujia"), 0.0)
         denominator = 1.0 + bonus_ratio + rights_ratio
         if denominator <= 0:
@@ -476,15 +581,13 @@ class EasyTdxProvider(DataProvider):
             return pd.Series(dtype="float64")
         daily_raw = self._fetch_daily_raw_for_factor(client, security)
         if daily_raw.empty:
-            return pd.Series(dtype="float64")
+            raise RuntimeError("easy_tdx 构造复权因子缺少原始日线")
         events = self._fetch_xdxr_events(security)
-        if events.empty:
-            return pd.Series(1.0, index=target_index, dtype="float64")
 
         target_ts = pd.DatetimeIndex(pd.to_datetime(target_index, errors="coerce")).dropna()
         if target_ts.empty:
             return pd.Series(dtype="float64")
-        horizon = target_ts.max().normalize()
+        horizon = max(target_ts.max().normalize(), daily_raw.index.max().normalize())
         ref_ts = self._format_timestamp(ref_date)
         if ref_ts is not None:
             horizon = max(horizon, ref_ts.normalize())
@@ -494,11 +597,30 @@ class EasyTdxProvider(DataProvider):
             return pd.Series(dtype="float64")
         daily_days = pd.DatetimeIndex(daily.index.normalize()).drop_duplicates().sort_values()
         factor_by_day = pd.Series(1.0, index=daily_days, dtype="float64")
+        origin_complete = True
         for _, event in events.iterrows():
             event_day = pd.Timestamp(event["date"]).normalize()
             if event_day > horizon:
                 continue
-            event_factor = self._event_adjust_factor(event, daily_raw)
+            before = daily_raw[daily_raw.index < event_day]
+            if before.empty:
+                # 早于已知行情起点的事件不影响区间内前复权比值，但绝对后复权不可验证。
+                origin_complete = False
+                continue
+            decimals = 3 if self._infer_jq_security_type(security) == "fund" else 2
+            previous = before.index[-1]
+            event_factor = float(
+                AdjustmentEvent(
+                    date=event_day.date(),
+                    cash_per_share=str(event.get("fenhong", 0.0)),
+                    gift=str(event.get("songzhuangu", 0.0)),
+                    transfer="0",
+                    rights=str(event.get("peigu", 0.0)),
+                    rights_price=str(event.get("peigujia", 0.0)),
+                    previous_close=str(round(float(before["close"].iloc[-1]), decimals)),
+                    previous_close_date=previous.date(),
+                ).multiplier(decimals)
+            )
             if event_factor == 1.0:
                 continue
             factor_by_day.loc[factor_by_day.index < event_day] *= event_factor
@@ -506,7 +628,15 @@ class EasyTdxProvider(DataProvider):
         target_days = pd.DatetimeIndex(pd.to_datetime(target_index, errors="coerce")).normalize()
         aligned = factor_by_day.reindex(target_days, method="ffill")
         aligned = aligned.bfill().fillna(1.0)
-        return pd.Series(aligned.to_numpy(dtype="float64"), index=target_index, dtype="float64")
+        result = pd.Series(aligned.to_numpy(dtype="float64"), index=target_index, dtype="float64")
+        reference = ref_ts.normalize() if ref_ts is not None else daily_days[-1]
+        visible = factor_by_day.loc[factor_by_day.index <= reference]
+        if visible.empty:
+            raise RuntimeError("easy_tdx 复权参考日早于已知历史")
+        result.attrs["reference_factor"] = float(visible.iloc[-1])
+        result.attrs["origin_factor"] = float(factor_by_day.iloc[0])
+        result.attrs["origin_complete"] = origin_complete
+        return result
 
     @staticmethod
     def _factor_ref_value(
@@ -517,6 +647,8 @@ class EasyTdxProvider(DataProvider):
         """从 factor 序列中提取动态前复权参考值。"""
         if factor.empty:
             return 1.0
+        if "reference_factor" in factor.attrs:
+            return float(factor.attrs["reference_factor"])
         if ref_date is None:
             value = factor.iloc[-1]
             return float(value) if pd.notna(value) and value else 1.0
@@ -534,18 +666,30 @@ class EasyTdxProvider(DataProvider):
         *,
         factor: pd.Series,
         ref_date: Optional[Union[str, datetime, Date]],
+        mode: str = "pre",
+        price_decimals: Optional[int] = None,
     ) -> pd.DataFrame:
         """使用构造出的 factor 对未复权 K 线执行动态前复权。"""
         if frame.empty or factor.empty:
             return frame
         result = frame.copy()
         aligned = factor.reindex(result.index).ffill().bfill().fillna(1.0)
-        factor_ref = self._factor_ref_value(aligned, ref_date=ref_date)
-        ratio = aligned / factor_ref
+        factor_ref = self._factor_ref_value(factor, ref_date=ref_date)
+        if mode == "post":
+            if not factor.attrs.get("origin_complete", True):
+                raise RuntimeError("easy_tdx 后复权原点之前的事件缺少历史价格，无法验证")
+            factor_ref = float(factor.attrs["origin_factor"])
+        ratio = (
+            aligned / factor_ref if mode in {"pre", "post"} else pd.Series(1.0, index=result.index)
+        )
         for field in _PRICE_FIELDS:
             if field in result.columns:
                 result[field] = pd.to_numeric(result[field], errors="coerce") * ratio
-        result["factor"] = aligned
+                if price_decimals is not None:
+                    result[field] = result[field].round(price_decimals)
+        if mode in {"pre", "post"} and "volume" in result:
+            result["volume"] = np.round(pd.to_numeric(result["volume"]) / ratio)
+        result["factor"] = ratio
         return result
 
     def _assemble_price_result(
@@ -557,10 +701,10 @@ class EasyTdxProvider(DataProvider):
         panel: bool,
     ) -> pd.DataFrame:
         """按聚宽兼容 shape 组装单证券、多证券、panel 和长表。"""
+        if len(securities) == 1:
+            return frames.get(securities[0], pd.DataFrame(columns=fields))
         if not frames:
-            return pd.DataFrame()
-        if len(securities) == 1 and panel:
-            return frames.get(securities[0], pd.DataFrame())
+            return pd.DataFrame(columns=fields)
         if panel:
             parts = []
             for field in fields:
@@ -646,8 +790,9 @@ class EasyTdxProvider(DataProvider):
             count=count,
         )
         period = self._resolve_period(frequency_norm)
-        use_constructed_pre = str(fq or "").lower().strip() in {"pre", "qfq"} or needs_factor
-        adjust = 0 if use_constructed_pre else self._resolve_adjust(fq)
+        mode = {"qfq": "pre", "hfq": "post"}.get(str(fq).lower(), str(fq or "none").lower())
+        use_constructed_pre = mode in {"pre", "post"} or needs_factor
+        adjust = 0
         frames: Dict[str, pd.DataFrame] = {}
         for sec in securities:
             fetch_fields = list(requested_fields)
@@ -671,26 +816,15 @@ class EasyTdxProvider(DataProvider):
                     pd.DatetimeIndex(frame.index),
                     ref_date=pre_factor_ref_date,
                 )
-                if factor.empty and pre_factor_ref_date is not None:
-                    raise NotImplementedError("easy_tdx online 模式无法构造复权因子，不能执行动态前复权")
-                if not factor.empty:
-                    frame = self._apply_constructed_pre_adjustment(
-                        frame,
-                        factor=factor,
-                        ref_date=pre_factor_ref_date,
-                    )
-                elif str(fq or "").lower().strip() in {"pre", "qfq"}:
-                    frame = self._fetch_single_kline(
-                        client,
-                        sec,
-                        period=period,
-                        fetch_count=fetch_count,
-                        adjust=self._resolve_adjust(fq),
-                        fields=fetch_fields,
-                        start_date=start_date,
-                        end_date=end_date,
-                        count=count,
-                    )
+                if factor.empty:
+                    raise RuntimeError("easy_tdx 无法构造复权因子，不能静默切换到其他复权算法")
+                frame = self._apply_constructed_pre_adjustment(
+                    frame,
+                    factor=factor,
+                    ref_date=pre_factor_ref_date,
+                    mode=mode,
+                    price_decimals=(3 if self._infer_jq_security_type(sec) == "fund" else 2),
+                )
             for field in requested_fields:
                 if field not in frame.columns:
                     frame[field] = 0.0
@@ -745,8 +879,14 @@ class EasyTdxProvider(DataProvider):
         client = self._ensure_client()
         if client is None:
             return []
-        fetch_count = max(int(count or 3000), 1)
-        raw = client.get_stock_kline(
+        fetch_count = self._resolve_fetch_count(
+            start_date=start_date,
+            end_date=end_date,
+            frequency="daily",
+            count=count or 3000,
+        )
+        raw = self._call(
+            "get_stock_kline",
             market=_MARKET_SH,
             code="999999",
             period=4,
@@ -904,10 +1044,9 @@ class EasyTdxProvider(DataProvider):
                 continue
             if end_ts is not None and pd.Timestamp(event_date) > end_ts.normalize():
                 continue
-            split = (
-                self._as_float(rec.get("songzhuangu", 0.0), 0.0)
-                + self._as_float(rec.get("peigu", 0.0), 0.0)
-            ) / 10.0
+            split = self._as_float(rec.get("songzhuangu", 0.0), 0.0) + self._as_float(
+                rec.get("peigu", 0.0), 0.0
+            )
             result.append(
                 {
                     "security": security,
@@ -989,9 +1128,24 @@ class EasyTdxProvider(DataProvider):
             return pd.DataFrame() if df else None
         market, code = self.jq_to_tdx(security)
         try:
-            quotes = getter([(market, code)])
-        except Exception:
-            return pd.DataFrame() if df else None
+            from easy_tdx.codec.bitmap import FieldBit, PresetField
+
+            fields = list(PresetField.COMMON.value) + [
+                FieldBit.SERVER_UPDATE_DATE,
+                FieldBit.SERVER_UPDATE_TIME,
+            ]
+        except ImportError:
+            fields = None
+        try:
+            if fields is None:
+                quotes = self._call("get_stock_quotes", [(market, code)])
+            else:
+                quotes = self._call("get_stock_quotes", [(market, code)], fields=fields)
+        except TypeError as exc:
+            if "fields" not in str(exc):
+                raise
+            quotes = self._call("get_stock_quotes", [(market, code)])
+        received = datetime.now()
         quote_df = pd.DataFrame(quotes)
         if quote_df.empty:
             return pd.DataFrame() if df else None
@@ -1016,6 +1170,19 @@ class EasyTdxProvider(DataProvider):
             "dt": str(dt or datetime.now()),
             "provider": self.name,
         }
+        # 仅使用服务器实际回报的日期/时间；接收时刻不能冒充行情源时间。
+        day, clock = row.get("server_update_date"), row.get("server_update_time")
+        if pd.notna(day) and pd.notna(clock):
+            try:
+                source = datetime.strptime(f"{int(day):08d}{int(clock):06d}", "%Y%m%d%H%M%S")
+                tick.update(
+                    source_time=source.isoformat(),
+                    received_time=received.isoformat(),
+                    query_completed_time=received.isoformat(),
+                    age_seconds=max((received - source).total_seconds(), 0.0),
+                )
+            except (ValueError, TypeError, OverflowError):
+                pass
         return pd.DataFrame([tick]) if df else tick
 
     def get_live_current(self, security: str) -> Dict[str, Any]:
@@ -1024,12 +1191,21 @@ class EasyTdxProvider(DataProvider):
         if not isinstance(tick, dict):
             return {}
         status = int(tick.get("trading_status", 0) or 0)
-        return {
+        result = {
             "last_price": float(tick.get("last_price", 0.0) or 0.0),
             "high_limit": float(tick.get("limit_up", 0.0) or 0.0),
             "low_limit": float(tick.get("limit_down", 0.0) or 0.0),
             "paused": bool(status & 0x8020),
         }
+        for name in (
+            "source_time",
+            "received_time",
+            "query_completed_time",
+            "age_seconds",
+        ):
+            if name in tick:
+                result[name] = tick[name]
+        return result
 
     def _stub_get_price(
         self,

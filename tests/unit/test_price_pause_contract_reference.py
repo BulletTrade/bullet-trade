@@ -19,7 +19,12 @@ FIXTURES = Path(__file__).parents[1] / "fixtures"
 
 def reference_frame(case):
     """输入固定用例，返回对应 RPC 原始结果表；无外部副作用，参数不匹配直接断言失败。"""
-    rows = json.loads((FIXTURES / "price_pause_jq_reference_20260924.json").read_text())["cases"]
+    name = (
+        "price_pause_jq_reference_20260924.json"
+        if case["full_day"]
+        else "price_pause_jq_partial_20260929.json"
+    )
+    rows = json.loads((FIXTURES / name).read_text())["cases"]
     row = next(row for row in rows if row["case_id"] == case["id"])
     assert row["request"] == case["request"]
     wire = row["frame"]
@@ -61,7 +66,7 @@ def test_shared_contract_rejects_incompatible_results(fault):
     elif fault == "wrong_paused":
         frame.loc[first, "paused"] = 1
     elif fault == "wrong_price":
-        frame.loc[first, "close"] = 2.334
+        frame.loc[first, "close"] = 2.308
     elif fault == "nonzero_volume":
         frame.loc[first, "volume"] = 100
     elif fault == "empty":

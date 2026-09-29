@@ -272,9 +272,15 @@ def test_easy_tdx_old_short_daily_range_fetches_enough_history() -> None:
 
 
 @pytest.mark.unit
-def test_easy_tdx_get_bars_wraps_get_price_without_dynamic_anchor() -> None:
+def test_easy_tdx_get_bars_wraps_get_price_without_dynamic_anchor(monkeypatch) -> None:
     """get_bars 应复用 get_price，默认 fq_ref_date 不应触发动态锚定限制。"""
     provider = _fake_provider()
+    def no_action_factor(client, security, target_index, *, ref_date=None):
+        """接收包装层因子请求，断言默认参考日并返回无公司行为的因子；无副作用。"""
+        assert ref_date is None
+        return pd.Series(1.0, index=target_index)
+
+    monkeypatch.setattr(provider, "_build_factor_for_index", no_action_factor)
 
     df = provider.get_bars(
         "000001.XSHE",

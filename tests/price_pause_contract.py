@@ -15,7 +15,8 @@ import pandas as pd
 FIELDS = ["open", "high", "low", "close", "volume", "money", "paused"]
 
 # 2026-09-24 实测：000929 的 RPC 与镜像八组完全一致；513100 当天镜像未覆盖，
-# 盘中暂停基准来自 RPC，不能把过期镜像自动填充的 240 根当作有效基准。
+# 盘中暂停于2026-09-29重新核对RPC：未复权暂停价格2.334，旧快照2.308为复牌开盘价。
+# 保留旧快照用于追溯，以重新冻结的原参数RPC结果作当前基准。
 SCENARIOS = (
     {
         "id": "stock_full_pause_daily",
@@ -53,7 +54,7 @@ SCENARIOS = (
     {
         "id": "qdii_etf_partial_pause_minute",
         "security_type": "沪市 QDII ETF，国泰纳斯达克 100，开盘暂停至 10:30",
-        "source": "JoinQuant RPC，2026-09-24 冻结；同期镜像尚未覆盖，不作此日基准",
+        "source": "JoinQuant RPC，2026-09-29 重新冻结；前一交易日日线收盘交叉验证",
         "request": {
             "security": "513100.XSHG",
             "start_date": "2026-09-24 09:30:00",
@@ -63,7 +64,7 @@ SCENARIOS = (
         "days": ["2026-09-24"],
         "pause_start": "2026-09-24 09:31:00",
         "pause_end": "2026-09-24 10:30:00",
-        "pause_price": 2.308,
+        "pause_price": 2.334,
         "full_day": False,
     },
 )
