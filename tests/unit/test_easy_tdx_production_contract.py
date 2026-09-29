@@ -93,7 +93,9 @@ def provider(monkeypatch):
     "security,expected",
     [
         ("000300.XSHG", 100000),
+        ("000300.SH", 100000),
         ("399001.XSHE", 100000),
+        ("399001.SZ", 100000),
         ("000001.XSHE", 1000),
         ("510300.XSHG", 1000),
     ],
@@ -104,6 +106,58 @@ def test_kline_volume_units(provider, security, expected):
         security, count=1, end_date="2024-01-04", fq=None, fields=["volume"]
     )
     assert result.iloc[-1]["volume"] == expected
+
+
+def test_events_follow_selected_quote_host(provider):
+    """输入已优选的行情地址，断言除权接口复用它且不进入SDK默认IP与无限重连。"""
+    captured = {}
+
+    class Events(CashEventClient):
+        """只记录连接参数并提供固定除权事件，无网络。"""
+
+        def __init__(self, **kwargs):
+            """输入连接参数，保存供断言，无返回或网络副作用。"""
+            captured.update(kwargs)
+
+    provider._client._host = "fixture-selected-host"
+    provider._tdx_client_cls = Events
+    assert len(provider._fetch_xdxr_events("159915.SZ")) == 1
+    assert captured["host"] == "fixture-selected-host"
+    assert captured["auto_reconnect"] is False
+
+
+def test_event_protocol_selects_own_hosts_and_retries_once(provider, monkeypatch):
+    """输入PC协议候选和一次连接失败，验证独立择优、排除坏地址及成功地址复用。"""
+    from easy_tdx import config
+    from easy_tdx.exceptions import TdxConnectionError
+
+    monkeypatch.setattr(config, "get_known_hosts", lambda: ["bad-pc", "good-pc"])
+    selections = []
+
+    class Events(CashEventClient):
+        """模拟PC协议主机与除权结果，保存所选地址。"""
+
+        def __init__(self, host=None, **kwargs):
+            """输入地址和连接选项，保存地址；无返回、无网络。"""
+            self._host = host
+
+        @classmethod
+        def from_best_host(cls, **kwargs):
+            """输入候选列表，记录后返回第一候选连接，无网络。"""
+            selections.append(kwargs["hosts"])
+            return cls(host=kwargs["hosts"][0])
+
+        def connect(self):
+            """无输入，坏候选抛SDK连接错误，其他成功；无网络。"""
+            if self._host == "bad-pc":
+                raise TdxConnectionError("fixture")
+
+    provider._client._host = "mac-only"
+    provider._tdx_client_cls = Events
+    assert len(provider._fetch_xdxr_events("159915.SZ")) == 1
+    assert len(provider._fetch_xdxr_events("159915.SZ")) == 1
+    assert selections == [["bad-pc", "good-pc"], ["good-pc"]]
+    assert provider._xdxr_host == "good-pc"
 
 
 @pytest.mark.parametrize(

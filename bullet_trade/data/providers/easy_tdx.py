@@ -118,6 +118,8 @@ class EasyTdxProvider(DataProvider):
         self._tdx_client_cls: Optional[Any] = self.config.get("tdx_client_cls")
         self._selected_day = datetime.now().date()
         self._failed_host = None
+        self._xdxr_host = None
+        self._xdxr_selected_day = None
 
     @staticmethod
     def _parse_bool(value: Any) -> bool:
@@ -146,10 +148,10 @@ class EasyTdxProvider(DataProvider):
     @staticmethod
     def _infer_jq_security_type(security: str) -> str:
         """按聚宽后缀和常见代码段推断证券类型。"""
-        code = str(security)
+        code = str(security).strip().upper()
         code_part = code.split(".", 1)[0]
-        if (code.endswith(".XSHG") and code_part.startswith("000")) or (
-            code.endswith(".XSHE") and code_part.startswith("399")
+        if (code.endswith((".XSHG", ".SH")) and code_part.startswith("000")) or (
+            code.endswith((".XSHE", ".SZ")) and code_part.startswith("399")
         ):
             return "index"
         if code_part.startswith(("15", "16", "18", "50", "51")):
@@ -520,24 +522,64 @@ class EasyTdxProvider(DataProvider):
         except Exception as exc:
             raise RuntimeError("easy_tdx 除权接口不可用") from exc
         market, code = self.jq_to_tdx(security)
-        client = None
-        try:
-            if self._host:
-                client = client_cls(host=self._host, port=self._port, timeout=self._timeout)
-            else:
-                client = client_cls(port=self._port, timeout=self._timeout)
-            connect = getattr(client, "connect", None)
-            if callable(connect):
-                connect()
-            records = client.get_xdxr_info(market, code)
-        except Exception as exc:
-            raise RuntimeError("easy_tdx 除权事件读取失败") from exc
-        finally:
-            if client is not None:
-                try:
-                    client.close()
-                except Exception:
-                    pass
+        failed_host = None
+        for attempt in range(2):
+            client = None
+            event_host = None
+            try:
+                if self._xdxr_selected_day != datetime.now().date():
+                    self._xdxr_host = None
+                event_host = self._host or self._xdxr_host
+                if not event_host and callable(getattr(client_cls, "from_best_host", None)):
+                    from easy_tdx.config import get_known_hosts
+
+                    hosts = [host for host in get_known_hosts() if host != failed_host]
+                    if not hosts:
+                        raise RuntimeError("easy_tdx 没有可用除权候选主机")
+                    client = client_cls.from_best_host(
+                        hosts=hosts,
+                        port=self._port,
+                        timeout=self._timeout,
+                        auto_reconnect=False,
+                        ping_timeout=1.0,
+                    )
+                else:
+                    event_host = event_host or getattr(self._client, "_host", None)
+                    client = client_cls(
+                        host=event_host,
+                        port=self._port,
+                        timeout=self._timeout,
+                        auto_reconnect=False,
+                    )
+                connect = getattr(client, "connect", None)
+                if callable(connect):
+                    connect()
+                records = client.get_xdxr_info(market, code)
+                selected = getattr(client, "_host", event_host)
+                if self._xdxr_host != selected:
+                    logger.info(
+                        "easy_tdx xdxr_host=%s reason=%s",
+                        selected,
+                        "failover" if attempt else "startup_or_new_day",
+                    )
+                self._xdxr_host = selected
+                self._xdxr_selected_day = datetime.now().date()
+                break
+            except Exception as exc:
+                failed_host = getattr(client, "_host", event_host)
+                self._xdxr_host = None
+                network_error = (
+                    isinstance(exc, (OSError, ConnectionError, TimeoutError))
+                    or type(exc).__name__ == "TdxConnectionError"
+                )
+                if self._host or attempt or not network_error:
+                    raise RuntimeError("easy_tdx 除权事件读取失败") from exc
+            finally:
+                if client is not None:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
         df = pd.DataFrame(records).copy()
         if df.empty:
             return pd.DataFrame()
