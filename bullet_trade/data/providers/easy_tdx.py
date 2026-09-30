@@ -84,6 +84,9 @@ _PRICE_FIELDS = {
     "low_limit",
 }
 logger = logging.getLogger(__name__)
+# Mac 标签位经 2026-09-30 临停/复牌及两只全日停牌证券的 QMT 快照交叉验证。
+_MAC_PAUSED_TAG = 0x1000
+_TDX_PAUSED_STATUS = 0x20
 _STUB_NAMES: Dict[str, str] = {
     "000001.XSHE": "平安银行",
     "600519.XSHG": "贵州茅台",
@@ -1158,7 +1161,11 @@ class EasyTdxProvider(DataProvider):
         dt: Optional[Union[str, datetime]] = None,
         df: bool = False,
     ) -> Optional[Any]:
-        """获取实时快照；stub 模式返回显式测试数据。"""
+        """输入证券、可选逻辑时间及 df 开关，返回实时字典或 DataFrame。
+
+        真实模式依赖 SDK 报价；仅明确停牌且零价时用有效昨收补齐最后价，保留源时间。
+        空报价返回 None 或空表；连接异常沿既有换址流程传播，stub 仅返回测试数据。
+        """
         if self._use_stub:
             tick = self._stub_current_tick(security)
             return pd.DataFrame([tick]) if df else tick
@@ -1192,26 +1199,45 @@ class EasyTdxProvider(DataProvider):
         if quote_df.empty:
             return pd.DataFrame() if df else None
         row = quote_df.iloc[0]
+        raw_last_price = float(
+            row.get("price", row.get("last_price", row.get("close", 0.0))) or 0.0
+        )
+        status = int(row.get("trading_status", 0) or 0)
+        tag_value = row.get("stock_tag_flags")
+        tag_flags = int(tag_value) if pd.notna(tag_value) else 0
+        paused = bool(status & _TDX_PAUSED_STATUS or tag_flags & _MAC_PAUSED_TAG)
+        previous_close = float(row.get("pre_close", 0.0) or 0.0)
+        last_price = raw_last_price
+        price_source = "quote"
+        # 停牌的零价不是成交价；只有明确停牌且昨收有效，才提供可审计的估值价格。
+        if paused and raw_last_price == 0 and math.isfinite(previous_close) and previous_close > 0:
+            last_price = previous_close
+            price_source = "pre_close"
         limit_up = row.get("limit_up", row.get("buy_price_limit", 0.0))
         limit_down = row.get("limit_down", row.get("sell_price_limit", 0.0))
         tick = {
             "sid": security,
             "symbol": security,
-            "last_price": float(
-                row.get("price", row.get("last_price", row.get("close", 0.0))) or 0.0
-            ),
+            "last_price": last_price,
+            "paused": paused,
             "open": float(row.get("open", 0.0) or 0.0),
             "high": float(row.get("high", 0.0) or 0.0),
             "low": float(row.get("low", 0.0) or 0.0),
             "volume": float(row.get("vol", row.get("volume", 0.0)) or 0.0) * 100.0,
             "amount": float(row.get("amount", 0.0) or 0.0),
-            "pre_close": float(row.get("pre_close", 0.0) or 0.0),
+            "pre_close": previous_close,
             "limit_up": float(limit_up or 0.0),
             "limit_down": float(limit_down or 0.0),
-            "trading_status": int(row.get("trading_status", 0) or 0),
+            "trading_status": status,
             "dt": str(dt or datetime.now()),
             "provider": self.name,
         }
+        if pd.notna(tag_value) or price_source == "pre_close":
+            tick.update(
+                stock_tag_flags=tag_flags,
+                raw_last_price=raw_last_price,
+                last_price_source=price_source,
+            )
         # 仅使用服务器实际回报的日期/时间；接收时刻不能冒充行情源时间。
         day, clock = row.get("server_update_date"), row.get("server_update_time")
         if pd.notna(day) and pd.notna(clock):
@@ -1228,7 +1254,11 @@ class EasyTdxProvider(DataProvider):
         return pd.DataFrame([tick]) if df else tick
 
     def get_live_current(self, security: str) -> Dict[str, Any]:
-        """返回 LiveCurrentData 需要的实时行情字典。"""
+        """输入证券代码，返回实时价格、停牌状态及源时间审计字典。
+
+        依赖 get_current_tick 的 SDK 查询；无报价返回空字典，网络异常传播。
+        Mac 快照附原始价、标签和价格来源，不因停牌补价而改变时效或声明频道健康。
+        """
         tick = self.get_current_tick(security)
         if not isinstance(tick, dict):
             return {}
@@ -1237,13 +1267,16 @@ class EasyTdxProvider(DataProvider):
             "last_price": float(tick.get("last_price", 0.0) or 0.0),
             "high_limit": float(tick.get("limit_up", 0.0) or 0.0),
             "low_limit": float(tick.get("limit_down", 0.0) or 0.0),
-            "paused": bool(status & 0x8020),
+            "paused": bool(tick.get("paused", status & _TDX_PAUSED_STATUS)),
         }
         for name in (
             "source_time",
             "received_time",
             "query_completed_time",
             "age_seconds",
+            "stock_tag_flags",
+            "raw_last_price",
+            "last_price_source",
         ):
             if name in tick:
                 result[name] = tick[name]
