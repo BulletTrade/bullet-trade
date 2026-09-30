@@ -63,6 +63,7 @@ from .models import (
     Trade,
 )
 from .orders import LimitOrderStyle, MarketOrderStyle, clear_order_queue, get_order_queue
+from .equity_matching import EquityLimitBook
 from .scheduler import (
     generate_daily_schedule,
     get_market_periods,
@@ -223,6 +224,7 @@ class BacktestEngine:
         self.daily_records = []  # 每日记录
         self.trades = []  # 所有交易记录
         self.orders: Dict[str, Order] = {}  # 当日订单快照
+        self._equity_limit_book = EquityLimitBook(self)
         self.events = []  # 事件记录（分红/拆分）
         self._processed_dividend_keys = set()  # 已处理的分红事件键（避免重复处理）
         self._split_price_adjustments: Dict[Tuple[str, date], Dict[str, float]] = {}
@@ -990,6 +992,7 @@ class BacktestEngine:
 
             # 执行当日调度（open/close等）
             self._run_trading_day(trade_day, market_periods)
+            self._equity_limit_book.expire()
 
             # 先更新收盘价与持仓市值，再记录每日数据，避免“日志总值≠CSV总值”的错位
             self._update_positions()
@@ -1148,6 +1151,14 @@ class BacktestEngine:
         timeline_set.add(open_dt)
         timeline_set.add(close_dt)
 
+        scheduled_points = set(timeline_set)
+        if not self.is_tick_backtest():
+            # 只为已有挂单补撮合时钟，不增加策略回调或预取未来行情。
+            for start, end in market_periods:
+                point = datetime.combine(day_date, start) + timedelta(minutes=1)
+                while point <= datetime.combine(day_date, end):
+                    timeline_set.add(point)
+                    point += timedelta(minutes=1)
         timeline = sorted(timeline_set)
         state = _DayRunState(trade_day=trade_day, previous_event_dt=self.context.previous_dt)
         anchors = {
@@ -1163,6 +1174,8 @@ class BacktestEngine:
             return
 
         for current_dt in timeline:
+            if current_dt not in scheduled_points and not self._equity_limit_book.pending:
+                continue
             self._execute_time_point(current_dt, state=state, **anchors)
 
     def _execute_time_point(
@@ -1277,6 +1290,9 @@ class BacktestEngine:
         if tick_snapshot is not None or self._is_trading_time(current_dt, market_periods):
             self._raise_if_backtest_data_error()
             self._process_orders(current_dt)
+
+        if current_dt == close_dt and tick_snapshot is None:
+            self._equity_limit_book.expire()
 
         if current_dt == close_dt and tick_snapshot is None and self.after_trading_end_func:
             try:
@@ -3141,13 +3157,17 @@ class BacktestEngine:
         account.on_day_start()
 
     def _process_orders(self, current_dt: datetime):
-        """处理订单队列"""
+        """输入回放时刻，处理新委托及挂单；无返回，更新订单、成交与组合。"""
         self._raise_if_backtest_data_error()
-        orders = get_order_queue()
+        book = self._equity_limit_book
+        queued = list(get_order_queue())
+        orders = list(book.pending.values()) + [
+            order for order in queued if order.order_id not in book.pending
+        ]
         if not orders:
             return
 
-        log.info(f"处理 {len(orders)} 个订单")
+        log.debug(f"处理 {len(orders)} 个订单")
 
         settings = get_settings()
 
@@ -3177,7 +3197,9 @@ class BacktestEngine:
                     key = target_key(o)
                     if key in last_target_index and idx < last_target_index[key]:
                         # 取消旧订单
-                        if o.status == OrderStatus.open:
+                        if o.order_id in book.pending:
+                            book.cancel(o.order_id, "superseded_target")
+                        elif o.status == OrderStatus.open:
                             o.status = OrderStatus.canceled
                             log.info(f"因目标下单，取消未完成订单: {o.security}, 订单ID {o.order_id}")
                         continue
@@ -3190,6 +3212,9 @@ class BacktestEngine:
 
         for order in orders:
             try:
+                if order.status not in (OrderStatus.open, OrderStatus.new, OrderStatus.filling):
+                    book.cancel(order.order_id, "terminal_order")
+                    continue
                 self._register_order(order)
                 tick_snapshot = (
                     self.get_current_tick_snapshot(order.security)
@@ -3221,6 +3246,9 @@ class BacktestEngine:
                     )
                 else:
                     log.warning(f"无法获取 {order.security} 的行情数据")
+                    if order.order_id in book.pending:
+                        order.extra["wait_reason"] = "missing_quote"
+                        continue
                     order.status = OrderStatus.rejected
                     continue
                 if tick_snapshot is not None and security_data.source != "tick_replay":
@@ -3238,6 +3266,11 @@ class BacktestEngine:
                 is_futures_order = security_category == "futures" or is_futures_security(
                     order.security
                 )
+                if not is_futures_order and tick_snapshot is None and isinstance(
+                    order.style, LimitOrderStyle
+                ):
+                    book.process(order, security_data, sec_info, current_dt, fq_mode)
+                    continue
                 if security_data.paused:
                     log.warning(f"{order.security} 停牌，订单取消")
                     order.status = OrderStatus.canceled
@@ -3247,7 +3280,19 @@ class BacktestEngine:
                 current_dt = self.context.current_dt
                 # 期货无复权概念，动态复权口径会篡改撮合基准价
                 exec_fq_mode = "none" if is_futures_order else fq_mode
-                if tick_snapshot is not None:
+                equity_bar = None
+                if not is_futures_order and tick_snapshot is None:
+                    equity_bar = book.bar(order.security, current_dt, exec_fq_mode)
+                    if equity_bar is None or book.remaining_volume(order.security, equity_bar) == 0:
+                        order.status = OrderStatus.canceled
+                        order.extra["cancel_reason"] = "missing_or_zero_volume_minute"
+                        continue
+                    if isinstance(order.style, MarketOrderStyle) and order.style.market_type:
+                        order.status = OrderStatus.rejected
+                        order.extra["rejection_reason"] = "native_market_type_requires_order_book"
+                        continue
+                    base_exec_price = equity_bar["price"]
+                elif tick_snapshot is not None:
                     # tick 回放的成交价基准就是当前这笔快照，不能再退回 bar 价
                     base_exec_price = float(tick_snapshot.current)
                 else:
@@ -3559,7 +3604,7 @@ class BacktestEngine:
                     # 按实际结算规则搜索可负担整手，最低佣金不与比例佣金重复预留。
                     available_for_buy = max(
                         0.0,
-                        self.context.portfolio.available_cash - self.context.portfolio.locked_cash,
+                        self.context.portfolio.available_cash,
                     )
                     low_lots, high_lots = 0, final_amount // min_trade_size
                     while low_lots < high_lots:
@@ -3606,6 +3651,16 @@ class BacktestEngine:
                     else:
                         log.debug(f"{order.security} 一次卖出全部可卖持仓 {final_amount}")
 
+                requested_amount = final_amount
+                if equity_bar is not None:
+                    volume_left = book.remaining_volume(order.security, equity_bar)
+                    final_amount = min(final_amount, volume_left)
+                    if is_buy or final_amount < requested_amount:
+                        final_amount = final_amount // min_trade_size * min_trade_size
+                    if final_amount <= 0:
+                        order.status = OrderStatus.canceled
+                        order.extra["cancel_reason"] = "insufficient_minute_volume"
+                        continue
                 trade_amount = final_amount
                 trade_value = trade_price * trade_amount
 
@@ -3692,6 +3747,8 @@ class BacktestEngine:
                     trade_id=trade_id,
                 )
                 self.trades.append(trade)
+                if equity_bar is not None:
+                    book.consume(order.security, trade_amount)
 
                 # 标记订单完成
                 order.price = trade_price
@@ -3700,6 +3757,10 @@ class BacktestEngine:
                 order.filled = trade_amount
                 order.avg_cost = avg_cost
                 order.commission = float(commission + tax)
+                if trade_amount < requested_amount:
+                    order.amount = requested_amount if is_buy else -requested_amount
+                    order.status = OrderStatus.canceled
+                    order.extra["cancel_reason"] = "insufficient_minute_volume"
                 try:
                     extra = getattr(order, "extra", None)
                     if extra is None:
@@ -3710,6 +3771,7 @@ class BacktestEngine:
                     pass
 
             except Exception as e:
+                book.cancel(order.order_id, "matching_error")
                 self._raise_if_backtest_data_error()
                 log.error(f"处理订单失败: {order.security}, 错误: {e}")
                 order.status = OrderStatus.rejected
@@ -3719,6 +3781,15 @@ class BacktestEngine:
 
         # 更新账户价值
         self.context.portfolio.update_value()
+
+    def cancel_pending_order(self, order_id: str) -> bool:
+        """输入回测订单ID，返回是否撤销挂单；立即释放剩余冻结资源，无券商调用。"""
+        return self._equity_limit_book.cancel(order_id)
+
+    def cancel_pending_orders(self) -> int:
+        """取消本回测全部挂单；无参数，返回数量，并释放冻结资源。"""
+        ids = list(self._equity_limit_book.pending)
+        return sum(self._equity_limit_book.cancel(order_id) for order_id in ids)
 
     def _register_order(self, order: Order) -> None:
         if not order:

@@ -656,6 +656,10 @@ def cancel_order(order_or_id: Union[Order, str]) -> bool:
         raise RuntimeError("严格 checkpoint 模式拒绝直接撤销已提交 broker 的订单；" "请在受 checkpoint 保护的执行层处理撤单")
 
     removed = False
+    if engine and not getattr(engine, "is_live", False):
+        cancel_pending = getattr(engine, "cancel_pending_order", None)
+        if callable(cancel_pending):
+            removed = cancel_pending(target_id)
     with _order_queue_lock:
         for idx, queued in list(enumerate(_order_queue)):
             if queued.order_id == target_id:
@@ -717,6 +721,11 @@ def cancel_all_orders() -> int:
     Side Effects:
         在队列锁保护下更新订单状态并原地清空全局队列。
     """
+    engine = get_current_engine()
+    cancel_pending = getattr(engine, "cancel_pending_orders", None)
+    pending_count = 0
+    if not getattr(engine, "is_live", False) and callable(cancel_pending):
+        pending_count = cancel_pending()
     with _order_queue_lock:
         count = len(_order_queue)
         for queued in _order_queue:
@@ -727,7 +736,7 @@ def cancel_all_orders() -> int:
         _order_queue.clear()
     if count:
         log.info(f"已清空本地订单队列，共 {count} 笔")
-    return count
+    return count + pending_count
 
 
 def order_value(

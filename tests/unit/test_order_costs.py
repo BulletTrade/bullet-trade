@@ -48,6 +48,7 @@ class OrderCostTestProvider(DataProvider):
             "high_limit": [price.get("high_limit", price["close"] * 1.1)],
             "low_limit": [price.get("low_limit", price["close"] * 0.9)],
             "paused": [0.0],
+            "volume": [100000000.0],
         }
         return pd.DataFrame(data, index=index)
 

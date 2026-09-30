@@ -77,6 +77,13 @@ def _build_order_engine(
         engine, "_resolve_base_exec_price", lambda _security, _dt, _fq: current_price
     )
     monkeypatch.setattr(
+        "bullet_trade.core.engine.api_get_price",
+        lambda **kwargs: pd.DataFrame(
+            {"close": [current_price], "volume": [10000000]},
+            index=[pd.Timestamp(kwargs["end_date"])],
+        ),
+    )
+    monkeypatch.setattr(
         engine,
         "_apply_slippage_price",
         lambda price, _is_buy, _security: slippage_price if slippage_price is not None else price,
@@ -253,6 +260,13 @@ def test_backtest_order_records_requested_and_fill_price(monkeypatch):
     monkeypatch.setattr(
         engine, "_resolve_base_exec_price", lambda security, current_dt, fq_mode: 10.0
     )
+    monkeypatch.setattr(
+        "bullet_trade.core.engine.api_get_price",
+        lambda **kwargs: pd.DataFrame(
+            {"close": [10.0], "volume": [10000000]},
+            index=[pd.Timestamp(kwargs["end_date"])],
+        ),
+    )
     monkeypatch.setattr(engine, "_apply_slippage_price", lambda price, is_buy, security: 10.2)
     monkeypatch.setattr(engine, "_infer_security_category", lambda security, info=None: "stock")
     monkeypatch.setattr(engine, "_infer_tplus_from_info", lambda info: 0)
@@ -268,7 +282,7 @@ def test_backtest_order_records_requested_and_fill_price(monkeypatch):
 
     assert local_order.status == OrderStatus.filled
     assert local_order.price == 10.2
-    assert local_order.extra["order_price"] == 10.2
+    assert local_order.extra["order_price"] == 10.5
     assert local_order.extra["requested_order_price"] == 10.5
     assert local_order.extra["fill_price"] == 10.2
     position = engine.context.portfolio.positions["000001.XSHE"]
@@ -355,7 +369,8 @@ def test_backtest_limit_buy_not_filled_when_bar_price_above_limit(monkeypatch):
 
     engine._process_orders(engine.context.current_dt)
 
-    assert local_order.status == OrderStatus.canceled
+    assert local_order.status == OrderStatus.open
+    assert engine.context.portfolio.locked_cash > 0
     assert engine.trades == []
     assert "000001.XSHE" not in engine.context.portfolio.positions
     clear_order_queue()
