@@ -290,7 +290,10 @@ def test_limit_order_keeps_price_crossing_without_daily_market_cap(engine, monke
     assert missed.filled == 0
 
 
-def test_stock_order_and_volume_ratio_default_are_unchanged(engine, monkeypatch):
+def test_stock_order_uses_equity_rules_without_futures_daily_bar(engine, monkeypatch):
+    """输入期货引擎fixture及股票行情，验证股票使用独立股市量规则，不查询期货日线。"""
+    from types import SimpleNamespace
+
     stock = "000001.XSHE"
     monkeypatch.setattr(engine, "_resolve_futures_daily_bar",
                         lambda *args: pytest.fail("stock queried futures daily data"))
@@ -298,7 +301,16 @@ def test_stock_order_and_volume_ratio_default_are_unchanged(engine, monkeypatch)
     monkeypatch.setattr("bullet_trade.data.api.get_current_data", lambda: {
         stock: SecurityUnitData(security=stock, last_price=10., paused=False)
     })
-    assert get_settings().options["order_volume_ratio"] == 0.25
+    def equity_prices(**kwargs):
+        """输入股票分钟或内部日量请求，返回固定可成交行情，无网络读取。"""
+        assert kwargs["security"] == stock
+        return pd.DataFrame({"close": [10.], "high": [10.], "low": [10.],
+                             "volume": [10000]}, index=[kwargs["end_date"]])
+
+    monkeypatch.setattr("bullet_trade.core.engine.api_get_price", equity_prices)
+    monkeypatch.setattr("bullet_trade.core.engine.get_data_provider",
+                        lambda: SimpleNamespace(get_price=equity_prices))
+    assert get_settings().options["order_volume_ratio"] == 1.0
     result = order(stock, 100)
     assert result.filled == 100
     assert result.status == OrderStatus.filled

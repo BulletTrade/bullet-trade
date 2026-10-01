@@ -191,7 +191,7 @@ class StrategySettings:
         self.options: Dict[str, Any] = {
             'use_real_price': False,  # 是否使用真实价格（动态复权）
             'avoid_future_data': False,  # 是否避免未来数据
-            'order_volume_ratio': 0.25,  # 成交量比例
+            'order_volume_ratio': 1.0,  # 每笔撮合成交量比例（聚宽平台实测默认值）
             'order_match_mode': 'immediate',  # 下单撮合模式：'bar_end' 或 'immediate'
             'match_by_signal': False,  # 限价资金检查按信号价或撮合价
             'fq_ref_date': Date.today(),  # 前复权参考日期（use_real_price=False 时使用）
@@ -211,7 +211,7 @@ class StrategySettings:
         self.options = {
             'use_real_price': False,
             'avoid_future_data': False,
-            'order_volume_ratio': 0.25,
+            'order_volume_ratio': 1.0,
             'order_match_mode': 'immediate',
             'match_by_signal': False,
             'fq_ref_date': Date.today(),

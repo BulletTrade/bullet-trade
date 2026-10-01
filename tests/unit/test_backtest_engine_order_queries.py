@@ -1,3 +1,8 @@
+"""作者：BruceLee。验证回测订单查询、价格及持仓显示。
+
+输入为内存行情、订单和组合；输出pytest断言。协作BacktestEngine与订单API，
+日量通过内存provider提供，不连接真实行情或券商。
+"""
 import datetime
 from types import SimpleNamespace
 
@@ -24,6 +29,16 @@ from bullet_trade.core.orders import (
     order_value,
 )
 from bullet_trade.utils.strategy_helpers import _position_rows
+
+
+@pytest.fixture(autouse=True)
+def daily_volume_provider(monkeypatch):
+    """输入patch，为订单测试提供当前日原始量；无返回，不触发外部认证。"""
+    def price(**kwargs):
+        """输入内部日量请求，返回同日充足成交量；无外部副作用。"""
+        return pd.DataFrame({'volume': [10000000]}, index=[kwargs['end_date']])
+    monkeypatch.setattr('bullet_trade.core.engine.get_data_provider',
+                        lambda: SimpleNamespace(get_price=price))
 
 
 def _dummy_initialize(context):
@@ -314,7 +329,8 @@ def test_backtest_limit_buy_fills_when_slippage_reaches_limit(monkeypatch):
     clear_order_queue()
 
 
-def test_backtest_limit_buy_caps_slippage_at_limit(monkeypatch):
+def test_backtest_limit_buy_waits_when_slippage_exceeds_limit(monkeypatch):
+    """输入高于限价的滑点后价格，验证即时撮合不能强制降价成交；无返回。"""
     engine = _build_order_engine(
         monkeypatch,
         current_price=81.71,
@@ -329,9 +345,9 @@ def test_backtest_limit_buy_caps_slippage_at_limit(monkeypatch):
 
     engine._process_orders(engine.context.current_dt)
 
-    assert local_order.status == OrderStatus.filled
-    assert local_order.price == pytest.approx(81.75)
-    assert engine.trades[-1].price == pytest.approx(81.75)
+    assert local_order.status == OrderStatus.open
+    assert not engine.trades
+    assert engine.context.portfolio.locked_cash > 0
     clear_order_queue()
 
 

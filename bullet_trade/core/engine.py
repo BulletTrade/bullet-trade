@@ -1233,6 +1233,10 @@ class BacktestEngine:
             except Exception as exc:
                 log.warning(f"期货盘中重估失败: {exc}")
             self._raise_if_backtest_data_error()
+        if (tick_snapshot is None and self._equity_limit_book.pending
+                and self._is_trading_time(current_dt, market_periods)):
+            # 已挂单先按刚结束的分钟撮合，策略回调应看到本分钟成交后的持仓。
+            self._process_orders(current_dt)
         for task in tasks:
             try:
                 log.debug(f"执行定时任务: {task.func.__name__}")
@@ -3283,7 +3287,7 @@ class BacktestEngine:
                 equity_bar = None
                 if not is_futures_order and tick_snapshot is None:
                     equity_bar = book.bar(order.security, current_dt, exec_fq_mode)
-                    if equity_bar is None or book.remaining_volume(order.security, equity_bar) == 0:
+                    if not book.can_trade(order.security, current_dt, equity_bar):
                         order.status = OrderStatus.canceled
                         order.extra["cancel_reason"] = "missing_or_zero_volume_minute"
                         continue
@@ -3653,13 +3657,15 @@ class BacktestEngine:
 
                 requested_amount = final_amount
                 if equity_bar is not None:
-                    volume_left = book.remaining_volume(order.security, equity_bar)
-                    final_amount = min(final_amount, volume_left)
-                    if is_buy or final_amount < requested_amount:
-                        final_amount = final_amount // min_trade_size * min_trade_size
+                    daily_volume = book.daily_volume(order.security, current_dt)
+                    if daily_volume is None:
+                        order.status = OrderStatus.canceled
+                        order.extra["cancel_reason"] = "missing_daily_volume"
+                        continue
+                    final_amount = min(final_amount, book.volume_limit(daily_volume))
                     if final_amount <= 0:
                         order.status = OrderStatus.canceled
-                        order.extra["cancel_reason"] = "insufficient_minute_volume"
+                        order.extra["cancel_reason"] = "insufficient_daily_volume"
                         continue
                 trade_amount = final_amount
                 trade_value = trade_price * trade_amount
@@ -3747,8 +3753,6 @@ class BacktestEngine:
                     trade_id=trade_id,
                 )
                 self.trades.append(trade)
-                if equity_bar is not None:
-                    book.consume(order.security, trade_amount)
 
                 # 标记订单完成
                 order.price = trade_price
@@ -3760,7 +3764,7 @@ class BacktestEngine:
                 if trade_amount < requested_amount:
                     order.amount = requested_amount if is_buy else -requested_amount
                     order.status = OrderStatus.canceled
-                    order.extra["cancel_reason"] = "insufficient_minute_volume"
+                    order.extra["cancel_reason"] = "insufficient_daily_volume"
                 try:
                     extra = getattr(order, "extra", None)
                     if extra is None:

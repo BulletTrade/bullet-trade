@@ -38,9 +38,16 @@ def market(monkeypatch):
         if data.empty:
             return pd.DataFrame()
         stamp = kwargs["end_date"] + pd.Timedelta(minutes=data.lag)
-        return pd.DataFrame({"close": [data.price], "volume": [data.volume]}, index=[stamp])
+        return pd.DataFrame({"close": [data.price], "low": [data.price],
+                             "high": [data.price], "volume": [data.volume]}, index=[stamp])
+
+    def daily_prices(**kwargs):
+        """输入内部日线量请求，返回当前日期总量；固定样本以data.volume控制日量。"""
+        return pd.DataFrame({"volume": [data.volume]}, index=[kwargs["end_date"]])
 
     monkeypatch.setattr("bullet_trade.core.engine.api_get_price", prices)
+    monkeypatch.setattr("bullet_trade.core.engine.get_data_provider",
+                        lambda: SimpleNamespace(get_price=daily_prices))
     monkeypatch.setattr("bullet_trade.data.api.get_current_data", lambda: {CODE: quote})
     monkeypatch.setattr("bullet_trade.core.engine.get_security_info", lambda *_: {"type": "fund"})
     monkeypatch.setattr(engine, "_infer_security_category", lambda *_: "fund")
@@ -106,7 +113,7 @@ def test_halt_resume_freezes_then_fills(market):
     assert ticket.status == OrderStatus.filled
     assert engine.trades[0].time.hour == 10 and engine.trades[0].time.minute == 31
     assert ticket.add_time == datetime(2026, 9, 16, 9, 40)
-    assert p.available_cash == pytest.approx(9775.6)
+    assert p.available_cash == pytest.approx(9773.2)
     assert p.locked_cash == pytest.approx(0)
     assert p.total_value == pytest.approx(9995)
 
@@ -137,23 +144,23 @@ def test_limit_never_repriced_and_day_expiry(market):
     assert engine.context.portfolio.available_cash == pytest.approx(10000)
 
 
-def test_partial_fill_shared_volume_fee_once(market):
-    """多单共享量，部分成交最低佣金不重复；输入 fixture，无返回。"""
+def test_partial_fill_independent_volume_fee_once(market):
+    """每笔独立量，部分成交最低佣金不重复；输入 fixture，无返回。"""
     engine, quote, data = market
     first = order(CODE, 200, style=LimitOrderStyle(2.218))
     second = order(CODE, 100, style=LimitOrderStyle(2.218))
     data.volume = 100
     advance(engine, 9, 40)
-    assert first.filled == 100 and second.filled == 0
+    assert first.filled == 100 and second.filled == 100
     assert first.status == OrderStatus.filling
     advance(engine, 9, 40)
-    assert len(engine.trades) == 1
+    assert len(engine.trades) == 2
     advance(engine, 9, 41)
-    assert first.filled == 200 and second.filled == 0
-    assert sum(t.commission for t in engine.trades) == pytest.approx(5)
-    assert cancel_all_orders() == 1
+    assert first.filled == 200 and second.filled == 100
+    assert sum(t.commission for t in engine.trades) == pytest.approx(10)
+    assert cancel_all_orders() == 0
     assert engine.context.portfolio.locked_cash == pytest.approx(0)
-    assert engine.context.portfolio.total_value == pytest.approx(9995)
+    assert engine.context.portfolio.total_value == pytest.approx(9994.4)
 
 
 def test_sell_reservation_prevents_double_sell(market):
@@ -174,7 +181,7 @@ def test_sell_reservation_prevents_double_sell(market):
     assert p.positions[CODE].closeable_amount == 0
     assert cancel_order(first)
     assert p.positions[CODE].closeable_amount == 100
-    assert p.total_value == pytest.approx(10434.2)
+    assert p.total_value == pytest.approx(10433)
 
 
 def test_target_replaces_pending_and_releases_cash(market):
@@ -228,7 +235,7 @@ def test_resume_between_callbacks_and_expire_before_after_close(market, monkeypa
     """真实调度须在无回调的复牌分钟撮合；输入 fixture/频率，无返回。"""
     engine, quote, data = market
     engine.frequency = frequency
-    calls, tickets = [], []
+    calls, tickets, observed = [], [], []
 
     def submit(context):
         """输入策略上下文，提交原限价单及无法成交的卖单；返回无值。"""
@@ -238,22 +245,29 @@ def test_resume_between_callbacks_and_expire_before_after_close(market, monkeypa
     def prices(**kwargs):
         """输入请求，按历史时间提供停牌及复牌行情；返回单行分钟表。"""
         now = kwargs["end_date"]
-        return pd.DataFrame({"close": [2.194], "volume": [10000 if now.time() >= time(10, 31) else 0]},
+        return pd.DataFrame({"close": [2.194], "low": [2.194], "high": [2.194],
+                             "volume": [10000 if now.time() >= time(10, 31) else 0]},
                             index=[now])
 
     def after_close(context):
         """输入收盘上下文，核验没有遗留冻结；无返回。"""
         assert context.portfolio.locked_cash == pytest.approx(0)
 
+    def observe_reopen(context):
+        """输入复牌分钟上下文，验证策略回调已经可见该分钟的挂单成交；无返回。"""
+        observed.append((tickets[0].filled, context.portfolio.positions[CODE].total_amount))
+
     monkeypatch.setattr("bullet_trade.core.engine.api_get_price", prices)
     monkeypatch.setattr("bullet_trade.core.engine.generate_daily_schedule", lambda *_a, **_k: {
-        datetime(2026, 9, 16, 9, 40): [SimpleNamespace(func=submit)]})
+        datetime(2026, 9, 16, 9, 40): [SimpleNamespace(func=submit)],
+        datetime(2026, 9, 16, 10, 31): [SimpleNamespace(func=observe_reopen)]})
     monkeypatch.setattr(engine, "_apply_dividends_for_day", lambda *_: None)
     monkeypatch.setattr(engine, "_mark_non_futures_intraday", lambda *_: None)
     monkeypatch.setattr(engine, "_mark_futures_intraday", lambda *_: None)
     engine.after_trading_end_func = after_close
     engine._run_trading_day(datetime(2026, 9, 16), [(time(9, 30), time(11, 30)), (time(13), time(15))])
     assert calls == [datetime(2026, 9, 16, 9, 40)]
+    assert observed == [(100, 100)]
     assert len(engine.trades) == 1
     assert engine.trades[0].time == datetime(2026, 9, 16, 10, 31)
 
