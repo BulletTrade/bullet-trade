@@ -10,6 +10,7 @@ import pandas as pd
 
 from ..cache import CacheManager
 from ..pickle_compat import install_pickle_compat_shims
+from ..adjustment_cache import AdjustmentCache
 from .base import DataProvider
 
 install_pickle_compat_shims()
@@ -130,6 +131,7 @@ class JQDataProvider(DataProvider):
 
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         self.config = config or {}
+        self._adjustment_cache = AdjustmentCache()
         cache_dir = self.config.get('cache_dir')
         use_env_cache = 'cache_dir' not in self.config
         self._cache = CacheManager(
@@ -1221,6 +1223,7 @@ class JQDataProvider(DataProvider):
         security: Union[str, List[str], None],
         ref_date: Optional[Union[str, datetime]],
     ) -> Dict[str, float]:
+        """输入证券与参考日，返回独立因子映射；同日同参考请求复用，失败或缺因子不缓存。"""
         if not security or ref_date is None:
             return {}
         try:
@@ -1230,6 +1233,11 @@ class JQDataProvider(DataProvider):
         securities = [security] if isinstance(security, str) else list(security)
         if not securities:
             return {}
+        key = tuple(securities)
+        request = ref_day
+        hit, cached = self._adjustment_cache.get(key, request)
+        if hit:
+            return cached
         kwargs = {
             "security": securities,
             "end_date": ref_day,
@@ -1252,7 +1260,10 @@ class JQDataProvider(DataProvider):
             )
 
         df = self._cache.cached_call("get_price_factor_ref", kwargs, _fetch, result_type="df")
-        return self._extract_factor_ref_map(df, securities)
+        result = self._extract_factor_ref_map(df, securities)
+        if all(code in result for code in securities):
+            self._adjustment_cache.put(key, result, request)
+        return result
 
     def _extract_factor_ref_map(
         self,

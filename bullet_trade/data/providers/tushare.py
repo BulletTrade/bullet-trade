@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional, Union
 
 import pandas as pd
 
+from ..adjustment_cache import AdjustmentCache
 from .base import DataProvider
 from ..cache import CacheManager
 
@@ -19,6 +20,7 @@ class TushareProvider(DataProvider):
 
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         self.config = config or {}
+        self._adjustment_cache = AdjustmentCache()
         self._token = self.config.get("token") or os.getenv("TUSHARE_TOKEN")
         self._tushare_custom_url = self.config.get("tushare_custom_url") or os.getenv("TUSHARE_CUSTOM_URL")
         cache_dir_set = "cache_dir" in self.config
@@ -536,6 +538,12 @@ class TushareProvider(DataProvider):
         return None
 
     def _fetch_adj_factor(self, security: str, start_dt: datetime, end_dt: datetime) -> pd.DataFrame:
+        """输入证券与日期区间，返回因子副本；当日同区间复用，SDK异常不写缓存。"""
+        key = ("factor", self._to_ts_code(security))
+        request = (start_dt.strftime("%Y%m%d"), end_dt.strftime("%Y%m%d"))
+        hit, cached = self._adjustment_cache.get(key, request)
+        if hit:
+            return cached
         kwargs = {
             "security": security,
             "start_date": start_dt.strftime("%Y%m%d"),
@@ -551,7 +559,12 @@ class TushareProvider(DataProvider):
                 end_date=kw["end_date"],
             )
 
-        return self._cache.cached_call("adj_factor", kwargs, _fetch, result_type="df")
+        result = self._cache.cached_call("adj_factor", kwargs, _fetch, result_type="df")
+        if isinstance(result, pd.DataFrame) and (
+            result.empty or {"trade_date", "adj_factor"}.issubset(result.columns)
+        ):
+            self._adjustment_cache.put(key, result, request)
+        return result
 
     # ------------------------ 交易日/基础信息 ------------------------
     def get_trade_days(
@@ -779,6 +792,17 @@ class TushareProvider(DataProvider):
         except Exception:
             return {}
 
+    def _fetch_dividend_table(self, pro, method: str, ts_code: str):
+        """输入SDK、分红接口名及代码，返回原始表；成功表当天复用，异常不缓存。"""
+        key = ("events", method, ts_code)
+        hit, cached = self._adjustment_cache.get(key)
+        if hit:
+            return cached
+        result = getattr(pro, method)(ts_code=ts_code)
+        if isinstance(result, pd.DataFrame):
+            self._adjustment_cache.put(key, result)
+        return result
+
     # ------------------------ 分红 / 拆分 ------------------------
     def get_split_dividend(
         self,
@@ -838,7 +862,7 @@ class TushareProvider(DataProvider):
                 # 基金分红：使用 fund_div 接口
                 try:
                     seen_dividends = set()
-                    df = pro.fund_div(ts_code=ts_code)
+                    df = self._fetch_dividend_table(pro, "fund_div", ts_code)
                     if df is not None and not df.empty:
                         for _, row in df.iterrows():
                             div_proc = str(row.get("div_proc") or "")
@@ -870,7 +894,7 @@ class TushareProvider(DataProvider):
             # 股票分红：使用 dividend 接口
             if not is_fund or not events:
                 try:
-                    df = pro.dividend(ts_code=ts_code)
+                    df = self._fetch_dividend_table(pro, "dividend", ts_code)
                     if df is not None and not df.empty:
                         for _, row in df.iterrows():
                             div_proc = str(row.get("div_proc") or "")

@@ -11,6 +11,7 @@ import pandas as pd
 
 from ..backtest_session import get_current_backtest_data_session
 from ..cache import CacheManager
+from ..adjustment_cache import AdjustmentCache
 from .base import DataProvider
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,7 @@ class MiniQMTProvider(DataProvider):
 
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         self.config = config or {}
+        self._adjustment_cache = AdjustmentCache()
         self.data_dir = self.config.get("data_dir") or os.getenv("QMT_DATA_PATH")
         if self.data_dir:
             self.config["data_dir"] = self.data_dir
@@ -2178,9 +2180,15 @@ class MiniQMTProvider(DataProvider):
         start_date: Optional[Union[str, datetime, Date]],
         end_date: Optional[Union[str, datetime, Date]],
     ) -> List[Dict[str, Any]]:
+        """输入证券与范围，返回事件列表；复用当天同范围成功结果，SDK异常不缓存。"""
         xt = self._ensure_xtdata()
         start_str = self._format_time(start_date, "1d")
         end_str = self._format_time(end_date, "1d")
+        key = security
+        request = (start_str, end_str)
+        hit, cached = self._adjustment_cache.get(key, request)
+        if hit:
+            return cached
         try:
             df = xt.get_divid_factors(
                 stock_code=security,
@@ -2193,7 +2201,10 @@ class MiniQMTProvider(DataProvider):
         except Exception:
             return []
 
-        if df is None or len(df) == 0:
+        if df is None:
+            return []
+        if len(df) == 0:
+            self._adjustment_cache.put(key, [], request)
             return []
 
         df = df.copy()
@@ -2257,6 +2268,7 @@ class MiniQMTProvider(DataProvider):
                     "per_base": per_base,
                 }
             )
+        self._adjustment_cache.put(key, events, request)
         return events
 
     # ------------------------ 分红 / 拆分 ------------------------

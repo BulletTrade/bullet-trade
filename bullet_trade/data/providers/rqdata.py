@@ -19,6 +19,7 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, Union
 
 import pandas as pd
 
+from ..adjustment_cache import AdjustmentCache
 from .base import DataProvider
 
 
@@ -40,6 +41,7 @@ class RQDataProvider(DataProvider):
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         """初始化 provider 配置，不在构造阶段导入或认证 rqdatac。"""
         self.config = config or {}
+        self._adjustment_cache = AdjustmentCache()
         self._username = (
             self.config.get("username")
             or os.getenv("RQDATA_USERNAME")
@@ -340,20 +342,26 @@ class RQDataProvider(DataProvider):
         factor_by_code: Dict[str, pd.Series] = {}
         getter = getattr(rq, "get_ex_factor", None)
         if callable(getter):
-            try:
-                raw = getter(
-                    securities if len(securities) > 1 else securities[0],
-                    start_date=None,
-                    end_date=end_date,
-                    market="cn",
-                )
-            except TypeError:
-                raw = getter(
-                    securities if len(securities) > 1 else securities[0],
-                    start_date=None,
-                    end_date=end_date,
-                )
-            events = self._normalize_factor_events(raw)
+            key = tuple(securities)
+            request = str(end_date)
+            hit, events = self._adjustment_cache.get(key, request)
+            if not hit:
+                try:
+                    raw = getter(
+                        securities if len(securities) > 1 else securities[0],
+                        start_date=None,
+                        end_date=end_date,
+                        market="cn",
+                    )
+                except TypeError:
+                    raw = getter(
+                        securities if len(securities) > 1 else securities[0],
+                        start_date=None,
+                        end_date=end_date,
+                    )
+                events = self._normalize_factor_events(raw)
+                if raw is not None and (len(raw) == 0 or not events.empty):
+                    self._adjustment_cache.put(key, events, request)
         else:
             events = pd.DataFrame()
         for code in securities:

@@ -27,6 +27,7 @@ from uuid import uuid4
 import numpy as np
 import pandas as pd
 
+from bullet_trade.data.adjustment_cache import AdjustmentCache
 from bullet_trade.data.qmt_adjustment import (
     AdjustmentError,
     adjust_bars,
@@ -650,6 +651,7 @@ class BigQmtDataAdapter(RemoteDataAdapter):
 
     def __init__(self, client: BigQmtGatewayClient) -> None:
         self.client = client
+        self._adjustment_cache = AdjustmentCache()
 
     def qmt_status(self) -> Dict[str, Any]:
         return self.client.qmt_status()
@@ -914,14 +916,18 @@ class BigQmtDataAdapter(RemoteDataAdapter):
         股改仅计算源字段已表达的现金、同证券送转股及配股，不推定未提供的其他权益。
         缺字段、非法标识或缺少前收盘仍抛错，不修改源事件或回退原生复权。
         """
-        data = await self.client.post(
-            "/data/split_dividend",
-            {
-                "security": security,
-                "start": lower.isoformat(),
-                "end": upper.isoformat(),
-            },
-        )
+        key = security
+        request = (lower.isoformat(), upper.isoformat())
+        hit, data = self._adjustment_cache.get(key, request)
+        if not hit:
+            data = await self.client.post(
+                "/data/split_dividend",
+                {
+                    "security": security,
+                    "start": lower.isoformat(),
+                    "end": upper.isoformat(),
+                },
+            )
         if not isinstance(data, dict) or data.get("schema") != "big-qmt-dividend-events/v1":
             raise AdjustmentError("QMT除权响应缺少完整事件schema")
         if data.get("source") != "ContextInfo.get_divid_factors" or not isinstance(
@@ -989,6 +995,8 @@ class BigQmtDataAdapter(RemoteDataAdapter):
             event["previous_close"] = close_row["close"]
             event["previous_close_date"] = previous[-1].date().isoformat()
             events.append(event)
+        if not hit:
+            self._adjustment_cache.put(key, data, request)
         return events
 
     async def _standard_history(

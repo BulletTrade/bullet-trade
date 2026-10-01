@@ -25,6 +25,7 @@ import numpy as np
 
 from ..qmt_adjustment import AdjustmentEvent
 
+from ..adjustment_cache import AdjustmentCache
 from .base import DataProvider
 
 __all__ = ["EasyTdxProvider"]
@@ -107,6 +108,7 @@ class EasyTdxProvider(DataProvider):
     def __init__(self, config: Optional[Dict[str, Any]] = None) -> None:
         """初始化 provider，不在构造阶段连接通达信服务器。"""
         self.config = config or {}
+        self._adjustment_cache = AdjustmentCache()
         self._host = self.config.get("host") or os.getenv("EASY_TDX_HOST")
         self._port = int(self.config.get("port") or os.getenv("EASY_TDX_PORT") or 7709)
         self._timeout = float(self.config.get("timeout") or os.getenv("EASY_TDX_TIMEOUT") or 10.0)
@@ -519,7 +521,11 @@ class EasyTdxProvider(DataProvider):
             return default
 
     def _fetch_xdxr_events(self, security: str) -> pd.DataFrame:
-        """输入证券，返回事件表；读取失败抛错，无事件才返回空表，产生只读网络请求。"""
+        """输入证券，返回事件表；读取失败抛错；成功表当天复用，未命中产生只读网络请求。"""
+        key = self.jq_to_tdx(security)
+        hit, cached = self._adjustment_cache.get(key)
+        if hit:
+            return cached
         try:
             client_cls = self._resolve_tdx_client_cls()
         except Exception as exc:
@@ -585,14 +591,21 @@ class EasyTdxProvider(DataProvider):
                         pass
         df = pd.DataFrame(records).copy()
         if df.empty:
-            return pd.DataFrame()
+            df = pd.DataFrame()
+            if records is not None:
+                self._adjustment_cache.put(key, df)
+            return df
         if "date" not in df.columns:
             raise RuntimeError("easy_tdx 除权事件缺少日期")
         df["date"] = pd.to_datetime(df["date"], errors="coerce")
+        valid_dates = df["date"].notna().all()
         df.dropna(subset=["date"], inplace=True)
         if "category" in df.columns:
             df = df[df["category"] == 1]
-        return df.sort_values("date").reset_index(drop=True)
+        df = df.sort_values("date").reset_index(drop=True)
+        if valid_dates:
+            self._adjustment_cache.put(key, df)
+        return df
 
     def _event_adjust_factor(self, event: pd.Series, daily_raw: pd.DataFrame) -> float:
         """按单条除权除息事件计算前复权乘数。"""
