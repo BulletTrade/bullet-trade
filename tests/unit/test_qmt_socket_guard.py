@@ -270,8 +270,8 @@ def test_qmt_guard_constructs_after_closed_loop_and_keeps_single_flight():
 
 
 @pytest.mark.unit
-def test_qmt_broker_connect_failure_is_single_attempt_and_cleans_trader(monkeypatch):
-    """验证 QMT broker 连接失败不会无限重试，并会清理本次 trader。
+def test_qmt_broker_failed_reconnect_reuses_started_trader_until_shutdown(monkeypatch):
+    """验证连续失败只启动一个 SDK，并在显式退出时清理。
 
     Args:
         monkeypatch: pytest monkeypatch fixture。
@@ -387,18 +387,26 @@ def test_qmt_broker_connect_failure_is_single_attempt_and_cleans_trader(monkeypa
     trader = instances[0]
     assert trader.session_id == 2026081101
     assert trader.connect_calls == 1
+    assert trader.unregister_calls == 0
+    assert trader.disconnect_calls == 0
+    assert trader.stop_calls == 0
+    assert broker._xt_trader is trader
+    assert broker._xt_account is not None
+    assert broker._xt_callback is not None
+    assert broker.is_connected is False
+
+    for _ in range(300):
+        with pytest.raises(RuntimeError, match="connect"):
+            broker.connect()
+    assert len(instances) == 1
+    assert trader.connect_calls == 301
+    broker.disconnect()
     assert trader.unregister_calls == 1
     assert trader.disconnect_calls == 1
     assert trader.stop_calls == 1
     assert broker._xt_trader is None
     assert broker._xt_account is None
     assert broker._xt_callback is None
-    assert broker.is_connected is False
-
-    with pytest.raises(RuntimeError, match="connect"):
-        broker.connect()
-    assert len(instances) == 2
-    assert instances[1].session_id > trader.session_id
 
 
 @pytest.mark.unit
@@ -1123,3 +1131,62 @@ def test_remote_connection_can_health_check_when_qmt_unavailable():
         asyncio.run_coroutine_threadsafe(app.shutdown(), loop).result(timeout=5)
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=5)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("failure_stage", ["connect", "subscribe"])
+def test_qmt_broker_reuses_trader_then_recovers_without_order_calls(monkeypatch, failure_stage):
+    """输入失败阶段与假 SDK，验证失败后复用、恢复、幂等连接和退出，无真实订单。"""
+    instances = []
+
+    class RecoveringTrader:
+        """模拟启动一次、连接或订阅先失败后恢复的 SDK，保存生命周期计数。"""
+
+        def __init__(self, data_path, session_id):
+            """输入目录和会话，记录实例与计数；无返回，不访问真实 QMT。"""
+            self.starts = self.stops = self.connects = self.subscribes = 0
+            self.callback = None
+            instances.append(self)
+
+        def register_callback(self, callback):
+            """输入回调并保存；无返回，只修改假 SDK 状态。"""
+            self.callback = callback
+
+        def start(self):
+            """无参数，递增启动次数并返回成功码零。"""
+            self.starts += 1
+            return 0
+
+        def connect(self):
+            """无参数，指定阶段首次返回失败码，后续返回成功码零。"""
+            self.connects += 1
+            return -1 if failure_stage == "connect" and self.connects == 1 else 0
+
+        def subscribe(self, account):
+            """输入账户，指定阶段首次返回失败码，后续返回成功码零。"""
+            self.subscribes += 1
+            return -1 if failure_stage == "subscribe" and self.subscribes == 1 else 0
+
+        def stop(self):
+            """无参数，递增停止次数，无返回或真实外部副作用。"""
+            self.stops += 1
+
+    _install_fake_xtquant(monkeypatch, RecoveringTrader)
+    broker = QmtBroker(account_id="demo", data_path="C:/isolated", session_id=1)
+    monkeypatch.setattr(broker, "_build_account_snapshot", lambda: {})
+    with pytest.raises(RuntimeError, match=failure_stage):
+        broker.connect()
+    assert not broker.is_connected
+    with pytest.raises(RuntimeError, match="未连接"):
+        broker._ensure_connected()
+    assert broker.connect()
+    assert broker.is_connected
+    assert len(instances) == 1
+    assert instances[0].starts == 1
+    calls = instances[0].connects
+    assert broker.connect()
+    assert instances[0].connects == calls
+    broker.disconnect()
+    broker.disconnect()
+    assert instances[0].stops == 1
+    assert not broker.is_connected
