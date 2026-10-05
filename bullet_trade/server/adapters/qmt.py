@@ -582,7 +582,7 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
                 try:
                     await self._connect_all_brokers()
                 except Exception as exc:
-                    await self._disconnect_all_brokers()
+                    # 保留各账户已启动的 SDK，失败重试不得制造新的原生队列。
                     self.guard.mark_failure(exc)
                     log.warning("QMT broker 重连失败: %s", exc)
                 else:
@@ -625,10 +625,6 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
                     auto_subscribe=ctx.config.auto_subscribe,
                 )
                 self._brokers[key] = broker
-            try:
-                await _run_in_qmt_executor(broker.disconnect)
-            except Exception:
-                pass
             await _run_in_qmt_executor(broker.connect)
             await self.account_router.attach_handle(key, broker)
 
