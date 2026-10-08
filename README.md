@@ -15,7 +15,7 @@
 ## ✨ 核心特性
 
 - **🔄 聚宽兼容**：`from jqdata import *`
-- **📊 多数据源**：JQData、MiniQMT、TuShare、本地缓存、远程 QMT server，以及 Beta 版 RQData/easy_tdx 均可切换。
+- **📊 多数据源**：JQData、MiniQMT、掘金 GM、TuShare、本地缓存、远程 QMT server，以及 Beta 版 RQData/easy_tdx 均可切换。
 - **⚡ 回测 & 报告**：分钟/日线回测、真实价格撮合、HTML/PDF 报告一键生成。
 - **💼 实盘接入**：本地 QMT、远程 QMT server、模拟券商按需选择。
 - **🧩 可扩展**：数据/券商接口基于抽象基类，便于自定义实现。
@@ -47,6 +47,8 @@
 - [回测引擎](docs/backtest.md)：真实价格成交、分红送股处理、聚宽代码示例与 CLI 回测。
 - [实盘引擎](docs/live.md)：本地 QMT 独立实盘与远程实盘流程。
 - [华鑫 TORA 接入](docs/huaxin.md)：同包 BYO SDK、Trader + XMD L1 server 模式、自动重连边界、私密配置与生产/仿真安全门禁。
+- [同花顺模拟交易服务](docs/ths-server.md)：Windows 已登录模拟客户端的 GUI actor、本机缓存 API 与 Server 接入；安装支持该功能的版本时使用 `pip install "bullet-trade[ths]"`。
+- [掘金环境准备](docs/gm.md)：可选 SDK、诊断和 Windows 安装脚本；[数据适配](docs/gm-data-adapter.md)仅使用 GM 数据，聚宽只用于测试对比，[本地交易候选版](docs/gm-trading.md)已完成银华日利仿真往返。
 - [交易支撑](docs/trade-support.md)：聚宽模拟盘接入、远程 QMT 服务与 helper 用法。
 - [QMT 服务配置](docs/qmt-server.md)：bullet-trade server 的完整说明。
 - [数据源指南](docs/data/DATA_PROVIDER_GUIDE.md)：聚宽、MiniQMT、Tushare、RQData/easy_tdx Beta 以及自定义 Provider 配置。

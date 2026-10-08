@@ -265,7 +265,16 @@ def _build_huaxin(config: Mapping[str, Any]) -> BrokerBase:
     )
 
 
+def _build_gm(config: Mapping[str, Any]) -> BrokerBase:
+    """延迟构造 GM Broker，不启动 SDK 或连接账户。"""
+    from ..integrations.gm.broker import GmBroker
+
+    settings = dict(config.get("gm") or {})
+    return GmBroker(settings.get("account_id", ""), config=settings)
+
+
 BROKER_REGISTRY = BrokerRegistry()
+BROKER_REGISTRY.register("gm", _build_gm)
 BROKER_REGISTRY.register("qmt", _build_qmt)
 BROKER_REGISTRY.register("qmt-remote", _build_remote_qmt)
 BROKER_REGISTRY.register("simulator", _build_simulator)

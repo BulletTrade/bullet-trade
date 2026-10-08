@@ -61,6 +61,8 @@ def _normalize_provider_name(name: Optional[str]) -> str:
         return "rqdata"
     if lowered in ("tdx", "easytdx", "easy_tdx", "easy-tdx"):
         return "easy_tdx"
+    if lowered in ("gm", "goldminer", "掘金"):
+        return "gm"
     return lowered
 
 
@@ -74,6 +76,12 @@ def _create_provider(
     target = _normalize_provider_name(provider_name or config.get("default") or "jqdata")
     overrides = overrides or {}
 
+    if target == "gm":
+        from .providers.gm import GmDataProvider
+
+        provider_cfg = dict(config.get("gm", {}) or {})
+        provider_cfg.update(overrides)
+        return GmDataProvider(provider_cfg)
     if target == "jqdata":
         from .providers.jqdata import JQDataProvider
 
@@ -263,7 +271,7 @@ def _sdk_fallback_targets(
             target = getattr(mod, method_name, None)
             if target:
                 return target
-    elif normalized == "remote_qmt":
+    elif normalized in ("remote_qmt", "gm"):
         raise AttributeError(f"{normalized} 未实现 {method_name}，且无可用的 SDK 回退路径")
     elif normalized == "rqdata":
         mod = _lazy_import("rqdatac")
@@ -1478,7 +1486,8 @@ def _try_get_dynamic_pre_price_from_backtest_session(
         return None
 
     provider_name = _normalize_provider_name(getattr(_get_default_provider(), "name", None))
-    if provider_name in ("miniqmt", "remote_qmt"):
+    # GM 同时调整价格和成交量，不能使用仅调整价格的通用动态复权缓存。
+    if provider_name in ("miniqmt", "remote_qmt", "gm"):
         return None
     freq_key = _price_block_frequency_key(frequency)
     if isinstance(fields, str):
@@ -2588,10 +2597,13 @@ def get_price(
         return session_price
 
     # 真实价格模式：使用当前回测时间作为复权参考日期
-    # 注意：当 panel=False 时跳过真实价格模式，因为 get_price_engine 不支持 panel 参数
-    # 此时直接使用标准的 get_price，它正确支持 panel=False 返回长表格式
+    # 既有 get_price_engine 不支持 panel=False；GM 自身支持长表和固定参考日，
+    # 因此 GM 长表也传递回测参考日，避免使用今天的因子。
     reference_kwargs = {}
-    if use_real_price and fq == "pre" and panel:
+    gm_long_reference = (
+        not panel and _normalize_provider_name(getattr(_get_default_provider(), "name", None)) == "gm"
+    )
+    if use_real_price and fq == "pre" and (panel or gm_long_reference):
         # 使用当前回测日期作为复权参考日期，以获得当时的真实价格
 
         # 确保 pre_factor_ref_date 是 datetime.date 类型

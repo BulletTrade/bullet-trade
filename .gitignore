@@ -139,6 +139,7 @@ celerybeat.pid
 .env.*
 .envrc
 .venv
+.venv-gm/
 env/
 venv/
 ENV/
@@ -211,3 +212,10 @@ logs/*
 # Big QMT helper runtime state
 artifacts/
 helpers/bt_big_qmt_order_tags.json
+
+# Local trading profiles, evidence, OCR samples and runtime databases
+*.private.*
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+digit_templates/

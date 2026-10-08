@@ -34,6 +34,7 @@ BulletTrade 是一套兼容聚宽 API 的开源量化研究与交易框架。新
 - [配置总览](config.md)：只有需要扩展默认行为时再查。
 - [API 文档](api.md)：查策略函数和对象。
 - [数据源指南](data/DATA_PROVIDER_GUIDE.md)：选择 JQData、QMT、Tushare 等数据源。
+- [掘金环境准备](gm.md)：可选 SDK、诊断与 Windows 环境；[数据适配](gm-data-adapter.md)已接入标准 API，仅使用 GM 数据，聚宽只用于测试对比，[本地交易候选版](gm-trading.md)已完成银华日利仿真往返。
 
 ## 安装
 

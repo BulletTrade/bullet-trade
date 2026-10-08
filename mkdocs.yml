@@ -28,6 +28,7 @@ nav:
       - 极简配置与完整配置: config.md
       - 实盘引擎: live.md
       - 交易支撑: trade-support.md
+      - 同花顺模拟交易服务: ths-server.md
       - Tick 行情: tick.md
       - QMT 服务参考: qmt-server.md
       - API 文档: api.md
@@ -42,6 +43,10 @@ nav:
   - 高级接入与贡献:
       - MiniQMT（兼容方案）: data/DATA_PROVIDER_MINIQMT.md
       - 华鑫 TORA（自备 SDK）: huaxin.md
+      - 掘金: gm.md
+      - 掘金数据层适配: gm-data-adapter.md
+      - 掘金本地交易候选版: gm-trading.md
+      - 掘金完整接入计划: gm-integration-plan.md
       - 聚宽接管设计说明: joinquant-live-takeover.md
       - 邀请贡献: contributing.md
 theme:

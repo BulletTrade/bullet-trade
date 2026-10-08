@@ -67,6 +67,19 @@ qmt = [
 qmtserver = [
     "pywin32>=305; platform_system == 'Windows'",
 ]
+ths = [
+    "pywin32>=305; platform_system == 'Windows'",
+    "pywinauto>=0.6.8; platform_system == 'Windows'",
+    "Pillow>=9.1",
+    "psutil>=5.9",
+]
+gm = [
+    "gm>=3.0.186,<3.1; platform_system == 'Windows' or platform_system == 'Linux'",
+]
+gm-validation = [
+    "interruptingcow>=0.8,<1",
+    "SQLAlchemy>=1.4,<3",
+]
 rqdata = [
     "rqdatac",
 ]
@@ -80,7 +93,7 @@ report = [
     "snapshot-phantomjs>=0.0.3",
 ]
 all = [
-    "bullet-trade[dev,tushare,qmt,qmtserver,rqdata,tdx,report]",
+    "bullet-trade[dev,tushare,qmt,qmtserver,gm,rqdata,tdx,report]",
 ]
 
 [project.urls]
@@ -105,6 +118,7 @@ include-package-data = true
 version = {attr = "bullet_trade.__version__.__version__"}
 
 [tool.setuptools.package-data]
+"bullet_trade.integrations.ths" = ["README.md"]
 "bullet_trade.reporting" = ["templates/*.html"]
 "bullet_trade" = ["notebook/**/*.ipynb", "notebook/**/*.md", "contracts/**/*.json", "config/**/*.json"]
 "bullet_trade.integrations.huaxin" = [

@@ -846,6 +846,21 @@ class ServerApplication:
                     )
                 pending_result = dict(entry.result)
 
+        # Opt-in durable resolution for transports whose broker cannot echo
+        # our idempotency key (THS). Keep existing adapters on their current
+        # resolution route. The original payload fingerprint was checked above.
+        if getattr(self.adapters.broker_adapter, "supports_durable_resolution", False) is True:
+            durable = await self._resolve_with_adapter(ctx, payload)
+            if (durable is not None and durable.get("write_action") == action
+                    and durable.get("idempotency_key") == key
+                    and durable.get("submission_state") in
+                    {"accepted", "rejected", "submit_unknown", "reconciling"}):
+                return durable
+            return _unknown_submission_result(
+                action, key, reason="durable_resolution_unavailable",
+                order_id=str(payload.get("order_id") or original_payload.get("order_id") or "") or None,
+            )
+
         strong_keys = {key}
         order_id = str(payload.get("order_id") or original_payload.get("order_id") or "").strip()
         matching_orders = await self._query_submission_orders(ctx, order_id, strong_keys)

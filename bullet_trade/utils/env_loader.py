@@ -162,6 +162,14 @@ def get_data_provider_config() -> dict:
 
     return {
         "default": get_env("DEFAULT_DATA_PROVIDER", "jqdata"),
+        "gm": {
+            "token": get_env("GM_TOKEN"),
+            "serv_addr": get_env("GM_SERV_ADDR"),
+            "python_executable": get_env("GM_PYTHON_EXECUTABLE"),
+            "timeout": get_env_float("GM_DATA_TIMEOUT", 30.0),
+            "alignment_mode": get_env("GM_ALIGNMENT_MODE", "native"),
+            "max_live_age_seconds": get_env_float("GM_LIVE_MAX_AGE_SECONDS", 5.0),
+        },
         "jqdata": {
             "username": get_env("JQDATA_USERNAME"),
             "password": get_env("JQDATA_PASSWORD"),
@@ -214,6 +222,16 @@ def get_broker_config() -> dict:
     """
     return {
         "default": get_env("DEFAULT_BROKER", "simulator"),
+        "gm": {
+            "account_id": get_env("GM_ACCOUNT_ID"),
+            "strategy_id": get_env("GM_STRATEGY_ID"),
+            "token": get_env("GM_TOKEN"),
+            "serv_addr": get_env("GM_SERV_ADDR", "127.0.0.1:7001"),
+            "python_executable": get_env("GM_PYTHON_EXECUTABLE"),
+            "journal_path": get_env("GM_JOURNAL_PATH"),
+            "enable_trading": get_env_bool("GM_ENABLE_TRADING", False),
+            "timeout": get_env_int("GM_TRADE_TIMEOUT", 20),
+        },
         "qmt": {
             "account_id": get_env("QMT_ACCOUNT_ID"),
             "account_type": get_env("QMT_ACCOUNT_TYPE", "stock"),
