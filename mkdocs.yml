@@ -21,6 +21,7 @@ nav:
   - 研究与回测:
       - 研究环境: research.md
       - 回测引擎: backtest.md
+      - 现金证券撮合与账本: equity-backtest.md
       - 回测数据会话优化: backtest-data-session.md
       - 参数优化: optimize.md
   - 配置与参考:

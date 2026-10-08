@@ -29,6 +29,7 @@ BulletTrade 是一套兼容聚宽 API 的开源量化研究与交易框架。新
 - [快速上手](quickstart.md)：先跑通最小示例。
 - [研究环境](research.md)：启动 JupyterLab。
 - [回测引擎](backtest.md)：运行和检查回测。
+- [现金证券撮合与账本](equity-backtest.md)：股票/ETF成交量约束、限价挂单、费用和停牌边界。
 - [实盘引擎](live.md)：了解本地实盘运行方式。
 - [配置总览](config.md)：只有需要扩展默认行为时再查。
 - [API 文档](api.md)：查策略函数和对象。
