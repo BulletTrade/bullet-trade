@@ -39,12 +39,13 @@ _AMBIGUOUS_SERVER_ERROR_CODES = frozenset({"REQUEST_FAILED", "REQUEST_TIMEOUT"})
 class RemoteServerError(RuntimeError):
     """表示远程服务器已明确返回的错误。"""
 
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(self, code: str, message: str, *, broker_called: Optional[bool] = None) -> None:
         """初始化服务器错误。
 
         Args:
             code: 服务器错误码。
             message: 服务器错误文本。
+            broker_called: 是否调用券商的严格布尔证据；缺失或非法值保留为未知。
 
         Returns:
             None。
@@ -52,6 +53,7 @@ class RemoteServerError(RuntimeError):
 
         super().__init__(message)
         self.code = str(code or "REQUEST_FAILED")
+        self.broker_called = broker_called if isinstance(broker_called, bool) else None
 
 
 class RemoteSubmissionUnknownError(RuntimeError, TimeoutError):
@@ -233,6 +235,8 @@ class RemoteQmtConnection:
             effective_timeout = timeout
         try:
             return future.result(timeout=effective_timeout)
+        except RemoteSubmissionUnknownError:
+            raise
         except concurrent.futures.TimeoutError as exc:
             future.cancel()
             if classify_remote_action(action) == "ambiguous_write":
@@ -369,6 +373,7 @@ class RemoteQmtConnection:
         await self._resubscribe_all()
 
     async def _reader_loop(self) -> None:
+        """读取响应及错误帧；无输入返回，更新pending并保留券商调用证据，断连时清理连接。"""
         assert self._reader
         try:
             while not self._stop.is_set():
@@ -383,6 +388,7 @@ class RemoteQmtConnection:
                     err = RemoteServerError(
                         str(msg.get("code") or "REQUEST_FAILED"),
                         str(msg.get("message") or "server error"),
+                        broker_called=msg.get("broker_called"),
                     )
                     if req_id and req_id in self._pending:
                         self._pending.pop(req_id).set_exception(err)
@@ -480,7 +486,11 @@ class RemoteQmtConnection:
                 raise
             except RemoteServerError as exc:
                 self._pending.pop(req_id, None)
-                if side_effect == "ambiguous_write" and exc.code in _AMBIGUOUS_SERVER_ERROR_CODES:
+                if (
+                    side_effect == "ambiguous_write"
+                    and exc.code in _AMBIGUOUS_SERVER_ERROR_CODES
+                    and not (exc.code == "REQUEST_FAILED" and exc.broker_called is False)
+                ):
                     raise RemoteSubmissionUnknownError(
                         action,
                         prepared_payload["idempotency_key"],
