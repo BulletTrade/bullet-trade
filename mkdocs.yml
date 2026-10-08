@@ -42,6 +42,10 @@ nav:
   - 高级接入与贡献:
       - MiniQMT（兼容方案）: data/DATA_PROVIDER_MINIQMT.md
       - 华鑫 TORA（自备 SDK）: huaxin.md
+      - 掘金: gm.md
+      - 掘金数据层适配: gm-data-adapter.md
+      - 掘金本地交易候选版: gm-trading.md
+      - 掘金完整接入计划: gm-integration-plan.md
       - 聚宽接管设计说明: joinquant-live-takeover.md
       - 邀请贡献: contributing.md
 theme:

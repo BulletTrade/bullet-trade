@@ -52,6 +52,19 @@
 
 说明：MiniQMT Provider 是本地 `xtquant` / `userdata_mini` 直连模式。大 QMT 不使用这个 provider 直接配置；大 QMT 应先启动 helper 和 `bullet-trade server --server-type big_qmt`，再由策略使用 `qmt-remote` 访问。详见 [大 QMT 服务向导](../big-qmt-server.md)。
 
+### 掘金 GM Provider
+
+`DEFAULT_DATA_PROVIDER=gm` 可使用标准行情、交易日历、证券信息、指数成份、分红和 tick 接口。
+运行时只依赖 GM SDK/终端与 GM_TOKEN，因子、金额等所有字段都来自 GM，不需要聚宽数据源。
+聚宽 RPC 仅用于开发验收对比，不参与运行接口。
+
+独立接入及实用验收已通过 52/52：接受小相对误差，后复权先统一参考日。
+原严格诊断保留 20 项数值差异；这不表示数值完全一致或所有策略都已验证。
+之前使用双来源所得的 52/52 不满足独立运行要求，已撤回为本方案验收结论。
+分红事件表基准仍受 Finance RPC 服务端线程错误阻塞。
+GM Broker、远程 Server、基本面、行业及概念接口尚未实现。
+配置和具体报告见[掘金数据层适配](../gm-data-adapter.md)。
+
 ### RQData Provider Beta
 
 **优点：**

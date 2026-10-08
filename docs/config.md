@@ -314,6 +314,7 @@ bullet_trade/config/security_overrides.json
 如果只是先跑通：
 
 - 本地 MiniQMT：只配 `DEFAULT_DATA_PROVIDER`、`DEFAULT_BROKER`、`QMT_DATA_PATH`、`QMT_ACCOUNT_ID`。
+- 掘金数据源：配置 `DEFAULT_DATA_PROVIDER=gm`、`GM_TOKEN`、`GM_SERV_ADDR`；按[掘金数据适配](gm-data-adapter.md)使用独立 GM 数据，本地交易见[GM Broker 配置](gm-trading.md)。
 - MiniQMT 远程 server：只配 `QMT_DATA_PATH`、`QMT_ACCOUNT_ID`、`QMT_SERVER_TOKEN`。
 - 大 QMT 远程 server：先按 [大 QMT 服务向导](big-qmt-server.md) 在大 QMT 里启动 helper；外部 `bullet-trade server` 再配 `BIG_QMT_GATEWAY_URL`、`BIG_QMT_GATEWAY_PASSWORD`、`QMT_SERVER_TOKEN`。
 - 远程客户端：只配 `DEFAULT_DATA_PROVIDER`、`DEFAULT_BROKER`、`QMT_SERVER_HOST`、`QMT_SERVER_PORT`、`QMT_SERVER_TOKEN`。

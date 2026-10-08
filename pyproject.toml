@@ -73,6 +73,13 @@ ths = [
     "Pillow>=9.1",
     "psutil>=5.9",
 ]
+gm = [
+    "gm>=3.0.186,<3.1; platform_system == 'Windows' or platform_system == 'Linux'",
+]
+gm-validation = [
+    "interruptingcow>=0.8,<1",
+    "SQLAlchemy>=1.4,<3",
+]
 rqdata = [
     "rqdatac",
 ]
@@ -86,7 +93,7 @@ report = [
     "snapshot-phantomjs>=0.0.3",
 ]
 all = [
-    "bullet-trade[dev,tushare,qmt,qmtserver,rqdata,tdx,report]",
+    "bullet-trade[dev,tushare,qmt,qmtserver,gm,rqdata,tdx,report]",
 ]
 
 [project.urls]

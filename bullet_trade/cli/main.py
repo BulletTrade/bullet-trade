@@ -220,7 +220,7 @@ def create_parser():
         choices=list(list_brokers()),
         default=None,
         help=(
-            "券商类型：qmt、qmt-remote、simulator、huaxin（huaxin 需外部 Trader bundle "
+            "券商类型：qmt、qmt-remote、simulator、gm、huaxin（huaxin 需外部 Trader bundle "
             "与私密配置；默认读取 DEFAULT_BROKER）"
         ),
     )
@@ -328,6 +328,12 @@ def create_parser():
     )
     configure_huaxin_parser(huaxin_parser)
 
+    # 掘金环境诊断；注册解析器不导入厂商 SDK
+    from bullet_trade.integrations.gm.cli import configure_parser as configure_gm_parser
+
+    gm_parser = subparsers.add_parser("gm", help="掘金 SDK 环境诊断与接入准备")
+    configure_gm_parser(gm_parser)
+
     # jupyterlab / lab 命令
     lab_parser = subparsers.add_parser(
         "lab", aliases=["jupyterlab"], help="启动 BulletTrade 研究环境 (JupyterLab)"
@@ -397,6 +403,10 @@ def main():
         return run_server_command(args)
     elif args.command == "huaxin":
         from bullet_trade.integrations.huaxin.cli import run_arguments
+
+        return run_arguments(args)
+    elif args.command == "gm":
+        from bullet_trade.integrations.gm.cli import run_arguments
 
         return run_arguments(args)
     elif args.command in ("lab", "jupyterlab"):

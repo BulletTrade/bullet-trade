@@ -211,6 +211,15 @@ class ReferenceProvider(DataProvider):
             # minute
             minute_key = f"{ts.strftime('%Y-%m-%d %H:%M')}"
             val = self.minute.get((sec, minute_key), None)
+            # 新撮合合同要求当前分钟价量证据。这里是权益/费用单元夹具，
+            # 为已声明的交易日显式构造按开盘价成交、流动性充足的分钟；
+            # 不改预期成交、分红或费用断言，也不用于真实行情回退。
+            if val is None and "volume" in fields_set:
+                val = self.daily.get(sec, {}).get(date_key, {}).get("open")
+            if val is not None and "volume" in fields_set:
+                return pd.DataFrame(
+                    [{"close": float(val), "volume": 1_000_000}], index=[pd.Timestamp(ts)]
+                )
             if val is None:
                 return pd.DataFrame()
             df = pd.DataFrame([{"close": float(val)}], index=[pd.Timestamp(ts)])

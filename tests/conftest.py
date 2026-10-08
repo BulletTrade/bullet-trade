@@ -24,6 +24,24 @@ def pytest_addoption(parser: pytest.Parser) -> None:
         default="jqdata",
         help="Comma separated provider list for online tests (e.g. jqdata,tushare,miniqmt)",
     )
+    parser.addoption(
+        "--gm-parity-report",
+        action="store",
+        default=None,
+        help="Explicit live GM versus JoinQuant RPC report produced by probe_gm_parity.py",
+    )
+    parser.addoption(
+        "--gm-adapter-report",
+        action="store",
+        default=None,
+        help="Explicit GM capture/review report from probe_gm_adapter.py or review_gm_acceptance.py",
+    )
+    parser.addoption(
+        "--gm-acceptance-profile",
+        choices=["practical", "strict"],
+        default="practical",
+        help="GM acceptance: practical tolerances/common post basis, or original strict diagnostic",
+    )
     # 兼容历史脚本：将选项映射为标记过滤
     parser.addoption(
         "--requires-network",
@@ -56,7 +74,9 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     """
     # 是否显式要求运行联网用例
     marker_expr = str(config.getoption("-m") or "")
-    want_network = ("requires_network" in marker_expr) or bool(config.getoption("--requires-network"))
+    want_network = ("requires_network" in marker_expr) or bool(
+        config.getoption("--requires-network")
+    )
     want_jq = ("requires_jqdata" in marker_expr) or bool(config.getoption("--requires-jqdata"))
 
     deselected: list[pytest.Item] = []
