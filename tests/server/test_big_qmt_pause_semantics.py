@@ -111,7 +111,7 @@ def test_partial_pause_keeps_240_rows_and_real_bars(skip, fill, fq):
     )
     assert len(result) == 240
     assert (result["paused"] == 0).all()
-    assert (result.iloc[:60][FIELDS[:4]] == 2.308).all().all()
+    assert (result.iloc[:60][FIELDS[:4]] == 2.334).all().all()
     assert (result.iloc[:60][["volume", "money"]] == 0).all().all()
     raw = gateway.frames[("513100.SH", "1m", False)].loc["2026-09-24", FIELDS[:6]]
     pd.testing.assert_frame_equal(
@@ -124,7 +124,8 @@ def test_partial_pause_keeps_240_rows_and_real_bars(skip, fill, fq):
 def test_count_includes_partial_pause_minutes(skip, count):
     """核对count和skip组合；输入数量与标志，无返回，盘中暂停不得使count提前跨天。"""
     gateway = FrozenGateway()
-    full = request(gateway, start_date="2026-09-23 09:30", skip_paused=skip)
+    # 样本没有 09-22 前收；241 根的对照只需前一天最后一分钟。
+    full = request(gateway, start_date="2026-09-23 15:00", skip_paused=skip)
     result = request(gateway, start_date=None, count=count, skip_paused=skip)
     pd.testing.assert_frame_equal(result, full.tail(count))
 
@@ -175,13 +176,17 @@ def test_full_day_pause_matches_rpc_and_mirror(skip, fill, frequency):
 @pytest.mark.parametrize("skip", [False, True])
 @pytest.mark.parametrize("fill", [False, True])
 def test_before_resume_does_not_read_future_price(skip, fill):
-    """验证历史截断不穿越；输入标志，无返回，窗口无可见成交价时明确失败且不抓未来分钟。"""
+    """验证历史截断不穿越；输入标志，无返回，早盘使用前收且不抓未来分钟。"""
     gateway = FrozenGateway()
-    with pytest.raises(RemoteServerError, match="截止时间内可见成交价格"):
-        request(gateway, end_date="2026-09-24 10:00", skip_paused=skip, fill_paused=fill)
+    early = request(gateway, end_date="2026-09-24 10:00", skip_paused=skip, fill_paused=fill)
+    assert len(early) == 30
+    assert (early[FIELDS[:4]] == 2.334).all().all()
     for path, payload in gateway.calls:
         if path == "/data/history" and payload["frequency"] == "1m":
             assert pd.Timestamp(payload["end"]) <= pd.Timestamp("2026-09-24 10:00:59")
+
+    full = request(FrozenGateway(), skip_paused=skip, fill_paused=fill)
+    pd.testing.assert_frame_equal(early, full.loc[early.index], check_freq=False)
 
 
 @pytest.mark.parametrize(
@@ -260,7 +265,7 @@ def test_partial_pause_aggregation_preserves_volume(frequency, count):
     gateway = FrozenGateway()
     result = request(gateway, frequency=frequency, fields=FIELDS[:6])
     assert len(result) == count
-    assert result.iloc[0]["open"] == 2.308
+    assert result.iloc[0]["open"] == 2.334
     raw = gateway.frames[("513100.SH", "1m", False)].loc["2026-09-24"]
     assert result["volume"].sum() == raw["volume"].sum()
     assert result["money"].sum() == raw["money"].sum()
@@ -271,3 +276,48 @@ def test_frozen_big_qmt_uses_shared_provider_contract(case):
     """输入跨源固定用例，无返回，WHZ样本重放必须通过与其他provider相同的断言。"""
     provider, _ = _client(FrozenGateway())
     assert_pause_contract(provider.get_price(**case["request"]), case)
+
+
+@pytest.mark.parametrize("fault", ["missing", "zero"])
+def test_opening_pause_rejects_unreliable_previous_close(fault):
+    """输入前收故障类别，无返回；不可信前收必须报错，不能借用复牌价。"""
+    gateway = FrozenGateway()
+    key = ("513100.SH", "1d", False)
+    day = pd.Timestamp("2026-09-23")
+    if fault == "missing":
+        gateway.frames[key] = gateway.frames[key].drop(day)
+    else:
+        gateway.frames[key].loc[day, "close"] = 0
+    with pytest.raises(RemoteServerError):
+        request(gateway, end_date="2026-09-24 10:00")
+
+
+def test_opening_pause_ignores_later_resume_price():
+    """无输入返回；改变未来复牌价不得改变早盘停牌补价，真实成交行仍原样输出。"""
+    gateway = FrozenGateway()
+    stamp = pd.Timestamp("2026-09-24 10:31")
+    for fill in [False, True]:
+        gateway.frames[("513100.SH", "1m", fill)].loc[stamp, FIELDS[:4]] = 9.0
+    result = request(gateway)
+    assert (result.iloc[:60][FIELDS[:4]] == 2.334).all().all()
+    assert (result.loc[stamp, FIELDS[:4]] == 9.0).all()
+
+
+def test_opening_pause_skips_confirmed_prior_full_day_halt():
+    """无输入返回；合成前日整日停牌时追溯有效前收，不能使用停牌日填充值。"""
+    gateway = FrozenGateway()
+    previous = pd.Timestamp("2026-09-23")
+    earlier = pd.Timestamp("2026-09-22")
+    for fill in [False, True]:
+        key = ("513100.SH", "1d", fill)
+        frame = gateway.frames[key].copy()
+        frame.loc[earlier] = frame.loc[previous]
+        frame.loc[earlier, "close"] = 2.5
+        if fill:
+            frame.loc[previous, "suspendFlag"] = 1
+            frame.loc[previous, "close"] = 99
+        else:
+            frame = frame.drop(previous)
+        gateway.frames[key] = frame.sort_index()
+    result = request(gateway, end_date="2026-09-24 10:00")
+    assert (result[FIELDS[:4]] == 2.5).all().all()

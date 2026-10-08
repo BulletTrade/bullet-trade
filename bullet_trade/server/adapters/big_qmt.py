@@ -840,7 +840,7 @@ class BigQmtDataAdapter(RemoteDataAdapter):
         """补齐已确认暂停的分钟；输入证券、原价、缺轴和截止，返回独立行情表。
 
         日线 flag=1 表示整日停牌，沿用后续 skip/fill 处理；其余缺轴须有原生
-        分钟 flag=1 且零量额。盘中暂停使用当日已可见成交价格，公开 paused=0。
+        分钟 flag=1 且零量额。盘中暂停用此前成交收盘，早盘无成交用前收，公开 paused=0。
         不采信 helper 合成价，不读取截止后的复牌价；缺事实、价格或矛盾数据抛错。
         仅在缺轴时额外读取有界行情，可能预热 helper 缓存，不修改输入或交易状态。
         """
@@ -891,12 +891,34 @@ class BigQmtDataAdapter(RemoteDataAdapter):
         for day in partial.normalize().unique():
             stamps = partial[partial.normalize() == day]
             visible = raw.loc[(raw.index.normalize() == day) & (raw["suspendFlag"] == 0)]
-            if visible.empty:
-                raise AdjustmentError("盘中停牌填充缺少截止时间内可见成交价格: %s" % day.date())
             positions = visible.index.get_indexer(stamps, method="ffill")
-            seeds = visible.iloc[np.maximum(positions, 0)]
-            _history_validate_values(seeds, columns)
-            prices = np.where(positions < 0, seeds["open"], seeds["close"])
+            prices = np.empty(len(stamps), dtype=float)
+            has_prior = positions >= 0
+            if has_prior.any():
+                seeds = visible.iloc[positions[has_prior]]
+                _history_validate_values(seeds, columns)
+                prices[has_prior] = seeds["close"].to_numpy()
+            if (~has_prior).any():
+                # 早盘未成交只能读过去的实际收盘，不用之后复牌价或 helper 合成价。
+                prior_end = day - pd.Timedelta(days=1)
+                while True:
+                    prior_days = await self._history_calendar(security, prior_end, count=1)
+                    if prior_days.empty:
+                        raise AdjustmentError("盘中停牌填充缺少前一有效收盘依赖")
+                    prior_day = prior_days[-1]
+                    support = await self._history_raw(
+                        security, "1d", prior_day, prior_day, ["close", "suspendFlag"]
+                    )
+                    if support.empty:
+                        await self._history_pause_facts(security, prior_days)
+                    else:
+                        _history_validate_values(support, ["close", "suspendFlag"])
+                        if support.iloc[-1]["suspendFlag"] == 0:
+                            if support.iloc[-1]["close"] <= 0:
+                                raise AdjustmentError("盘中停牌填充前收盘必须大于零")
+                            prices[~has_prior] = support.iloc[-1]["close"]
+                            break
+                    prior_end = prior_day - pd.Timedelta(days=1)
             result.loc[stamps, ["open", "high", "low", "close"]] = np.repeat(
                 prices[:, None], 4, axis=1
             )
