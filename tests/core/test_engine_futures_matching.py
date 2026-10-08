@@ -25,6 +25,7 @@ from datetime import date, datetime
 import pytest
 
 from bullet_trade.core.engine import BacktestEngine
+from bullet_trade.core.futures_account import ContractSpecTable
 from bullet_trade.core.models import Context, Order, OrderStatus, Portfolio
 from bullet_trade.core.settings import OrderCost, reset_settings, set_option, set_order_cost
 
@@ -35,17 +36,18 @@ CASH = 1_000_000.0
 
 
 @pytest.fixture(autouse=True)
-def _futures_settings():
+def _futures_settings(monkeypatch):
     """为每个用例配置期货保证金率与手续费。
 
     Args:
-        无。
+        monkeypatch: pytest补丁器，将默认证券信息固定为空；到期测试可单独覆盖。
 
     Returns:
         Iterator[None]: 用例结束后恢复全局设置。
     """
 
     reset_settings()
+    monkeypatch.setattr("bullet_trade.core.engine.get_security_info", lambda _code: {})
     set_option("futures_margin_rate", MARGIN_RATE)
     set_order_cost(
         OrderCost(
@@ -70,6 +72,8 @@ def _engine(cash: float = CASH) -> BacktestEngine:
     """
 
     engine = BacktestEngine()
+    # 本组测试只验证内置规格下的撮合，禁止意外读取远端合约信息。
+    engine._futures_spec_table = ContractSpecTable(enable_remote=False)
     engine.context = Context(
         portfolio=Portfolio(
             total_value=cash,

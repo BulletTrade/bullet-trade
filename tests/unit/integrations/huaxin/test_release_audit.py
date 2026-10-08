@@ -1037,7 +1037,8 @@ def test_sensitive_json_depth_and_placeholder_prefix_fail_closed(tmp_path: Path)
     """
 
     # 其他依赖可能提高进程递归上限，样本必须仍触发真实 JSON 解码深度异常。
-    depth = sys.getrecursionlimit() + 100
+    # Python 3.12的JSON原生解码深度上限不等同于Python递归上限；构造明确超限样本。
+    depth = max(10000, sys.getrecursionlimit() + 100)
     deep_json = ("[" * depth + "0" + "]" * depth).encode()
     wheel = _write_wheel(
         tmp_path,

@@ -1,5 +1,14 @@
-from datetime import datetime
+"""作者：BruceLee。
 
+职责：验证现金证券撮合的预算、费用、精度及可卖数量。
+输入：固定行情、组合和订单；输出：真实引擎订单入口的账本断言。
+上下游：BacktestEngine与订单API；行情和证券信息均使用局部替身，无联网配置。
+"""
+
+from datetime import datetime, timedelta
+from types import SimpleNamespace
+
+import pandas as pd
 import pytest
 
 from bullet_trade.core.engine import BacktestEngine
@@ -39,7 +48,9 @@ def reset_state():
 
 @pytest.fixture
 def make_engine(monkeypatch):
+    """输入pytest补丁器，返回现金撮合引擎工厂；全部行情使用固定响应，不访问外部接口。"""
     def build(cash=1000.0, price=1.0, category="fund", subtype="etf"):
+        """输入现金、价格和类别，返回带足量分钟及日线行情的测试引擎，设置局部补丁。"""
         code = "510300.XSHG"
         info = {"type": "fund", "subtype": subtype, "category": category, "tplus": 0}
         quote = SecurityUnitData(
@@ -57,6 +68,26 @@ def make_engine(monkeypatch):
         monkeypatch.setattr("bullet_trade.core.engine.get_security_info", lambda _: info)
         monkeypatch.setattr(engine, "_resolve_base_exec_price", lambda *a: quote.last_price)
         monkeypatch.setattr(engine, "_apply_slippage_price", lambda price, *a: price)
+
+        def minute_prices(**kwargs):
+            """输入行情查询参数，返回当前分钟固定价量表；仅供现金预算测试使用。"""
+            return pd.DataFrame(
+                {"close": [quote.last_price], "high": [quote.last_price],
+                 "low": [quote.last_price], "volume": [1000000]},
+                index=pd.DatetimeIndex([engine.context.current_dt]),
+            )
+
+        def daily_prices(**kwargs):
+            """输入引擎日量查询，返回同日足量原始成交量；不使用真实数据源。"""
+            assert kwargs["frequency"] == "daily" and kwargs["fq"] is None
+            return pd.DataFrame(
+                {"volume": [1000000]},
+                index=pd.DatetimeIndex([pd.Timestamp(engine.context.current_dt).normalize()]),
+            )
+
+        monkeypatch.setattr("bullet_trade.core.engine.api_get_price", minute_prices)
+        monkeypatch.setattr("bullet_trade.core.engine.get_data_provider",
+                            lambda: SimpleNamespace(get_price=daily_prices))
         engine.test_code = code
         engine.test_quote = quote
         return engine
@@ -149,8 +180,10 @@ def test_minimum_commission_is_a_floor_not_an_extra_charge(make_engine, cash, ex
 
 
 def test_budget_accounts_for_tax_and_existing_locked_cash(make_engine):
+    """输入204元总现金和1元冻结，验证仅203元可用、费用及冻结守恒；无外部依赖。"""
     engine = make_engine(cash=204.0)
     engine.context.portfolio.locked_cash = 1
+    engine.context.portfolio.available_cash -= 1
     set_order_cost(cost(rate=0.01, minimum=2, tax=0.01), type="fund")
     result = execute(engine, order(engine.test_code, 200))
     assert result.filled == 100
@@ -168,6 +201,7 @@ def test_default_budget_does_not_spend_cash_needed_for_fees(make_engine):
 
 @pytest.mark.parametrize("decimals,buy_fee,buy_tax", [(2, 0.01, 0), (None, 0.0146, 0.0034)])
 def test_notional_budget_debits_fees_after_principal_check(make_engine, decimals, buy_fee, buy_tax):
+    """输入金额精度和预期费用，验证两分钟买卖逐笔扣费及余额；无外部副作用。"""
     engine = make_engine(cash=20, price=0.2)
     set_option("equity_cash_budget", "notional")
     set_option("equity_cash_decimals", decimals)
@@ -178,6 +212,7 @@ def test_notional_budget_debits_fees_after_principal_check(make_engine, decimals
     assert engine.trades[-1].tax == pytest.approx(buy_tax)
     assert engine.context.portfolio.available_cash == pytest.approx(-buy_fee - buy_tax)
     engine.test_quote.last_price = 0.203
+    engine.context.current_dt += timedelta(minutes=1)
     result = execute(engine, order_target_value(engine.test_code, 0))
     assert result.filled == 100
     sell_fee = 0.01 if decimals == 2 else 20.3 * 0.00073

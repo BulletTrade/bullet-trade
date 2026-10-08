@@ -171,6 +171,7 @@ class ReferenceProvider(DataProvider):
         pre_factor_ref_date: Optional[Union[str, datetime]] = None,
         prefer_engine: bool = False,
     ) -> pd.DataFrame:
+        """输入证券、日期、周期及字段，返回固定价量样本；09:30为合成竞价快照，无联网。"""
         # 简化：仅支持单标的，按 end_date 返回最后一条
         sec = security if isinstance(security, str) else security[0]
         ts = pd.to_datetime(end_date) if end_date is not None else pd.Timestamp("2024-07-10 09:30")
@@ -184,7 +185,7 @@ class ReferenceProvider(DataProvider):
             for d in days:
                 key = d.date().isoformat()
                 base = dict(self.daily.get(sec, {}).get(key, {"open": 1.0, "close": 1.0}))
-                base.setdefault("volume", 1.0)
+                base.setdefault("volume", 1000000.0)
                 base.setdefault("paused", 0)
                 rows.append(base)
             df = pd.DataFrame(rows, index=[pd.Timestamp(d.date()) for d in days])
@@ -211,9 +212,15 @@ class ReferenceProvider(DataProvider):
             # minute
             minute_key = f"{ts.strftime('%Y-%m-%d %H:%M')}"
             val = self.minute.get((sec, minute_key), None)
+            # 本夹具以固定日开构造09:30集合竞价快照，明确提供成交量；不是在线行情验收。
+            if val is None and ts.time() == Time(9, 30):
+                val = self.daily.get(sec, {}).get(date_key, {}).get("open")
             if val is None:
                 return pd.DataFrame()
-            df = pd.DataFrame([{"close": float(val)}], index=[pd.Timestamp(ts)])
+            df = pd.DataFrame(
+                [{"close": float(val), "high": float(val), "low": float(val),
+                  "volume": 1000000.0}], index=[pd.Timestamp(ts)]
+            )
             return df
 
     def get_trade_days(self, start_date=None, end_date=None, count=None) -> List[datetime]:

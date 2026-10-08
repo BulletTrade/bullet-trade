@@ -3,6 +3,7 @@
 """
 
 import json
+import re
 import shutil
 from pathlib import Path
 
@@ -139,6 +140,7 @@ def test_load_results_from_directory_merges_metrics_meta(tmp_path):
 
 
 def test_generate_html_report_includes_benchmark_and_run_context(tmp_path):
+    """输入临时报告目录，验证报告标题及坐标语义；兼容Plotly的JSON Unicode转义输出。"""
     results_dir = _prepare_results_dir(tmp_path)
     html = generate_html_report(results_dir=str(results_dir))
     assert "Benchmark: 000300.XSHG" in html
@@ -149,9 +151,10 @@ def test_generate_html_report_includes_benchmark_and_run_context(tmp_path):
     assert "return raw.toFixed(1) + '%'" in html
     assert "回撤 / 超额收益 (%)" not in html
     assert '"yaxis3"' not in html
-    assert '"text":"回撤 (%)"' in html
-    assert '"text":"资产 / 超额资产 (元)"' in html
-    assert '超额资产 (元)' in html
+    labels = [json.loads(value) for value in re.findall(r'"text"\s*:\s*("(?:\\.|[^"\\])*")', html)]
+    assert "回撤 (%)" in labels
+    assert "资产 / 超额资产 (元)" in labels
+    assert "回撤 / 超额收益 (%)" not in labels
 
 
 def test_analysis_resample_aliases_work_across_supported_pandas_versions():

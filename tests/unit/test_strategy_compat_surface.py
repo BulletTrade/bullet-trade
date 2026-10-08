@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import datetime
+from types import SimpleNamespace
 
 import pandas as pd
 import pytest
@@ -515,6 +516,21 @@ def _stock_engine(monkeypatch, *, price: float = 10.0, cash: float = 200000.0) -
     engine = BacktestEngine()
     engine.context = _context(cash=cash)
     engine.start_total_value = cash
+    engine.test_price = price
+
+    def prices(**kwargs):
+        """输入分钟或日量请求，返回同一时刻的足量测试行情；无外部访问。"""
+        stamp = pd.Timestamp(engine.context.current_dt)
+        if kwargs.get("frequency") == "daily":
+            stamp = stamp.normalize()
+        return pd.DataFrame(
+            {"close": [engine.test_price], "high": [engine.test_price],
+             "low": [engine.test_price], "volume": [1000000]}, index=[stamp]
+        )
+
+    monkeypatch.setattr("bullet_trade.core.engine.api_get_price", prices)
+    monkeypatch.setattr("bullet_trade.core.engine.get_data_provider",
+                        lambda: SimpleNamespace(get_price=prices))
 
     monkeypatch.setattr(
         "bullet_trade.core.orders._trigger_order_processing", lambda *args, **kwargs: None
@@ -551,6 +567,8 @@ def _reprice(monkeypatch, engine: BacktestEngine, price: float) -> None:
         None。
     """
 
+    engine.test_price = price
+    engine.context.current_dt += datetime.timedelta(minutes=1)
     monkeypatch.setattr(
         "bullet_trade.data.api.get_current_data",
         lambda: {
