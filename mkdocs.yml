@@ -27,6 +27,7 @@ nav:
       - 极简配置与完整配置: config.md
       - 实盘引擎: live.md
       - 交易支撑: trade-support.md
+      - 同花顺模拟交易服务: ths-server.md
       - Tick 行情: tick.md
       - QMT 服务参考: qmt-server.md
       - API 文档: api.md

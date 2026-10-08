@@ -246,7 +246,7 @@ def create_parser():
         "--server-type",
         dest="server_type",
         default=None,
-        help="服务类型（qmt、big_qmt/big-qmt 或 huaxin）",
+        help="服务类型（qmt、big_qmt/big-qmt、huaxin 或 ths）",
     )
     server_parser.add_argument(
         "--listen", dest="listen", default=None, help="监听地址（覆盖 QMT_SERVER_LISTEN）"

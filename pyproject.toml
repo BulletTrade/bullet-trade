@@ -67,6 +67,12 @@ qmt = [
 qmtserver = [
     "pywin32>=305; platform_system == 'Windows'",
 ]
+ths = [
+    "pywin32>=305; platform_system == 'Windows'",
+    "pywinauto>=0.6.8; platform_system == 'Windows'",
+    "Pillow>=9.1",
+    "psutil>=5.9",
+]
 rqdata = [
     "rqdatac",
 ]
@@ -105,6 +111,7 @@ include-package-data = true
 version = {attr = "bullet_trade.__version__.__version__"}
 
 [tool.setuptools.package-data]
+"bullet_trade.integrations.ths" = ["README.md"]
 "bullet_trade.reporting" = ["templates/*.html"]
 "bullet_trade" = ["notebook/**/*.ipynb", "notebook/**/*.md", "contracts/**/*.json", "config/**/*.json"]
 "bullet_trade.integrations.huaxin" = [

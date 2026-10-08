@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
+import sys
 from typing import Optional
 
 from bullet_trade.core.globals import log
@@ -30,6 +31,14 @@ def _install_signal_handlers(app: ServerApplication) -> None:
             pass
 
 
+def _get_server_adapter(server_type: str):
+    if isinstance(server_type, str) and server_type.strip().lower() == "ths":
+        if sys.version_info < (3, 9):
+            raise RuntimeError("THS server adapter requires Python 3.9 or newer")
+        from .adapters import ths  # noqa: F401 - register only when selected
+    return get_adapter(server_type)
+
+
 async def _async_main(args) -> int:
     # 如果显式提供 env 文件，则覆盖加载一次（优先于默认 .env）
     try:
@@ -45,7 +54,7 @@ async def _async_main(args) -> int:
         except Exception:
             log.warning("无法将日志写入 %s，继续使用默认输出", config.log_file)
     router = AccountRouter(config.accounts)
-    builder = get_adapter(config.server_type)
+    builder = _get_server_adapter(config.server_type)
     bundle = builder(config, router)
     app = ServerApplication(config=config, router=router, adapters=bundle)
     _install_signal_handlers(app)

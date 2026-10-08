@@ -1180,7 +1180,7 @@ class HuaxinAssetConsolidationCoordinator:
             trading_day: 八位柜台交易日。
 
         Returns:
-            Dict[str, Any]: 可交付给 AIStocks 的单日完整 READY 文档。
+            Dict[str, Any]: 可供调用方使用的单日完整 READY 文档。
 
         Raises:
             HuaxinAssetConsolidationWaiting: 当日归集仍在进行时抛出。
