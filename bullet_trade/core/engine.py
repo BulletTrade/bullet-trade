@@ -4,13 +4,14 @@
 实现策略回测的核心逻辑
 """
 
+from copy import deepcopy
 import importlib.util
 import inspect as _inspect
 import math
 import re
 import sys
 import time
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import date, datetime
 from datetime import time as Time
 from datetime import timedelta
@@ -180,6 +181,7 @@ class BacktestEngine:
         process_initialize: Optional[Callable] = None,
         data_session_config: Optional[Dict[str, Any]] = None,
         strict_data: bool = False,
+        on_day_end: Optional[Callable[[Dict[str, Any]], None]] = None,
     ):
         """
         初始化回测引擎
@@ -204,12 +206,14 @@ class BacktestEngine:
             process_initialize: 实盘初始化函数
             data_session_config: 回测数据会话配置，仅用于回测内的临时性能优化
             strict_data: 历史读取故障或必需持仓价格缺失时终止回放，默认保留宽松行为
+            on_day_end: 可选日终观察回调，接收已完成日记录、持仓和新增成交的独立副本；异常仅告警
         """
         self.strategy_file = strategy_file
         self.start_date = pd.to_datetime(start_date) if start_date else None
         self.end_date = pd.to_datetime(end_date) if end_date else None
         self.frequency = frequency
         self.initial_cash = initial_cash
+        self.benchmark = benchmark
         self.log_file = log_file
         self.file_handler = None  # 文件处理器
 
@@ -237,6 +241,7 @@ class BacktestEngine:
         self.algorithm_id = algorithm_id
         self.data_session_config = data_session_config or None
         self.strict_data = bool(strict_data)
+        self.on_day_end = on_day_end
         # 新增：收益计算基准（首次总资产）
         self.start_total_value: Optional[float] = None
         # 新增：回测运行耗时（秒）
@@ -758,9 +763,7 @@ class BacktestEngine:
             self.initial_cash = capital_base
         if frequency:
             self.frequency = frequency
-        if benchmark is not None:  # 允许传入 None 来不设置基准
-            # benchmark 会在load_strategy后通过 set_benchmark 设置
-            pass
+        effective_benchmark = benchmark if benchmark is not None else self.benchmark
 
         # 验证必需参数
         if self.start_date is None or self.end_date is None:
@@ -885,6 +888,12 @@ class BacktestEngine:
                 log.error(traceback.format_exc())
                 raise
 
+        # 显式运行参数优先于初始化中的设置；未指定时保留策略原有基准。
+        if effective_benchmark is not None:
+            from .settings import set_benchmark
+
+            set_benchmark(effective_benchmark)
+
         # 避免重复：若 before_market_open/market_open 已通过调度注册，则取消直接调用
         try:
             tasks = get_tasks()
@@ -958,7 +967,9 @@ class BacktestEngine:
             self._load_benchmark_data(settings.benchmark)
 
         # 逐日回测
+        observed_trades = 0
         for i, trade_day in enumerate(trade_days):
+            positions_start = len(self.daily_positions)
             # 更新前一个时间点
             self.context.previous_dt = self.context.current_dt if i > 0 else None
 
@@ -1009,6 +1020,9 @@ class BacktestEngine:
 
             # 新增：记录每日持仓快照（已是收盘价）
             self._record_daily_positions()
+            if self.on_day_end is not None:
+                self._notify_day_end(i + 1, len(trade_days), positions_start, observed_trades)
+                observed_trades = len(self.trades)
 
         log.info("\n" + "=" * 60)
         log.info("回测完成")
@@ -4087,6 +4101,28 @@ class BacktestEngine:
                 f"累计超额收益: {record['excess_returns_pct']:.2f}%"
             )
 
+    def _notify_day_end(self, completed, total, positions_start, trades_start):
+        """向观察回调发送本日已计算事实，返回 None。
+
+        输入完成日数、总日数、本日持仓起点和上次成交游标；不传递引擎或组合对象。
+        输出字段为 completed/total/daily/positions/trades，其中成交使用原始 Trade 字段。
+        独立深拷贝隔离回调修改，回调普通异常仅记录告警，不改变撮合和最终结果。
+        回调同步执行，调用方应快速返回；不承诺阻止回调通过外部引用访问引擎。
+        """
+        try:
+            payload = deepcopy(
+                {
+                    "completed": completed,
+                    "total": total,
+                    "daily": self.daily_records[-1],
+                    "positions": self.daily_positions[positions_start:],
+                    "trades": [asdict(trade) for trade in self.trades[trades_start:]],
+                }
+            )
+            self.on_day_end(payload)
+        except Exception as exc:
+            log.warning("日终观察回调失败，不影响回测结果: %s", exc)
+
     # 新增：记录每日持仓快照（在更新收盘价后调用）
     def _record_daily_positions(self):
         portfolio = self.context.portfolio
@@ -4412,6 +4448,7 @@ def create_backtest(
     initial_positions: Optional[List[Dict[str, Any]]] = None,
     algorithm_id: Optional[str] = None,
     data_session_config: Optional[Dict[str, Any]] = None,
+    on_day_end: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     """
     创建并运行回测
@@ -4428,6 +4465,7 @@ def create_backtest(
         initial_positions: 初始持仓列表
         algorithm_id: 算法ID（可选）
         data_session_config: 回测数据会话配置（可选）
+        on_day_end: 可选只读日终观察回调；接收独立事实副本，异常仅告警
     """
     engine = BacktestEngine(
         strategy_file=strategy_file,
@@ -4441,6 +4479,7 @@ def create_backtest(
         initial_positions=initial_positions,
         algorithm_id=algorithm_id,
         data_session_config=data_session_config,
+        on_day_end=on_day_end,
     )
 
     return engine.run()

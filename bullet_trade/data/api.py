@@ -42,6 +42,22 @@ _provider_cache: Dict[str, DataProvider] = {}
 _provider_auth_attempted: Dict[str, bool] = {}
 _provider_init_lock = threading.RLock()
 _pending_default_provider_name: Optional[str] = None
+_security_tplus_resolver: Optional[Callable] = None
+
+
+def set_security_tplus_resolver(resolver: Optional[Callable]) -> None:
+    """设置当前进程的回转规则解释器，不返回值。
+
+    输入 callable 或 None；解释器接收证券、日期、合并信息和原始数据源 T+ 值，
+    返回 0、1 或 None（沿用原行为）。仅修改 T+，清除证券缓存；非 callable 抛 TypeError。
+    调用方负责运行结束后清除，不改变其他元数据合并规则。
+    """
+    global _security_tplus_resolver
+    if resolver is not None and not callable(resolver):
+        raise TypeError("回转规则解释器须为 callable 或 None")
+    _security_tplus_resolver = resolver
+    _security_info_cache.clear()
+    _security_info_cache_refreshed_at.clear()
 
 
 def _normalize_provider_name(name: Optional[str]) -> str:
@@ -2365,7 +2381,7 @@ def get_security_info(security: str, date: Optional[Union[str, datetime]] = None
             return cached
 
     provider = _ensure_auth()
-    if not callable(getattr(provider, "get_security_info", None)):
+    if not callable(getattr(provider, "get_security_info", None)) and _security_tplus_resolver is None:
         empty = SecurityInfo(security, {})
         _security_info_cache[cache_key] = empty
         _security_info_cache_refreshed_at.pop(cache_key, None)
@@ -2377,8 +2393,15 @@ def get_security_info(security: str, date: Optional[Union[str, datetime]] = None
         return cached
 
     normalized = _normalize_security_info(security, raw_info)
+    provider_tplus = normalized.get("tplus")
     # 应用配置覆盖（分类/tplus/slippage等）
     normalized = _merge_overrides(security, normalized)
+    if _security_tplus_resolver is not None:
+        tplus = _security_tplus_resolver(security, resolved_date, dict(normalized), provider_tplus)
+        if tplus is not None:
+            if type(tplus) is not int or tplus not in (0, 1):
+                raise ValueError("回转规则解释器须返回 0、1 或 None")
+            normalized["tplus"] = tplus
     info_obj = SecurityInfo(security, normalized)
     _security_info_cache[cache_key] = info_obj
     if info_obj.get("rule_version") and date is None:
@@ -3845,6 +3868,7 @@ __all__ = [
     "get_data_provider",
     "set_security_overrides",
     "reset_security_overrides",
+    "set_security_tplus_resolver",
     "get_tick_decimals",
 ]
 
