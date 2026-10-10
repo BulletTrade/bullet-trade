@@ -22,6 +22,38 @@ from bullet_trade.core.settings import reset_settings
 from test_scheduler_engine import StubProvider
 
 
+@pytest.mark.parametrize("constructor, runtime, initialized, processed, expected", [
+    (None, None, "000300.XSHG", None, "000300.XSHG"),
+    (None, None, "000300.XSHG", "000016.XSHG", "000016.XSHG"),
+    ("000905.XSHG", None, "000300.XSHG", None, "000905.XSHG"),
+    (None, "000905.XSHG", "000300.XSHG", "000016.XSHG", "000905.XSHG"),
+    ("000016.XSHG", "000905.XSHG", "000300.XSHG", None, "000905.XSHG"),
+    ("000905.XSHG", None, None, None, "000905.XSHG"),
+])
+def test_explicit_benchmark_priority(constructor, runtime, initialized, processed, expected):
+    """输入各入口基准，核验真实三日结果；未指定保留策略值，显式参数优先，无网络。"""
+    from bullet_trade.core.settings import get_settings, set_benchmark
+
+    def initialize(context):
+        """输入上下文，无返回；按测试场景设置策略基准。"""
+        if initialized is not None:
+            set_benchmark(initialized)
+
+    def process_initialize(context):
+        """输入上下文，无返回；按测试场景覆盖策略初始化基准。"""
+        if processed is not None:
+            set_benchmark(processed)
+
+    engine = BacktestEngine(initialize=initialize, process_initialize=process_initialize,
+                            benchmark=constructor)
+    result = engine.run(start_date="2024-06-17", end_date="2024-06-19",
+                        capital_base=100000, frequency="daily", benchmark=runtime)
+    assert get_settings().benchmark == expected
+    assert result["meta"]["benchmark"] == expected
+    assert len(engine.daily_records) == 3
+    assert engine.benchmark_data is not None
+
+
 @pytest.fixture(autouse=True)
 def isolated_state(monkeypatch):
     """输入 pytest 补丁对象，安装离线行情；返回无值，前后清理调度和全局状态。"""
