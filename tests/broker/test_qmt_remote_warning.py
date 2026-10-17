@@ -156,7 +156,7 @@ def test_remote_qmt_broker_forwards_explicit_market_type(monkeypatch):
         16,
         market=True,
         extra={
-            "idempotency_key": "huaxin-dg14-o2-opponent-best",
+            "idempotency_key": "mock_provider-dg14-o2-opponent-best",
             "market_type": "opponent_best",
         },
     )
@@ -166,7 +166,7 @@ def test_remote_qmt_broker_forwards_explicit_market_type(monkeypatch):
     assert payload["market"] is True
     assert payload["style"] == {"type": "market", "protect_price": 101.212}
     assert payload["market_type"] == "opponent_best"
-    assert payload["idempotency_key"] == "huaxin-dg14-o2-opponent-best"
+    assert payload["idempotency_key"] == "mock_provider-dg14-o2-opponent-best"
 
 
 def test_remote_qmt_broker_forwards_order_extra_metadata(monkeypatch):

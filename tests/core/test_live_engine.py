@@ -1045,8 +1045,8 @@ async def test_live_account_sync_positions_support_broker_suffix_aliases(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_live_account_sync_accepts_huaxin_nullable_market_fields_atomically(tmp_path):
-    """验证华鑫不提供市值和现价时仍保留真实可卖持仓。
+async def test_live_account_sync_accepts_mock_provider_nullable_market_fields_atomically(tmp_path):
+    """验证券商不提供市值和现价时仍保留真实可卖持仓。
 
     Args:
         tmp_path: pytest 提供的临时运行目录。
@@ -1055,8 +1055,8 @@ async def test_live_account_sync_accepts_huaxin_nullable_market_fields_atomicall
         None；合法空行情字段成功应用，非法后续快照不清空旧持仓即通过。
     """
 
-    class HuaxinNullableMarketDummy(DummyBroker):
-        """返回华鑫 Trader 真实 nullable 行情字段形态的 Broker 替身。"""
+    class NullableMarketDummy(DummyBroker):
+        """返回券商 真实 nullable 行情字段形态的 Broker 替身。"""
 
         def sync_account(self):
             """返回资金和 511880 可卖持仓联合快照。
@@ -1082,7 +1082,7 @@ async def test_live_account_sync_accepts_huaxin_nullable_market_fields_atomicall
             }
 
     strategy = _write_strategy(tmp_path)
-    broker = HuaxinNullableMarketDummy()
+    broker = NullableMarketDummy()
     engine = LiveEngine(
         strategy_file=strategy,
         broker_factory=lambda: broker,

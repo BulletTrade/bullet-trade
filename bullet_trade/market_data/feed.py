@@ -4,7 +4,7 @@
 文件职责: 定义独立实时行情 Feed 契约，并提供无需厂商 SDK 的确定性 Mock 实现。
 主要输入: CapabilityManifest、MarketSubscriptionSpec、typed MarketEvent 和 callback。
 主要输出: 生命周期状态、精确订阅回执、兼容 tick、分级快照与 FeedHealth。
-上游关系: 未来由 LiveEngine、远程客户端或 Huaxin native bridge 创建和驱动 Feed。
+上游关系: 未来由 LiveEngine、远程客户端或 行情桥接层 创建和驱动 Feed。
 下游关系: 策略 tick/market callback、DataSourceRouter、健康门禁和离线合同测试。
 关键配置约定: Mock 不联网；通配符只展开协商且 ready 的事件；全市场必须显式门禁。
 """

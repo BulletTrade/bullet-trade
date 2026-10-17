@@ -4,7 +4,7 @@
 文件职责: 提供实时行情 Feed 的延迟工厂注册、查询、创建和受控未知名称错误。
 主要输入: 规范化 Feed 名称、无副作用 factory、公开 metadata 和创建参数。
 主要输出: RealtimeMarketDataFeed 实例、已注册名称及不可变注册信息。
-上游关系: 由内置 backend、未来 Huaxin integration 或应用启动代码显式注册工厂。
+上游关系: 由内置 backend、行情集成或应用启动代码显式注册工厂。
 下游关系: 供 LiveEngine、CLI 配置解析和测试按名称创建 Feed，避免硬编码分支。
 关键配置约定: 注册本身不得加载 SDK、连接网络或创建 Feed；只有 create 调用 factory。
 """

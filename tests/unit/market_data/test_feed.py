@@ -5,7 +5,7 @@
 主要输入: 合成 CapabilityManifest、订阅 spec 与 typed/tick 事件。
 主要输出: FeedHealth、逐项 receipt、callback 过滤和受控错误断言。
 上游关系: 覆盖 bullet_trade.market_data.feed 的公共接口。
-下游关系: 为未来 LiveEngine 与 Huaxin adapter 接入提供纯 Python 合同门禁。
+下游关系: 为未来 LiveEngine 与 模拟后端 adapter 接入提供纯 Python 合同门禁。
 关键配置约定: Mock 立即确认合法订阅；全市场 L2 默认关闭；测试不联网不加载 SDK。
 """
 

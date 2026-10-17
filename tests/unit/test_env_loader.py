@@ -73,13 +73,11 @@ class TestEnvLoader:
         """测试获取券商配置"""
         monkeypatch.setenv("DEFAULT_BROKER", "qmt")
         monkeypatch.setenv("QMT_ACCOUNT_ID", "12345")
-        monkeypatch.setenv("HUAXIN_ENABLE_NODE_TRANSFER", "true")
 
         config = get_broker_config()
 
         assert config["default"] == "qmt"
         assert config["qmt"]["account_id"] == "12345"
-        assert "enable_node_transfer" not in config["huaxin"]
 
     def test_get_system_config(self, monkeypatch):
         """测试获取系统配置"""

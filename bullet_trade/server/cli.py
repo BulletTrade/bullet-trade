@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import signal
-import sys
 from typing import Optional
 
 from bullet_trade.core.globals import log
@@ -10,7 +9,6 @@ from bullet_trade.utils.env_loader import load_env
 
 from .adapters import get_adapter  # type: ignore
 from .adapters import big_qmt  # noqa: F401
-from .adapters import huaxin  # noqa: F401
 from .adapters import qmt  # noqa: F401
 from .adapters.base import AccountRouter
 from .app import ServerApplication
@@ -32,10 +30,6 @@ def _install_signal_handlers(app: ServerApplication) -> None:
 
 
 def _get_server_adapter(server_type: str):
-    if isinstance(server_type, str) and server_type.strip().lower() == "ths":
-        if sys.version_info < (3, 9):
-            raise RuntimeError("THS server adapter requires Python 3.9 or newer")
-        from .adapters import ths  # noqa: F401 - register only when selected
     return get_adapter(server_type)
 
 

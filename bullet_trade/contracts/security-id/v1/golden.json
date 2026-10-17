@@ -16,8 +16,7 @@
         "formats": {
           "canonical": {"ok": true, "value": "510180.XSHG"},
           "jq": {"ok": true, "value": "510180.XSHG"},
-          "qmt": {"ok": true, "value": "510180.SH"},
-          "ths": {"ok": true, "value": "510180"}
+          "qmt": {"ok": true, "value": "510180.SH"}
         },
         "idempotency_identity": "security-id/v1|510180.XSHG",
         "semantic_signature": "b724dece4f9c3985540bbc900269f5fd2f77a51349df13473d209aea7f607e68"
@@ -32,8 +31,7 @@
         "formats": {
           "canonical": {"ok": true, "value": "510180.XSHG"},
           "jq": {"ok": true, "value": "510180.XSHG"},
-          "qmt": {"ok": true, "value": "510180.SH"},
-          "ths": {"ok": true, "value": "510180"}
+          "qmt": {"ok": true, "value": "510180.SH"}
         },
         "idempotency_identity": "security-id/v1|510180.XSHG",
         "semantic_signature": "b724dece4f9c3985540bbc900269f5fd2f77a51349df13473d209aea7f607e68"
@@ -48,8 +46,7 @@
         "formats": {
           "canonical": {"ok": true, "value": "159915.XSHE"},
           "jq": {"ok": true, "value": "159915.XSHE"},
-          "qmt": {"ok": true, "value": "159915.SZ"},
-          "ths": {"ok": true, "value": "159915"}
+          "qmt": {"ok": true, "value": "159915.SZ"}
         },
         "idempotency_identity": "security-id/v1|159915.XSHE",
         "semantic_signature": "09084282d7e4cda3a7d8f1249d289b44d25259dd8943b014d772d8f8c815ff94"
@@ -64,28 +61,10 @@
         "formats": {
           "canonical": {"ok": true, "value": "920002.BSE"},
           "jq": {"ok": true, "value": "920002.BSE"},
-          "qmt": {"ok": true, "value": "920002.BJ"},
-          "ths": {"ok": true, "value": "920002"}
+          "qmt": {"ok": true, "value": "920002.BJ"}
         },
         "idempotency_identity": "security-id/v1|920002.BSE",
         "semantic_signature": "3553091d86627d830c0f81a5fd6c5d4418d6f6838d64414ef7cd876a324a391b"
-      }
-    },
-    {
-      "id": "sh_stock_ths_with_exchange",
-      "source": "ths",
-      "input": "600519",
-      "exchange": "SH",
-      "expected": {
-        "serialized": {"scheme_version": "security-id/v1", "symbol": "600519", "exchange": "XSHG", "canonical": "600519.XSHG"},
-        "formats": {
-          "canonical": {"ok": true, "value": "600519.XSHG"},
-          "jq": {"ok": true, "value": "600519.XSHG"},
-          "qmt": {"ok": true, "value": "600519.SH"},
-          "ths": {"ok": true, "value": "600519"}
-        },
-        "idempotency_identity": "security-id/v1|600519.XSHG",
-        "semantic_signature": "ac2e3eb328de627c9081423d6ce63d344b4e09e6a002045e4a967b32802d0716"
       }
     },
     {
@@ -97,8 +76,7 @@
         "formats": {
           "canonical": {"ok": true, "value": "RB2610.XSGE"},
           "jq": {"ok": true, "value": "RB2610.XSGE"},
-          "qmt": {"ok": true, "value": "rb2610.SF"},
-          "ths": {"ok": false, "error": "adapter_unsupported"}
+          "qmt": {"ok": true, "value": "rb2610.SF"}
         },
         "idempotency_identity": "security-id/v1|RB2610.XSGE",
         "semantic_signature": "4dbf8351b5f3e340f7a2dfaff0ddc21478fffec9711c4094eae2516eb2f109bc"
@@ -113,8 +91,7 @@
         "formats": {
           "canonical": {"ok": true, "value": "IF2609.CCFX"},
           "jq": {"ok": true, "value": "IF2609.CCFX"},
-          "qmt": {"ok": true, "value": "IF2609.IF"},
-          "ths": {"ok": false, "error": "adapter_unsupported"}
+          "qmt": {"ok": true, "value": "IF2609.IF"}
         },
         "idempotency_identity": "security-id/v1|IF2609.CCFX",
         "semantic_signature": "46c7e94dd90f421f3e27386328bd11f9d29670e1bd19ae9b123a66d26ccdebce"
@@ -129,8 +106,7 @@
         "formats": {
           "canonical": {"ok": true, "value": "M2609.XDCE"},
           "jq": {"ok": true, "value": "M2609.XDCE"},
-          "qmt": {"ok": true, "value": "m2609.DF"},
-          "ths": {"ok": false, "error": "adapter_unsupported"}
+          "qmt": {"ok": true, "value": "m2609.DF"}
         },
         "idempotency_identity": "security-id/v1|M2609.XDCE",
         "semantic_signature": "0c7e718b74bd13788131d58559ef7aaf46ebd58148c3279fd838754f8b132477"
@@ -145,8 +121,7 @@
         "formats": {
           "canonical": {"ok": true, "value": "SR609.XZCE"},
           "jq": {"ok": true, "value": "SR609.XZCE"},
-          "qmt": {"ok": true, "value": "SR609.ZF"},
-          "ths": {"ok": false, "error": "adapter_unsupported"}
+          "qmt": {"ok": true, "value": "SR609.ZF"}
         },
         "idempotency_identity": "security-id/v1|SR609.XZCE",
         "semantic_signature": "ded6d411f039502379d7375dc2d4d8c54580d9505f72613de38d5add5bc37068"
@@ -161,8 +136,7 @@
         "formats": {
           "canonical": {"ok": true, "value": "SC2609.XINE"},
           "jq": {"ok": true, "value": "SC2609.XINE"},
-          "qmt": {"ok": true, "value": "sc2609.INE"},
-          "ths": {"ok": false, "error": "adapter_unsupported"}
+          "qmt": {"ok": true, "value": "sc2609.INE"}
         },
         "idempotency_identity": "security-id/v1|SC2609.XINE",
         "semantic_signature": "fa266c8be2583540d6930123eac78c52d4b0d230feebb425deeb2c5e48cc569b"
@@ -177,8 +151,7 @@
         "formats": {
           "canonical": {"ok": true, "value": "LC2609.GFEX"},
           "jq": {"ok": true, "value": "LC2609.GFEX"},
-          "qmt": {"ok": true, "value": "lc2609.GF"},
-          "ths": {"ok": false, "error": "adapter_unsupported"}
+          "qmt": {"ok": true, "value": "lc2609.GF"}
         },
         "idempotency_identity": "security-id/v1|LC2609.GFEX",
         "semantic_signature": "2fc48647d8dae28b8ce17beb12ab8047b879bce906448ac497495e632ba7184f"
@@ -193,8 +166,7 @@
         "formats": {
           "canonical": {"ok": true, "value": "RBJQ00.XSGE"},
           "jq": {"ok": true, "value": "RBJQ00.XSGE"},
-          "qmt": {"ok": true, "value": "rbJQ00.SF"},
-          "ths": {"ok": false, "error": "adapter_unsupported"}
+          "qmt": {"ok": true, "value": "rbJQ00.SF"}
         },
         "idempotency_identity": "security-id/v1|RBJQ00.XSGE",
         "semantic_signature": "1980e4bf151ece32f78de8e31f32baa1054d56721b349857e9e01b5bcfe47a10"
@@ -209,8 +181,7 @@
         "formats": {
           "canonical": {"ok": true, "value": "IO2607-C-3800.CCFX"},
           "jq": {"ok": true, "value": "IO2607-C-3800.CCFX"},
-          "qmt": {"ok": true, "value": "IO2607-C-3800.IF"},
-          "ths": {"ok": false, "error": "adapter_unsupported"}
+          "qmt": {"ok": true, "value": "IO2607-C-3800.IF"}
         },
         "idempotency_identity": "security-id/v1|IO2607-C-3800.CCFX",
         "semantic_signature": "4b99d5b924e948f4b469c166162a985dacdbdd33e0f39b03ba5967a5e9f9c0cb"
@@ -225,8 +196,7 @@
         "formats": {
           "canonical": {"ok": true, "value": "CU2610.XSGE"},
           "jq": {"ok": true, "value": "CU2610.XSGE"},
-          "qmt": {"ok": true, "value": "cu2610.SF"},
-          "ths": {"ok": false, "error": "adapter_unsupported"}
+          "qmt": {"ok": true, "value": "cu2610.SF"}
         },
         "idempotency_identity": "security-id/v1|CU2610.XSGE",
         "semantic_signature": "ccab7e62fecd903eeda9c891450ee4e5298dd34275ef3e98c9b301d0202ae03d"
@@ -236,15 +206,11 @@
   "invalid_cases": [
     {"id": "canonical_missing_exchange", "source": "canonical", "input": "000001", "expected_error": "missing_exchange"},
     {"id": "qmt_missing_exchange", "source": "qmt", "input": "000001", "expected_error": "missing_exchange"},
-    {"id": "ths_missing_exchange_metadata", "source": "ths", "input": "000001", "expected_error": "missing_exchange"},
-    {"id": "ths_code_must_not_contain_suffix", "source": "ths", "input": "600519.SH", "exchange": "SH", "expected_error": "invalid_symbol"},
-    {"id": "ths_future_is_not_supported", "source": "ths", "input": "RB2610", "exchange": "SHFE", "expected_error": "adapter_unsupported"},
     {"id": "canonical_rejects_qmt_suffix", "source": "canonical", "input": "510180.SH", "expected_error": "exchange_not_allowed"},
     {"id": "qmt_rejects_canonical_suffix", "source": "qmt", "input": "510180.XSHG", "expected_error": "exchange_not_allowed"},
     {"id": "qmt_rejects_display_suffix", "source": "qmt", "input": "rb2610.SHFE", "expected_error": "exchange_not_allowed"},
     {"id": "qmt_rejects_wrong_shfe_symbol_case", "source": "qmt", "input": "RB2610.SF", "expected_error": "invalid_symbol"},
     {"id": "qmt_rejects_wrong_czce_symbol_case", "source": "qmt", "input": "sr609.ZF", "expected_error": "invalid_symbol"},
-    {"id": "ths_rejects_letters_on_stock_exchange", "source": "ths", "input": "RB2610", "exchange": "SH", "expected_error": "invalid_symbol"},
     {"id": "unknown_exchange", "source": "canonical", "input": "AAPL.NASDAQ", "expected_error": "unknown_exchange"},
     {"id": "invalid_symbol_character", "source": "canonical", "input": "ABC_DEF.XSHG", "expected_error": "invalid_format"},
     {"id": "multiple_dots", "source": "canonical", "input": "510180.SH.XSHG", "expected_error": "invalid_format"},

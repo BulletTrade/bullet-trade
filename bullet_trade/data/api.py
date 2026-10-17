@@ -118,13 +118,6 @@ def _create_provider(
         provider_cfg = dict(config.get("easy_tdx", {}) or {})
         provider_cfg.update(overrides)
         return EasyTdxProvider(provider_cfg)
-    if target in ("huaxin", "huaxin_xmd", "xmd"):
-        from .providers.huaxin import HuaxinDataProvider
-
-        provider_cfg = dict(config.get("huaxin", {}) or {})
-        provider_cfg.update(overrides)
-        return HuaxinDataProvider(provider_cfg)
-
     raise ValueError(f"未知的数据提供者: {provider_name}")
 
 

@@ -181,7 +181,7 @@ class ServerApplication:
             None。
 
         Side Effects:
-            只停止本应用持有的组件；华鑫 XMD 与 Trader 分别按自己的生命周期关闭。
+            只停止本应用持有的组件，各组件按自己的生命周期关闭。
         """
 
         self._ensure_runtime_events()
@@ -251,7 +251,7 @@ class ServerApplication:
             None。
 
         Returns:
-            Optional[Dict[str, Any]]: 华鑫等通用后端优先返回 ``backend_status``；
+            Optional[Dict[str, Any]]: 通用后端优先返回 ``backend_status``；
             既有 QMT adapter 继续兼容 ``qmt_status``。
         """
 
@@ -267,62 +267,8 @@ class ServerApplication:
                 if isinstance(value, dict):
                     snapshots.append(value)
         if snapshots:
-            if len(snapshots) > 1 and all(
-                item.get("backend_type") == "huaxin" for item in snapshots
-            ):
-                return self._merge_huaxin_backend_statuses(snapshots)
             return snapshots[0]
         return self._qmt_status_snapshot()
-
-    @staticmethod
-    def _merge_huaxin_backend_statuses(
-        snapshots: List[Dict[str, Any]],
-    ) -> Dict[str, Any]:
-        """合并 Huaxin Trader/XMD health，同时保留逐模块 readiness。
-
-        Args:
-            snapshots: broker/data adapter 各自返回的华鑫 backend_status。
-
-        Returns:
-            Dict[str, Any]: action 合并、modules 分离且整体状态可判定的 health。
-
-        Notes:
-            ``modules.trader`` 与 ``modules.xmd_l1`` 各自保留 ready/state/reason；
-            整体 ready 只表示所有已启用模块均 ready，不能反推任一具体写能力。
-        """
-
-        by_component = {
-            str(item.get("component") or f"component_{index}"): dict(item)
-            for index, item in enumerate(snapshots)
-        }
-        base = dict(by_component.get("trader") or snapshots[0])
-        actions: Dict[str, Any] = {}
-        modules: Dict[str, Any] = {}
-        for component, item in by_component.items():
-            actions.update(dict(item.get("actions") or {}))
-            modules[component] = {
-                "ready": bool(item.get("ready")),
-                "state": str(item.get("state") or "unavailable"),
-                "reason": item.get("reason"),
-                "source": item.get("source"),
-            }
-            if component == "xmd_l1" and isinstance(item.get("xmd_l1"), dict):
-                base["xmd_l1"] = dict(item["xmd_l1"])
-        ready_values = [bool(item.get("ready")) for item in by_component.values()]
-        overall_ready = bool(ready_values) and all(ready_values)
-        any_ready = any(ready_values)
-        base.update(
-            {
-                "backend_type": "huaxin",
-                "component": "composite",
-                "ready": overall_ready,
-                "state": "ready" if overall_ready else ("degraded" if any_ready else "unavailable"),
-                "reason": None if overall_ready else "one_or_more_modules_not_ready",
-                "modules": modules,
-                "actions": actions,
-            }
-        )
-        return base
 
     async def wait_started(self) -> None:
         self._ensure_runtime_events()
@@ -846,21 +792,6 @@ class ServerApplication:
                     )
                 pending_result = dict(entry.result)
 
-        # Opt-in durable resolution for transports whose broker cannot echo
-        # our idempotency key (THS). Keep existing adapters on their current
-        # resolution route. The original payload fingerprint was checked above.
-        if getattr(self.adapters.broker_adapter, "supports_durable_resolution", False) is True:
-            durable = await self._resolve_with_adapter(ctx, payload)
-            if (durable is not None and durable.get("write_action") == action
-                    and durable.get("idempotency_key") == key
-                    and durable.get("submission_state") in
-                    {"accepted", "rejected", "submit_unknown", "reconciling"}):
-                return durable
-            return _unknown_submission_result(
-                action, key, reason="durable_resolution_unavailable",
-                order_id=str(payload.get("order_id") or original_payload.get("order_id") or "") or None,
-            )
-
         strong_keys = {key}
         order_id = str(payload.get("order_id") or original_payload.get("order_id") or "").strip()
         matching_orders = await self._query_submission_orders(ctx, order_id, strong_keys)
@@ -888,34 +819,6 @@ class ServerApplication:
             reason="no_strong_order_evidence",
             order_id=order_id or None,
         )
-
-    async def _resolve_with_adapter(
-        self,
-        ctx: AccountContext,
-        payload: Dict[str, Any],
-    ) -> Optional[Dict[str, Any]]:
-        """调用最靠近真实写入的 adapter 解析能力。
-
-        Args:
-            ctx: 父账户运行上下文。
-            payload: 解析请求载荷。
-
-        Returns:
-            Optional[Dict[str, Any]]: adapter 提供的结果；未实现或无结果时返回 None。
-
-        Side Effects:
-            只允许调用 adapter 的只读解析入口。
-        """
-
-        resolver = getattr(self.adapters.broker_adapter, "resolve_submission", None)
-        if not callable(resolver):
-            return None
-        try:
-            result = await resolver(ctx, payload)
-        except Exception as exc:
-            log.warning(f"adapter 解析写结果失败，保持 fail-closed: {exc}")
-            return None
-        return dict(result) if isinstance(result, dict) and result else None
 
     async def _query_submission_orders(
         self,
@@ -1016,23 +919,6 @@ class ServerApplication:
         """
         style_value = payload.get("style") or {}
         style = style_value if isinstance(style_value, dict) else {}
-        explicit_price = (
-            style.get("price")
-            or style.get("protect_price")
-            or style.get("limit_price")
-            or payload.get("price")
-        )
-        strict_execution_price = any(
-            bool(getattr(adapter, "requires_explicit_execution_price", False))
-            for adapter in (self.adapters.broker_adapter, self.adapters.data_adapter)
-            if adapter is not None
-        )
-        if strict_execution_price:
-            if explicit_price is None:
-                raise ValueError(
-                    "HUAXIN_EXECUTION_PRICE_REQUIRED: 华鑫订单必须由上游基于新鲜 XMD " "快照显式提供限价或保护价"
-                )
-            return
         try:
             price = style.get("price")
             protect_price = style.get("protect_price")
@@ -1084,13 +970,11 @@ class ServerApplication:
         data_adapter = self.adapters.data_adapter
         if not data_adapter:
             return
-        authoritative_realtime = bool(getattr(data_adapter, "authoritative_realtime_only", False))
         security = payload.get("security")
         if not security:
             return
 
         snapshot = None
-        last_error: Optional[Exception] = None
         for fn_name in ("get_live_current", "get_snapshot", "get_current_tick"):
             fn = getattr(data_adapter, fn_name, None)
             if not callable(fn):
@@ -1101,16 +985,11 @@ class ServerApplication:
                 else:
                     snapshot = await fn({"security": security})  # type: ignore[arg-type]
                 break
-            except Exception as exc:
-                last_error = exc
+            except Exception:
                 continue
 
         if not isinstance(snapshot, dict):
-            if authoritative_realtime:
-                raise ValueError("HUAXIN_XMD_SNAPSHOT_REQUIRED: 华鑫下单前无法取得新鲜权威行情") from last_error
             return
-        if authoritative_realtime and str(snapshot.get("source") or "") != "huaxin_xmd_l1":
-            raise ValueError("HUAXIN_XMD_SOURCE_INVALID: 华鑫下单前行情来源不是 huaxin_xmd_l1")
 
         paused_flag = snapshot.get("paused")
         if paused_flag is None:
@@ -1182,7 +1061,7 @@ class ServerApplication:
             Exception: 任一显式启用模块启动失败时原样抛出，由 start 统一回滚。
 
         Side Effects:
-            华鑫场景分别创建 Trader 与 XMD 生命周期，不以一个模块就绪替代另一个。
+            分别维护已启用组件的生命周期，不以一个模块就绪替代另一个。
         """
 
         broker_adapter = self.adapters.broker_adapter
@@ -1218,8 +1097,7 @@ class ServerApplication:
             backend_type = (
                 backend_status.get("backend_type") if isinstance(backend_status, dict) else None
             )
-            status_key = "huaxin" if backend_type == "huaxin" else "qmt"
-            value[status_key] = backend_status
+            value["qmt"] = backend_status
             if backend_type:
                 value["backend_type"] = backend_type
             big_qmt_gateway = (
@@ -1439,35 +1317,7 @@ def _build_write_fingerprint(action: str, payload: Dict[str, Any]) -> str:
             }
         )
     else:
-        provider_extension = payload.get("provider_extension") or {}
-        if isinstance(provider_extension, dict):
-            huaxin_identity = provider_extension.get("huaxin_tora") or provider_extension
-        else:
-            huaxin_identity = {}
-        if not isinstance(huaxin_identity, dict):
-            huaxin_identity = {}
-        normalized.update(
-            {
-                "order_id": str(payload.get("order_id") or ""),
-                "provider_order_identity": {
-                    "exchange": str(
-                        payload.get("exchange") or huaxin_identity.get("exchange") or ""
-                    ),
-                    "order_sys_id": str(
-                        payload.get("order_sys_id") or huaxin_identity.get("order_sys_id") or ""
-                    ),
-                    "front_id": _safe_int(
-                        payload.get("front_id") or huaxin_identity.get("front_id") or 0
-                    ),
-                    "session_id": _safe_int(
-                        payload.get("session_id") or huaxin_identity.get("session_id") or 0
-                    ),
-                    "order_ref": _safe_int(
-                        payload.get("order_ref") or huaxin_identity.get("order_ref") or 0
-                    ),
-                },
-            }
-        )
+        normalized["order_id"] = str(payload.get("order_id") or "")
     return json.dumps(normalized, ensure_ascii=False, sort_keys=True, default=str)
 
 

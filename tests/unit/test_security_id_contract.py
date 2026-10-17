@@ -2,7 +2,7 @@
 security-id/v1 权威实现与跨仓 golden corpus 的单元测试。
 
 作者: BruceLee
-文件职责: 验证 canonical 身份、JQ/QMT/THS 边界、稳定错误、序列化、哈希和幂等身份。
+文件职责: 验证 canonical 身份、JQ/QMT/供应商 边界、稳定错误、序列化、哈希和幂等身份。
 主要输入: 随包发布的 bullet_trade/contracts/security-id/v1/golden.json。
 主要输出: 对所有有效、非法和序列化冲突样例的离线断言。
 上下游关系: 上游是 OpenSpec security-identity-contract，下游是 AIStocks/strategies conformance 消费方。
@@ -72,7 +72,7 @@ def _assert_format_result(identity: SecurityId, target: str, expected: Dict[str,
 
     Args:
         identity: 已解析的领域 SecurityId。
-        target: canonical、jq、qmt 或 ths。
+        target: canonical、jq、qmt。
         expected: fixture 中的预期结果结构。
 
     Returns:
@@ -158,14 +158,6 @@ def test_domain_constructor_rejects_vendor_short_exchange() -> None:
     with pytest.raises(SecurityIdValidationError) as captured:
         SecurityId(symbol="510180", exchange="SH")
     assert captured.value.code == SecurityIdErrorCode.EXCHANGE_NOT_ALLOWED
-
-
-def test_ths_plain_code_requires_trusted_exchange_metadata() -> None:
-    """同花顺纯代码没有 exchange 元数据时不得按数字前缀猜市场。"""
-
-    with pytest.raises(SecurityIdValidationError) as captured:
-        parse_security_id("600519", "ths")
-    assert captured.value.code == SecurityIdErrorCode.MISSING_EXCHANGE
 
 
 def test_outbound_adapter_rejects_raw_string() -> None:

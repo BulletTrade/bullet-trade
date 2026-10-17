@@ -5,7 +5,7 @@
 主要输入: server-type 名称及返回 ``AdapterBundle`` 的 builder。
 主要输出: 稳定的 adapter builder，或确定性的未注册/冲突错误。
 上游关系: ``bullet-trade server`` 命令与第一方 adapter 模块。
-下游关系: QMT、Big QMT、stub 以及后续华鑫服务端 adapter。
+下游关系: QMT、Big QMT、stub 。
 关键配置: 注册过程不创建监听、不连接数据源或券商，也不加载厂商 SDK。
 """
 

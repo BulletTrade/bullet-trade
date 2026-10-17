@@ -5,7 +5,7 @@
 主要输入: 临时策略、合成 capability manifest、纯内存券商和订单意图。
 主要输出: 启动顺序、RouteDecision、写请求拒绝与券商调用次数断言。
 上游关系: 覆盖 core.live_engine、core.orders 和 market_data.capability 的组合合同。
-下游关系: 作为 Huaxin 实盘接入前的无 SDK、无网络安全回归门禁。
+下游关系: 作为 模拟后端 实盘接入前的无 SDK、无网络安全回归门禁。
 关键配置约定: 全部用例离线运行，不加载厂商库、不连柜台且不触发真实交易。
 """
 
