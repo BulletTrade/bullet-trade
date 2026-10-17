@@ -180,7 +180,7 @@ def _full_transaction_event() -> TransactionEvent:
     china_tz = timezone(timedelta(hours=8), name="CST")
     gateway_time = datetime(2026, 8, 13, 9, 30, 0, 123456, tzinfo=china_tz)
     return TransactionEvent(
-        provider="huaxin-mock",
+        provider="mock-provider",
         capability_key="realtime.stream.transaction",
         event_type=MarketEventType.TRANSACTION,
         level=MarketDataLevel.L2,
@@ -195,11 +195,11 @@ def _full_transaction_event() -> TransactionEvent:
         raw_security_code="000001",
         raw_market_code="2",
         asset_type="stock",
-        field_set_version="huaxin-l2-v1",
+        field_set_version="mock_provider-l2-v1",
         field_profile="canonical_with_raw",
         route_rule="route-realtime-transaction",
         route=MarketEventRoute(
-            provider="huaxin-mock",
+            provider="mock-provider",
             capability_key="realtime.stream.transaction",
             rule_id="route-realtime-transaction",
             semantic_class="realtime_transaction",
@@ -225,7 +225,7 @@ def _full_transaction_event() -> TransactionEvent:
         ),
         raw_type="Transaction",
         provider_extension={
-            "huaxin_tora": {
+            "mock_provider_details": {
                 "schema_version": "1",
                 "ExecType": "F",
                 "BidApplSeqNum": 9223372036854775807,

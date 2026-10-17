@@ -8,7 +8,7 @@ BulletTrade 是一套兼容聚宽 API 的开源量化研究与交易框架。新
 2. [新手选型](beginner-guide.md)
 3. [大 QMT：两种接入方式](big-qmt-server.md)
 
-当前主要推荐大 QMT。MiniQMT 继续作为兼容方案保留；华鑫 TORA 面向自备 SDK 的专业用户，不作为新手主线。
+当前主要推荐大 QMT。MiniQMT 继续作为兼容方案保留。
 
 ## 大 QMT 的两条主路线
 

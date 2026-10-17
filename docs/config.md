@@ -151,7 +151,7 @@ QMT_SERVER_SUB_ACCOUNT=demo@main
 | --- | --- | --- |
 | `BT_ENV_FILE` / `BULLET_TRADE_ENV_FILE` / `ENV_FILE` | `./.env.live` | 显式指定要加载的 `.env` 文件；优先于自动向上查找 `.env`。 |
 | `DEFAULT_DATA_PROVIDER` | `jqdata` | 默认行情源：`jqdata`、`tushare`、`qmt`、`qmt-remote`、`rqdata`、`easy_tdx`。RQData/easy_tdx 仍为 Beta，需要显式启用。 |
-| `DEFAULT_BROKER` | `simulator` | 默认券商/交易通道：`simulator`、`qmt`、`qmt-remote`、`huaxin`；远程华鑫策略通常仍选择 `qmt-remote`，由 server 使用 `huaxin` adapter。 |
+| `DEFAULT_BROKER` | `simulator` | 默认券商/交易通道：`simulator`、`qmt`、`qmt-remote`、`gm`。 |
 | `LOG_DIR` | `./logs` | 日志目录。 |
 | `LOG_LEVEL` | `INFO` | 控制台日志级别。 |
 | `LOG_FILE_LEVEL` | 跟随 `LOG_LEVEL` | 文件日志级别。 |

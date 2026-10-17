@@ -5,13 +5,12 @@
 主要输入: 券商名称、环境配置映射和返回 ``BrokerBase`` 的构造函数。
 主要输出: 已注册券商实例，或包含可用名称的确定性配置错误。
 上游关系: ``LiveEngine`` 和未来服务端适配器通过本模块选择券商实现。
-下游关系: QMT、远程 QMT、模拟器以及后续第一方华鑫适配器。
+下游关系: QMT、远程 QMT、模拟器。
 关键配置: 注册表本身不读取环境变量，也不会连接券商或加载厂商 SDK。
 """
 
 from __future__ import annotations
 
-import os
 from threading import RLock
 from typing import Any, Callable, Dict, Mapping, Tuple
 
@@ -229,42 +228,6 @@ def _build_simulator(config: Mapping[str, Any]) -> BrokerBase:
     )
 
 
-def _build_huaxin(config: Mapping[str, Any]) -> BrokerBase:
-    """根据完整配置延迟构造第一方华鑫券商。
-
-    Args:
-        config: 完整券商配置，使用其中的 ``huaxin`` 子映射。
-
-    Returns:
-        尚未 preflight、默认禁止交易与撤单的 ``HuaxinBroker``。
-
-    Side Effects:
-        仅延迟导入并构造 Python 对象，不 dlopen、编译、联网或加载厂商 SDK。
-    """
-
-    from ..integrations.huaxin.broker import HuaxinBroker
-
-    huaxin_config = dict(config.get("huaxin") or {})
-    for k, v in os.environ.items():
-        if k.startswith("HUAXIN_"):
-            clean_key = k[7:].lower()
-            if clean_key not in huaxin_config:
-                huaxin_config[clean_key] = v
-
-    account_id = (
-        huaxin_config.get("account_id")
-        or huaxin_config.get("login_account")
-        or os.getenv("HUAXIN_LOGIN_ACCOUNT")
-        or os.getenv("HUAXIN_ACCOUNT_ID")
-        or "huaxin-unconfigured"
-    )
-    return HuaxinBroker(
-        account_id=account_id,
-        account_type=huaxin_config.get("account_type", "stock"),
-        config=huaxin_config,
-    )
-
-
 def _build_gm(config: Mapping[str, Any]) -> BrokerBase:
     """延迟构造 GM Broker，不启动 SDK 或连接账户。"""
     from ..integrations.gm.broker import GmBroker
@@ -278,7 +241,6 @@ BROKER_REGISTRY.register("gm", _build_gm)
 BROKER_REGISTRY.register("qmt", _build_qmt)
 BROKER_REGISTRY.register("qmt-remote", _build_remote_qmt)
 BROKER_REGISTRY.register("simulator", _build_simulator)
-BROKER_REGISTRY.register("huaxin", _build_huaxin)
 
 
 def register_broker(

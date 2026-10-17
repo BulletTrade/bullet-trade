@@ -5,7 +5,7 @@
 主要输入: 脱敏的 full/partial 市场作用域、合成 session 与底层成功/失败回执。
 主要输出: desired/sent/confirmed、引用计数、安全转换动作和重连恢复断言。
 上游关系: 覆盖 bullet_trade.market_data.subscriptions 纯 Python 公共合同。
-下游关系: 为未来远程 server、Huaxin adapter 和 Feed receipt 接入提供回归门禁。
+下游关系: 为未来远程 server、模拟后端 adapter 和 Feed receipt 接入提供回归门禁。
 关键配置约定: 全部测试离线运行，不联网、不加载厂商 SDK、不执行交易。
 """
 

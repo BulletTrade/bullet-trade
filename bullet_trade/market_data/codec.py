@@ -4,7 +4,7 @@
 文件职责: 为版本化类型化市场事件提供确定、无损且 fail-closed 的 JSON wire codec。
 主要输入: MarketEvent 及其具名子类，或来自可信传输边界的 schema-v1 wire mapping/JSON。
 主要输出: 不依赖厂商 SDK 的 JSON-safe 字典、UTF-8 JSON 和恢复后的具体事件模型。
-上游关系: 由 realtime feed、未来 Huaxin native wrapper 和远程 market-data 协议调用。
+上游关系: 由 realtime feed、行情供应商包装层 和远程 market-data 协议调用。
 下游关系: 供客户端、EventBus、录制回放和合同测试保留证券身份、时间与通道序列。
 关键配置约定: 仅接受显式支持的 schema；未知对象不字符串化；大整数与 bytes 使用带标签编码。
 """

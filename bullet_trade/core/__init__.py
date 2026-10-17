@@ -38,7 +38,6 @@ from .security_id import (
     SecurityId,
     SecurityIdErrorCode,
     SecurityIdValidationError,
-    ThsSecurityIdAdapter,
     format_security_id,
     parse_security_id,
 )
@@ -70,6 +69,6 @@ __all__ = [
     'SECURITY_ID_SCHEME_VERSION',
     'SecurityCodeSource', 'SecurityCodeTarget', 'SecurityExchange', 'SecurityId',
     'SecurityIdErrorCode', 'SecurityIdValidationError',
-    'JoinQuantSecurityIdAdapter', 'QmtSecurityIdAdapter', 'ThsSecurityIdAdapter',
+    'JoinQuantSecurityIdAdapter', 'QmtSecurityIdAdapter',
     'format_security_id', 'parse_security_id',
 ]

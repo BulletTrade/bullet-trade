@@ -5,7 +5,7 @@
 主要输入: 合成 CapabilityManifest、RouteRule、CapabilityRequest 与测试 owner。
 主要输出: Router 决策、预检结果和具名失败断言。
 上游关系: 覆盖 bullet_trade.market_data.capability 的公共接口。
-下游关系: 为未来 LiveEngine 和 Huaxin 集成提供不换源的回归门禁。
+下游关系: 为未来 LiveEngine 和 模拟后端 集成提供不换源的回归门禁。
 关键配置约定: 全部测试离线执行，不加载 SDK、网络或真实账户。
 """
 
@@ -345,14 +345,14 @@ def test_route_decision_records_provider_and_request_scope_provenance() -> None:
     router = DataSourceRouter()
     router.register_provider(
         _manifest(
-            "huaxin",
+            "mock_provider",
             {capability_id: declaration},
             provider_version="4.0.8",
             build_id="bridge-test",
         ),
         _Owner(),
     )
-    router.set_route(RouteRule(capability_id, "huaxin", rule_id="l2-live"))
+    router.set_route(RouteRule(capability_id, "mock_provider", rule_id="l2-live"))
     request = CapabilityRequest(
         capability_id,
         mode="live",

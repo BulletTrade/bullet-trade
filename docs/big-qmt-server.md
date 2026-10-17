@@ -272,6 +272,6 @@ DEFAULT_DATA_PROVIDER=qmt-remote
 
 只有改端口、跨机器部署、启用 TLS/IP 白名单、配置多个账号或排查超时时，才需要查看 [配置总览](config.md) 和 [QMT 服务配置](qmt-server.md)。第一次接入不要复制整份 `.env`。
 
-### MiniQMT 和华鑫在哪里
+### MiniQMT 在哪里
 
-MiniQMT 仍作为兼容方案保留在高级接入文档中；华鑫 TORA 是面向自备 SDK 的专业接入，不作为新手主线。
+MiniQMT 仍作为兼容方案保留在高级接入文档中。

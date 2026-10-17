@@ -84,11 +84,11 @@ def test_external_broker_order_preserves_root_idempotency_identity(tmp_path: Pat
             "price": 100.701,
             "status": "open",
             "side": "SELL",
-            "idempotency_key": "huaxin-dg14-20260817-o1",
+            "idempotency_key": "mock_provider-dg14-20260817-o1",
         },
         "broker-order-1",
         None,
     )
 
     assert order is not None
-    assert order.extra["idempotency_key"] == "huaxin-dg14-20260817-o1"
+    assert order.extra["idempotency_key"] == "mock_provider-dg14-20260817-o1"

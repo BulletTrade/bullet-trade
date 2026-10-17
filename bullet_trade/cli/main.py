@@ -219,10 +219,7 @@ def create_parser():
         type=str,
         choices=list(list_brokers()),
         default=None,
-        help=(
-            "券商类型：qmt、qmt-remote、simulator、gm、huaxin（huaxin 需外部 Trader bundle "
-            "与私密配置；默认读取 DEFAULT_BROKER）"
-        ),
+        help="券商类型：qmt、qmt-remote、simulator、gm（默认读取 DEFAULT_BROKER）",
     )
     live_parser.add_argument("--log-dir", type=str, default=None, help="覆盖 LOG_DIR，优先于 .env")
     live_parser.add_argument(
@@ -246,7 +243,7 @@ def create_parser():
         "--server-type",
         dest="server_type",
         default=None,
-        help="服务类型（qmt、big_qmt/big-qmt、huaxin 或 ths）",
+        help="服务类型（qmt、big_qmt/big-qmt）",
     )
     server_parser.add_argument(
         "--listen", dest="listen", default=None, help="监听地址（覆盖 QMT_SERVER_LISTEN）"
@@ -318,15 +315,6 @@ def create_parser():
     server_parser.add_argument(
         "--no-access-log", dest="access_log", action="store_false", help="关闭请求访问日志"
     )
-
-    # 华鑫 native 显式离线工具；配置解析不会加载 SDK、编译或联网
-    from bullet_trade.integrations.huaxin.cli import configure_parser as configure_huaxin_parser
-
-    huaxin_parser = subparsers.add_parser(
-        "huaxin",
-        help="华鑫第一方 native bridge 离线诊断与显式构建",
-    )
-    configure_huaxin_parser(huaxin_parser)
 
     # 掘金环境诊断；注册解析器不导入厂商 SDK
     from bullet_trade.integrations.gm.cli import configure_parser as configure_gm_parser
@@ -401,10 +389,6 @@ def main():
         from bullet_trade.server.cli import run_server_command
 
         return run_server_command(args)
-    elif args.command == "huaxin":
-        from bullet_trade.integrations.huaxin.cli import run_arguments
-
-        return run_arguments(args)
     elif args.command == "gm":
         from bullet_trade.integrations.gm.cli import run_arguments
 

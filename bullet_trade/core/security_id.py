@@ -2,11 +2,11 @@
 BulletTrade 证券身份 V1 的权威解析、序列化与供应商边界适配。
 
 作者: BruceLee
-文件职责: 定义结构化 SecurityId、稳定错误码、canonical 长后缀和 JQ/QMT/THS 适配器。
-主要输入: 带明确来源格式的证券代码，或同花顺纯代码与可信交易所元数据。
+文件职责: 定义结构化 SecurityId、稳定错误码、canonical 长后缀和 JQ/QMT 适配器。
+主要输入: 带明确来源格式的证券代码。
 主要输出: security-id/v1 canonical 身份、供应商边界代码、稳定幂等身份和语义哈希。
 上下游关系: 上游是数据源、券商和历史兼容入站边界，下游是领域比较、信号、账本与订单幂等。
-关键约定: 领域 canonical 固定使用长后缀；无后缀不得猜交易所；THS 股票模拟边界不支持期货。
+关键约定: 领域 canonical 固定使用长后缀；无后缀不得猜交易所。
 """
 
 from __future__ import annotations
@@ -69,7 +69,6 @@ class SecurityCodeSource(str, Enum):
     CANONICAL = "canonical"
     JQ = "jq"
     QMT = "qmt"
-    THS = "ths"
     LEGACY_ALIAS = "legacy_alias"
 
 
@@ -79,7 +78,6 @@ class SecurityCodeTarget(str, Enum):
     CANONICAL = "canonical"
     JQ = "jq"
     QMT = "qmt"
-    THS = "ths"
 
 
 class SecurityIdValidationError(ValueError):
@@ -156,10 +154,6 @@ _FUTURES_EXCHANGES = frozenset(
         SecurityExchange.GFEX,
     }
 )
-_THS_SUPPORTED_EXCHANGES = frozenset(
-    {SecurityExchange.XSHG, SecurityExchange.XSHE, SecurityExchange.BSE}
-)
-
 
 def _validate_required_text(value: Any, field_name: str) -> str:
     """验证必填文本并保留原始大小写。
@@ -382,36 +376,6 @@ def _parse_qmt_code(value: Any) -> "SecurityId":
             "QMT 期货 symbol 大小写不符合交易所标准",
         )
     return identity
-
-
-def _normalize_exchange_metadata(value: Any) -> SecurityExchange:
-    """把可信的外部 exchange 元数据规范为 canonical 交易所。
-
-    Args:
-        value: canonical 或已登记供应商交易所后缀。
-
-    Returns:
-        SecurityExchange: canonical 交易所枚举。
-
-    Raises:
-        SecurityIdValidationError: 元数据缺失或交易所未知。
-    """
-
-    if value is None or value == "":
-        raise SecurityIdValidationError(
-            SecurityIdErrorCode.MISSING_EXCHANGE,
-            "纯证券代码必须提供可信 exchange 元数据",
-        )
-    if isinstance(value, SecurityExchange):
-        return value
-    suffix = _normalize_required_text(value, "exchange")
-    exchange = _LEGACY_SUFFIX_TO_EXCHANGE.get(suffix)
-    if exchange is None:
-        raise SecurityIdValidationError(
-            SecurityIdErrorCode.UNKNOWN_EXCHANGE,
-            "未知 exchange 元数据: {0}".format(suffix),
-        )
-    return exchange
 
 
 def _coerce_source(value: Union[SecurityCodeSource, str]) -> SecurityCodeSource:
@@ -717,66 +681,6 @@ class QmtSecurityIdAdapter:
         return "{0}.{1}".format(_format_qmt_symbol(security_id), suffix)
 
 
-class ThsSecurityIdAdapter:
-    """同花顺股票模拟纯代码与 SecurityId 之间的严格边界适配器。"""
-
-    @staticmethod
-    def parse(value: Any, exchange: Any) -> SecurityId:
-        """用纯代码和可信交易所元数据解析同花顺证券身份。
-
-        Args:
-            value: 同花顺返回的不带后缀证券代码。
-            exchange: 来自账户或行情元数据的可信交易所。
-
-        Returns:
-            SecurityId: canonical 领域身份。
-
-        Raises:
-            SecurityIdValidationError: 缺少交易所、代码含后缀或市场不受支持。
-        """
-
-        normalized_exchange = _normalize_exchange_metadata(exchange)
-        if normalized_exchange not in _THS_SUPPORTED_EXCHANGES:
-            raise SecurityIdValidationError(
-                SecurityIdErrorCode.ADAPTER_UNSUPPORTED,
-                "THS 股票模拟 adapter 不支持交易所 {0}".format(normalized_exchange.value),
-            )
-        symbol = _normalize_symbol(value)
-        if not symbol.isdigit():
-            raise SecurityIdValidationError(
-                SecurityIdErrorCode.INVALID_SYMBOL,
-                "THS 股票模拟 adapter 只接受数字证券代码",
-            )
-        return SecurityId(symbol=symbol, exchange=normalized_exchange)
-
-    @staticmethod
-    def format(security_id: SecurityId) -> str:
-        """把领域身份格式化为同花顺股票模拟纯代码。
-
-        Args:
-            security_id: 已校验的领域身份。
-
-        Returns:
-            str: 不含后缀的证券代码。
-
-        Raises:
-            SecurityIdValidationError: 参数错误或当前交易所不是股票模拟市场。
-        """
-
-        _require_security_id(security_id)
-        if security_id.exchange not in _THS_SUPPORTED_EXCHANGES:
-            raise SecurityIdValidationError(
-                SecurityIdErrorCode.ADAPTER_UNSUPPORTED,
-                "THS 股票模拟 adapter 不支持交易所 {0}".format(security_id.exchange.value),
-            )
-        if not security_id.symbol.isdigit():
-            raise SecurityIdValidationError(
-                SecurityIdErrorCode.INVALID_SYMBOL,
-                "THS 股票模拟 adapter 只接受数字证券代码",
-            )
-        return security_id.symbol
-
-
 def _require_security_id(value: Any) -> SecurityId:
     """确保出站边界只接收结构化领域身份。
 
@@ -807,8 +711,8 @@ def parse_security_id(
 
     Args:
         value: 待解析证券代码。
-        source: canonical、jq、qmt、ths 或受控 legacy_alias。
-        exchange: 仅 THS 纯代码允许使用的可信交易所元数据。
+        source: canonical、jq、qmt 或受控 legacy_alias。
+        exchange: 保留参数；当前支持的来源均不接受额外交易所元数据。
 
     Returns:
         SecurityId: 唯一 canonical 领域身份。
@@ -818,12 +722,10 @@ def parse_security_id(
     """
 
     normalized_source = _coerce_source(source)
-    if normalized_source == SecurityCodeSource.THS:
-        return ThsSecurityIdAdapter.parse(value, exchange)
     if exchange is not None:
         raise SecurityIdValidationError(
             SecurityIdErrorCode.EXCHANGE_CONFLICT,
-            "仅 THS 纯代码边界允许额外 exchange 元数据",
+            "当前代码来源不允许额外 exchange 元数据",
         )
     if normalized_source == SecurityCodeSource.CANONICAL:
         return SecurityId.parse_canonical(value)
@@ -842,7 +744,7 @@ def format_security_id(
 
     Args:
         security_id: 结构化 SecurityId。
-        target: canonical、jq、qmt 或 ths。
+        target: canonical、jq 或 qmt。
 
     Returns:
         str: 目标边界的证券代码。
@@ -857,9 +759,7 @@ def format_security_id(
         return security_id.canonical
     if normalized_target == SecurityCodeTarget.JQ:
         return JoinQuantSecurityIdAdapter.format(security_id)
-    if normalized_target == SecurityCodeTarget.QMT:
-        return QmtSecurityIdAdapter.format(security_id)
-    return ThsSecurityIdAdapter.format(security_id)
+    return QmtSecurityIdAdapter.format(security_id)
 
 
 __all__ = [
@@ -872,7 +772,6 @@ __all__ = [
     "SecurityIdValidationError",
     "JoinQuantSecurityIdAdapter",
     "QmtSecurityIdAdapter",
-    "ThsSecurityIdAdapter",
     "format_security_id",
     "parse_security_id",
 ]

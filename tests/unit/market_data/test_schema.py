@@ -5,7 +5,7 @@
 主要输入: 合成厂商字段、未知枚举、无法解码 bytes、int64 边界与显式版本迁移。
 主要输出: 三层字段值、presence/completeness/missing reason、损失清单和 fail-closed 异常断言。
 上游关系: 覆盖 bullet_trade.market_data.schema 的公共类与投影方法。
-下游关系: 为未来 Huaxin field manifest、native wrapper、远程协议和兼容 tick 接入提供回归门禁。
+下游关系: 为未来 模拟后端 field manifest、native wrapper、远程协议和兼容 tick 接入提供回归门禁。
 关键配置约定: 全部 fixture 均为脱敏合成数据，不联网、不加载 SDK、不连接服务器且不执行任何交易。
 """
 

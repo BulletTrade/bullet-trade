@@ -4,7 +4,7 @@
 文件职责: 定义实时行情订阅、逐项回执、类型化市场事件和健康状态的离线数据模型。
 主要输入: 规范化证券/市场 selector、行情级别、事件类型、Provider 回执和事件字段。
 主要输出: 稳定指纹的 MarketSubscriptionSpec、不可变 Receipt、MarketEvent 与 FeedHealth。
-上游关系: 由 RealtimeMarketDataFeed、远程协议适配层和未来 Huaxin native bridge 构造。
+上游关系: 由 RealtimeMarketDataFeed、远程协议适配层和行情桥接层 构造。
 下游关系: 供 LiveEngine、策略 callback、健康检查、协议序列化和单元测试消费。
 关键配置约定: selector 三选一；通配事件只可单独出现；指纹不包含传输 request_id。
 """

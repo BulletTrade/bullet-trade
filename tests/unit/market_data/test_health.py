@@ -5,7 +5,7 @@
 主要输入: 合成 manifest、显式更新 policy、可控单调时钟、订阅和市场事件。
 主要输出: stale/unavailable 具名错误、分层 readiness、时间证据和队列指标断言。
 上游关系: 覆盖 market_data.health、MockRealtimeMarketDataFeed 与有界事件队列接线。
-下游关系: 为策略门禁、远程 health 和 Huaxin adapter 后续接入提供回归基线。
+下游关系: 为策略门禁、远程 health 和 模拟后端 adapter 后续接入提供回归基线。
 关键配置约定: 测试不读取本机交易日历、不联网；午休/闭市/停牌只由注入 policy 表达。
 """
 
