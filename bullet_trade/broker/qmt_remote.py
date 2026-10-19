@@ -324,6 +324,19 @@ class RemoteQmtBroker(BrokerBase):
             info["positions"] = self.get_positions()
         return info
 
+    def get_account_identity(self) -> Dict[str, Any]:
+        """无输入，走独立broker.identity只读接口并校验结果；不退回旧account回显。
+
+        不调用持仓、下单或撤单；有远端虚拟子路由时拒绝拿它认证实体父账户。
+        旧Server不支持会保持原异常，调用方显示待核对；不修改连接或账本。
+        """
+        from .identity import identity_pending, validate_identity_result
+
+        if self.sub_account_id:
+            return identity_pending("UNSUPPORTED")
+        value = self._connection.request("broker.identity", {"account_key": self.account_key})
+        return validate_identity_result(value)
+
     def get_positions(self) -> List[Dict[str, Any]]:
         payload = self._base_payload()
         resp = self._connection.request("broker.positions", payload)

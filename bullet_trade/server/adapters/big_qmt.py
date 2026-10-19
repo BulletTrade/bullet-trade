@@ -1458,6 +1458,24 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
         data = await self.client.post("/account", self._account_payload(account))
         return data if _is_dict_payload(data) else dict_payload(_extract_dict(data))
 
+    async def get_account_identity(self, account: AccountContext) -> Dict:
+        """输入原父账户，返回helper柜台原始账号观察；只调用原/account，不改GBK helper。
+
+        仅使用查询结果raw.m_strAccountID，不使用外层由请求参数回显的account_id；
+        缺原字段、类型错误或与路由目标不同均待核对，不猜券商、不下单或同步持仓。
+        """
+        from bullet_trade.broker.identity import identity_from_query, identity_pending
+
+        try:
+            data = _extract_dict(await self.client.post("/account", self._account_payload(account)))
+            raw = data.get("raw") if isinstance(data, dict) else None
+            actual = raw.get("m_strAccountID") if isinstance(raw, dict) else None
+            if isinstance(actual, str) and actual.strip() != account.config.account_id.strip():
+                return identity_pending("ACCOUNT_MISMATCH")
+            return identity_from_query(None, actual)
+        except Exception:
+            return identity_pending("QUERY_FAILED")
+
     async def get_positions(self, account: AccountContext) -> List[Dict]:
         data = await self.client.post("/positions", self._account_payload(account))
         return [

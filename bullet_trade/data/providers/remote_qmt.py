@@ -203,6 +203,14 @@ class RemoteQmtProvider(DataProvider):
         self._tick_callback: Optional[Callable[..., None]] = None
         self._tick_context: Optional[Any] = None
 
+    def close(self) -> None:
+        """无输入返回；关闭本 Provider 自己创建的远程行情连接，不发送撤单/交易或关闭服务器。
+
+        用于连接配置修订或拥有者退出时回收本地线程；底层 close 可重复调用。
+        不触碰其他 Provider/Broker 实例，也不修改远端账户和订阅之外的业务状态。
+        """
+        self._connection.close()
+
     def get_price(
         self,
         security: Union[str, List[str]],

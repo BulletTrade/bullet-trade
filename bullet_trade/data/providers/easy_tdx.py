@@ -459,11 +459,22 @@ class EasyTdxProvider(DataProvider):
 
     @staticmethod
     def _normalize_kline_frame(raw: Any, fields: List[str]) -> pd.DataFrame:
-        """把 easy_tdx K 线返回值转换为 index=time 的聚宽字段表。"""
+        """输入 SDK 原始K线和字段，返回 index=time 的兼容表；attrs标记补值/坏源字段。
+
+        保留旧字段数值及形状；维护来源可据 synthetic_fields/invalid_source_fields
+        拒绝将补零、坏时间丢行或非法成交量作为真实数据发布，不触发SDK或其他来源。
+        """
         df = pd.DataFrame(raw).copy()
         if df.empty:
             return pd.DataFrame()
         df.rename(columns={"vol": "volume", "amount": "money"}, inplace=True)
+        # 保留兼容返回值，但让维护适配器辨认补值，不能把缺失量价发布为真实零。
+        df.attrs["synthetic_fields"] = tuple(field for field in fields if field not in df)
+        df.attrs["invalid_source_fields"] = tuple(
+            field for field in fields if field in df
+            and field in {"open", "high", "low", "close", "volume", "money"}
+            and pd.to_numeric(df[field], errors="coerce").isna().any()
+        )
         time_col = None
         for candidate in ("datetime", "date", "time"):
             if candidate in df.columns:
@@ -472,6 +483,8 @@ class EasyTdxProvider(DataProvider):
         if time_col is None:
             return pd.DataFrame()
         df["time"] = pd.to_datetime(df[time_col], errors="coerce")
+        if df["time"].isna().any():
+            df.attrs["invalid_source_fields"] += ("time",)
         df.dropna(subset=["time"], inplace=True)
         df.set_index("time", inplace=True)
         df.sort_index(inplace=True)

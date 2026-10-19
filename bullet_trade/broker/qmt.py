@@ -340,6 +340,25 @@ class QmtBroker(BrokerBase):
         snapshot.setdefault("account_type", self.account_type)
         return snapshot
 
+    def get_account_identity(self) -> Dict[str, Any]:
+        """无输入，查询原xtquant资产的资金账号并返回身份观察，不使用快照的配置回显。
+
+        仅调用query_stock_asset，不订阅/下单/撤单/同步持仓；查询失败返回固定待核对。
+        XtAsset没有券商名称字段，不能把broker_type或用户选择当券商；因此本地
+        原生查询保留真实账号观察，由可信服务端后续补券商依据。未连接仍按原合同抛错。
+        """
+        from .identity import identity_from_query, identity_pending
+
+        self._ensure_connected()
+        try:
+            asset = self._xt_trader.query_stock_asset(self._xt_account)
+            account_id = getattr(asset, "account_id", None)
+            if isinstance(account_id, str) and account_id.strip() != self.account_id.strip():
+                return identity_pending("ACCOUNT_MISMATCH")
+            return identity_from_query(None, account_id)
+        except Exception:
+            return identity_pending("QUERY_FAILED")
+
     def get_positions(self) -> List[Dict[str, Any]]:
         self._ensure_connected()
         # 与 _build_account_snapshot 对齐，返回已映射的持仓结构

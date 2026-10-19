@@ -1191,6 +1191,11 @@ class LiveEngine:
         return f"bt:{label}:{short_id}"
 
     def _prepare_order_metadata(self, order: Order) -> Optional[str]:
+        """输入引擎原订单，返回展示备注并附完整稳定身份；不提交交易，不用缩短备注作为幂等编号。
+
+        扩展字段中保存引擎原 order_id，覆盖同名用户字段；不改变旧备注长度或其余审计字段。
+        元数据对象异常时保留既有返回 None 行为，下游需要身份的适配器必须明确拒绝。
+        """
         if not order:
             return None
         try:
@@ -1205,6 +1210,9 @@ class LiveEngine:
             if "strategy_name" not in extra:
                 raw_name = self.config.strategy_name or self.strategy_path.stem
                 extra["strategy_name"] = raw_name
+            # 完整引擎订单身份供共同账本幂等使用；短备注只用于展示，不能充当唯一键。
+            # 保留为独立元数据，既有券商仍可忽略；不允许策略扩展字段覆盖引擎原编号。
+            extra["bullet_trade_order_id"] = str(order.order_id)
             return remark
         except Exception:
             return None

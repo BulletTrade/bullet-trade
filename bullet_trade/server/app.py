@@ -405,6 +405,18 @@ class ServerApplication:
                 sub_cfg.sub_account_id if sub_cfg else str(sub_account_id).split("@", 1)[0]
             )
         ctx = self.router.get(resolved_key)
+        if method == "identity":
+            from bullet_trade.broker.identity import identity_pending, identity_with_server_declaration
+
+            # 身份核验只允许实体父账户和既有认证会话，不接受客户端自造身份字段。
+            if sub_cfg or sub_account_id or set(payload) - {"account_key"}:
+                return identity_pending("UNSUPPORTED")
+            probe = getattr(self.adapters.broker_adapter, "get_account_identity", None)
+            if not callable(probe):
+                return identity_pending("UNSUPPORTED")
+            return identity_with_server_declaration(
+                await probe(ctx), ctx.config.broker_id, ctx.config.account_id
+            )
         if method == "resolve_submission":
             return await self._resolve_submission(resolved_key, sub_cfg, ctx, payload)
         write_action = f"broker.{method}" if method in {"place_order", "cancel_order"} else None

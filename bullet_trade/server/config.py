@@ -1,3 +1,11 @@
+"""作者：BruceLee。
+
+职责：合并远程服务CLI及环境配置，保持行情、交易和账户身份配置边界。
+输入：原CLI对象及环境变量；输出：Server/Account配置，不启动SDK或网络。
+上下游：原服务入口、账户路由及适配器；券商声明仅用于独立只读身份核验。
+约定：券商可选且逐父账户明确配置，不从QMT类型、IP或客户端选择推断。
+"""
+
 from __future__ import annotations
 
 import ipaddress
@@ -22,12 +30,21 @@ class TLSConfig:
 
 @dataclass
 class AccountConfig:
+    """保存父账户路由和可选服务端券商声明；账号配置本身不是柜台查询证明。"""
     key: str
     account_id: str
     account_type: str = "stock"
     data_path: Optional[str] = None
     session_id: Optional[int] = None
     auto_subscribe: Optional[bool] = None
+    broker_id: Optional[str] = None
+
+    def __post_init__(self):
+        """无输入返回；规范显式券商声明，不填保持旧行为，非法声明抛ValueError，不连接后端。"""
+        if self.broker_id is not None:
+            from bullet_trade.broker.identity import normalize_broker_id
+
+            self.broker_id = normalize_broker_id(self.broker_id)
 
 
 @dataclass
@@ -121,6 +138,21 @@ def _parse_sub_accounts(raw: Optional[str]) -> List[SubAccountConfig]:
             parent = "default"
         items.append(SubAccountConfig(sub_account_id=sub_id, account_key=parent, order_limit=limit))
     return items
+
+
+def _parse_account_brokers(raw: Optional[str], accounts: Dict[str, AccountConfig]) -> None:
+    """输入显式别名券商映射和原账户，无返回；只修改匹配声明，重复/未知/坏格式拒绝，无I/O。"""
+    from bullet_trade.broker.identity import normalize_broker_id
+
+    declared = {}
+    for item in _split_items(raw):
+        alias, separator, broker = item.partition("=")
+        alias = alias.strip()
+        if not separator or alias not in accounts or alias in declared:
+            raise ValueError("服务端券商声明须对应唯一的已配置账户别名")
+        declared[alias] = normalize_broker_id(broker)
+    for alias, broker in declared.items():
+        accounts[alias].broker_id = broker
 
 
 def _parse_allowlist(raw: Optional[str], *, strict: bool = False) -> List[str]:
@@ -252,6 +284,11 @@ def build_server_config(args) -> ServerConfig:
                     cfg.session_id = None
         if cfg.auto_subscribe is None:
             cfg.auto_subscribe = get_env_optional_bool("QMT_AUTO_SUBSCRIBE")
+
+    _parse_account_brokers(
+        getattr(args, "account_brokers", None) or get_env("QMT_SERVER_ACCOUNT_BROKERS"),
+        accounts_map,
+    )
 
     sub_accounts = _parse_sub_accounts(
         getattr(args, "sub_accounts", None) or get_env("QMT_SERVER_SUB_ACCOUNTS")

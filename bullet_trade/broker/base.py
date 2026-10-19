@@ -60,6 +60,16 @@ class BrokerBase(ABC):
             - positions: 持仓列表
         """
         pass
+
+    def get_account_identity(self) -> Dict[str, Any]:
+        """无输入，返回独立只读实体身份；默认待核对，不拿配置账号或余额查询推断。
+
+        旧适配器无需实现新抽象方法；不连接服务、不下单、不读取资产，也不改变
+        旧账户/委托接口。实现者必须使用真实账号查询并明确券商依据。
+        """
+        from .identity import identity_pending
+
+        return identity_pending()
     
     @abstractmethod
     def get_positions(self) -> List[Dict[str, Any]]:

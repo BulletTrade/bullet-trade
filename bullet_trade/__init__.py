@@ -1,6 +1,9 @@
-"""
-BulletTrade - 专业的量化交易系统
-完整的本地策略回测系统，兼容聚宽API，支持多数据源和实盘交易
+"""作者：BruceLee。
+
+职责：公开聚宽兼容的数据、策略和回测入口，按需提供分析绘图接口。
+输入：模块导入和显式导出访问；输出：标准API对象及延迟绘图导出。
+上下游：Provider、核心模型/调度/引擎和分析模块；数据导入不初始化字体管理器。
+约定：保留Agg非交互后端及原plt/分析接口，绘图库失败保持警告/None兼容。
 """
 
 from importlib import import_module
@@ -12,7 +15,6 @@ try:
     import matplotlib
     # 设置非交互式后端，避免程序挂起
     matplotlib.use('Agg')
-    import matplotlib.pyplot as plt  # noqa: F401
 except Exception as exc:  # pragma: no cover - 兼容运行环境缺少 GUI 依赖的情况
     warnings.warn(f"Matplotlib 初始化失败，将跳过图形相关功能：{exc!r}")
     matplotlib = None  # type: ignore
@@ -84,7 +86,15 @@ __all__ = [
 
 
 def __getattr__(name: str) -> Any:
-    """延迟加载分析绘图相关函数，避免在未安装 matplotlib 时导入失败"""
+    """输入导出名称，返回并缓存原绘图模块/分析对象；显式请求才导入，未知名称抛AttributeError。"""
+    if name == 'plt':
+        try:
+            attr = import_module('matplotlib.pyplot')
+        except Exception as exc:  # 兼容此前入口的可选绘图库加载失败行为。
+            warnings.warn(f"Matplotlib 初始化失败，将跳过图形相关功能：{exc!r}")
+            attr = None
+        globals()[name] = attr
+        return attr
     if name in _ANALYSIS_EXPORTS:
         module = import_module('.core.analysis', __name__)
         attr = getattr(module, name)
@@ -94,5 +104,5 @@ def __getattr__(name: str) -> Any:
 
 
 def __dir__() -> list[str]:
-    """让内建 dir() 同样展示延迟导出的接口"""
-    return sorted(set(globals().keys()) | set(_ANALYSIS_EXPORTS))
+    """无输入，返回包含原plt和延迟分析接口的名称列表；仅列举不触发绘图导入。"""
+    return sorted(set(globals().keys()) | set(_ANALYSIS_EXPORTS) | {'plt'})

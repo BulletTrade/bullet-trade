@@ -79,6 +79,8 @@ def _normalize_provider_name(name: Optional[str]) -> str:
         return "easy_tdx"
     if lowered in ("gm", "goldminer", "掘金"):
         return "gm"
+    if lowered in ("bullet_data", "bullet-data", "local"):
+        return "bullet_data"
     return lowered
 
 
@@ -92,6 +94,11 @@ def _create_provider(
     target = _normalize_provider_name(provider_name or config.get("default") or "jqdata")
     overrides = overrides or {}
 
+    if target == "bullet_data":
+        from .providers.local import LocalBulletDataProvider
+
+        # 本地目录必须显式传入，不从外部连接或默认环境补参数。
+        return LocalBulletDataProvider(dict(overrides))
     if target == "gm":
         from .providers.gm import GmDataProvider
 
@@ -2200,8 +2207,11 @@ def _ensure_history_view(api_name: str, date_value: Optional[Date]) -> None:
 
 
 def _raise_if_not_implemented(error: Exception) -> None:
-    if isinstance(error, NotImplementedError):
-        raise
+    """输入查询异常，无返回；未实现或严格本地查询失败原样传播，不伪装空结果。"""
+    if isinstance(error, NotImplementedError) or (
+        _provider is not None and getattr(type(_provider), "strict_query_errors", False)
+    ):
+        raise error
 
 
 def _query_mentions_valuation(query_object: Any) -> bool:
@@ -2345,6 +2355,8 @@ def _get_security_info_from_provider(
                     raise
         return raw_info, bool(raw_info)
     except Exception as exc:
+        if getattr(type(provider), "strict_query_errors", False):
+            raise
         log.debug(f"获取{security}基本信息失败: {exc}")
         return {}, False
 

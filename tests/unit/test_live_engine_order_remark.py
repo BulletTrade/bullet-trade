@@ -18,6 +18,23 @@ def test_live_engine_build_order_remark_uses_strategy_name(tmp_path):
     assert len(remark) <= 24
     assert order.extra.get("order_remark") == remark
     assert order.extra.get("strategy_name") == "Alpha-1"
+    assert order.extra.get("bullet_trade_order_id") == "oid-123"
+
+
+def test_live_engine_complete_identity_is_not_short_remark_or_user_override(tmp_path):
+    """输入临时目录，无返回；核对完整引擎编号覆盖同名用户字段，旧备注及审计内容保持。"""
+    strategy_file = tmp_path / "identity.py"
+    strategy_file.write_text("def initialize(context):\n    pass\n")
+    engine = LiveEngine(strategy_file=str(strategy_file))
+    identifier = "完整引擎订单身份-" + "x" * 80
+    order = Order(order_id=identifier, security="000001.XSHE", amount=100,
+                  extra={"bullet_trade_order_id": "user-spoof", "signal_batch_id": 8})
+    remark = engine._prepare_order_metadata(order)
+    payload = engine._order_extra_payload(order)
+    assert len(remark) <= 24
+    assert payload["bullet_trade_order_id"] == identifier
+    assert payload["signal_batch_id"] == 8
+    assert payload["order_remark"] == remark
 
 
 class _BrokerWithExtra:

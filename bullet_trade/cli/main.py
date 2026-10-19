@@ -288,6 +288,11 @@ def create_parser():
         help="多账户配置（例: main=123456:stock,hedge=654321:future）",
     )
     server_parser.add_argument(
+        "--account-brokers",
+        dest="account_brokers",
+        help="服务端券商声明，按父账户别名配置，例如 main=guojin,other=huatai；仅用于身份核验",
+    )
+    server_parser.add_argument(
         "--sub-accounts",
         dest="sub_accounts",
         default=None,

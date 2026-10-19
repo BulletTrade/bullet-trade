@@ -4196,9 +4196,13 @@ class BacktestEngine:
                     log.info(f"基准代码兼容成功: {benchmark} -> {candidate}")
                 return
             except Exception as e:
+                if getattr(type(provider), "strict_query_errors", False):
+                    raise
                 last_error = e
 
         if last_error is not None:
+            if getattr(type(provider), "strict_query_errors", False):
+                raise last_error
             log.warning(f"加载基准数据失败: {last_error}")
 
     def _resolve_benchmark_close(self, current_dt: datetime) -> Optional[float]:

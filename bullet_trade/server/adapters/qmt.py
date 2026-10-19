@@ -787,6 +787,19 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
         positions = await _run_in_qmt_executor(broker.get_positions)
         return positions or []
 
+    async def get_account_identity(self, account: AccountContext) -> Dict:
+        """输入原父账户，返回独立只读账号观察；复用自有Broker，不读取旧配置回显或持仓。
+
+        缺原生接口明确待核对；不调用交易写接口、不更改远端运行状态。
+        """
+        from bullet_trade.broker.identity import identity_pending
+
+        broker = self._broker_for(account)
+        probe = getattr(broker, "get_account_identity", None)
+        if not callable(probe):
+            return identity_pending()
+        return await _run_in_qmt_executor(probe)
+
     async def list_orders(
         self, account: AccountContext, filters: Optional[Dict] = None
     ) -> List[Dict]:
