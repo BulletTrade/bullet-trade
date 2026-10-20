@@ -355,7 +355,13 @@ class LocalBulletDataProvider(DataProvider):
                         ref.iloc[-1].factor
                     )
             missing = set(requested) - set(frame.columns)
-            if missing or (not frame.empty and frame[requested].isna().any().any() and fill_paused):
+            empty_fields = (
+                {name for name in requested if name in frame.columns and frame[name].isna().any()}
+                if not frame.empty and fill_paused
+                else set()
+            )
+            if missing or empty_fields:
+                missing |= empty_fields  # 列存在但值缺失也写明字段名，便于用户补齐对应来源
                 self._missing(
                     object_name,
                     code,

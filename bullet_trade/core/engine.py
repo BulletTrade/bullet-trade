@@ -4453,6 +4453,7 @@ def create_backtest(
     algorithm_id: Optional[str] = None,
     data_session_config: Optional[Dict[str, Any]] = None,
     on_day_end: Optional[Callable[[Dict[str, Any]], None]] = None,
+    strict_data: bool = False,
 ) -> Dict[str, Any]:
     """
     创建并运行回测
@@ -4470,6 +4471,7 @@ def create_backtest(
         algorithm_id: 算法ID（可选）
         data_session_config: 回测数据会话配置（可选）
         on_day_end: 可选只读日终观察回调；接收独立事实副本，异常仅告警
+        strict_data: 历史读取故障或必需价格缺失时终止回放（默认 False 保持原宽松行为）
     """
     engine = BacktestEngine(
         strategy_file=strategy_file,
@@ -4484,6 +4486,7 @@ def create_backtest(
         algorithm_id=algorithm_id,
         data_session_config=data_session_config,
         on_day_end=on_day_end,
+        strict_data=strict_data,
     )
 
     return engine.run()

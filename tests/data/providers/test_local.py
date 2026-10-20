@@ -320,3 +320,27 @@ def test_public_api_propagates_local_errors_and_factory(dataset, monkeypatch):
         api._provider = previous
         api._current_context = context
         api._security_info_cache.clear()
+
+
+
+
+def test_empty_schema_field_reason_names_the_field(tmp_path, monkeypatch):
+    """列已发布但值全空（如来源未提供涨跌停价）时，缺口原因写明字段名，不留空。"""
+    monkeypatch.setattr(socket.socket, "connect", lambda *a, **k: (_ for _ in ()).throw(AssertionError("禁网")))
+    publisher = DatasetPublisher(tmp_path)
+    publish(publisher, "trade_calendar",
+            pd.DataFrame([{"market": "XSHG", "trade_date": date, "is_open": True} for date in DATES]))
+    publish(publisher, "instrument_master", pd.DataFrame([{
+        "canonical_code": "510300.XSHG", "display_name": "300ETF", "name": "300ETF",
+        "security_type": "fund", "exchange": "XSHG", "list_date": "2012-05-28", "delist_date": None}]))
+    publish(publisher, "price_bars_1d", pd.DataFrame([{
+        "canonical_code": "510300.XSHG", "trade_date": date, "open": 4.0, "high": 4.1, "low": 3.9,
+        "close": 4.0, "volume": 1.0, "money": 4.0, "paused": False,
+        "high_limit": float("nan"), "low_limit": float("nan")} for date in DATES]))
+    provider = LocalBulletDataProvider({"workspace_root": str(tmp_path)})
+    with pytest.raises(LocalCoverageError) as error:
+        provider.get_price(security="510300.XSHG", end_date=DATES[-1], count=1,
+                           fields=["close", "high_limit"], fq=None, fill_paused=True)
+    reasons = [gap["reason"] for gap in error.value.diagnostic["gaps"]]
+    assert reasons == ["MISSING_FIELD:high_limit"]
+    assert error.value.diagnostic["fallback_attempted"] is False
