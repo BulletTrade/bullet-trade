@@ -313,8 +313,11 @@ class LocalBulletDataProvider(DataProvider):
                         [field for field in DEFAULT_FIELDS + ["avg"] if field in frame],
                     ] = float("nan")
             if mode or "factor" in requested:
+                reference = pre_factor_ref_date if pre_factor_ref_date is not None else end.date()
+                reference_day = _timestamp(reference).date()
+                factor_end = max(reference_day, end.date())
                 factors = self.local.query(
-                    object_name="adjustment_factor", codes=[code], end=str(end.date())
+                    object_name="adjustment_factor", codes=[code], end=str(factor_end)
                 )
                 if (
                     "factor" not in factors
@@ -327,9 +330,21 @@ class LocalBulletDataProvider(DataProvider):
                     self._missing(
                         "adjustment_factor", code, str(start), str(end), "INVALID_ADJUSTMENT_FACTOR"
                     )
-                reference = pre_factor_ref_date if pre_factor_ref_date is not None else end.date()
-                if _timestamp(reference).date() > end.date():
-                    raise ValueError("复权参考日不能晚于查询结束日")
+                if reference_day > end.date():
+                    # 前复权参考日可晚于查询区间（如以回测结束日为基准），但参考日前最后一个
+                    # 交易日必须真实有因子，不能用更早的旧因子代替。
+                    open_days = self._calendar(end.date(), reference_day)
+                    open_days = open_days.loc[open_days.is_open.astype(bool), "trade_date"].astype(str)
+                    if not open_days.empty and str(open_days.iloc[-1]) not in set(
+                        factors.trade_date.astype(str).str[:10]
+                    ):
+                        self._missing(
+                            "adjustment_factor",
+                            code,
+                            str(reference_day),
+                            str(reference_day),
+                            "MISSING_REFERENCE_FACTOR",
+                        )
                 if mode:
                     frame = apply_adjustment(
                         frame,

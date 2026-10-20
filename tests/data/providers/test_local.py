@@ -267,7 +267,8 @@ def test_old_manifest_does_not_follow_new_publication(dataset):
         {"frequency": "tick"},
         {"fq": "post"},
         {"skip_paused": True, "security": CODES},
-        {"pre_factor_ref_date": "2025-01-07"},
+        # 参考日晚于查询区间现在是合法前复权语义；超出覆盖时改为明确缺口，
+        # 见 test_reference_after_query_end_uses_reference_factor_and_missing_reference_is_gap。
     ],
 )
 def test_invalid_or_unsupported_parameters_fail_explicitly(dataset, kwargs):
@@ -343,4 +344,21 @@ def test_empty_schema_field_reason_names_the_field(tmp_path, monkeypatch):
                            fields=["close", "high_limit"], fq=None, fill_paused=True)
     reasons = [gap["reason"] for gap in error.value.diagnostic["gaps"]]
     assert reasons == ["MISSING_FIELD:high_limit"]
+    assert error.value.diagnostic["fallback_attempted"] is False
+
+
+def test_reference_after_query_end_uses_reference_factor_and_missing_reference_is_gap(dataset):
+    """固定参考日晚于查询区间（回测以结束日为基准）时按参考日因子前复权；超出覆盖则明确缺口。"""
+    _, provider = dataset
+    early = provider.get_price(
+        CODES[0], start_date=DATES[0], end_date=DATES[0], fields=["close", "factor"],
+        pre_factor_ref_date=DATES[-1],
+    )
+    assert early.close.tolist() == [5.0]
+    assert early.factor.tolist() == [0.5]
+    with pytest.raises(LocalCoverageError) as error:
+        provider.get_price(
+            CODES[0], start_date=DATES[0], end_date=DATES[0], fields=["close"],
+            pre_factor_ref_date="2025-01-08",
+        )
     assert error.value.diagnostic["fallback_attempted"] is False

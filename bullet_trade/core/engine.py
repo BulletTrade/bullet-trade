@@ -182,6 +182,7 @@ class BacktestEngine:
         data_session_config: Optional[Dict[str, Any]] = None,
         strict_data: bool = False,
         on_day_end: Optional[Callable[[Dict[str, Any]], None]] = None,
+        fq_ref_date: Optional[str] = None,
     ):
         """
         初始化回测引擎
@@ -242,6 +243,8 @@ class BacktestEngine:
         self.data_session_config = data_session_config or None
         self.strict_data = bool(strict_data)
         self.on_day_end = on_day_end
+        # 可选固定前复权参考日（YYYY-MM-DD）；None 保持原默认（当天）。冻结数据版本的回测用它保证可复现。
+        self.fq_ref_date = pd.to_datetime(fq_ref_date).date() if fq_ref_date else None
         # 新增：收益计算基准（首次总资产）
         self.start_total_value: Optional[float] = None
         # 新增：回测运行耗时（秒）
@@ -799,6 +802,9 @@ class BacktestEngine:
 
         # 注意：load_strategy 内部会调用 reset_settings()，需要重新注入频率配置
         set_option("backtest_frequency", self.frequency)
+        if self.fq_ref_date is not None:
+            # 在策略 initialize 之前注入，策略仍可用 set_option('fq_ref_date', ...) 覆盖
+            set_option("fq_ref_date", self.fq_ref_date)
 
         # 初始化上下文
         self.context = Context(
@@ -4454,6 +4460,7 @@ def create_backtest(
     data_session_config: Optional[Dict[str, Any]] = None,
     on_day_end: Optional[Callable[[Dict[str, Any]], None]] = None,
     strict_data: bool = False,
+    fq_ref_date: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     创建并运行回测
@@ -4472,6 +4479,7 @@ def create_backtest(
         data_session_config: 回测数据会话配置（可选）
         on_day_end: 可选只读日终观察回调；接收独立事实副本，异常仅告警
         strict_data: 历史读取故障或必需价格缺失时终止回放（默认 False 保持原宽松行为）
+        fq_ref_date: 固定前复权参考日 'YYYY-MM-DD'（默认 None 保持当天）
     """
     engine = BacktestEngine(
         strategy_file=strategy_file,
@@ -4487,6 +4495,7 @@ def create_backtest(
         data_session_config=data_session_config,
         on_day_end=on_day_end,
         strict_data=strict_data,
+        fq_ref_date=fq_ref_date,
     )
 
     return engine.run()
