@@ -228,16 +228,39 @@ def test_miniqmt_resample_count_expands_1m_window_and_accepts_min_alias(monkeypa
 
 
 @pytest.mark.unit
-def test_miniqmt_resamples_front_ratio_before_grouping(monkeypatch):
+def test_miniqmt_resample_pre_uses_event_factor_not_front_ratio(monkeypatch):
+    """分钟重采样前复权：按事件+真实前收算因子作用于重采样结果，不再读取 front_ratio。"""
     times = [f"2026-05-14 09:{minute:02d}:00" for minute in range(31, 41)]
     raw_1m = _build_minute_frame(times)
-    front_1m = _build_minute_frame(times, price_scale=0.5)
+    raw_1d = pd.DataFrame(
+        {
+            "time": [_qmt_time_ms("2026-05-14 00:00:00")],
+            "open": [10.0],
+            "high": [20.5],
+            "low": [9.5],
+            "close": [20.0],
+            "volume": [1000.0],
+            "amount": [15000.0],
+        }
+    )
     fake_xt = FakeXtData(
         {
             (SECURITY_QMT, "1m", "none"): raw_1m,
-            (SECURITY_QMT, "1m", "front_ratio"): front_1m,
+            (SECURITY_QMT, "1d", "none"): raw_1d,
         }
     )
+    dividends = pd.DataFrame(
+        {
+            "interest": [2.0],
+            "stockBonus": [0.0],
+            "stockGift": [0.0],
+            "allotNum": [0.0],
+            "allotPrice": [0.0],
+            "gugai": [0.0],
+        },
+        index=["20260515"],
+    )
+    fake_xt.get_divid_factors = lambda stock_code, start_time="", end_time="": dividends.copy()
     provider = _make_provider(monkeypatch, fake_xt)
 
     result = provider.get_price(
@@ -247,19 +270,21 @@ def test_miniqmt_resamples_front_ratio_before_grouping(monkeypatch):
         frequency="5m",
         fq="pre",
         fields=["open", "high", "low", "close"],
+        pre_factor_ref_date="2026-05-15",
     )
 
-    expected = pd.DataFrame(
+    # 因子 = (前收 20 - 现金 2) / 20 = 0.9，股票两位小数
+    raw_5m = pd.DataFrame(
         {
-            "open": [5.0, 7.5],
-            "high": [7.25, 9.75],
-            "low": [4.75, 7.25],
-            "close": [7.0, 9.5],
+            "open": [10.0, 15.0],
+            "high": [14.5, 19.5],
+            "low": [9.5, 14.5],
+            "close": [14.0, 19.0],
         },
         index=pd.to_datetime(["2026-05-14 09:35:00", "2026-05-14 09:40:00"]),
     )
-    pd.testing.assert_frame_equal(result, expected)
-    assert [call["dividend_type"] for call in fake_xt.local_calls] == ["none", "front_ratio"]
+    pd.testing.assert_frame_equal(result, (raw_5m * 0.9).round(2))
+    assert {call["dividend_type"] for call in fake_xt.local_calls} == {"none"}
 
 
 @pytest.mark.unit

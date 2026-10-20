@@ -804,44 +804,8 @@ class MiniQMTProvider(DataProvider):
         if period == "1m":
             raw_df = self._merge_open_auction_minute_for_resample(raw_df)
 
-        if fq == "pre":
-            # Prefer xtquant built-in front-ratio (前复权) first, then anchor to ref date
-            # This ensures parity with JQData when a pre_factor_ref_date is provided.
-            adj_df = self._fetch_local_data(
-                xt,
-                security=security,
-                period=period,
-                start_time=fetch_start_str,
-                end_time=end_str,
-                count=count,
-                dividend_type="front_ratio",
-            )
-            if period == "1m":
-                adj_df = self._merge_open_auction_minute_for_resample(adj_df)
-            if adj_df.empty:
-                # Fallback: event-based forward-adjust when local ratio data is unavailable
-                adj_df = self._build_adjusted_from_events(security, raw_df, direction="pre")
-            df = self._align_reference(raw_df, adj_df, pre_factor_ref_date)
-            # Adjust numeric precision to match raw price precision (2 or 3+ decimals as needed)
-            decimals = self._infer_price_decimals_from_raw(raw_df)
-            df = self._round_price_columns(df, decimals)
-        elif fq == "post":
-            adj_df = self._fetch_local_data(
-                xt,
-                security=security,
-                period=period,
-                start_time=fetch_start_str,
-                end_time=end_str,
-                count=count,
-                dividend_type="back_ratio",
-            )
-            if period == "1m":
-                adj_df = self._merge_open_auction_minute_for_resample(adj_df)
-            if adj_df.empty:
-                adj_df = self._build_adjusted_from_events(security, raw_df, direction="post")
-            df = self._align_reference(raw_df, adj_df, pre_factor_ref_date, default_to_start=True)
-            decimals = self._infer_price_decimals_from_raw(raw_df)
-            df = self._round_price_columns(df, decimals)
+        if fq in ("pre", "post"):
+            df = self._adjust_with_events(xt, security, raw_df, fq, pre_factor_ref_date)
         else:
             df = raw_df
 
@@ -915,42 +879,8 @@ class MiniQMTProvider(DataProvider):
             return raw_1m
 
         raw_df = self._resample_minute_frame(raw_1m, minute_group)
-        if fq == "pre":
-            adj_1m = self._fetch_local_data(
-                xt,
-                security=security,
-                period=source_period,
-                start_time=start_str,
-                end_time=end_str,
-                count=source_count,
-                dividend_type="front_ratio",
-            )
-            if adj_1m.empty:
-                adj_df = self._build_adjusted_from_events(security, raw_df, direction="pre")
-            else:
-                adj_1m = self._merge_open_auction_minute_for_resample(adj_1m)
-                adj_df = self._resample_minute_frame(adj_1m, minute_group)
-            df = self._align_reference(raw_df, adj_df, pre_factor_ref_date)
-            decimals = self._infer_price_decimals_from_raw(raw_1m)
-            df = self._round_price_columns(df, decimals)
-        elif fq == "post":
-            adj_1m = self._fetch_local_data(
-                xt,
-                security=security,
-                period=source_period,
-                start_time=start_str,
-                end_time=end_str,
-                count=source_count,
-                dividend_type="back_ratio",
-            )
-            if adj_1m.empty:
-                adj_df = self._build_adjusted_from_events(security, raw_df, direction="post")
-            else:
-                adj_1m = self._merge_open_auction_minute_for_resample(adj_1m)
-                adj_df = self._resample_minute_frame(adj_1m, minute_group)
-            df = self._align_reference(raw_df, adj_df, pre_factor_ref_date, default_to_start=True)
-            decimals = self._infer_price_decimals_from_raw(raw_1m)
-            df = self._round_price_columns(df, decimals)
+        if fq in ("pre", "post"):
+            df = self._adjust_with_events(xt, security, raw_df, fq, pre_factor_ref_date)
         else:
             df = raw_df
 
@@ -1130,51 +1060,6 @@ class MiniQMTProvider(DataProvider):
         except Exception as e:
             logger.debug(f"QMT _fill_paused_days: 填充失败 {e}")
             return df
-
-    @staticmethod
-    def _round_price_columns(df: pd.DataFrame, decimals: int) -> pd.DataFrame:
-        if df.empty or decimals is None:
-            return df
-        cols = [c for c in ("open", "high", "low", "close") if c in df.columns]
-        if not cols:
-            return df
-        out = df.copy()
-        for c in cols:
-            out[c] = out[c].astype(float).round(decimals)
-        return out
-
-    @staticmethod
-    def _infer_price_decimals_from_raw(raw_df: pd.DataFrame) -> int:
-        """Infer price precision from raw series by checking how closely values align
-        to 2 or 3 decimals. Fall back to 2 if uncertain.
-        """
-        if raw_df is None or raw_df.empty:
-            return 2
-        cols = [c for c in ("open", "high", "low", "close") if c in raw_df.columns]
-        if not cols:
-            return 2
-        sample = raw_df[cols].tail(min(len(raw_df), 40)).to_numpy().ravel()
-        sample = [float(x) for x in sample if pd.notna(x)]
-        if not sample:
-            return 2
-
-        def _score(dec):
-            tol = 5e-5 if dec <= 2 else 5e-6
-            ok = 0
-            for v in sample:
-                if abs(v - round(v, dec)) <= tol:
-                    ok += 1
-            return ok / len(sample)
-
-        score2 = _score(2)
-        score3 = _score(3)
-        # Prefer smallest decimals that fits well; require high fit to choose lower precision
-        if score2 >= 0.98:
-            return 2
-        if score3 >= 0.98 or score3 > score2:
-            return 3
-        # Fall back to 2
-        return 2
 
     def _local_block_cache_bounds(
         self,
@@ -1678,143 +1563,231 @@ class MiniQMTProvider(DataProvider):
                 pass
         return normalized
 
-    def _collect_dividend_events(
-        self,
-        security: str,
-        raw_df: pd.DataFrame,
-    ) -> List[Dict[str, Any]]:
-        if raw_df.empty:
-            return []
-        start_dt = raw_df.index.min()
-        end_dt = raw_df.index.max()
-        start_date = None
-        end_date = None
-        if hasattr(start_dt, "to_pydatetime") and pd.notna(start_dt):
-            start_date = start_dt.to_pydatetime().date()
-        if hasattr(end_dt, "to_pydatetime") and pd.notna(end_dt):
-            end_date = end_dt.to_pydatetime().date()
-        events = self._get_xt_split_dividend(security, start_date=start_date, end_date=end_date)
-        if events:
-            return [self._standardize_event(event) for event in events]
-        return []
+    # ------------------------ 事件复权 ------------------------
+    # 前/后复权不再使用 xtdata front_ratio/back_ratio：其内置 dr 并非按除权前一日真实收盘计算，
+    # 与聚宽、大QMT适配器存在系统偏差（如 510500 2026-07-15 dr=1.01591，真实应为 1.01803）。
+    # 这里与 big_qmt 适配器同口径：get_divid_factors 事件 + 除权前真实交易日收盘，
+    # 交由 qmt_adjustment.adjust_bars 统一计算，公式只保留在纯计算模块一处。
+    _ADJUST_COLUMNS = ("open", "high", "low", "close", "volume")
+    _EVENT_REQUIRED_COLUMNS = ("interest", "stockBonus", "stockGift", "allotNum")
+    # 无上市日元数据时使用的后复权原点；早于沪深开市，原点之前不可能存在除权事件。
+    _POST_ORIGIN_FALLBACK = Date(1990, 1, 1)
 
-    def _build_adjusted_from_events(
-        self,
-        security: str,
-        raw_df: pd.DataFrame,
-        direction: str,
-    ) -> pd.DataFrame:
-        if direction not in {"pre", "post"}:
-            return pd.DataFrame()
-        events = self._collect_dividend_events(security, raw_df)
-        if not events:
-            return pd.DataFrame()
-        if direction == "post":
-            # 缺少官方后复权数据时回退到未复权，避免误差放大
-            return pd.DataFrame()
-        price_cols = [col for col in ["open", "high", "low", "close"] if col in raw_df.columns]
-        if not price_cols:
-            return pd.DataFrame()
-        adj_df = raw_df.copy()
-        # Build multiplicative forward-adjust factors series
-        factors = pd.Series(1.0, index=adj_df.index)
-        sorted_events = sorted(
-            (
-                {
-                    **event,
-                    "date": pd.to_datetime(event.get("date"), errors="coerce"),
-                }
-                for event in events
-            ),
-            key=lambda item: item["date"] if item["date"] is not pd.NaT else pd.Timestamp.max,
-        )
-        for event in sorted_events:
-            event_date = event.get("date")
-            if event_date is pd.NaT or event_date is None:
-                continue
-            event_day = event_date.date()
-            mask = adj_df.index.date < event_day
-            if not mask.any():
-                continue
-            # scale factor: for share bonus/split, forward-adjust multiply earlier prices by 1/scale
-            try:
-                scale = float(event.get("scale_factor") or 1.0)
-            except Exception:
-                scale = 1.0
-            scale_factor = 1.0 / scale if scale and scale > 0 else 1.0
-            # cash dividend: forward-adjust multiply earlier prices by (preclose - cash_per_share)/preclose
-            try:
-                cash = float(event.get("bonus_pre_tax") or 0.0)
-            except Exception:
-                cash = 0.0
-            try:
-                per_base = float(event.get("per_base") or 10.0)
-            except Exception:
-                per_base = 10.0
-            # 将 bonus_pre_tax 转换为每股分红
-            cash_per_share = cash / per_base if per_base > 0 else 0.0
-            # Determine preclose for the ex-date
-            preclose = None
-            if "preClose" in adj_df.columns and event_day in adj_df.index.date:
-                preclose = float(adj_df.loc[adj_df.index.date == event_day, "preClose"].iloc[0])
-            if preclose is None or preclose == 0.0:
-                # fallback to previous day's close
-                prev = adj_df.index[adj_df.index.date < event_day]
-                if len(prev) > 0 and "close" in adj_df.columns:
-                    preclose = float(adj_df.loc[prev.max(), "close"])
-            cash_factor = 1.0
-            if cash_per_share and preclose and preclose > 0:
-                cash_factor = max((preclose - cash_per_share) / preclose, 0.0)
-            total_factor = scale_factor * cash_factor
-            if total_factor != 1.0:
-                factors.loc[mask] = factors.loc[mask] * total_factor
-        # Apply factors to OHLC
-        for col in price_cols:
-            adj_df[col] = adj_df[col].astype(float) * factors
-        return adj_df
+    @staticmethod
+    def _adjust_today() -> Date:
+        """返回中国日期，作为前复权默认参考日，与 big_qmt 适配器 `_history_today` 一致。"""
+        return pd.Timestamp.now(tz="Asia/Shanghai").date()
 
-    def _align_reference(
-        self,
-        raw_df: pd.DataFrame,
-        adj_df: pd.DataFrame,
-        pre_factor_ref_date: Optional[Union[str, datetime]],
-        default_to_start: bool = False,
-    ) -> pd.DataFrame:
-        if adj_df.empty:
-            return raw_df
-        if not pre_factor_ref_date:
-            return adj_df
+    def _event_price_decimals(self, xt: Any, security: str) -> int:
+        """按最小变动价位确定报价位数；规则与 big_qmt `_history_price_decimals` 一致。"""
         try:
-            ref_dt = pd.to_datetime(pre_factor_ref_date)
+            info = xt.get_instrument_detail(security)
         except Exception:
-            ref_dt = adj_df.index[0 if default_to_start else -1]
+            info = None
+        tick = info.get("PriceTick") if isinstance(info, dict) else None
+        if tick is not None and not isinstance(tick, bool):
+            try:
+                value = float(tick)
+                if math.isfinite(value) and value > 0:
+                    for decimals in range(9):
+                        if math.isclose(value, 10.0**-decimals, rel_tol=1e-9, abs_tol=0.0):
+                            return decimals
+            except (TypeError, ValueError, OverflowError):
+                pass
+        code = security.split(".", 1)[0]
+        return 3 if code.startswith(("5", "15", "16")) else 2
 
-        reference_raw = None
-        reference_adj = None
-        if ref_dt in raw_df.index and ref_dt in adj_df.index:
-            reference_raw = raw_df.loc[ref_dt, "close"]
-            reference_adj = adj_df.loc[ref_dt, "close"]
+    def _listing_date(self, xt: Any, security: str) -> Optional[Date]:
+        """读取上市日作为后复权固定原点；取不到时返回 None。"""
+        try:
+            info = xt.get_instrument_detail(security)
+        except Exception:
+            return None
+        if not isinstance(info, dict):
+            return None
+        value = info.get("OpenDate")
+        if value in (None, "", 0, "0", 19700101, "19700101"):
+            return None
+        return self._to_date(str(value))
+
+    @staticmethod
+    def _divid_event_dates(df: pd.DataFrame) -> List[Date]:
+        """解析 get_divid_factors 的除权日：优先 time 毫秒戳（按沪深时区），否则解析索引。"""
+        if "time" in df.columns:
+            stamps = pd.to_datetime(df["time"].astype("int64"), unit="ms", utc=True)
+            return list(stamps.dt.tz_convert("Asia/Shanghai").dt.date)
+        dates: List[Date] = []
+        for value in df.index:
+            text = str(value).strip()
+            stamp = (
+                pd.to_datetime(text, format="%Y%m%d") if len(text) == 8 else pd.to_datetime(text)
+            )
+            dates.append(stamp.date())
+        return dates
+
+    def _fetch_adjustment_events(
+        self,
+        xt: Any,
+        security: str,
+        lower: Date,
+        upper: Date,
+    ) -> List[Dict[str, Any]]:
+        """读取 (lower, upper] 内的除权事件，转换为 qmt_adjustment 事件字段（不含前收）。
+
+        字段映射与大QMT helper 一致：gift=stockBonus（送股），transfer=stockGift（转增），
+        interest 为每股/份现金。取数异常或缺字段直接抛错，不能把查询失败当作无事件。
+        """
+        from ..qmt_adjustment import AdjustmentError
+
+        start_str = lower.strftime("%Y%m%d")
+        end_str = upper.strftime("%Y%m%d")
+        try:
+            df = xt.get_divid_factors(security, start_str, end_str)
+        except Exception as exc:
+            raise AdjustmentError(f"QMT get_divid_factors 失败({security}): {exc}") from exc
+        if df is None or len(df) == 0:
+            return []
+        missing = [name for name in self._EVENT_REQUIRED_COLUMNS if name not in df.columns]
+        if missing:
+            raise AdjustmentError(f"QMT 除权事件缺少字段({security}): {missing}")
+        events: List[Dict[str, Any]] = []
+        for event_date, (_, row) in zip(self._divid_event_dates(df), df.iterrows()):
+            if not lower < event_date <= upper:
+                continue
+            rights = float(row["allotNum"])
+            rights_price = row.get("allotPrice")
+            if rights_price is None or pd.isna(rights_price):
+                # 旧版 xtquant 可能不返回 allotPrice；仅在无配股时可视为零。
+                if rights != 0:
+                    raise AdjustmentError(f"{security} {event_date} 有配股但缺少配股价")
+                rights_price = 0.0
+            gugai = row.get("gugai", 0.0)
+            gugai = 0.0 if gugai is None or pd.isna(gugai) else float(gugai)
+            if gugai not in (0.0, 1.0):
+                raise AdjustmentError(f"{security} {event_date} 股改标识不是已知的 0/1")
+            events.append(
+                {
+                    "date": event_date.isoformat(),
+                    "cash_per_share": float(row["interest"]),
+                    "gift": float(row["stockBonus"]),
+                    "transfer": float(row["stockGift"]),
+                    "rights": rights,
+                    "rights_price": float(rights_price),
+                    "share_reform": gugai == 1.0,
+                }
+            )
+        return events
+
+    def _event_previous_close(self, xt: Any, security: str, event_date: Date) -> tuple:
+        """取除权日之前最近一个真实交易日（有成交、非停牌）的未复权收盘价。
+
+        与 big_qmt `_history_events` 相同：跳过停牌日向前追溯，绝不使用除权日 preClose。
+        历史收盘不可变，按 (证券, 除权日) 记忆化。返回 (收盘价, 交易日)。
+        """
+        from ..qmt_adjustment import AdjustmentError
+
+        memo = self.__dict__.setdefault("_event_previous_close_memo", {})
+        key = (security, event_date)
+        if key in memo:
+            return memo[key]
+        end = pd.Timestamp(event_date) - pd.Timedelta(days=1)
+        for lookback_days in (40, 400, 4000):
+            start = end - pd.Timedelta(days=lookback_days)
+            daily = self._fetch_local_data(
+                xt,
+                security=security,
+                period="1d",
+                start_time=start.strftime("%Y%m%d"),
+                end_time=end.strftime("%Y%m%d"),
+                count=None,
+                dividend_type="none",
+            )
+            if daily is not None and not daily.empty and "close" in daily.columns:
+                daily = daily.loc[daily.index < pd.Timestamp(event_date)]
+                traded = daily["close"].notna() & (daily["close"] > 0)
+                if "suspendFlag" in daily.columns:
+                    traded &= daily["suspendFlag"].fillna(0) == 0
+                if "volume" in daily.columns:
+                    traded &= daily["volume"].fillna(0) > 0
+                daily = daily.loc[traded]
+                if not daily.empty:
+                    result = (float(daily["close"].iloc[-1]), daily.index[-1].date())
+                    memo[key] = result
+                    return result
+        raise AdjustmentError(f"{security} 无法取得 {event_date} 除权前的实际交易日收盘")
+
+    def _adjust_with_events(
+        self,
+        xt: Any,
+        security: str,
+        raw_df: pd.DataFrame,
+        fq: str,
+        pre_factor_ref_date: Optional[Union[str, datetime, Date]],
+    ) -> pd.DataFrame:
+        """对未复权行情做事件复权，返回新表；口径与大QMT适配器、聚宽一致。
+
+        - pre：以 pre_factor_ref_date（默认今天）为基准日，基准日价格等于真实价；
+        - post：以上市日为固定原点（与 big_qmt 一致），不使用 pre_factor_ref_date；
+        - OHLC 乘因子后按最小变动价位舍入，volume 除以因子取整（与 adjust_bars 一致）；
+          preClose 若存在按同一因子换算；停牌等缺值保持缺值。
+        """
+        from ..qmt_adjustment import AdjustmentError, adjust_bars
+
+        if raw_df.empty:
+            return raw_df
+        if not isinstance(raw_df.index, pd.DatetimeIndex):
+            raise AdjustmentError("复权行情必须使用 DatetimeIndex")
+        local_index = (
+            raw_df.index.tz_convert("Asia/Shanghai")
+            if raw_df.index.tz is not None
+            else raw_df.index
+        )
+        first_day = local_index[0].date()
+        last_day = local_index[-1].date()
+        if fq == "pre":
+            if pre_factor_ref_date is None or pre_factor_ref_date == "":
+                anchor = self._adjust_today()
+            else:
+                anchor = pd.Timestamp(pre_factor_ref_date).date()
+            reference_date, post_origin = anchor, None
         else:
-            ref_date = ref_dt.date() if hasattr(ref_dt, "date") else None
-            if ref_date is not None and hasattr(raw_df.index, "date"):
-                raw_mask = raw_df.index.date == ref_date
-                adj_mask = adj_df.index.date == ref_date
-                if raw_mask.any() and adj_mask.any():
-                    try:
-                        reference_raw = raw_df.loc[raw_mask, "close"].iloc[-1]
-                        reference_adj = adj_df.loc[adj_mask, "close"].iloc[-1]
-                    except Exception:
-                        reference_raw = None
-                        reference_adj = None
-        if reference_raw is None or reference_adj is None:
-            return adj_df
-        if reference_adj == 0:
-            return adj_df
-        scale = reference_raw / reference_adj
-        for col in ["open", "high", "low", "close"]:
-            if col in adj_df.columns:
-                adj_df[col] = adj_df[col] * scale
-        return adj_df
+            listing = self._listing_date(xt, security) or self._POST_ORIGIN_FALLBACK
+            anchor = min(listing, first_day)
+            reference_date, post_origin = None, anchor
+        lower = min(first_day, anchor)
+        upper = max(last_day, anchor)
+        events = []
+        if lower < upper:
+            for event in self._fetch_adjustment_events(xt, security, lower, upper):
+                close, close_day = self._event_previous_close(
+                    xt, security, Date.fromisoformat(event["date"])
+                )
+                event["previous_close"] = close
+                event["previous_close_date"] = close_day.isoformat()
+                events.append(event)
+
+        columns = [col for col in self._ADJUST_COLUMNS if col in raw_df.columns]
+        values = raw_df[columns].astype(float)
+        missing = values.isna()
+        decimals = self._event_price_decimals(xt, security)
+        adjusted = adjust_bars(
+            values.fillna(0.0),
+            events,
+            fq=fq,
+            price_decimals=decimals,
+            reference_date=reference_date,
+            post_origin_date=post_origin,
+            event_coverage_start=lower,
+            event_coverage_end=upper,
+            events_complete=True,
+            include_factor=True,
+        )
+        df = raw_df.copy()
+        for col in columns:
+            df[col] = adjusted[col].mask(missing[col])
+        if "preClose" in df.columns:
+            df["preClose"] = (df["preClose"].astype(float) * adjusted["factor"]).round(decimals)
+        return df
 
     # ------------------------ 交易日/基础信息 ------------------------
     def get_trade_days(
