@@ -12,9 +12,12 @@ easy_tdx 通达信在线数据源适配器
 from __future__ import annotations
 
 import importlib
+import itertools
 import logging
 import math
 import os
+import struct
+import time
 from datetime import date as Date
 from datetime import datetime
 from pathlib import Path
@@ -96,6 +99,169 @@ _STUB_NAMES: Dict[str, str] = {
     "000001.XSHG": "上证指数",
 }
 
+# ---------------------------------------------------------------------------
+# 传输层串包防护
+#
+# easy-tdx 1.14.4 的 TdxConnection.execute 在 recv 超时后不关闭 socket，也不核对
+# 响应帧头与请求的对应关系；握手超时直接忽略。迟到的响应会留在缓冲区，之后每个
+# 请求都读到上一个请求的结果（2026-10-16 实证）。这里不改 site-packages，而是在
+# provider 侧用子类替换 MacClient 内部连接：
+#   1. MAC 请求帧 bytes 1-4（customize，SDK 恒为 0）写入单调递增序号，服务器在响应
+#      帧头 bytes 5-8 原样回显；bytes 10-11 回显请求 bytes 10-11 的 msg_id；
+#   2. 帧头 magic/序号/msg_id 任一不符即判定串包；
+#   3. K 线与证券信息响应体回显 market+code，报价按返回代码核对标的；
+#   4. 任何异常（含解析错误、串包）都立即关闭 socket，绝不在同一连接上继续读写。
+# ---------------------------------------------------------------------------
+_TDX_MAGIC = 7654321
+_MAC_HEAD_FLAG = 0x1C
+_MSG_SYMBOL_INFO = 0x122A
+_MSG_SYMBOL_QUOTES = 0x122B
+_MSG_SYMBOL_BAR = 0x122E
+_SEQ_COUNTER = itertools.count(1)
+
+
+class TdxResponseMismatchError(ConnectionError):
+    """响应与请求不对应（串包）；继承 ConnectionError，便于按网络故障换连接。"""
+
+
+_GUARDED_CONNECTION_CLS: Optional[type] = None
+
+
+def _guarded_connection_cls() -> type:
+    """无输入，返回带串包防护的 TdxConnection 子类；首次调用时导入 SDK 并构造。"""
+    global _GUARDED_CONNECTION_CLS
+    if _GUARDED_CONNECTION_CLS is not None:
+        return _GUARDED_CONNECTION_CLS
+    from easy_tdx.codec.frame import HEADER_SIZE, decompress_body, parse_header
+    from easy_tdx.commands.setup import SETUP_COMMANDS
+    from easy_tdx.exceptions import TdxConnectionError
+    from easy_tdx.transport.sync import TdxConnection
+
+    class GuardedTdxConnection(TdxConnection):
+        """校验响应对应关系、异常即断开的同步连接。"""
+
+        def _drop_socket(self) -> None:
+            """关闭 socket 并清空引用；调用方已持有 _lock，故不在此 join 心跳线程。"""
+            sock, self._sock = self._sock, None
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+
+        def _send_setup(self) -> None:
+            """严格握手：任何握手响应缺失都视为连接不可用，避免残留迟到响应。"""
+            assert self._sock is not None
+            for cmd_bytes in SETUP_COMMANDS:
+                self._sock.sendall(cmd_bytes)
+                try:
+                    header_buf = self._recv_exact(HEADER_SIZE)
+                    header = parse_header(header_buf)
+                    if header.magic != _TDX_MAGIC:
+                        raise TdxResponseMismatchError("easy_tdx 握手响应 magic 不符")
+                    if header.zipsize > 0:
+                        self._recv_exact(header.zipsize)
+                except OSError as exc:
+                    raise TdxConnectionError(f"握手无响应，放弃该连接: {exc}") from exc
+
+        def execute(self, cmd: Any) -> Any:
+            """发送请求并核对响应帧头与标的；任何异常都关闭 socket 后再抛出。"""
+            with self._lock:
+                self._last_active = time.monotonic()
+                self._consecutive_heartbeats = 0
+                if self._sock is None:
+                    raise TdxConnectionError("未连接，请先调用 connect()")
+                request = bytearray(cmd.build_request())
+                if len(request) >= 12 and request[0] == _MAC_HEAD_FLAG:
+                    seq = next(_SEQ_COUNTER) % 0xFFFFFFFF or 1
+                    request[1:5] = struct.pack("<I", seq)
+                try:
+                    self._sock.sendall(bytes(request))
+                    header_buf = self._recv_exact(HEADER_SIZE)
+                    header = parse_header(header_buf)
+                    _check_frame_echo(request, header_buf, header.magic)
+                    raw_body = self._recv_exact(header.zipsize)
+                    body = decompress_body(header, raw_body)
+                    _check_body_identity(request, body)
+                    result = cmd.parse_response(body)
+                    _check_quote_identity(request, cmd, result)
+                    return result
+                except BaseException as exc:
+                    self._drop_socket()
+                    if isinstance(exc, OSError) and not isinstance(exc, TdxResponseMismatchError):
+                        raise TdxConnectionError(f"通信错误: {exc}") from exc
+                    raise
+
+    _GUARDED_CONNECTION_CLS = GuardedTdxConnection
+    return GuardedTdxConnection
+
+
+def _check_frame_echo(request: bytes, header_buf: bytes, magic: int) -> None:
+    """输入请求与 16 字节响应帧头；magic、序号或 msg_id 回显不符时抛 TdxResponseMismatchError。"""
+    if magic != _TDX_MAGIC:
+        raise TdxResponseMismatchError(f"easy_tdx 响应 magic 异常: {magic}")
+    if bytes(header_buf[5:9]) != bytes(request[1:5]):
+        raise TdxResponseMismatchError(
+            "easy_tdx 响应序号与请求不符（串包）: "
+            f"request={bytes(request[1:5]).hex()} response={bytes(header_buf[5:9]).hex()}"
+        )
+    if bytes(header_buf[10:12]) != bytes(request[10:12]):
+        raise TdxResponseMismatchError(
+            "easy_tdx 响应命令号与请求不符（串包）: "
+            f"request={bytes(request[10:12]).hex()} response={bytes(header_buf[10:12]).hex()}"
+        )
+
+
+def _check_body_identity(request: bytes, body: bytes) -> None:
+    """输入请求与响应体；单标的命令响应回显的 market+code 与请求不符时抛错。"""
+    if len(request) < 36:
+        return
+    msg_id = struct.unpack_from("<H", request, 10)[0]
+    offset = {_MSG_SYMBOL_BAR: 0, _MSG_SYMBOL_INFO: 8}.get(msg_id)
+    if offset is None:
+        return
+    expected = bytes(request[12:36])
+    actual = bytes(body[offset : offset + 24])
+    if actual != expected:
+        raise TdxResponseMismatchError(
+            f"easy_tdx 响应标的与请求不符（串包）: request={expected.hex()} response={actual.hex()}"
+        )
+
+
+def _check_quote_identity(request: bytes, cmd: Any, result: Any) -> None:
+    """输入报价请求与解析结果；返回了未请求的标的时抛错。"""
+    if len(request) < 12 or struct.unpack_from("<H", request, 10)[0] != _MSG_SYMBOL_QUOTES:
+        return
+    stocks = getattr(cmd, "_stocks", None)
+    if not stocks or not isinstance(result, list):
+        return
+    requested = {(int(market), str(code).zfill(6)) for market, code in stocks}
+    for item in result:
+        market, code = getattr(item, "market", None), getattr(item, "code", None)
+        if market is None or code is None:
+            continue
+        if (int(market), str(code).zfill(6)) not in requested:
+            raise TdxResponseMismatchError(
+                f"easy_tdx 报价返回未请求的标的（串包）: {market}/{code}"
+            )
+
+
+def _install_connection_guard(client: Any) -> None:
+    """输入未连接的 MacClient，把内部 TdxConnection 换成防护子类；非真实 SDK 客户端不处理。"""
+    conn = getattr(client, "_conn", None)
+    if conn is None:
+        return
+    try:
+        from easy_tdx.transport.sync import TdxConnection
+    except ImportError:  # pragma: no cover - 只在缺依赖时触发
+        return
+    if not isinstance(conn, TdxConnection):
+        return
+    guarded_cls = _guarded_connection_cls()
+    if isinstance(conn, guarded_cls):
+        return
+    client._conn = guarded_cls(conn.host, conn.port, conn.timeout)
+
 
 class EasyTdxProvider(DataProvider):
     """通达信在线行情数据源，负责把 easy_tdx 输出转换为聚宽兼容格式。"""
@@ -125,6 +291,11 @@ class EasyTdxProvider(DataProvider):
         self._failed_host = None
         self._xdxr_host = None
         self._xdxr_selected_day = None
+        # 证券名称进程内缓存，按自然日失效；失败结果只短暂缓存，避免故障期反复打服务器。
+        self._name_cache: Dict[str, Tuple[str, float]] = {}
+        self._name_cache_day: Optional[Date] = None
+        # 当日报价锚点：security -> (日期, 昨收, 涨停, 跌停)，用于识别错位行情。
+        self._price_refs: Dict[str, Tuple[Date, float, float, float]] = {}
 
     @staticmethod
     def _parse_bool(value: Any) -> bool:
@@ -271,6 +442,16 @@ class EasyTdxProvider(DataProvider):
         if self._use_stub:
             self._connected = True
             return
+        injected = self.config.get("client")
+        if injected is not None:
+            # 注入客户端被重置后原样恢复；带 connect 的真实客户端需重新握手。
+            self._client = injected
+            connect = getattr(injected, "connect", None)
+            if callable(connect) and getattr(injected, "_conn", None) is not None:
+                _install_connection_guard(injected)
+                connect()
+            self._connected = True
+            return
         target_host = host or self._host
         target_port = int(port or self._port)
         client_cls = self._resolve_mac_client_cls()
@@ -298,6 +479,8 @@ class EasyTdxProvider(DataProvider):
                 self._client = client_cls.from_best_host(**options)
             else:
                 self._client = client_cls(port=target_port, timeout=self._timeout)
+            # 必须在 connect 之前替换内部连接，握手也走严格模式。
+            _install_connection_guard(self._client)
             connect = getattr(self._client, "connect", None)
             if callable(connect):
                 connect()
@@ -340,24 +523,37 @@ class EasyTdxProvider(DataProvider):
         self._connected = False
         close = getattr(client, "close", None)
         if callable(close):
-            close()
+            try:
+                close()
+            except Exception as exc:  # 关闭失败不影响后续重建连接
+                logger.warning("easy_tdx close_failed error=%s: %s", type(exc).__name__, exc)
 
     def _call(self, method: str, *args: Any, **kwargs: Any) -> Any:
         """调用只读行情方法；输入方法与参数，返回 SDK 结果，失联最多换址一次后抛错。
 
-        自动模式从原候选名单排除失败 IP 后重选；固定 host 保持显式配置。
-        每次只重试网络错误，不重试参数、数据解析或策略错误。
+        请求一旦可能已发出，任何异常（不只网络异常）都先关闭连接：socket 里可能残留
+        迟到的响应，继续复用会让后续请求读到上一个请求的结果（串包）。
+        自动模式下网络错误与串包从原候选名单排除失败 IP 后重选并重试一次；
+        固定 host 或注入客户端只重置不换址；参数、数据解析等其他错误重置后原样抛出。
         """
         client = self._ensure_client()
         try:
             return getattr(client, method)(*args, **kwargs)
         except Exception as exc:
+            failed_host = getattr(client, "_host", None)
+            self.close()
+            logger.warning(
+                "easy_tdx reset_connection method=%s host=%s error=%s: %s",
+                method,
+                failed_host,
+                type(exc).__name__,
+                exc,
+            )
             network_error = isinstance(exc, (ConnectionError, TimeoutError, OSError))
             network_error = network_error or type(exc).__name__ == "TdxConnectionError"
             if not network_error or self._host or self.config.get("client"):
                 raise
-            self._failed_host = getattr(client, "_host", None)
-            self.close()
+            self._failed_host = failed_host
             self.auth()
             return getattr(self._client, method)(*args, **kwargs)
 
@@ -422,6 +618,7 @@ class EasyTdxProvider(DataProvider):
             adjust=adjust,
         )
         df = self._normalize_kline_frame(raw, fields)
+        self._check_kline_consistency(security, df)
         # Mac K 线的指数成交量单位与股票/ETF 不同；统一到聚宽的股数口径。
         if self._infer_jq_security_type(security) == "index" and "volume" in df:
             df["volume"] = df["volume"] * 100.0
@@ -979,12 +1176,11 @@ class EasyTdxProvider(DataProvider):
         rows = []
         categories = self._resolve_categories(type_list)
         for category, label in categories:
+            # 经 _call 统一处理：失败先重置连接；不再吞异常返回残缺列表。
             try:
-                raw = getter(category, count=5000)
+                raw = self._call("get_stock_quotes_list", category, count=5000)
             except TypeError:
-                raw = getter(category)
-            except Exception:
-                continue
+                raw = self._call("get_stock_quotes_list", category)
             df = pd.DataFrame(raw)
             if df.empty:
                 continue
@@ -1046,8 +1242,10 @@ class EasyTdxProvider(DataProvider):
         market, code = self.jq_to_tdx(index_symbol)
         board_code = f"{market}{code}"
         try:
-            raw = getter(board_code)
-        except Exception:
+            raw = self._call("get_board_members", board_code)
+        except Exception as exc:
+            # _call 已重置连接，成分股查询失败维持旧约定返回空列表。
+            logger.warning("easy_tdx get_index_stocks_failed %s: %s", index_symbol, exc)
             return []
         df = pd.DataFrame(raw)
         if df.empty:
@@ -1147,17 +1345,7 @@ class EasyTdxProvider(DataProvider):
         code = str(security)
         display_name = _STUB_NAMES.get(code, code)
         if not self._use_stub:
-            try:
-                client = self._ensure_client()
-                info_getter = (
-                    getattr(client, "get_symbol_info", None) if client is not None else None
-                )
-                if callable(info_getter):
-                    market, raw_code = self.jq_to_tdx(code)
-                    raw_info = info_getter(market, raw_code)
-                    display_name = str(getattr(raw_info, "name", None) or display_name)
-            except Exception:
-                pass
+            display_name = self._lookup_display_name(code, display_name)
         kind = self._infer_jq_security_type(code)
         return {
             "code": security,
@@ -1167,6 +1355,60 @@ class EasyTdxProvider(DataProvider):
             "end_date": Date(2200, 1, 1),
             "type": kind,
         }
+
+    _NAME_FAILURE_TTL = 300.0
+
+    def _lookup_display_name(self, code: str, fallback: str) -> str:
+        """输入证券代码与兜底名，返回缓存或在线名称；失败时已重置连接并返回兜底名。"""
+        today = datetime.now().date()
+        if self._name_cache_day != today:
+            self._name_cache.clear()
+            self._name_cache_day = today
+        cached = self._name_cache.get(code)
+        if cached is not None and (cached[1] == 0.0 or time.monotonic() < cached[1]):
+            return cached[0]
+        try:
+            client = self._ensure_client()
+            if client is None or not callable(getattr(client, "get_symbol_info", None)):
+                return fallback
+            market, raw_code = self.jq_to_tdx(code)
+            raw_info = self._call("get_symbol_info", market, raw_code)
+            name = self._extract_symbol_name(raw_info, market, raw_code)
+        except Exception as exc:
+            # 名称只用于展示，降级为代码并短暂缓存失败结果；但连接必须先重置
+            # （_call 内的异常已关闭，这里兜住标的核对等 _call 之外的失败）。
+            self.close()
+            logger.warning("easy_tdx display_name_failed %s: %s", code, exc)
+            self._name_cache[code] = (fallback, time.monotonic() + self._NAME_FAILURE_TTL)
+            return fallback
+        if not name:
+            return fallback
+        self._name_cache[code] = (name, 0.0)
+        return name
+
+    @staticmethod
+    def _extract_symbol_name(raw_info: Any, market: int, code: str) -> Optional[str]:
+        """输入 get_symbol_info 结果（DataFrame 或对象），返回名称；标的不符时抛串包错误。"""
+        if isinstance(raw_info, pd.DataFrame):
+            if raw_info.empty:
+                return None
+            row = raw_info.iloc[0]
+            got_market, got_code, name = row.get("market"), row.get("code"), row.get("name")
+        else:
+            got_market = getattr(raw_info, "market", None)
+            got_code = getattr(raw_info, "code", None)
+            name = getattr(raw_info, "name", None)
+        if got_code is not None and pd.notna(got_code):
+            if str(got_code).zfill(6) != str(code).zfill(6) or (
+                got_market is not None and pd.notna(got_market) and int(got_market) != int(market)
+            ):
+                raise TdxResponseMismatchError(
+                    f"easy_tdx 名称查询返回了其他标的: request={market}/{code} "
+                    f"response={got_market}/{got_code}"
+                )
+        if name is None or (not isinstance(name, str) and pd.isna(name)):
+            return None
+        return str(name).strip() or None
 
     def get_current_tick(
         self,
@@ -1212,6 +1454,15 @@ class EasyTdxProvider(DataProvider):
         if quote_df.empty:
             return pd.DataFrame() if df else None
         row = quote_df.iloc[0]
+        got_code = row.get("code")
+        if got_code is not None and pd.notna(got_code):
+            got_market = row.get("market")
+            if str(got_code).zfill(6) != str(code).zfill(6) or (
+                got_market is not None and pd.notna(got_market) and int(got_market) != int(market)
+            ):
+                self._reject_misaligned(
+                    f"easy_tdx 报价返回了其他标的: request={security} response={got_market}/{got_code}"
+                )
         raw_last_price = float(
             row.get("price", row.get("last_price", row.get("close", 0.0))) or 0.0
         )
@@ -1228,6 +1479,14 @@ class EasyTdxProvider(DataProvider):
             price_source = "pre_close"
         limit_up = row.get("limit_up", row.get("buy_price_limit", 0.0))
         limit_down = row.get("limit_down", row.get("sell_price_limit", 0.0))
+        self._check_quote_consistency(
+            security,
+            row,
+            last_price=raw_last_price,
+            previous_close=previous_close,
+            limit_up=self._as_float(limit_up, 0.0),
+            limit_down=self._as_float(limit_down, 0.0),
+        )
         tick = {
             "sid": security,
             "symbol": security,
@@ -1265,6 +1524,126 @@ class EasyTdxProvider(DataProvider):
             except (ValueError, TypeError, OverflowError):
                 pass
         return pd.DataFrame([tick]) if df else tick
+
+    # 内容防线阈值：涨跌停外留 1% 浮点余量；无涨跌停时按数量级（0.5~2 倍）判断。
+    _LIMIT_TOLERANCE = 0.01
+    _MAGNITUDE_LOW = 0.5
+    _MAGNITUDE_HIGH = 2.0
+    # 历史日线相对昨收的容忍更宽，兼顾 10 送 10 等除权缺口。
+    _HISTORY_MAGNITUDE_LOW = 1.0 / 3.0
+    _HISTORY_MAGNITUDE_HIGH = 3.0
+
+    def _reject_misaligned(self, message: str) -> None:
+        """输入原因，关闭连接并抛出 TdxResponseMismatchError；用于内容防线判定的串包。"""
+        self.close()
+        logger.error("easy_tdx misaligned_response %s", message)
+        raise TdxResponseMismatchError(message)
+
+    @staticmethod
+    def _quote_day(row: Any) -> Optional[Date]:
+        """输入报价行，返回服务器行情日期；缺失或非法时返回 None。"""
+        day = row.get("server_update_date") if hasattr(row, "get") else None
+        if day is None or pd.isna(day):
+            return None
+        try:
+            return datetime.strptime(f"{int(day):08d}", "%Y%m%d").date()
+        except (ValueError, TypeError, OverflowError):
+            return None
+
+    def _check_quote_consistency(
+        self,
+        security: str,
+        row: Any,
+        *,
+        last_price: float,
+        previous_close: float,
+        limit_up: float,
+        limit_down: float,
+    ) -> None:
+        """输入报价核心字段，价格与昨收/涨跌停数量级不一致时按串包处理；一致则记录当日锚点。"""
+        prices = [last_price] + [
+            self._as_float(row.get(name), 0.0) for name in ("open", "high", "low")
+        ]
+        prices = [value for value in prices if math.isfinite(value) and value > 0]
+        has_limits = limit_up > 0 and limit_down > 0 and limit_up >= limit_down
+        if has_limits:
+            low_bound = limit_down * (1 - self._LIMIT_TOLERANCE)
+            high_bound = limit_up * (1 + self._LIMIT_TOLERANCE)
+            outside = [value for value in prices if not low_bound <= value <= high_bound]
+            if previous_close > 0 and not low_bound <= previous_close <= high_bound:
+                outside.append(previous_close)
+            if outside:
+                self._reject_misaligned(
+                    f"easy_tdx 报价超出涨跌停区间: {security} prices={outside} "
+                    f"limit=[{limit_down}, {limit_up}]"
+                )
+        elif previous_close > 0 and self._infer_jq_security_type(security) != "stock":
+            # 个股无涨跌停多为新股上市初期，涨幅可达数倍，不做数量级判断。
+            outside = [
+                value
+                for value in prices
+                if not self._MAGNITUDE_LOW <= value / previous_close <= self._MAGNITUDE_HIGH
+            ]
+            if outside:
+                self._reject_misaligned(
+                    f"easy_tdx 报价与昨收数量级不符: {security} prices={outside} "
+                    f"pre_close={previous_close}"
+                )
+        day = self._quote_day(row)
+        if day is None or not (math.isfinite(previous_close) and previous_close > 0):
+            return
+        cached = self._price_refs.get(security)
+        if cached is not None and cached[0] == day:
+            ratio = previous_close / cached[1]
+            if not self._MAGNITUDE_LOW <= ratio <= self._MAGNITUDE_HIGH:
+                self._reject_misaligned(
+                    f"easy_tdx 同日昨收突变: {security} cached={cached[1]} now={previous_close}"
+                )
+        self._price_refs[security] = (
+            day,
+            previous_close,
+            limit_up if has_limits else 0.0,
+            limit_down if has_limits else 0.0,
+        )
+
+    def _check_kline_consistency(self, security: str, df: pd.DataFrame) -> None:
+        """输入未复权 K 线，若与当日报价锚点数量级不一致则按串包处理；无锚点时跳过。"""
+        ref = self._price_refs.get(security)
+        if ref is None or df.empty:
+            return
+        day, previous_close, limit_up, limit_down = ref
+        index_days = pd.DatetimeIndex(df.index).normalize()
+        today_rows = df[index_days == pd.Timestamp(day)]
+        price_cols = [name for name in ("open", "high", "low", "close") if name in df.columns]
+        if not price_cols:
+            return
+        if not today_rows.empty:
+            values = pd.to_numeric(today_rows[price_cols].stack(), errors="coerce")
+            values = values[values > 0]
+            if limit_up > 0 and limit_down > 0:
+                low_bound = limit_down * (1 - self._LIMIT_TOLERANCE)
+                high_bound = limit_up * (1 + self._LIMIT_TOLERANCE)
+            elif self._infer_jq_security_type(security) == "stock":
+                low_bound, high_bound = 0.0, math.inf
+            else:
+                low_bound = previous_close * self._MAGNITUDE_LOW
+                high_bound = previous_close * self._MAGNITUDE_HIGH
+            bad = values[(values < low_bound) | (values > high_bound)]
+            if not bad.empty:
+                self._reject_misaligned(
+                    f"easy_tdx K线与当日报价不一致: {security} value={float(bad.iloc[0])} "
+                    f"range=[{low_bound:.4f}, {high_bound:.4f}]"
+                )
+        before = df[index_days < pd.Timestamp(day)]
+        if not before.empty and "close" in before.columns:
+            last_close = self._as_float(before["close"].iloc[-1], 0.0)
+            if last_close > 0:
+                ratio = last_close / previous_close
+                if not self._HISTORY_MAGNITUDE_LOW <= ratio <= self._HISTORY_MAGNITUDE_HIGH:
+                    self._reject_misaligned(
+                        f"easy_tdx 历史K线与昨收数量级不符: {security} last_close={last_close} "
+                        f"pre_close={previous_close}"
+                    )
 
     def get_live_current(self, security: str) -> Dict[str, Any]:
         """输入证券代码，返回实时价格、停牌状态及源时间审计字典。
