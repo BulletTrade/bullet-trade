@@ -73,8 +73,66 @@ class EquityLimitBook:
                     }
         except Exception:
             self.engine._raise_if_backtest_data_error()
+        if result is None:
+            result = self._open_window_bar(security, now)
         self.bars[security] = result
         return result
+
+    def _open_window_bar(self, security, now):
+        """日频回测开盘时刻（09:25～09:31 前）尚无已完成分钟线时，以当日首根 09:31 分钟线作撮合依据。
+
+        价格取该分钟开盘价（即集合竞价开盘价，原始价；默认不复权撮合，真实价格模式参考日为当天，二者相同），
+        能否成交看该分钟成交量：零量（如盘中临停）仍按原规则市价取消、限价保留，不用日线开盘价越过停牌。
+        单笔数量上限仍由 daily_volume 按日量限额。分钟回测或其他时刻返回 None，原规则不变。
+        """
+        if not self.engine._is_daily_backtest_frequency(getattr(self.engine, "frequency", None)):
+            return None
+        moment = pd.Timestamp(now)
+        if not (pd.Timestamp("09:25").time() <= moment.time() < pd.Timestamp("09:31").time()):
+            return None
+        from .engine import get_data_provider
+
+        first = moment.replace(hour=9, minute=31, second=0, microsecond=0)
+        try:
+            frame = get_data_provider().get_price(
+                security=security,
+                start_date=first,
+                end_date=first,
+                frequency="minute",
+                fields=["open", "high", "low", "volume"],
+                fq=None,
+                skip_paused=False,
+            )
+            if frame.empty:
+                return None
+            row = frame.iloc[-1]
+            stamp = row.get("time")
+            if stamp is None and isinstance(frame.index, pd.DatetimeIndex):
+                stamp = frame.index[-1]
+            price, volume = float(row["open"]), float(row["volume"])
+            if (
+                pd.Timestamp(stamp) != first
+                or not (math.isfinite(price) and price > 0)
+                or not (math.isfinite(volume) and volume >= 0)
+            ):
+                return None
+            return {
+                "price": price,
+                "volume": int(volume),
+                "high": row.get("high"),
+                "low": row.get("low"),
+                "paused": row.get("paused", False) == 1,
+                "open_window": True,
+            }
+        except Exception as exc:
+            self.engine._raise_if_backtest_data_error()
+            if self.engine.strict_data:
+                failure = BacktestDataError(
+                    f"Required opening minute unavailable: security={security}, time={first}"
+                )
+                self.engine.context._backtest_data_error = failure
+                raise failure from exc
+        return None
 
     def volume_limit(self, volume):
         """输入原始成交量，返回每笔比例限额；非法比例抛ValueError，不修改状态。"""
