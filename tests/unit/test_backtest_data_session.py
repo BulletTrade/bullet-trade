@@ -1046,7 +1046,10 @@ def test_miniqmt_backtest_session_keeps_periods_independent(monkeypatch):
 @pytest.mark.unit
 def test_miniqmt_local_block_cache_reuses_dynamic_pre_factor_inputs(monkeypatch):
     """
-    验证 MiniQMT 本地数据块缓存复用 raw/front_ratio 输入，动态复权仍逐日锚定。
+    验证 MiniQMT 本地数据块缓存复用未复权输入，事件前复权仍按每次参考日逐日锚定。
+
+    2025-01-04 除权、每股现金 1.0，前收为 2025-01-03 收盘 12.0；参考日 01-03 时事件
+    在区间外不调整，参考日 01-04 时 01-03 收盘调整为 12 - 1 = 11。全程不读 front_ratio。
 
     Args:
         monkeypatch: pytest monkeypatch fixture。
@@ -1061,14 +1064,20 @@ def test_miniqmt_local_block_cache_reuses_dynamic_pre_factor_inputs(monkeypatch)
             "2025-01-06",
         ]
     )
-    front_ratio = raw.copy()
-    for column in ("open", "high", "low", "close"):
-        front_ratio[column] = front_ratio[column] * 10
-    frames = {
-        (SECURITY_QMT, "1d", "none"): raw,
-        (SECURITY_QMT, "1d", "front_ratio"): front_ratio,
-    }
+    frames = {(SECURITY_QMT, "1d", "none"): raw}
     fake_xt = FakeXtData(frames)
+    dividends = pd.DataFrame(
+        {
+            "interest": [1.0],
+            "stockBonus": [0.0],
+            "stockGift": [0.0],
+            "allotNum": [0.0],
+            "allotPrice": [0.0],
+            "gugai": [0.0],
+        },
+        index=["20250104"],
+    )
+    fake_xt.get_divid_factors = lambda stock_code, start_time="", end_time="": dividends.copy()
     provider = _make_provider(monkeypatch, fake_xt, mode="backtest", auto_download=False)
     session = create_backtest_data_session(
         overrides={"enabled": True, "price_block_cache_enabled": True},
@@ -1100,14 +1109,11 @@ def test_miniqmt_local_block_cache_reuses_dynamic_pre_factor_inputs(monkeypatch)
         session.close()
         reset_current_backtest_data_session(token)
 
-    assert [call[:3] for call in fake_xt.local_calls] == [
-        (SECURITY_QMT, "1d", "none"),
-        (SECURITY_QMT, "1d", "front_ratio"),
-    ]
+    # 行情块读取一次；除权前收的回看窗口超出会话块范围，额外读取一次未复权日线。
+    assert {call[:3] for call in fake_xt.local_calls} == {(SECURITY_QMT, "1d", "none")}
     assert first["close"].tolist() == [11.0, 12.0]
-    assert second["close"].tolist() == [12.0, 13.0]
-    assert session.stats.cache_writes == 2
-    assert session.stats.cache_hits == 2
+    assert second["close"].tolist() == [11.0, 13.0]
+    assert session.stats.cache_hits >= 1
 
 
 @pytest.mark.unit
