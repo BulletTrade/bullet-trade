@@ -2008,8 +2008,16 @@ class MiniQMTProvider(DataProvider):
             last_price = float(raw_price)
         except (TypeError, ValueError) as exc:
             raise RuntimeError("MINIQMT_LIVE_PRICE_INVALID") from exc
+        raw_last_price = last_price
+        last_price_source = "last_trade"
         if not math.isfinite(last_price) or last_price <= 0:
-            raise RuntimeError("MINIQMT_LIVE_PRICE_INVALID")
+            # 停牌时原生行情的最新价可能为 0；仅在状态码明确为停牌时，用昨收作参考价，
+            # 并标明来源，不伪造成交价或新的源时间。其他零价仍按非法价格拒绝。
+            reference = self._halted_reference_price(tick)
+            if reference is None:
+                raise RuntimeError("MINIQMT_LIVE_PRICE_INVALID")
+            last_price = reference
+            last_price_source = "pre_close"
 
         raw_time = tick.get("time")
         if raw_time in (None, ""):
@@ -2031,6 +2039,8 @@ class MiniQMTProvider(DataProvider):
             "code": code,
             "tick": tick,
             "last_price": last_price,
+            "raw_last_price": raw_last_price if math.isfinite(raw_last_price) else 0.0,
+            "last_price_source": last_price_source,
             "source_time": source_time,
             "received_time": received_time,
             "age_seconds": max(age_seconds, 0.0),
@@ -2042,6 +2052,22 @@ class MiniQMTProvider(DataProvider):
             },
             "source": "windows_miniqmt_xtdata",
         }
+
+    _HALTED_OPEN_INT = (1, 17, 20)  # 停牌、临时停牌、暂停交易至闭市
+
+    @classmethod
+    def _halted_reference_price(cls, tick: Dict[str, Any]) -> Optional[float]:
+        """停牌快照的参考价：仅当 openInt 明确为停牌且昨收为有限正数时返回昨收，否则 None。"""
+
+        try:
+            if int(tick.get("openInt")) not in cls._HALTED_OPEN_INT:
+                return None
+            reference = float(tick.get("lastClose"))
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(reference) or reference <= 0:
+            return None
+        return reference
 
     def get_live_current(self, security: str) -> Dict[str, Any]:
         """返回带源时间和新鲜度证明的实盘当前快照。
@@ -2108,7 +2134,9 @@ class MiniQMTProvider(DataProvider):
             "last_price": snapshot["last_price"],
             "high_limit": high_limit,
             "low_limit": low_limit,
-            "paused": paused,
+            "paused": paused or snapshot["last_price_source"] == "pre_close",
+            "raw_last_price": snapshot["raw_last_price"],
+            "last_price_source": snapshot["last_price_source"],
             "source_time": snapshot["source_time"],
             "received_time": snapshot["received_time"],
             "query_completed_time": snapshot["received_time"],

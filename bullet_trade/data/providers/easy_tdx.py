@@ -1636,7 +1636,9 @@ class EasyTdxProvider(DataProvider):
         """输入证券代码，返回实时价格、停牌状态及源时间审计字典。
 
         依赖 get_current_tick 的 SDK 查询；无报价返回空字典，网络异常传播。
-        Mac 快照附原始价、标签和价格来源，不因停牌补价而改变时效或声明频道健康。
+        Mac 快照附原始价、标签和价格来源。非停牌行情不声明频道健康，过期即由下游拒绝；
+        仅当本次查询成功且证券明确停牌、价格取自昨收时，附 feed_health=healthy（basis=paused_reference），
+        与 MiniQMT 停牌快照语义一致，使下游接受停牌期间不再推进的源时间。
         """
         tick = self.get_current_tick(security)
         if not isinstance(tick, dict):
@@ -1659,6 +1661,13 @@ class EasyTdxProvider(DataProvider):
         ):
             if name in tick:
                 result[name] = tick[name]
+        if result["paused"] and result["last_price"] > 0 and result.get("last_price_source") == "pre_close":
+            result["feed_health"] = {
+                "status": "healthy",
+                "query_succeeded": True,
+                "transport": "easy_tdx.quotes",
+                "basis": "paused_reference",
+            }
         return result
 
     def _stub_get_price(
