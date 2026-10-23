@@ -778,8 +778,19 @@ class EasyTdxProvider(DataProvider):
                     isinstance(exc, (OSError, ConnectionError, TimeoutError))
                     or type(exc).__name__ == "TdxConnectionError"
                 )
+                # 记下每次失败的主机与原因：此前只留下“读取失败”，无法判断是超时、断连还是解析错误。
+                logger.warning(
+                    "easy_tdx xdxr_failed attempt=%s host=%s security=%s error=%s: %s",
+                    attempt,
+                    failed_host,
+                    security,
+                    type(exc).__name__,
+                    exc,
+                )
                 if self._host or attempt or not network_error:
-                    raise RuntimeError("easy_tdx 除权事件读取失败") from exc
+                    raise RuntimeError(
+                        f"easy_tdx 除权事件读取失败: {type(exc).__name__}: {exc}"
+                    ) from exc
             finally:
                 if client is not None:
                     try:
