@@ -64,7 +64,8 @@ def test_verified_mac_pause_uses_previous_close(security, flags, previous_close,
     assert snapshot["last_price_source"] == "pre_close"
     assert snapshot["raw_last_price"] == 0.0
     assert snapshot["stock_tag_flags"] == flags
-    assert "feed_health" not in snapshot
+    # 2026-10-21 统一停牌语义：停牌参考价声明频道健康，使下游接受不再推进的源时间
+    assert snapshot["feed_health"]["basis"] == "paused_reference"
 
 
 @pytest.mark.parametrize("flags", [524290, 1081344, 1048576, 11, 6, 0])
