@@ -139,6 +139,11 @@ order('600519.XSHG', 100, wait_timeout=10)         # 等 10 秒
 - 若看到 `status=open/submitted` 且 `timed_out=true`，含义是“委托已提交但等待终态超时”，不是下单失败；后续应通过订单/成交查询确认最终状态。
 - 若客户端网络超时且没有拿到 `order_id`，只能视为 `submit_unknown`，需要后续查订单/成交，不应直接重复下单。
 
+实时引擎收到明确的 `RemoteSubmissionUnknownError` 后，保留订单的 `new`（待柜台确认）
+状态，并在 `order.extra` 中记录 `submission_state="unknown"` 和原 `idempotency_key`。
+这个意图不会重新入队，也不标为已拒绝；原适配器只按原幂等号查询提交结果。策略后续
+明确产生的另一笔订单仍是新意图，不能用“重试”重新表达尚待核对的原订单。
+
 开源用户升级时建议保留默认值：
 
 ```env

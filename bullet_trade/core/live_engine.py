@@ -71,6 +71,7 @@ from ..utils.env_loader import (
     parse_bool,
 )
 from ..broker import BrokerBase, create_broker
+from ..remote import RemoteSubmissionUnknownError
 from ..market_data import (
     CapabilityRequest,
     DataCapabilityUnavailableError,
@@ -1098,6 +1099,14 @@ class LiveEngine:
                             meta["pre_amount"] = pre_amount
                             meta["pre_avg_cost"] = pre_avg_cost
                         meta["broker_order_ids"].append(str(order_id))
+                except RemoteSubmissionUnknownError as exc:
+                    # 原意图已从队列取出；保留待确认和原号，不假定拒绝，也不重新入队。
+                    order.status = OrderStatus.new
+                    order.extra = dict(order.extra or {})
+                    order.extra.update(
+                        submission_state="unknown", idempotency_key=exc.idempotency_key
+                    )
+                    log.warning("委托结果待柜台确认 %s；仅按原号查询，不重发", order.security)
                 except LiveRuntimePersistenceError:
                     raise
                 except Exception as exc:
