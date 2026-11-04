@@ -417,6 +417,15 @@ class ServerApplication:
             return identity_with_server_declaration(
                 await probe(ctx), ctx.config.broker_id, ctx.config.account_id
             )
+        if method == "facts":
+            from bullet_trade.broker.facts import validate_account_facts
+
+            if sub_cfg or sub_account_id or set(payload) - {"account_key"}:
+                raise ValueError("严格券商事实仅支持实体父账户和空查询参数")
+            probe = getattr(self.adapters.broker_adapter, "get_account_facts", None)
+            if not callable(probe):
+                raise NotImplementedError("当前适配器尚未提供严格只读事实接口")
+            return validate_account_facts(await probe(ctx))
         if method == "resolve_submission":
             return await self._resolve_submission(resolved_key, sub_cfg, ctx, payload)
         write_action = f"broker.{method}" if method in {"place_order", "cancel_order"} else None

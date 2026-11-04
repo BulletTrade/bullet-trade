@@ -1484,6 +1484,21 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
             if isinstance(item, dict)
         ]
 
+    async def get_account_facts(self, account: AccountContext) -> Dict:
+        """输入实体父账户，返回helper严格四类事实；旧helper/失败/坏结构不回退普通查询。"""
+        from bullet_trade.broker.facts import validate_account_facts
+
+        value = validate_account_facts(
+            await self.client.post("/facts", self._account_payload(account))
+        )
+        result = dict(value)
+        result["orders"] = [_normalize_order(row) for row in value["orders"]]
+        for row in result["orders"]:
+            if row.get("side") in {"BUY", "SELL"}:
+                row["side"] = row["side"].lower()
+        result["executions"] = [_normalize_trade(row) for row in value["executions"]]
+        return validate_account_facts(result)
+
     async def list_orders(
         self, account: AccountContext, filters: Optional[Dict] = None
     ) -> List[Dict]:

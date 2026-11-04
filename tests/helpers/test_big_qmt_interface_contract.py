@@ -34,6 +34,7 @@ _ROUTES = {
     "/data/index_stocks": "index_stocks",
     "/data/split_dividend": "split_dividend",
     "/account": "account",
+    "/facts": "facts",
     "/positions": "positions",
     "/orders": "orders",
     "/trades": "trades",
@@ -117,6 +118,7 @@ def _install_business_mocks(helper, monkeypatch, action):
     order = {"order_id": "mock-order", "status": "filled"}
     trade = {"trade_id": "mock-trade", "amount": 100}
     query_values = {
+        "_query_strict_facts": value,
         "_get_full_tick": value,
         "_query_account": account,
         "_query_positions": [position],
@@ -124,6 +126,7 @@ def _install_business_mocks(helper, monkeypatch, action):
         "_query_trades": [trade],
     }
     action_target = {
+        "facts": "_query_strict_facts",
         "snapshot": "_get_full_tick",
         "current_tick": "_get_full_tick",
         "live_current": "_get_full_tick",

@@ -359,6 +359,12 @@ class QmtBroker(BrokerBase):
         except Exception:
             return identity_pending("QUERY_FAILED")
 
+    def get_account_facts(self) -> Dict[str, Any]:
+        """无输入，返回四类严格SDK读取；异常/None不补空，不改变旧查询与交易行为。"""
+        from .qmt_facts import read_qmt_facts
+
+        return read_qmt_facts(self)
+
     def get_positions(self) -> List[Dict[str, Any]]:
         self._ensure_connected()
         # 与 _build_account_snapshot 对齐，返回已映射的持仓结构

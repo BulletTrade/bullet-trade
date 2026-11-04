@@ -100,6 +100,23 @@ bullet-trade live strategies/demo_strategy.py --broker qmt-remote
 --accounts main=123456,hedge=654321:future
 ```
 
+## 严格只读账户事实（候选接口）
+
+`BrokerBase.get_account_facts()` 与远程 `broker.facts` 提供资产、持仓、委托、成交的
+完整读取合同，和原有查询、下单、撤单接口并存。接口不新增用户配置，不订阅行情，
+不下单、不撤单，也不执行结算。
+
+响应为 `schema_version=1`、`status=complete`，并包含 `assets`、`positions`、`orders`、
+`executions`。四类底层查询均明确成功才返回；真实空明细可以是 `[]`，SDK 抛错、
+返回 `None`、能力缺失或远程响应损坏则明确失败，不回退旧查询凑出空仓或零资产。
+资产必须有实际读取的 `total_value` 和 `available_cash`；可选成本、冻结额等缺失时
+保留 `None`，不猜测为 0。
+
+远程请求经过原令牌认证，仅接受父账户路由 `account_key`，不支持虚拟子账户或
+客户端伪造的事实参数。旧适配器或旧 Server 不支持时明确报错，原接口行为不变。
+QMT 的四次 SDK 读取是顺序读取，不代表交易所同一瞬间的原子快照；工作台需要结合
+账户身份、批次时间和新鲜度展示，失败时保留并标记上一批事实。
+
 ## 独立账户身份查询
 
 候选核心提供可选 `BrokerBase.get_account_identity()` 和远程只读

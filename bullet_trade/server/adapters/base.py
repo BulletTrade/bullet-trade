@@ -100,6 +100,10 @@ class RemoteBrokerAdapter(Protocol):
     async def get_positions(self, account: AccountContext) -> List[Dict]:
         ...
 
+    async def get_account_facts(self, account: AccountContext) -> Dict:
+        """输入实体父账户，返回严格四类读取；未实现不能由旧接口拼出伪成功。"""
+        ...
+
     async def list_orders(
         self, account: AccountContext, filters: Optional[Dict] = None
     ) -> List[Dict]:

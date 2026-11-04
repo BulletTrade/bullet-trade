@@ -70,6 +70,14 @@ class BrokerBase(ABC):
         from .identity import identity_pending
 
         return identity_pending()
+
+    def get_account_facts(self) -> Dict[str, Any]:
+        """无输入，返回严格只读四类事实；默认明确不支持，不回退到可能吞异常的旧查询。
+
+        实现必须区分实际空列表和SDK查询失败，遵循broker.facts的版本化合同。
+        不连接服务、不修改现有查询或交易行为，也不发送订单或撤单。
+        """
+        raise NotImplementedError("当前券商尚未提供严格只读事实接口")
     
     @abstractmethod
     def get_positions(self) -> List[Dict[str, Any]]:

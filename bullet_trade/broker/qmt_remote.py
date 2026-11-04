@@ -337,6 +337,16 @@ class RemoteQmtBroker(BrokerBase):
         value = self._connection.request("broker.identity", {"account_key": self.account_key})
         return validate_identity_result(value)
 
+    def get_account_facts(self) -> Dict[str, Any]:
+        """无输入，返回认证Server的严格父账户事实；旧Server或坏响应明确失败，不回退旧接口。"""
+        from .facts import validate_account_facts
+
+        if self.sub_account_id:
+            raise NotImplementedError("严格券商事实仅支持实体父账户")
+        return validate_account_facts(
+            self._connection.request("broker.facts", {"account_key": self.account_key})
+        )
+
     def get_positions(self) -> List[Dict[str, Any]]:
         payload = self._base_payload()
         resp = self._connection.request("broker.positions", payload)

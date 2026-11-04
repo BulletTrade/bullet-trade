@@ -800,6 +800,16 @@ class QmtBrokerAdapter(RemoteBrokerAdapter):
             return identity_pending()
         return await _run_in_qmt_executor(probe)
 
+    async def get_account_facts(self, account: AccountContext) -> Dict:
+        """输入实体上下文，返回原Broker严格读取；只读且不向宽松查询回退，错误原样上抛。"""
+        from bullet_trade.broker.facts import validate_account_facts
+
+        broker = self._broker_for(account)
+        method = getattr(broker, "get_account_facts", None)
+        if not callable(method):
+            raise NotImplementedError("当前QMT Broker尚未提供严格事实读取")
+        return validate_account_facts(await _run_in_qmt_executor(method))
+
     async def list_orders(
         self, account: AccountContext, filters: Optional[Dict] = None
     ) -> List[Dict]:

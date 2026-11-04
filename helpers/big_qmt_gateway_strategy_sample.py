@@ -1,7 +1,7 @@
 #encoding:gbk
 # Author: BruceLee
 # Date: 2026-09-08
-# Version: 20260908_dividend_facts_v1
+# Version: 20261104_strict_facts_v1
 # 职责：在大 QMT 内提供现有 HTTP 行情和交易桥接，以及完整除权事件事实。
 # 输入：HTTP 请求、ContextInfo 和下方现有账户/端口/认证配置。
 # 输出：兼容现有客户端的 JSON；除权事件同时保留旧字段及 QMT 原始七字段。
@@ -44,7 +44,7 @@ LISTEN_PORT = 9000
 
 # Build marker shown in startup logs and /health. Update this when copying a new
 # helper build into QMT so tests can prove the running file version.
-GATEWAY_BUILD_ID = "20260908_dividend_facts_v1"
+GATEWAY_BUILD_ID = "20261104_strict_facts_v1"
 
 # 除权事实协议版本；仅说明字段格式，不证明本地事件已下载完整或算法验收通过。
 DIVIDEND_EVENT_SCHEMA = "big-qmt-dividend-events/v1"
@@ -1620,6 +1620,95 @@ def _merge_trade_detail_rows(account_id: str, account_type: str, detail_types: L
     return rows
 
 
+def _facts_field(row: Any, name: str, required: bool = False) -> Any:
+    """输入原始行、字段名及是否必需，返回实际值；缺字段或读取异常明确失败，不补零。"""
+    try:
+        value = row.get(name) if isinstance(row, dict) else getattr(row, name, None)
+    except Exception:
+        raise ValueError("strict facts field unavailable") from None
+    if required and (value is None or value == "" or isinstance(value, bool)):
+        raise ValueError("strict facts required field missing")
+    return value
+
+
+def _facts_rows(account_id: str, account_type: str, detail_type: str, source: Optional[str] = None) -> List[Any]:
+    """输入账户、明细类型及查询范围，返回成功原始列表；None/异常/非列表不得当成空结果。"""
+    getter = _qmt_global("get_trade_detail_data")
+    try:
+        value = getter(account_id, account_type, detail_type, source) if source else getter(account_id, account_type, detail_type)
+    except Exception:
+        raise ValueError("strict facts SDK query failed") from None
+    if value is None or not isinstance(value, (list, tuple)):
+        raise ValueError("strict facts SDK query incomplete")
+    return list(value)
+
+
+def _facts_union(account_id: str, account_type: str, detail_type: str) -> List[Any]:
+    """输入账户与委托/成交类型，返回终端和默认范围的去重并集；任一范围失败拒绝整包。"""
+    rows, seen = [], set()
+    for source in ("qmt", None):
+        for row in _facts_rows(account_id, account_type, detail_type, source):
+            key = _row_identity(row, detail_type)
+            if key not in seen:
+                seen.add(key)
+                rows.append(row)
+    return rows
+
+
+def _query_strict_facts(account_id: str, account_type: str) -> Dict[str, Any]:
+    """输入实体账户，返回严格四类事实；保留缺失值，不改变旧查询、下单、撤单或配置。"""
+    accounts = _facts_rows(account_id, account_type, "account")
+    if len(accounts) != 1:
+        raise ValueError("strict facts account query incomplete")
+    account = accounts[0]
+    actual = _facts_field(account, "m_strAccountID")
+    if actual not in (None, "") and str(actual) != account_id:
+        raise ValueError("strict facts account mismatch")
+    assets = {"available_cash": _facts_field(account, "m_dAvailable", True),
+              "total_value": _facts_field(account, "m_dBalance", True), "cash": None,
+              "frozen_cash": _facts_field(account, "m_dFrozenCash")}
+    positions, orders, trades = [], [], []
+    for row in _facts_rows(account_id, account_type, "position"):
+        code = _facts_field(row, "m_strInstrumentID", True)
+        exchange = _facts_field(row, "m_strExchangeID", True)
+        costs = [_finite_nonnegative_float(_facts_field(row, name)) for name in ("m_dAvgOpenPrice", "m_dOpenPrice")]
+        cost = next((value for value in costs if value is not None and value > 0), next((value for value in costs if value is not None), None))
+        positions.append({"security": _security(code, exchange), "name": _facts_field(row, "m_strInstrumentName"),
+                          "amount": _facts_field(row, "m_nVolume", True),
+                          "closeable_amount": _facts_field(row, "m_nCanUseVolume"),
+                          "avg_cost": cost,
+                          "current_price": _facts_field(row, "m_dLastPrice"),
+                          "market_value": _facts_field(row, "m_dMarketValue")})
+    for row in _facts_union(account_id, account_type, "order"):
+        _facts_field(row, "m_strOrderSysID", True)
+        _facts_field(row, "m_strInstrumentID", True)
+        _facts_field(row, "m_strExchangeID", True)
+        amount = _facts_field(row, "m_nVolumeTotalOriginal", True)
+        item = {"order_id": str(_facts_field(row, "m_strOrderSysID", True)),
+                "security": _security(_facts_field(row, "m_strInstrumentID", True), _facts_field(row, "m_strExchangeID", True)),
+                "raw_status": _facts_field(row, "m_nOrderStatus"), "amount": amount,
+                "filled": _facts_field(row, "m_nVolumeTraded"),
+                "order_price": _facts_field(row, "m_dLimitPrice"), "price": _facts_field(row, "m_dTradedPrice"),
+                "raw": _basic_value(row)}
+        orders.append(item)
+    for row in _facts_union(account_id, account_type, "deal"):
+        _facts_field(row, "m_strTradeID", True)
+        _facts_field(row, "m_strInstrumentID", True)
+        _facts_field(row, "m_strExchangeID", True)
+        amount = _facts_field(row, "m_nVolume", True)
+        price = _facts_field(row, "m_dTradePrice")
+        if price is None:
+            price = _facts_field(row, "m_dPrice", True)
+        item = {"trade_id": str(_facts_field(row, "m_strTradeID", True)),
+                "order_id": str(_facts_field(row, "m_strOrderSysID") or ""),
+                "security": _security(_facts_field(row, "m_strInstrumentID", True), _facts_field(row, "m_strExchangeID", True)),
+                "amount": amount, "price": price, "commission": _facts_field(row, "m_dCommission"),
+                "tax": _facts_field(row, "m_dStampTax"), "raw": _basic_value(row)}
+        trades.append(item)
+    return {"schema_version": 1, "status": "complete", "assets": assets,
+            "positions": positions, "orders": orders, "executions": trades}
+
+
 def _query_account(account_id: str, account_type: str) -> Dict[str, Any]:
     rows = _trade_detail(account_id, account_type, "account")
     return _account_to_dict(rows[0] if rows else None, account_id, account_type)
@@ -2766,6 +2855,11 @@ def _query_trade_detail_debug(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _dispatch_qmt_action(context_info: Any, action: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     request_id = payload.get("request_id")
+    if action == "facts":
+        account = _resolve_account(payload)
+        if _is_placeholder_account_id(account["account_id"]):
+            return _error("ACCOUNT_NOT_CONFIGURED", "account required for strict facts", request_id)
+        return _ok(_query_strict_facts(account["account_id"], account["account_type"]), request_id)
     if action in ("snapshot", "current_tick", "live_current"):
         value = _get_full_tick(context_info, payload)
         if value.get("ok") is False and value.get("code"):
@@ -2842,6 +2936,7 @@ def _dispatch_qmt_action(context_info: Any, action: str, payload: Dict[str, Any]
 
 ACCOUNT_QUERY_ACTIONS = set(
     [
+        "facts",
         "account",
         "money_total",
         "money_available",
@@ -3181,6 +3276,7 @@ def _route_to_action(route: str, payload: Dict[str, Any]) -> Optional[str]:
         "/data/index_stocks": "index_stocks",
         "/data/split_dividend": "split_dividend",
         "/account": "account",
+        "/facts": "facts",
         "/positions": "positions",
         "/orders": "orders",
         "/trades": "trades",
@@ -3211,6 +3307,7 @@ def _build_application() -> tornado.web.Application:
         (r"/health", _GatewayHandler),
         (r"/data/.*", _GatewayHandler),
         (r"/account", _GatewayHandler),
+        (r"/facts", _GatewayHandler),
         (r"/positions", _GatewayHandler),
         (r"/orders", _GatewayHandler),
         (r"/trades", _GatewayHandler),

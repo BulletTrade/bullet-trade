@@ -19,7 +19,7 @@ import pandas as pd
 import pytest
 
 
-_BUILD_ID = "20260908_dividend_facts_v1"
+_BUILD_ID = "20261104_strict_facts_v1"
 _SCHEMA = "big-qmt-dividend-events/v1"
 _SOURCE = "ContextInfo.get_divid_factors"
 _CASH_ROW = [0.149, 0.0, 0.0, 0.0, 0.0, 0, 0.98]
