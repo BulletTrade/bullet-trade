@@ -810,6 +810,8 @@ class EasyTdxProvider(DataProvider):
                         client.close()
                     except Exception:
                         pass
+        if records is None:
+            raise RuntimeError("easy_tdx 除权事件读取未返回结果")
         df = pd.DataFrame(records).copy()
         if df.empty:
             df = pd.DataFrame()
@@ -1287,30 +1289,12 @@ class EasyTdxProvider(DataProvider):
         start_date: Optional[Union[str, datetime]] = None,
         end_date: Optional[Union[str, datetime]] = None,
     ) -> List[Dict[str, Any]]:
-        """读取通达信除权除息记录；不可用时返回空列表。"""
+        """输入证券和日期范围，返回标准除权除息事件；复用原缓存，读取失败抛错而非返回无分红。"""
         if self._use_stub:
             return []
-        try:
-            client_cls = self._resolve_tdx_client_cls()
-        except Exception:
-            return []
-        market, code = self.jq_to_tdx(security)
-        try:
-            client = client_cls(host=self._host, port=self._port, timeout=self._timeout)
-            connect = getattr(client, "connect", None)
-            if callable(connect):
-                connect()
-            records = client.get_xdxr_info(market, code)
-        except Exception:
-            return []
-        finally:
-            try:
-                client.close()
-            except Exception:
-                pass
         start_ts = self._format_timestamp(start_date)
         end_ts = self._format_timestamp(end_date)
-        records_df = pd.DataFrame(records).copy()
+        records_df = self._fetch_xdxr_events(security)
         if records_df.empty:
             return []
         if "category" in records_df.columns:

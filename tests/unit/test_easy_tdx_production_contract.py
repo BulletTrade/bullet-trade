@@ -82,6 +82,29 @@ class FailingEventsClient(CashEventClient):
         raise ConnectionError("fixture: xdxr unavailable")
 
 
+def test_public_dividend_query_reuses_event_cache_and_keeps_per_share_basis(provider):
+    """输入固定行情Provider，无返回；公开分红接口返回每份金额并复用原事件缓存。"""
+    events = provider.get_split_dividend("510300.XSHG", "2024-01-03", "2024-01-03")
+    assert len(events) == 1
+    assert events[0]["bonus_pre_tax"] == 1 and events[0]["per_base"] == 1
+    assert provider.get_split_dividend("510300.XSHG", "2024-01-04", "2024-01-04") == []
+
+
+def test_public_dividend_query_does_not_turn_network_failure_into_no_dividend(provider, monkeypatch):
+    """输入断网客户端，无返回；数据源失败明确抛错，不让统计将其当作0现金分红。"""
+    monkeypatch.setattr(provider, "_resolve_tdx_client_cls", lambda: FailingEventsClient)
+    provider._host = "fixture-only"
+    with pytest.raises(RuntimeError, match="除权事件读取失败"):
+        provider.get_split_dividend("510300.XSHG")
+
+
+def test_public_dividend_none_is_not_a_successful_empty_list(provider, monkeypatch):
+    """输入SDK的None结果，无返回；缺失响应不等于成功空列表，不进入成功缓存。"""
+    monkeypatch.setattr(CashEventClient, "get_xdxr_info", lambda *_: None)
+    with pytest.raises(RuntimeError, match="未返回结果"):
+        provider.get_split_dividend("510300.XSHG")
+
+
 @pytest.fixture
 def provider(monkeypatch):
     """接收 monkeypatch 清除 stub 覆盖，返回注入固定客户端的 provider。"""

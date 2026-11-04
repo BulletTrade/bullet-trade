@@ -427,8 +427,8 @@ def test_easy_tdx_security_type_distinguishes_sz_stock_from_sh_index() -> None:
 
 
 @pytest.mark.unit
-def test_easy_tdx_split_dividend_without_tdx_client_returns_empty(monkeypatch) -> None:
-    """输入pytest补丁器，验证公开分红查询在SDK缺失时返回空表；禁止真实SDK访问。"""
+def test_easy_tdx_split_dividend_without_tdx_client_reports_failure(monkeypatch) -> None:
+    """输入pytest补丁器，验证SDK缺失不被解释为无分红；禁止真实SDK访问。"""
     provider = _fake_provider()
 
     def unavailable():
@@ -436,4 +436,5 @@ def test_easy_tdx_split_dividend_without_tdx_client_returns_empty(monkeypatch) -
         raise ImportError("测试除权接口缺失")
 
     monkeypatch.setattr(provider, "_resolve_tdx_client_cls", unavailable)
-    assert provider.get_split_dividend("000001.XSHE") == []
+    with pytest.raises(RuntimeError, match="除权接口不可用"):
+        provider.get_split_dividend("000001.XSHE")
