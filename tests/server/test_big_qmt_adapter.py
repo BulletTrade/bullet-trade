@@ -1179,7 +1179,7 @@ async def test_big_qmt_cancel_request_confirms_exact_order_terminal_status():
     )
 
     assert result["order_id"] == "6128"
-    assert result["status"] == "partly_canceled"
+    assert result["status"] == "canceled"
     assert result["value"] is True
     assert result["last_snapshot"]["raw_status"] == 54
     assert [path for _, path, _ in client.calls].count("/cancel_order") == 1
