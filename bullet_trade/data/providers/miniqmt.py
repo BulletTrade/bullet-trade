@@ -709,6 +709,11 @@ class MiniQMTProvider(DataProvider):
         rows = []
         for sec, df in frames.items():
             tmp = df.copy()
+            # 聚宽 panel=False 多证券返回 time/code 长表；单证券行情的时间在索引中，
+            # 此处还原为 time 列，否则策略的 pivot(index='time') 会抛 KeyError: 'time'。
+            if "time" not in tmp.columns:
+                tmp = tmp.reset_index()
+                tmp = tmp.rename(columns={tmp.columns[0]: "time"})
             tmp["code"] = sec
             rows.append(tmp)
         return pd.concat(rows, axis=0)
