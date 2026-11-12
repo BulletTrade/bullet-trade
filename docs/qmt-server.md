@@ -127,3 +127,15 @@ QMT_SERVER_ACCOUNT_KEY=main
 - `QMT_DATA_PATH` 是否指向正确的 MiniQMT `userdata_mini`
 - Windows 防火墙是否放行了监听端口
 - `QMT_SERVER_TOKEN` 是否和客户端一致
+
+### V2 服务中的订单身份
+
+经 AIStocks V2 服务查询时，`order_id` 保留原始柜台合同号，不能假定它跨交易日唯一。
+V2 回包新增 `local_order_id`（稳定内部主键）与 `broker_trade_day`（业务日）。
+单笔查询或撤单应将 `local_order_id` 与原始 `order_id` 一起传回 V2；内部主键不能替代原始号发给柜台。
+
+`RemoteQmtBroker.get_order_status(order_id, local_order_id=...)` 和
+`RemoteQmtBroker.cancel_order(order_id, local_order_id=...)` 支持显式内部主键。
+客户端会保留已受理订单的身份；若发现同一裸号对应多个主键，省略主键的请求会报错，不能自动选最后一笔。
+V2 对历史订单返回本地状态，并拒绝用历史身份撤销当天同号委托。
+原生 QMT Server 没有 V2 内部主键时，保持其原有接口。

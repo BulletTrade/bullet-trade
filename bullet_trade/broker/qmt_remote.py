@@ -276,6 +276,7 @@ class RemoteQmtBroker(BrokerBase):
         )
         self._last_warning: Optional[str] = None
         self._last_order_responses: Dict[str, Dict[str, Any]] = {}
+        self._ambiguous_order_ids: set[str] = set()
 
     def _warn_if_timeout_budget_is_risky(self) -> None:
         """检查远程下单默认超时预算是否存在明显风险。
@@ -398,18 +399,20 @@ class RemoteQmtBroker(BrokerBase):
             "SELL", security, amount, price, wait_timeout, remark, market, extra
         )
 
-    async def cancel_order(self, order_id: str) -> bool:
+    async def cancel_order(self, order_id: str, *, local_order_id: Optional[int] = None) -> bool:
+        """撤销明确订单；输入柜台号及可选本地主键，返回确认结果，歧义时不调用券商。"""
         loop = asyncio.get_running_loop()
-        result = await loop.run_in_executor(None, self._cancel_sync, order_id)
+        result = await loop.run_in_executor(None, self._cancel_sync, order_id, local_order_id)
         ok = _is_confirmed_cancel_result(result, order_id)
         if isinstance(result, dict) and result.get("timed_out"):
             status = result.get("status") or result.get("raw_status") or "unknown"
             log.warning(f"撤单等待超时: order_id={order_id}, status={status}")
         return ok
 
-    async def get_order_status(self, order_id: str) -> Dict[str, Any]:
+    async def get_order_status(self, order_id: str, *, local_order_id: Optional[int] = None) -> Dict[str, Any]:
+        """查询明确订单；输入柜台号及可选本地主键，返回状态，歧义时拒绝猜测。"""
         loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(None, self._order_status_sync, order_id)
+        return await loop.run_in_executor(None, self._order_status_sync, order_id, local_order_id)
 
     def supports_orders_sync(self) -> bool:
         return True
@@ -540,7 +543,7 @@ class RemoteQmtBroker(BrokerBase):
             raise RuntimeError(f"远程券商未返回 order_id: {resp}")
         if status in {"rejected", "canceled", "cancelled", "failed", "error"}:
             raise RuntimeError(f"远程券商下单失败: order_id={order_id} status={status} response={resp}")
-        self._last_order_responses[str(order_id)] = dict(resp)
+        self._remember_order_response(str(order_id), dict(resp))
         return str(order_id)
 
     def _merge_order_extra_payload(
@@ -698,7 +701,7 @@ class RemoteQmtBroker(BrokerBase):
             response = dict(resolution.get("resolved_result") or resolution)
             response.setdefault("order_id", order_id)
             response.setdefault("idempotency_key", key)
-            self._last_order_responses[order_id] = response
+            self._remember_order_response(order_id, response)
             return order_id
         if state == "rejected":
             raise RuntimeError(f"远程券商下单已确认拒绝: response={resolution}") from cause
@@ -774,9 +777,11 @@ class RemoteQmtBroker(BrokerBase):
         except Exception:
             return None
 
-    def _cancel_sync(self, order_id: str) -> Dict:
+    def _cancel_sync(self, order_id: str, local_order_id: Optional[int] = None) -> Dict:
+        """同步撤单；输入柜台号/主键，返回远端事实，仅传原始号给柜台。"""
         payload = self._base_payload()
         payload["order_id"] = order_id
+        payload.update({"local_order_id": local_order_id} if local_order_id is not None else self._local_order_identity(order_id))
         payload["idempotency_key"] = _new_idempotency_key("cancel_order")
         try:
             result = self._connection.request("broker.cancel_order", payload)
@@ -867,10 +872,26 @@ class RemoteQmtBroker(BrokerBase):
             raise error from cause
         raise error
 
-    def _order_status_sync(self, order_id: str) -> Dict:
+    def _order_status_sync(self, order_id: str, local_order_id: Optional[int] = None) -> Dict:
+        """同步查单；输入柜台号/主键，返回对应本地订单状态。"""
         payload = self._base_payload()
         payload["order_id"] = order_id
+        payload.update({"local_order_id": local_order_id} if local_order_id is not None else self._local_order_identity(order_id))
         return self._connection.request("broker.order_status", payload)
+
+    def _remember_order_response(self, order_id: str, response: Dict[str, Any]) -> None:
+        """保存受理事实；输入柜台号/响应，无返回，同号不同主键记为歧义且不自动选最后一笔。"""
+        previous = self._last_order_responses.get(order_id) or {}
+        if previous.get("local_order_id") and response.get("local_order_id") != previous["local_order_id"]:
+            self._ambiguous_order_ids.add(order_id)
+        self._last_order_responses[order_id] = response
+
+    def _local_order_identity(self, order_id: str) -> Dict[str, Any]:
+        """传递已受理订单的内部身份；输入柜台号，返回身份字段，无网络或账本写入。"""
+        if str(order_id) in self._ambiguous_order_ids:
+            raise ValueError("同号对应多笔本地订单，请显式提供 local_order_id")
+        row = self._last_order_responses.get(str(order_id), {}) or {}
+        return {key: row[key] for key in ("local_order_id", "broker_trade_day") if row.get(key)}
 
     def _base_payload(self) -> Dict[str, Any]:
         payload = {"account_key": self.account_key, "sub_account_id": self.sub_account_id}

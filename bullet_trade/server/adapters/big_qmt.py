@@ -21,6 +21,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass, field
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, Iterable, List, Optional
 from uuid import uuid4
 
@@ -1425,7 +1426,7 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
         self.config = config
         self.account_router = account_router
         self.client = client
-        self._order_tag_overrides: Dict[str, Dict[str, Any]] = {}
+        self._order_tag_overrides: Dict[tuple, Dict[str, Any]] = {}
 
     async def start(self) -> None:
         await self.refresh_backend_status()
@@ -1473,7 +1474,7 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
         payload.update(self._account_payload(account))
         data = await self.client.post("/orders", payload)
         orders = [
-            self._apply_local_order_tag(_normalize_order(item))
+            self._apply_local_order_tag(_normalize_order(item), account)
             for item in _extract_list(data, "orders")
             if isinstance(item, dict)
         ]
@@ -1486,7 +1487,7 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
         payload.update(self._account_payload(account))
         data = await self.client.post("/trades", payload)
         trades = [
-            self._apply_local_order_tag(_normalize_trade(item))
+            self._apply_local_order_tag(_normalize_trade(item), account)
             for item in _extract_list(data, "trades")
             if isinstance(item, dict)
         ]
@@ -1496,7 +1497,7 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
         payload = self._account_payload(account)
         payload["order_id"] = order_id
         data = await self.client.post("/order_status", payload)
-        return self._apply_local_order_tag(_normalize_order(_extract_dict(data)))
+        return self._apply_local_order_tag(_normalize_order(_extract_dict(data)), account)
 
     async def place_order(self, account: AccountContext, payload: Dict) -> Dict:
         request = dict(payload or {})
@@ -1547,8 +1548,8 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
                     )
                     continue
                 confirmed = dict(matched)
-                self._remember_local_order_tag(confirmed.get("order_id"), request)
-                confirmed = self._apply_local_order_tag(confirmed)
+                self._remember_local_order_tag(confirmed, request, account)
+                confirmed = self._apply_local_order_tag(confirmed, account)
                 for key in (
                     "order_ref",
                     "passorder_return",
@@ -1642,9 +1643,19 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
                 ids.add(order_id)
         return ids
 
-    def _remember_local_order_tag(self, order_id: Any, request: Dict[str, Any]) -> None:
-        order_id_text = str(order_id or "").strip()
-        if not order_id_text:
+    def _local_order_tag_key(self, item: Dict[str, Any], account: AccountContext) -> tuple:
+        """构造标签缓存身份；输入柜台行与实体账户，返回账户/业务日/合同号，不使用子仓划分。"""
+        raw = item.get("raw") if isinstance(item.get("raw"), dict) else {}
+        stamp = _big_qmt_order_timestamp(item, raw)
+        trade_time = item.get("traded_time") or _big_qmt_trade_datetime(item, raw)
+        if stamp is None and trade_time:
+            stamp = _parse_order_timestamp(trade_time)
+        day = datetime.fromtimestamp(stamp, ZoneInfo("Asia/Shanghai")).date() if stamp else datetime.now(ZoneInfo("Asia/Shanghai")).date()
+        return (account.config.account_id, account.config.account_type, str(day), str(item.get("order_id") or ""))
+
+    def _remember_local_order_tag(self, item: Dict[str, Any], request: Dict[str, Any], account: AccountContext) -> None:
+        """缓存确认后的本地标签；输入精确订单、请求和账户，无返回，不跨账户或跨日复用。"""
+        if not str(item.get("order_id") or "").strip():
             return
         tag: Dict[str, Any] = {}
         sub_account_id = _virtual_account_id(request)
@@ -1661,11 +1672,13 @@ class BigQmtBrokerAdapter(RemoteBrokerAdapter):
         if strategy_name:
             tag["strategy_name"] = strategy_name
         if tag:
-            self._order_tag_overrides[order_id_text] = tag
+            self._order_tag_overrides[self._local_order_tag_key(item, account)] = tag
 
-    def _apply_local_order_tag(self, item: Dict[str, Any]) -> Dict[str, Any]:
-        order_id = str(item.get("order_id") or "").strip()
-        tag = self._order_tag_overrides.get(order_id)
+    def _apply_local_order_tag(self, item: Dict[str, Any], account: AccountContext) -> Dict[str, Any]:
+        """补充同一订单标签；输入柜台行与账户，返回副本，不覆盖明确冲突的子仓归属。"""
+        tag = self._order_tag_overrides.get(self._local_order_tag_key(item, account))
+        if tag and item.get("sub_account_id") and item["sub_account_id"] != tag.get("sub_account_id"):
+            return item
         if not tag:
             return item
         result = dict(item)

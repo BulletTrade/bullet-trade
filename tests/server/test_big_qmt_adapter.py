@@ -1300,3 +1300,19 @@ async def test_bigqmt_confirmation_requires_unambiguous_broker_identity(identity
     )
     assert result["status"] == "submit_unknown"
     assert len([call for call in client.calls if call[1] == "/place_order"]) == 1
+
+
+def test_local_order_tags_never_cross_account_or_trade_day():
+    """同号标签隔离回归；输入不同账户/日期回包，只有原订单可补子仓标签。"""
+    config = _server_config()
+    config.accounts.append(AccountConfig(key="other", account_id="other-demo", account_type="stock"))
+    router = AccountRouter(config.accounts)
+    adapter = BigQmtBrokerAdapter(config, router, _FakeGatewayClient({}))
+    old = {"order_id": "635013691", "order_time": "2026-09-17 10:00:00"}
+    current = {"order_id": "635013691", "order_time": "2026-11-12 10:00:00"}
+    account = router.get("default")
+    adapter._remember_local_order_tag(old, {"sub_account_id": "old-sub"}, account)
+    assert adapter._apply_local_order_tag(old, account)["sub_account_id"] == "old-sub"
+    assert "sub_account_id" not in adapter._apply_local_order_tag(current, account)
+    assert "sub_account_id" not in adapter._apply_local_order_tag(old, router.get("other"))
+    assert adapter._apply_local_order_tag(dict(old, sub_account_id="explicit"), account)["sub_account_id"] == "explicit"
