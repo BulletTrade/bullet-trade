@@ -341,7 +341,11 @@ class EquityLimitBook:
             order.extra["wait_reason"] = "paused"
             return
         bar = self.bar(order.security, now, fq)
-        if bar is None or bar["paused"]:
+        if bar is None:
+            self.engine._record_missing_minute(order, now)
+            order.extra["wait_reason"] = "missing_or_zero_volume_minute"
+            return
+        if bar["paused"]:
             order.extra["wait_reason"] = "missing_or_zero_volume_minute"
             return
         if new_order:

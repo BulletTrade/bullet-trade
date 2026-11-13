@@ -78,6 +78,7 @@ def test_missing_quote_retains_cancelable_reservation(market, monkeypatch):
     monkeypatch.setattr("bullet_trade.data.api.get_current_data", lambda: {})
     advance(engine, 9, 41)
     assert ticket.status == OrderStatus.open
+    assert engine._data_quality_summary() == {}
     assert ticket.extra["wait_reason"] == "missing_quote"
     assert cancel_order(ticket)
     assert engine.context.portfolio.locked_cash == pytest.approx(0)
@@ -103,6 +104,7 @@ def test_halt_resume_freezes_then_fills(market):
     advance(engine, 9, 40)
     p = engine.context.portfolio
     assert ticket.status == OrderStatus.open
+    assert engine._data_quality_summary() == {}
     assert p.available_cash == pytest.approx(9773.2)
     assert p.locked_cash == pytest.approx(226.8)
     assert p.total_value == pytest.approx(10000)
@@ -111,6 +113,7 @@ def test_halt_resume_freezes_then_fills(market):
     data.price, data.volume = 2.194, 10000
     advance(engine, 10, 31)
     assert ticket.status == OrderStatus.filled
+    assert engine._data_quality_summary() == {}
     assert engine.trades[0].time.hour == 10 and engine.trades[0].time.minute == 31
     assert ticket.add_time == datetime(2026, 9, 16, 9, 40)
     assert p.available_cash == pytest.approx(9773.2)
@@ -126,9 +129,35 @@ def test_invalid_minute_cannot_fill(market, lag, empty):
     ticket = order(CODE, 100, style=LimitOrderStyle(2.218))
     advance(engine, 9, 40)
     assert ticket.status == OrderStatus.open and not engine.trades
+    assert engine._data_quality_summary()["missing_minute_orders"] == 1
     assert cancel_order(ticket.order_id)
     assert engine.context.portfolio.available_cash == pytest.approx(10000)
     assert engine.context.portfolio.locked_cash == pytest.approx(0)
+
+
+def test_limit_missing_minute_waits_once_then_recovers_without_extra_fee(market):
+    """输入限价单缺bar再恢复，返回无；质量只计一次，仍按原限价撮合及计费。"""
+    engine, _, data = market
+    data.empty = True
+    ticket = order(CODE, 100, style=LimitOrderStyle(2.218))
+    advance(engine, 9, 40)
+    advance(engine, 9, 41)
+    assert ticket.status == OrderStatus.open
+    assert ticket.extra["wait_reason"] == "missing_or_zero_volume_minute"
+    assert engine._data_quality_summary() == {
+        "incomplete": True, "missing_minute_orders": 1,
+        "examples": [{"security": CODE, "date": "2026-09-16", "time": "09:40:00",
+                      "reason": "missing_minute"}],
+    }
+    assert engine.context.portfolio.locked_cash == pytest.approx(226.8)
+    data.empty, data.volume, data.price = False, 10000, 2.194
+    advance(engine, 10, 31)
+    assert ticket.status == OrderStatus.filled
+    assert ticket.filled == 100 and ticket.style.price == 2.218
+    assert len(engine.trades) == 1
+    assert engine.context.portfolio.available_cash == pytest.approx(9773.2)
+    assert engine.context.portfolio.locked_cash == pytest.approx(0)
+    assert engine._data_quality_summary()["missing_minute_orders"] == 1
 
 
 def test_limit_never_repriced_and_day_expiry(market):
@@ -206,6 +235,61 @@ def test_market_no_fill_when_paused_or_zero_volume(market, paused):
     advance(engine, 9, 40)
     assert ticket.status == OrderStatus.canceled and not engine.trades
     assert engine.context.portfolio.available_cash == 10000
+    assert engine._data_quality_summary() == {}
+
+
+@pytest.mark.parametrize(
+    "missing,detail",
+    [
+        (True, "缺少可用于撮合的分钟行情"),
+        (False, "当前分钟无可用成交量"),
+    ],
+)
+def test_market_cancel_explains_missing_or_zero_minute_once(market, monkeypatch, missing, detail):
+    """输入缺失或零量分钟，返回无；验证订单取消与用户可见原因只记录一次。"""
+    engine, _, data = market
+    data.empty = missing
+    data.volume = 0
+    warnings = []
+    monkeypatch.setattr("bullet_trade.core.engine.log.warning", warnings.append)
+    ticket = order(CODE, 100)
+    advance(engine, 9, 40)
+    advance(engine, 9, 41)
+    assert ticket.status == OrderStatus.canceled
+    assert ticket.extra["cancel_reason"] == "missing_or_zero_volume_minute"
+    assert len(warnings) == 1
+    assert CODE in warnings[0] and "2026-09-16 09:40:00" in warnings[0]
+    assert detail in warnings[0] and "不是策略未发出信号" in warnings[0]
+    assert not engine.trades
+    if missing:
+        assert engine._data_quality_summary() == {
+            "incomplete": True, "missing_minute_orders": 1,
+            "examples": [{"security": CODE, "date": "2026-09-16", "time": "09:40:00",
+                          "reason": "missing_minute"}],
+        }
+    else:
+        assert engine._data_quality_summary() == {}
+
+
+def test_missing_minute_quality_day_callback_is_independent_snapshot(market):
+    """输入缺分钟订单和日终回调，返回无；验证有限摘要快照不被调用方修改。"""
+    engine, _, data = market
+    data.empty = True
+    for minute in range(40, 47):
+        ticket = order(CODE, 100)
+        advance(engine, 9, minute)
+        assert ticket.status == OrderStatus.canceled
+    observed = []
+    engine.daily_records = [{"date": datetime(2026, 9, 16, 15), "total_value": 10000}]
+    engine.on_day_end = observed.append
+    engine._notify_day_end(1, 1, 0, 0)
+    assert observed[0]["data_quality"]["missing_minute_orders"] == 7
+    assert len(observed[0]["data_quality"]["examples"]) == 5
+    observed[0]["data_quality"]["examples"].clear()
+    assert len(engine._data_quality_summary()["examples"]) == 5
+    engine.start_date = pd.Timestamp("2026-09-16")
+    engine.end_date = pd.Timestamp("2026-09-16")
+    assert engine._generate_results()["meta"]["data_quality"]["missing_minute_orders"] == 7
 
 
 def test_market_cannot_spend_reserved_cash(market):

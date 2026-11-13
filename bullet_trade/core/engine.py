@@ -229,6 +229,8 @@ class BacktestEngine:
         self.daily_records = []  # 每日记录
         self.trades = []  # 所有交易记录
         self.orders: Dict[str, Order] = {}  # 当日订单快照
+        self._missing_minute_orders = 0
+        self._missing_minute_examples: List[Dict[str, str]] = []
         self._equity_limit_book = EquityLimitBook(self)
         self.events = []  # 事件记录（分红/拆分）
         self._processed_dividend_keys = set()  # 已处理的分红事件键（避免重复处理）
@@ -3310,6 +3312,17 @@ class BacktestEngine:
                     if not book.can_trade(order.security, current_dt, equity_bar):
                         order.status = OrderStatus.canceled
                         order.extra["cancel_reason"] = "missing_or_zero_volume_minute"
+                        if equity_bar is None:
+                            self._record_missing_minute(order, current_dt)
+                        detail = (
+                            "缺少可用于撮合的分钟行情（数据源历史分钟覆盖可能不足）"
+                            if equity_bar is None
+                            else "当前分钟无可用成交量或明确停牌"
+                        )
+                        log.warning(
+                            f"{order.security} {current_dt} 订单已创建但未成交：{detail}，"
+                            "本单取消；不是策略未发出信号"
+                        )
                         continue
                     if isinstance(order.style, MarketOrderStyle) and order.style.market_type:
                         order.status = OrderStatus.rejected
@@ -4125,9 +4138,35 @@ class BacktestEngine:
                     "trades": [asdict(trade) for trade in self.trades[trades_start:]],
                 }
             )
+            if self._missing_minute_orders:
+                payload["data_quality"] = self._data_quality_summary()
             self.on_day_end(payload)
         except Exception as exc:
             log.warning("日终观察回调失败，不影响回测结果: %s", exc)
+
+    def _record_missing_minute(self, order, now):
+        """输入受缺分钟影响的订单与回放时刻，无返回；按订单标记只累计一次质量事实。"""
+        if order.extra.get("_missing_minute_recorded"):
+            return
+        order.extra["_missing_minute_recorded"] = True
+        self._missing_minute_orders += 1
+        if len(self._missing_minute_examples) < 5:
+            self._missing_minute_examples.append({
+                "security": order.security,
+                "date": now.date().isoformat(),
+                "time": now.time().isoformat(),
+                "reason": "missing_minute",
+            })
+
+    def _data_quality_summary(self):
+        """无输入；返回累计缺分钟受影响订单的有限独立副本，无缺数返回空字典。"""
+        if not self._missing_minute_orders:
+            return {}
+        return {
+            "incomplete": True,
+            "missing_minute_orders": self._missing_minute_orders,
+            "examples": deepcopy(self._missing_minute_examples),
+        }
 
     # 新增：记录每日持仓快照（在更新收盘价后调用）
     def _record_daily_positions(self):
@@ -4297,6 +4336,7 @@ class BacktestEngine:
                 "benchmark": get_settings().benchmark,
                 "initial_total_value": float(self.initial_cash),
                 "final_total_value": float(self.initial_cash),
+                **({"data_quality": self._data_quality_summary()} if self._missing_minute_orders else {}),
             },
         }
 
@@ -4432,6 +4472,7 @@ class BacktestEngine:
                     else self.initial_cash
                 ),
                 "final_total_value": float(df["total_value"].iloc[-1] if len(df) > 0 else 0.0),
+                **({"data_quality": self._data_quality_summary()} if self._missing_minute_orders else {}),
             },
         }
 
