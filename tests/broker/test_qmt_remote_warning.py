@@ -424,3 +424,17 @@ def test_remote_qmt_broker_get_open_orders_includes_submitted(monkeypatch):
     orders = broker.get_open_orders()
 
     assert [item["order_id"] for item in orders] == ["oid-submitted"]
+
+
+def test_order_identity_rejects_cached_raw_collision_and_allows_explicit_pk():
+    """缓存中出现跨日同号；输入两笔受理响应，裸号拒绝，显式主键准确透传且只请求一次。"""
+    broker = RemoteQmtBroker("demo", config={"host": "127.0.0.1", "port": 58620, "token": "test"})
+    broker._remember_order_response("same", {"order_id": "same", "local_order_id": 10, "broker_trade_day": "2026-09-17"})
+    assert broker._local_order_identity("same")["local_order_id"] == 10
+    broker._remember_order_response("same", {"order_id": "same", "local_order_id": 11, "broker_trade_day": "2026-11-12"})
+    broker._connection = _FakeConn(response={"order_id": "same", "status": "filled"})
+    with pytest.raises(ValueError, match="local_order_id"):
+        broker._order_status_sync("same")
+    assert not broker._connection.requests
+    broker._order_status_sync("same", 11)
+    assert broker._connection.requests[0][1]["local_order_id"] == 11
